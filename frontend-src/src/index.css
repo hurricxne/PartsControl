@@ -1,0 +1,149 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── CSS Variables (light mode default) ─────────────────────────── */
+:root {
+  --surface:     #f8fafc;
+  --surface-100: #ffffff;
+  --surface-200: #f1f5f9;
+  --surface-300: #e2e8f0;
+  --border:      #e2e8f0;
+  --text-primary: #0f172a;
+  --text-muted:   #64748b;
+  --text-faint:   #94a3b8;
+}
+
+/* Dark mode overrides */
+.dark {
+  --surface:     #0f172a;
+  --surface-100: #1e293b;
+  --surface-200: #263347;
+  --surface-300: #334155;
+  --border:      #334155;
+  --text-primary: #f1f5f9;
+  --text-muted:   #94a3b8;
+  --text-faint:   #64748b;
+}
+
+/* ── Empresa color variables ──────────────────────────────────── */
+:root, [data-empresa="automotriz"] {
+  --empresa-primary:    #1550d4;
+  --empresa-primary-hv: #0e3faf;
+  --empresa-primary-sh: rgba(21,80,212,0.2);
+  --empresa-gradient-a: #031f6a;
+  --empresa-gradient-b: #1a5cf0;
+  --empresa-gradient-c: #0e3faf;
+  --empresa-accent:     #487af2;
+  --empresa-text-soft:  #c5d6fc;
+}
+
+[data-empresa="mineria"] {
+  --empresa-primary:    #ea6c0d;
+  --empresa-primary-hv: #c45c0a;
+  --empresa-primary-sh: rgba(234,108,13,0.2);
+  --empresa-gradient-a: #431404;
+  --empresa-gradient-b: #ea6c0d;
+  --empresa-gradient-c: #c45c0a;
+  --empresa-accent:     #f97316;
+  --empresa-text-soft:  #fed7aa;
+}
+
+@layer base {
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    background-color: var(--surface);
+    color: var(--text-primary);
+    -webkit-font-smoothing: antialiased;
+  }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--surface-200); }
+  ::-webkit-scrollbar-thumb { background: var(--surface-300); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
+}
+
+@layer components {
+  /* ── Layout ───────────────────────────────────────────────────── */
+  .sidebar-bg {
+    background-color: var(--surface-100);
+    border-color: var(--border);
+  }
+  .header-bg {
+    background-color: color-mix(in srgb, var(--surface-100) 80%, transparent);
+    border-color: var(--border);
+  }
+
+  /* ── Cards ────────────────────────────────────────────────────── */
+  .card {
+    background-color: var(--surface-100);
+    border: 1px solid var(--border);
+    @apply rounded-2xl shadow-xl;
+  }
+
+  /* Dark-mode specific card styles */
+  .dark .card {
+    background-image: linear-gradient(145deg, #1e293b, #263347);
+    border-color: rgba(51, 65, 85, 0.5);
+  }
+
+  /* ── Buttons ──────────────────────────────────────────────────── */
+  .btn-primary {
+    background-color: var(--empresa-primary, #1550d4);
+    box-shadow: 0 4px 14px var(--empresa-primary-sh, rgba(21,80,212,0.2));
+    @apply text-white font-semibold px-5 py-2.5 rounded-xl
+           transition-all duration-200 flex items-center gap-2
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary:hover:not(:disabled) {
+    background-color: var(--empresa-primary-hv, #0e3faf);
+    box-shadow: 0 4px 20px var(--empresa-primary-sh, rgba(21,80,212,0.25));
+  }
+  .btn-secondary {
+    @apply font-medium px-5 py-2.5 rounded-xl
+           transition-all duration-200 flex items-center gap-2;
+    background-color: var(--surface-200);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+  }
+  .btn-secondary:hover {
+    background-color: var(--surface-300);
+    color: var(--text-primary);
+  }
+
+  /* ── Form ─────────────────────────────────────────────────────── */
+  .input {
+    @apply rounded-xl px-4 py-2.5 w-full focus:outline-none
+           focus:ring-2 focus:ring-brand-500/20 transition-all duration-200;
+    background-color: var(--surface-200);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+  }
+  .input:focus {
+    border-color: var(--empresa-primary, #1a5cf0);
+  }
+  .input::placeholder { color: var(--text-faint); }
+
+  /* ── Badge ────────────────────────────────────────────────────── */
+  .badge {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold;
+  }
+
+  /* ── Stat card ────────────────────────────────────────────────── */
+  .stat-card {
+    @apply card p-5 flex flex-col gap-2 hover:border-brand-600/40 transition-all duration-200;
+  }
+}
+
+/* ── Animations ──────────────────────────────────────────────────── */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in  { animation: fadeIn  0.4s ease-out; }
+.animate-slide-up { animation: slideUp 0.4s ease-out; }
