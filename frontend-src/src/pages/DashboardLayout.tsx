@@ -10,6 +10,7 @@ import {
 import { useAuthStore } from '../stores/authStore'
 import { useTheme } from '../context/ThemeContext'
 import { comprasAPI } from '../services/api'
+import NotificationBell from '../components/NotificationBell'
 import toast from 'react-hot-toast'
 
 interface NavItem {
@@ -304,46 +305,7 @@ export default function DashboardLayout() {
             </button>
 
             {/* Notifications */}
-            <div className="relative" ref={bellRef}>
-              <button
-                onClick={() => { setBellOpen(!bellOpen); setUserOpen(false) }}
-                className="w-9 h-9 rounded-xl flex items-center justify-center transition-all duration-200 hover:bg-[var(--surface-200)] relative"
-                style={{ color: 'var(--text-muted)' }}
-              >
-                <Bell className="w-4 h-4" />
-                <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-red-500 ring-2 ring-[var(--surface-100)]" />
-              </button>
-
-              {bellOpen && (
-                <div className="absolute right-0 top-12 w-[calc(100vw-2rem)] sm:w-80 rounded-2xl shadow-2xl border overflow-hidden z-50"
-                  style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
-                  <div className="flex items-center justify-between px-4 py-3 border-b" style={{ borderColor: 'var(--border)' }}>
-                    <span className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>Notificaciones</span>
-                    <span className="text-xs px-2 py-0.5 rounded-full bg-brand-500/10 text-brand-500 font-medium">
-                      {MOCK_NOTIFICATIONS.length} nuevas
-                    </span>
-                  </div>
-                  <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
-                    {MOCK_NOTIFICATIONS.map(n => (
-                      <div key={n.id} className="flex items-start gap-3 px-4 py-3 hover:bg-[var(--surface-200)] transition-colors cursor-pointer">
-                        <span className={`w-2 h-2 rounded-full mt-1.5 shrink-0 ${n.dot}`} />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>{n.title}</p>
-                          <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>{n.desc}</p>
-                        </div>
-                        <span className="text-xs shrink-0" style={{ color: 'var(--text-faint)' }}>{n.time}</span>
-                      </div>
-                    ))}
-                  </div>
-                  <div className="border-t px-4 py-2.5" style={{ borderColor: 'var(--border)' }}>
-                    <button className="text-xs text-brand-500 hover:text-brand-400 font-medium transition-colors w-full text-center">
-                      Ver todas las notificaciones
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
+            <NotificationBell />
             {/* User menu */}
             <div className="relative ml-1" ref={userRef}>
               <button

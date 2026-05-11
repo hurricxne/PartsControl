@@ -27,6 +27,9 @@ interface EmbItem {
   oc_proveedor_nombre: string
   numero_cot: string
   cliente: string
+  unit_price_usd: number | null
+  numero_oc_cliente: string
+  numero_factura: string | null
 }
 
 interface Embarque {
@@ -58,6 +61,11 @@ function fmtClp(v?: number | null) {
   if (!v) return '—'
   return '$' + Math.round(v).toLocaleString('es-CL')
 }
+function fmtUsd(v: number | null): string {
+  if (v == null) return '—'
+  return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
 function fmtKg(lbs?: number | null, qty = 1) {
   if (!lbs) return '—'
   return (lbs * 0.453592 * qty).toFixed(2) + ' kg'
@@ -218,6 +226,27 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
   const [estadoEdit, setEstadoEdit] = useState(emb.estado)
   const [confirmDes, setConfirmDes] = useState<EmbItem | null>(null)
   const [desembarcando, setDesembarcando] = useState<number | null>(null)
+  const [usdEdits, setUsdEdits]       = useState<Record<number, string>>({})
+  const [usdValues, setUsdValues]     = useState<Record<number, number | null>>({})
+  const [savingUsd, setSavingUsd]     = useState<Record<number, boolean>>({})
+
+  const handleSaveUsdEmb = async (itemId: number) => {
+    const raw = usdEdits[itemId]
+    if (raw === undefined || raw === '') return
+    const val = parseFloat(raw)
+    if (isNaN(val) || val < 0) return
+    setSavingUsd(prev => ({ ...prev, [itemId]: true }))
+    try {
+      const { data } = await comprasAPI.updatePrecioUsd(itemId, val)
+      setUsdValues(prev => ({ ...prev, [itemId]: data.unit_price_usd }))
+      toast.success('Precio USD guardado')
+    } catch {
+      toast.error('Error al guardar precio USD')
+    } finally {
+      setSavingUsd(prev => ({ ...prev, [itemId]: false }))
+      setUsdEdits(prev => { const n = { ...prev }; delete n[itemId]; return n })
+    }
+  }
 
   // Docs local state (initialized from emb, updated via DocField)
   const toDocFile = (s: string) => s ? { filename: s, original: s } : null
@@ -407,7 +436,7 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
                   <table className="w-full text-xs">
                     <thead>
                       <tr style={{ backgroundColor: 'var(--surface-200)', borderBottom: '1px solid var(--border)' }}>
-                        {['N° Parte','Descripción','Marca','Qty','Peso','Plazo','Días Rest.','Total Compra USD','OCP','COT / Cliente',''].map(h => (
+                        {['N° Parte','Descripción','Marca','Qty','Peso','Plazo','Días Rest.','OC Cliente','Invoice','Unit USD','Total USD','OCP','COT / Cliente',''].map(h => (
                           <th key={h} className="px-3 py-2 text-left font-semibold uppercase tracking-wider whitespace-nowrap"
                             style={{ color: 'var(--text-faint)' }}>{h}</th>
                         ))}
@@ -426,7 +455,39 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
                             {item.plazo_entrega_max ? `${item.plazo_entrega_max}d háb.` : '—'}
                           </td>
                           <td className="px-3 py-2.5 text-center"><DiasRestantes dias={item.dias_restantes} /></td>
-                          <td className="px-3 py-2.5 font-semibold whitespace-nowrap text-brand-400">{fmtClp(item.total_venta_clp)}</td>
+                          {/* A-3.4: OC Cliente */}
+                          <td className="px-3 py-2.5 font-mono whitespace-nowrap text-xs" style={{ color: 'var(--text-muted)' }}>
+                            {item.numero_oc_cliente || '—'}
+                          </td>
+                          {/* A-3.4: Invoice */}
+                          <td className="px-3 py-2.5 font-mono whitespace-nowrap text-xs" style={{ color: 'var(--text-muted)' }}>
+                            {item.numero_factura || '—'}
+                          </td>
+                          {/* A-3.2: Unit USD inline edit */}
+                          <td className="px-3 py-2.5 text-xs" onClick={e => e.stopPropagation()}>
+                            <div className="flex items-center gap-1">
+                              <input
+                                type="number"
+                                step="0.01"
+                                min="0"
+                                value={usdEdits[item.id] !== undefined ? usdEdits[item.id] : (usdValues[item.id] ?? item.unit_price_usd ?? '')}
+                                placeholder="—"
+                                onChange={e => setUsdEdits(prev => ({ ...prev, [item.id]: e.target.value }))}
+                                onBlur={() => handleSaveUsdEmb(item.id)}
+                                onKeyDown={e => { if (e.key === 'Enter') handleSaveUsdEmb(item.id) }}
+                                className="w-20 text-right text-xs rounded px-1 py-0.5 font-mono outline-none"
+                                style={{ backgroundColor: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--text-primary)' }}
+                              />
+                              {savingUsd[item.id] && <Loader2 className="w-3 h-3 animate-spin text-brand-400 shrink-0" />}
+                            </div>
+                          </td>
+                          {/* A-3.4: Total USD */}
+                          <td className="px-3 py-2.5 font-semibold whitespace-nowrap text-xs text-emerald-400">
+                            {(() => {
+                              const u = usdValues[item.id] ?? item.unit_price_usd
+                              return u != null ? fmtUsd(u * item.cantidad) : '—'
+                            })()}
+                          </td>
                           <td className="px-3 py-2.5 font-mono whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{item.oc_proveedor_numero || '—'}</td>
                           <td className="px-3 py-2.5 whitespace-nowrap">
                             <p className="font-mono text-[10px] text-brand-400">{item.numero_cot ? `COT-${item.numero_cot}` : '—'}</p>
@@ -457,9 +518,12 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
                     </span>
                   </span>
                   <span style={{ color: 'var(--text-muted)' }}>
-                    Total compra USD:{' '}
-                    <span className="text-brand-400">
-                      {fmtClp(detalle.items.reduce((s, i) => s + (i.total_venta_clp || 0), 0))}
+                    Total USD:{' '}
+                    <span className="text-emerald-400">
+                      {fmtUsd(detalle.items.reduce((s, i) => {
+                        const u = usdValues[i.id] ?? i.unit_price_usd
+                        return s + (u != null ? u * i.cantidad : 0)
+                      }, 0))}
                     </span>
                   </span>
                 </div>

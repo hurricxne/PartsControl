@@ -152,6 +152,8 @@ export const comprasAPI = {
   updatePreEmbarque: (id: number, data: Record<string, any>) => api.put(`/compras/pre-embarques/${id}`, data),
   getEmbarque: (id: number) => api.get(`/compras/embarques-list/${id}`),
   desembarcarItem: (embId: number, embarqueItemId: number) => api.delete(`/compras/embarques-list/${embId}/items/${embarqueItemId}`),
+  updatePrecioUsd: (itemId: number, unit_price_usd: number) =>
+    api.patch(`/compras/items/${itemId}/precio-usd`, { unit_price_usd }),
 }
 
 // Facturas Proveedor
@@ -171,4 +173,40 @@ export const facturasAPI = {
   remove: (id: number) => api.delete(`/facturas/${id}`),
   validarPreEmbarque: (preEmbarqueId: number) =>
     api.get(`/facturas/validar-pre-embarque/${preEmbarqueId}`),
+}
+
+
+// Notificaciones
+export const notificacionesAPI = {
+  list: () => api.get('/notificaciones'),
+  countNoLeidas: () => api.get('/notificaciones/no-leidas/count'),
+  marcarLeida: (id: number) => api.patch(`/notificaciones/${id}/leida`),
+  marcarTodasLeidas: () => api.patch('/notificaciones/marcar-todas-leidas'),
+}
+
+// Bodega
+export const bodegaAPI = {
+  listEmbarques: () => api.get('/bodega/embarques'),
+  historialEmbarques: () => api.get('/bodega/embarques/historial'),
+  getEmbarque: (id: number) => api.get(`/bodega/embarques/${id}`),
+  iniciarRecepcion: (embarqueId: number) => api.post(`/bodega/embarques/${embarqueId}/recibir`),
+  getRecepcion: (recepcionId: number) => api.get(`/bodega/recepciones/${recepcionId}`),
+  marcarItem: (recepcionId: number, itemId: number, data: Record<string, any>) =>
+    api.patch(`/bodega/recepciones/${recepcionId}/items/${itemId}`, data),
+  subirFoto: (recepcionId: number, riId: number, file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return api.post(`/bodega/recepciones/${recepcionId}/items/${riId}/foto`, fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+  },
+  eliminarFoto: (recepcionId: number, riId: number, fotoId: number) =>
+    api.delete(`/bodega/recepciones/${recepcionId}/items/${riId}/foto/${fotoId}`),
+  cerrarRecepcion: (recepcionId: number, obs?: string) =>
+    api.post(`/bodega/recepciones/${recepcionId}/cerrar`, { observacion_general: obs }),
+  listReclamos: () => api.get('/bodega/reclamos'),
+  actualizarReclamo: (id: number, data: Record<string, any>) =>
+    api.patch(`/bodega/reclamos/${id}`, data),
+  listoParaDespachar: () => api.get('/bodega/ventas/listo-para-despachar'),
+  alertasPlazo: () => api.get('/bodega/ventas/alertas-plazo-critico'),
 }

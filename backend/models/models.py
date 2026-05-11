@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    Column, Integer, String, Float, DateTime, ForeignKey, Numeric, Numeric,
+    Column, Integer, String, Float, DateTime, Date, ForeignKey, Numeric, Numeric,
     Text, Enum, Boolean
 )
 from sqlalchemy.orm import relationship
@@ -143,7 +143,7 @@ class OcCliente(Base):
     numero_oc = Column(String(100))
     fecha_oc = Column(String(50))
     cond_pago = Column(String(200))
-    fecha_entrega = Column(String(50))
+    fecha_entrega = Column(Date, nullable=True)
     asesor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -196,7 +196,7 @@ class Embarque(Base):
     forwarder = Column(String(255))
     awb = Column(String(100))
     fecha_despacho = Column(String(50))
-    fecha_llegada_est = Column(String(50))
+    fecha_llegada_est = Column(Date, nullable=True)
     notas = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -342,3 +342,88 @@ class FacturaProveedorItem(Base):
 
     factura  = relationship("FacturaProveedor", back_populates="items")
     ocp_item = relationship("OcProveedorItem", foreign_keys=[ocp_item_id])
+
+
+# ─── v2 Models ───────────────────────────────────────────────────────────────
+
+class Notificacion(Base):
+    """In-app notifications per rol"""
+    __tablename__ = "notificaciones"
+    id = Column(Integer, primary_key=True, index=True)
+    destinatario_rol = Column(String(50), nullable=False)
+    severidad = Column(String(20), default='info')
+    titulo = Column(String(255), nullable=False)
+    mensaje = Column(Text, nullable=False)
+    entidad_tipo = Column(String(50), nullable=True)
+    entidad_id = Column(Integer, nullable=True)
+    link = Column(String(500), nullable=True)
+    leida = Column(Boolean, default=False)
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    regla = Column(String(150), nullable=True)
+
+
+class RecepcionEmbarque(Base):
+    """Physical reception of a shipment at warehouse"""
+    __tablename__ = "recepciones_embarque"
+    id = Column(Integer, primary_key=True, index=True)
+    embarque_id = Column(Integer, ForeignKey("embarques.id"), unique=True)
+    fecha_inicio = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_cierre = Column(DateTime(timezone=True), nullable=True)
+    usuario_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    estado = Column(String(20), default='abierta')
+    observacion_general = Column(Text, nullable=True)
+
+    embarque = relationship("Embarque")
+    usuario = relationship("User", foreign_keys="[RecepcionEmbarque.usuario_id]")
+    items = relationship("RecepcionEmbarqueItem", back_populates="recepcion",
+                         cascade="all, delete-orphan")
+
+
+class RecepcionEmbarqueItem(Base):
+    """Per-item reception status"""
+    __tablename__ = "recepcion_embarque_items"
+    id = Column(Integer, primary_key=True, index=True)
+    recepcion_id = Column(Integer, ForeignKey("recepciones_embarque.id", ondelete="CASCADE"))
+    embarque_item_id = Column(Integer, ForeignKey("embarque_items.id"))
+    qty_recibida = Column(Integer, default=0)
+    qty_danada = Column(Integer, default=0)
+    estado_recepcion = Column(String(30), nullable=True)
+    observacion = Column(Text, nullable=True)
+    fecha_marcado = Column(DateTime(timezone=True), onupdate=func.now())
+    usuario_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    recepcion = relationship("RecepcionEmbarque", back_populates="items")
+    embarque_item = relationship("EmbarqueItem")
+    fotos = relationship("RecepcionItemFoto", back_populates="item_recepcion",
+                         cascade="all, delete-orphan")
+
+
+class RecepcionItemFoto(Base):
+    """Photos attached to a damaged/incomplete reception item"""
+    __tablename__ = "recepcion_item_fotos"
+    id = Column(Integer, primary_key=True, index=True)
+    recepcion_item_id = Column(Integer, ForeignKey("recepcion_embarque_items.id", ondelete="CASCADE"))
+    url_foto = Column(String(500), nullable=False)
+    subida_por = Column(Integer, ForeignKey("users.id"), nullable=True)
+    fecha_subida = Column(DateTime(timezone=True), server_default=func.now())
+
+    item_recepcion = relationship("RecepcionEmbarqueItem", back_populates="fotos")
+
+
+class ReclamoProveedor(Base):
+    """Supplier claim generated from failed reception items"""
+    __tablename__ = "reclamos_proveedor"
+    id = Column(Integer, primary_key=True, index=True)
+    oc_proveedor_id = Column(Integer, ForeignKey("oc_proveedor.id"), nullable=True)
+    item_cotizacion_id = Column(Integer, ForeignKey("items_cotizacion.id"), nullable=True)
+    recepcion_item_id = Column(Integer, ForeignKey("recepcion_embarque_items.id"), nullable=True)
+    motivo = Column(String(30), nullable=False)
+    qty_afectada = Column(Integer, default=0)
+    estado = Column(String(20), default='pendiente')
+    observacion = Column(Text, nullable=True)
+    usuario_resuelve_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_resolucion = Column(DateTime(timezone=True), nullable=True)
+
+    item_cotizacion = relationship("ItemCotizacion")
+    recepcion_item = relationship("RecepcionEmbarqueItem")

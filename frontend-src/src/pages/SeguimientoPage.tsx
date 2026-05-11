@@ -30,6 +30,8 @@ interface SeguimientoItem {
   ocp_proveedor: string
   numero_oc_cliente: string
   ocp_item_id: number | null   // OcProveedorItem.id
+  unit_price_usd: number | null
+  dias_transcurridos: number | null
 }
 
 interface OcpGroup {
@@ -96,6 +98,15 @@ function DiasRestantes({ dias }: { dias: number | null }) {
   if (dias <= 5) return <span className="text-red-400 font-semibold text-xs">{dias}d ⚠</span>
   if (dias <= 15) return <span className="text-amber-400 font-semibold text-xs">{dias}d</span>
   return <span className="text-emerald-400 text-xs">{dias}d</span>
+}
+
+function DeltaPlazo({ prometido, transcurrido }: { prometido: number | null; transcurrido: number | null }) {
+  if (prometido == null || transcurrido == null) return <span style={{ color: 'var(--text-faint)' }}>—</span>
+  const delta = transcurrido - prometido
+  if (delta < 0) return <span className="text-emerald-400 font-semibold text-xs" title={`${Math.abs(delta)}d adelantado`}>▲ {Math.abs(delta)}d</span>
+  if (delta === 0) return <span className="text-emerald-400 text-xs">En plazo</span>
+  if (delta <= 3) return <span className="text-amber-400 font-semibold text-xs" title={`${delta}d de atraso`}>⚠ {delta}d</span>
+  return <span className="text-red-400 font-bold text-xs" title={`${delta}d de atraso`}>● {delta}d atraso</span>
 }
 
 function MatchIcon({ match, qtySistema, qtyFacturada }: {
@@ -568,7 +579,30 @@ function OcpGroupCard({
 }) {
   const [expanded, setExpanded] = useState(true)
   const [qtyEdits, setQtyEdits] = useState<Record<number, string>>({})
+  const [usdEdits, setUsdEdits] = useState<Record<number, string>>({})
+  const [savingUsd, setSavingUsd] = useState<Record<number, boolean>>({})
+  const [usdValues, setUsdValues] = useState<Record<number, number | null>>(
+    Object.fromEntries(group.items.map(i => [i.id, i.unit_price_usd]))
+  )
   const groupIds = group.items.map(i => i.id)
+
+  const handleSaveUsd = async (itemId: number) => {
+    const raw = usdEdits[itemId]
+    if (raw === undefined || raw === '') return
+    const val = parseFloat(raw)
+    if (isNaN(val) || val < 0) return
+    setSavingUsd(prev => ({ ...prev, [itemId]: true }))
+    try {
+      const { data } = await comprasAPI.updatePrecioUsd(itemId, val)
+      setUsdValues(prev => ({ ...prev, [itemId]: data.unit_price_usd }))
+      toast.success('Precio USD guardado')
+    } catch {
+      toast.error('Error al guardar precio USD')
+    } finally {
+      setSavingUsd(prev => ({ ...prev, [itemId]: false }))
+      setUsdEdits(prev => { const n = { ...prev }; delete n[itemId]; return n })
+    }
+  }
   const allSelected = groupIds.every(id => selectedIds.has(id))
   const someSelected = groupIds.some(id => selectedIds.has(id))
   const selectedInGroup = groupIds.filter(id => selectedIds.has(id))
@@ -622,7 +656,7 @@ function OcpGroupCard({
                         onChange={() => onToggleAll(group)} className="rounded"
                         onClick={e => e.stopPropagation()} />
                     </th>
-                    {['N° Parte','Descripción','Marca','Qty','Qty Desp.','Peso','Total USD','Pzo. Prov.','Pzo. Máx.','Días Rest.','COT','OC Cliente','Cliente'].map(h => (
+                    {['N° Parte','Descripción','Marca','Qty','Qty Desp.','Peso','Unit USD','Total USD','Trans.','Delta','Pzo. Prov.','Pzo. Máx.','Días Rest.','COT','OC Cliente','Cliente'].map(h => (
                       <th key={h} className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wider"
                         style={{ color: 'var(--text-faint)' }}>{h}</th>
                     ))}
@@ -661,8 +695,38 @@ function OcpGroupCard({
                       <td className="px-3 py-2.5 text-xs text-right font-mono" style={{ color: 'var(--text-muted)' }}>
                         {fmtKg(item.peso_unit_lbs, item.cantidad)}
                       </td>
+                      {/* A-2.4: Unit USD inline edit */}
+                      <td className="px-3 py-2.5 text-xs text-right" onClick={e => e.stopPropagation()}>
+                        <div className="flex items-center gap-1 justify-end">
+                          <input
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            value={usdEdits[item.id] !== undefined ? usdEdits[item.id] : (usdValues[item.id] ?? '')}
+                            placeholder="—"
+                            onChange={e => setUsdEdits(prev => ({ ...prev, [item.id]: e.target.value }))}
+                            onBlur={() => handleSaveUsd(item.id)}
+                            onKeyDown={e => { if (e.key === 'Enter') handleSaveUsd(item.id) }}
+                            className="w-20 text-right text-xs rounded px-1 py-0.5 font-mono outline-none"
+                            style={{ backgroundColor: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--text-primary)' }}
+                            title="Precio unitario USD de compra"
+                          />
+                          {savingUsd[item.id] && <Loader2 className="w-3 h-3 animate-spin text-brand-400 shrink-0" />}
+                        </div>
+                      </td>
+                      {/* A-2.4: Total USD computed */}
                       <td className="px-3 py-2.5 text-xs text-right font-mono font-semibold" style={{ color: 'var(--text-primary)' }}>
-                        {fmtUsd(item.precio_unit_cotizacion ? item.precio_unit_cotizacion * item.cantidad : null)}
+                        {usdValues[item.id] != null
+                          ? fmtUsd(usdValues[item.id]! * item.cantidad)
+                          : <span style={{ color: 'var(--text-faint)' }}>—</span>}
+                      </td>
+                      {/* A-2.1: Días transcurridos */}
+                      <td className="px-3 py-2.5 text-xs text-center font-mono" style={{ color: 'var(--text-muted)' }}>
+                        {item.dias_transcurridos != null ? `${item.dias_transcurridos}d` : '—'}
+                      </td>
+                      {/* A-2.1: Delta semáforo */}
+                      <td className="px-3 py-2.5 text-xs text-center">
+                        <DeltaPlazo prometido={item.plazo_dias_prov} transcurrido={item.dias_transcurridos} />
                       </td>
                       <td className="px-3 py-2.5 text-xs text-center" style={{ color: 'var(--text-muted)' }}>
                         {item.plazo_dias_prov ? `${item.plazo_dias_prov}d` : '—'}

@@ -32,6 +32,7 @@ interface PrepItem {
   numero_oc_cliente: string
   fecha_entrega_cliente: string
   cantidad_despacho: number | null
+  unit_price_usd: number | null
 }
 
 interface PreEmbarque {
@@ -963,6 +964,24 @@ function PreEmbarqueCard({ pre, availableItems, onRefresh }: { pre: PreEmbarque;
   const [savingFecha, setSavingFecha] = useState(false)
   const [savingQty, setSavingQty] = useState<number | null>(null)
   const [qtyEdits, setQtyEdits] = useState<Record<number, string>>({})
+  const [usdEdits, setUsdEdits]   = useState<Record<number, string>>({})
+  const [usdValues, setUsdValues] = useState<Record<number, number | null>>({})
+
+  const handleSaveUsdPre = async (itemId: number) => {
+    const raw = usdEdits[itemId]
+    if (raw === undefined || raw === '') return
+    const val = parseFloat(raw)
+    if (isNaN(val) || val < 0) return
+    try {
+      const { data } = await comprasAPI.updatePrecioUsd(itemId, val)
+      setUsdValues(prev => ({ ...prev, [itemId]: data.unit_price_usd }))
+      toast.success('Precio USD guardado')
+    } catch {
+      toast.error('Error al guardar precio USD')
+    } finally {
+      setUsdEdits(prev => { const n = { ...prev }; delete n[itemId]; return n })
+    }
+  }
 
   const handleSaveFecha = async (val: string) => {
     setSavingFecha(true)
@@ -1150,7 +1169,7 @@ function PreEmbarqueCard({ pre, availableItems, onRefresh }: { pre: PreEmbarque;
             <table className="w-full text-xs">
               <thead>
                 <tr style={{ backgroundColor: 'var(--surface-200)', borderBottom: '1px solid var(--border)' }}>
-                  {['#','N° Parte','Descripción','Proveedor / OCP','Qty','Qty Desp.','Pzo.Máx','Días Rest.','Peso (kg)','Total USD',...(!isEmbarcado ? [''] : [])].map(h => (
+                  {['#','N° Parte','Descripción','Proveedor / OCP','Qty','Qty Desp.','Pzo.Máx','Días Rest.','Peso (kg)','Unit USD','Total USD',...(!isEmbarcado ? [''] : [])].map(h => (
                     <th key={h} className="px-3 py-2 text-left font-semibold uppercase tracking-wider whitespace-nowrap"
                       style={{ color: 'var(--text-faint)' }}>{h}</th>
                   ))}
@@ -1214,10 +1233,27 @@ function PreEmbarqueCard({ pre, availableItems, onRefresh }: { pre: PreEmbarque;
                     <td className="px-3 py-2.5 text-right font-mono" style={{ color: 'var(--text-muted)' }}>
                       {fmtKgItem(item.peso_unit_lbs, item.cantidad)}
                     </td>
-                    <td className="px-3 py-2.5 text-right font-mono font-semibold text-brand-400">
-                      {item.precio_unit_cotizacion > 0
-                        ? '$' + (item.precio_unit_cotizacion * item.cantidad).toLocaleString('en-US', { minimumFractionDigits: 2 })
-                        : '—'}
+                    {/* A-3.2: Unit USD inline edit */}
+                    <td className="px-3 py-2.5 text-right" onClick={e => e.stopPropagation()}>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        value={usdEdits[item.id] !== undefined ? usdEdits[item.id] : (usdValues[item.id] ?? item.unit_price_usd ?? '')}
+                        placeholder="—"
+                        onChange={e => setUsdEdits(prev => ({ ...prev, [item.id]: e.target.value }))}
+                        onBlur={() => handleSaveUsdPre(item.id)}
+                        onKeyDown={e => { if (e.key === 'Enter') handleSaveUsdPre(item.id) }}
+                        className="w-20 text-right text-xs rounded px-1 py-0.5 font-mono outline-none"
+                        style={{ backgroundColor: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--text-primary)' }}
+                      />
+                    </td>
+                    {/* A-3.2: Total USD computed */}
+                    <td className="px-3 py-2.5 text-right font-mono font-semibold text-emerald-400">
+                      {(() => {
+                        const u = usdValues[item.id] ?? item.unit_price_usd
+                        return u != null ? ('$' + (u * item.cantidad).toLocaleString('en-US', { minimumFractionDigits: 2 })) : '—'
+                      })()}
                     </td>
                     {!isEmbarcado && (
                       <td className="px-3 py-2.5 text-center">

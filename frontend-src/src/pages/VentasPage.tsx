@@ -9,7 +9,7 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Area, AreaChart,
 } from 'recharts'
-import { ventasAPI } from '../services/api'
+import { ventasAPI, bodegaAPI } from '../services/api'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -54,6 +54,25 @@ interface Venta {
   fecha_entrega: string
   created_at: string | null
   items: ItemVenta[]
+}
+
+interface OcListaDespacho {
+  oc_cliente_id: number
+  numero_oc: string
+  cliente: string
+  fecha_entrega: string | null
+  total_items: number
+  items_en_bodega: number
+}
+
+interface OcAlertaPlazo {
+  oc_cliente_id: number
+  numero_oc: string
+  cliente: string
+  fecha_entrega: string | null
+  dias_habiles_restantes: number
+  items_en_bodega: number
+  total_items: number
 }
 
 interface Kpis {
@@ -359,6 +378,9 @@ export default function VentasPage() {
   const [periodo, setPeriodo] = useState<string>('')
   const [error, setError] = useState('')
   const [exporting, setExporting] = useState(false)
+  const [listos, setListos] = useState<OcListaDespacho[]>([])
+  const [alertas, setAlertas] = useState<OcAlertaPlazo[]>([])
+  const [loadingPaneles, setLoadingPaneles] = useState(false)
 
   const load = useCallback(async (search?: string, per?: string) => {
     setLoading(true)
@@ -380,6 +402,24 @@ export default function VentasPage() {
   }, [])
 
   useEffect(() => { load(q || undefined, periodo || undefined) }, [periodo])
+
+  // B6/B7: Load bodega panels on mount
+  useEffect(() => {
+    const loadPaneles = async () => {
+      setLoadingPaneles(true)
+      try {
+        const [lRes, aRes] = await Promise.all([
+          bodegaAPI.listoParaDespachar(),
+          bodegaAPI.alertasPlazo(),
+        ])
+        setListos(lRes.data ?? [])
+        setAlertas(aRes.data ?? [])
+      } catch { /* silent */ } finally {
+        setLoadingPaneles(false)
+      }
+    }
+    loadPaneles()
+  }, [])
 
   const handleSearch = (v: string) => {
     setQ(v)
@@ -479,6 +519,76 @@ export default function VentasPage() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* B6: Listo para despachar */}
+      {!loadingPaneles && listos.length > 0 && (
+        <div className="rounded-2xl border p-5 space-y-3"
+          style={{ backgroundColor: 'var(--surface-50)', borderColor: 'var(--border)' }}>
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+            <h2 className="font-semibold text-sm text-emerald-400">
+              Listo para despachar ({listos.length})
+            </h2>
+          </div>
+          <div className="space-y-2">
+            {listos.map(oc => (
+              <div key={oc.oc_cliente_id}
+                className="flex items-center justify-between px-3 py-2 rounded-xl border"
+                style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
+                <div className="flex items-center gap-3 min-w-0">
+                  <Package className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <div className="min-w-0">
+                    <span className="font-semibold text-xs text-emerald-400">{oc.numero_oc || `OC #${oc.oc_cliente_id}`}</span>
+                    <span className="text-xs ml-2" style={{ color: 'var(--text-muted)' }}>{oc.cliente}</span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 shrink-0 text-xs" style={{ color: 'var(--text-muted)' }}>
+                  <span>{oc.items_en_bodega}/{oc.total_items} ítems</span>
+                  {oc.fecha_entrega && (
+                    <span className="font-mono px-2 py-0.5 rounded-lg text-[10px] bg-emerald-500/10 text-emerald-400">
+                      Entrega: {oc.fecha_entrega}
+                    </span>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* B7: Alertas plazo critico */}
+      {!loadingPaneles && alertas.length > 0 && (
+        <div className="rounded-2xl border p-5 space-y-3"
+          style={{ backgroundColor: 'var(--surface-50)', borderColor: 'rgba(239,68,68,0.3)' }}>
+          <div className="flex items-center gap-2">
+            <Clock className="w-4 h-4 text-red-400" />
+            <h2 className="font-semibold text-sm text-red-400">
+              Plazo crítico ≤ 3 días hábiles ({alertas.length})
+            </h2>
+          </div>
+          <div className="space-y-2">
+            {alertas.map(oc => (
+              <div key={oc.oc_cliente_id}
+                className="flex items-center justify-between px-3 py-2 rounded-xl border border-red-500/20"
+                style={{ backgroundColor: 'rgba(239,68,68,0.05)' }}>
+                <div className="flex items-center gap-3 min-w-0">
+                  <Clock className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                  <div className="min-w-0">
+                    <span className="font-semibold text-xs text-red-400">{oc.numero_oc || `OC #${oc.oc_cliente_id}`}</span>
+                    <span className="text-xs ml-2" style={{ color: 'var(--text-muted)' }}>{oc.cliente}</span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 shrink-0 text-xs" style={{ color: 'var(--text-muted)' }}>
+                  <span>{oc.items_en_bodega}/{oc.total_items} en bodega</span>
+                  <span className="font-mono px-2 py-0.5 rounded-lg text-[10px] bg-red-500/10 text-red-400 font-bold">
+                    {oc.dias_habiles_restantes <= 0 ? 'VENCIDO' : `${oc.dias_habiles_restantes}d hábiles`}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 

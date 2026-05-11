@@ -16,7 +16,7 @@ from database import get_db
 from models.models import (
     Cotizacion, ItemCotizacion, OcCliente, OcProveedor, OcProveedorItem,
     User, Proveedor, Embarque, EmbarqueItem, PreEmbarque, PreEmbarqueItem,
-    ConfiguracionCotizador,
+    ConfiguracionCotizador, FacturaProveedor, FacturaProveedorItem,
 )
 from services.pricing_service import calcular_cotizacion
 
@@ -424,6 +424,8 @@ def _item_to_dict(item: ItemCotizacion, ocp_id: Optional[int],
         "fecha_asignacion": asig_date.isoformat() if asig_date else None,
         "plazo_dias_prov": asig.plazo_dias_prov if asig else None,
         "ocp_item_id": asig.id if asig else None,
+        "unit_price_usd": None,  # populated separately when needed
+        "dias_transcurridos": (datetime.utcnow().date() - asig_date.date()).days if asig_date else None,
     }
 
 
@@ -499,6 +501,29 @@ def crear_oc_cliente(
     ).update({"estado_item": "cerrado"})
     db.commit()
     db.refresh(oc)
+
+    # C.4 — Notify abastecimiento of new OC-Cliente
+    try:
+        from notificaciones import crear_notificacion
+        n_items = db.query(ItemCotizacion).filter(
+            ItemCotizacion.cotizacion_id == body.cotizacion_id,
+            ItemCotizacion.estado_item == "cerrado",
+        ).count()
+        fecha_str = str(oc.fecha_entrega) if oc.fecha_entrega else "sin definir"
+        crear_notificacion(
+            db=db,
+            rol="abastecimiento",
+            severidad="info",
+            titulo=f"Nueva OC Cliente N°{oc.numero_oc or oc.id}",
+            mensaje=f"{n_items} ítems pendientes de asignar a proveedor — plazo cliente {fecha_str}",
+            entidad_tipo="oc_cliente",
+            entidad_id=oc.id,
+            link=f"/compras?oc_cliente={oc.id}",
+            regla=f"nueva_oc_cliente_{oc.id}",
+        )
+    except Exception as e:
+        print(f"[warn] notificacion oc-cliente: {e}")
+
     return {"id": oc.id, "cotizacion_id": oc.cotizacion_id}
 
 
@@ -1218,6 +1243,14 @@ def listar_pre_embarques(
             if d.get("dias_restantes") is not None:
                 dias_list.append(d["dias_restantes"])
 
+            # A-3.2: populate unit_price_usd from FacturaProveedorItem
+            fpi_pre = None
+            if asig:
+                fpi_pre = db.query(FacturaProveedorItem).filter(
+                    FacturaProveedorItem.ocp_item_id == asig.id
+                ).first()
+            d["unit_price_usd"] = float(fpi_pre.unit_price_usd) if fpi_pre and fpi_pre.unit_price_usd else None
+
             items_out.append(d)
 
         # find associated embarque awb
@@ -1337,6 +1370,32 @@ def get_embarque(
         d["embarque_item_id"] = ei.id
         d["numero_cot"] = cot.numero if cot else ""
         d["cliente"] = cot.cliente if cot else ""
+
+        # A-3.4: populate unit_price_usd from FacturaProveedorItem
+        fpi = None
+        if asig:
+            fpi = db.query(FacturaProveedorItem).filter(
+                FacturaProveedorItem.ocp_item_id == asig.id
+            ).first()
+        if fpi and fpi.unit_price_usd:
+            d["unit_price_usd"] = float(fpi.unit_price_usd)
+        else:
+            d["unit_price_usd"] = None
+
+        # A-3.4: OC Cliente numero
+        occ = None
+        if asig and asig.oc_cliente_id:
+            occ = db.query(OcCliente).filter(OcCliente.id == asig.oc_cliente_id).first()
+        d["numero_oc_cliente"] = occ.numero_oc if occ else ""
+
+        # A-3.4: Invoice (factura proveedor)
+        factura = None
+        if ocp_id:
+            factura = db.query(FacturaProveedor).filter(
+                FacturaProveedor.oc_proveedor_id == ocp_id
+            ).first()
+        d["numero_factura"] = factura.numero_factura if factura else ""
+
         items_out.append(d)
 
     return {
@@ -1558,3 +1617,82 @@ def eliminar_proveedor(
     db.delete(p)
     db.commit()
     return None
+
+
+# ─── v2: precio USD editable ──────────────────────────────────────────────
+
+class PrecioUsdBody(BaseModel):
+    unit_price_usd: float
+
+
+@router.patch("/items/{item_id}/precio-usd")
+def update_precio_usd(
+    item_id: int,
+    body: PrecioUsdBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Update or create FacturaProveedorItem.unit_price_usd for a given ItemCotizacion.
+    Looks for an existing FacturaProveedorItem via OcProveedorItem → FacturaProveedor chain.
+    Creates one if not found (linked to the first FacturaProveedor of the OCP, or standalone).
+    """
+    item = db.query(ItemCotizacion).filter(ItemCotizacion.id == item_id).first()
+    if not item:
+        raise HTTPException(404, "Item not found")
+
+    # Try to find via OcProveedorItem
+    ocp_item = (
+        db.query(OcProveedorItem)
+        .filter(OcProveedorItem.item_cotizacion_id == item_id)
+        .first()
+    )
+
+    fpi = None
+    if ocp_item:
+        fpi = (
+            db.query(FacturaProveedorItem)
+            .filter(FacturaProveedorItem.ocp_item_id == ocp_item.id)
+            .first()
+        )
+
+    if fpi:
+        fpi.unit_price_usd = body.unit_price_usd
+    else:
+        # Create a standalone FacturaProveedorItem
+        # Find or create a FacturaProveedor for the OCP
+        factura = None
+        if ocp_item and ocp_item.oc_proveedor_id:
+            factura = (
+                db.query(FacturaProveedor)
+                .filter(FacturaProveedor.oc_proveedor_id == ocp_item.oc_proveedor_id)
+                .first()
+            )
+        if not factura:
+            # Create a placeholder factura
+            factura = FacturaProveedor(
+                oc_proveedor_id=ocp_item.oc_proveedor_id if ocp_item else None,
+                numero_factura=f"AUTO-{item_id}",
+                estado="borrador",
+            )
+            db.add(factura)
+            db.flush()
+
+        fpi = FacturaProveedorItem(
+            factura_id=factura.id,
+            ocp_item_id=ocp_item.id if ocp_item else None,
+            descripcion=item.descripcion or item.numero_parte or "",
+            qty_facturada=item.cantidad or 1,
+            unit_price_usd=body.unit_price_usd,
+        )
+        db.add(fpi)
+
+    db.commit()
+    db.refresh(fpi)
+    total_usd = float(fpi.unit_price_usd or 0) * float(item.cantidad or 1)
+    return {
+        "item_id": item_id,
+        "unit_price_usd": float(fpi.unit_price_usd),
+        "total_usd": total_usd,
+        "factura_proveedor_item_id": fpi.id,
+    }

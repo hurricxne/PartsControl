@@ -1,191 +1,654 @@
-import { Package, CheckCircle2, AlertCircle, Clock, Search, Truck, Ship, Activity } from 'lucide-react'
+import { useState, useEffect, useCallback } from 'react'
+import { createPortal } from 'react-dom'
+import {
+  Package, CheckCircle2, AlertTriangle, Clock, ChevronDown, ChevronRight,
+  Loader2, Camera, Trash2, X, Check, History, Inbox, RefreshCw,
+  AlertOctagon, Archive, ImagePlus,
+} from 'lucide-react'
+import toast from 'react-hot-toast'
+import { bodegaAPI } from '../services/api'
 
-const DEMO_RECEPCION = [
-  {
-    embarque: 'EMB-2026-018', carrier: 'LATAM Cargo', fechaEsperada: '25-03-2026', fechaReal: null,
-    estado: 'en_aduana',
-    items: [
-      { parte: '4V0907',   desc: 'SEAL-O-RING',         cliente: 'Minera Los Pelambres',           cant: 2,  recibido: 0, estado: 'pendiente' },
-      { parte: '1649578',  desc: 'CAP AS',               cliente: 'Minera Los Pelambres',           cant: 5,  recibido: 0, estado: 'pendiente' },
-      { parte: '8E5600',   desc: 'BEARING',              cliente: 'Codelco Div. El Teniente',       cant: 1,  recibido: 0, estado: 'pendiente' },
-    ]
-  },
-  {
-    embarque: 'EMB-2026-012', carrier: 'Fast Mark', fechaEsperada: '10-03-2026', fechaReal: '11-03-2026',
-    estado: 'en_bodega',
-    items: [
-      { parte: '7T1997',   desc: 'SPACER',               cliente: 'Anglo American Chile',           cant: 4,  recibido: 4, estado: 'recibido' },
-      { parte: '3P0366',   desc: 'GASKET',               cliente: 'Anglo American Chile',           cant: 10, recibido: 10,estado: 'recibido' },
-      { parte: '2346225',  desc: 'FILTER AS-FUEL',       cliente: 'Antofagasta Minerals',           cant: 6,  recibido: 5, estado: 'faltante' },
-    ]
-  },
-  {
-    embarque: 'EMB-2026-009', carrier: 'LATAM Cargo', fechaEsperada: '28-02-2026', fechaReal: '01-03-2026',
-    estado: 'despachado',
-    items: [
-      { parte: '4590686',  desc: 'SEAL O-RING',          cliente: 'H-E Parts International',       cant: 8,  recibido: 8, estado: 'despachado' },
-      { parte: '1R0716',   desc: 'FILTER AS-OIL',        cliente: 'H-E Parts International',       cant: 12, recibido: 12,estado: 'despachado' },
-    ]
-  },
-]
+// ── Types ─────────────────────────────────────────────────────────────────────
 
-const estadoEmbarque: Record<string, { cls: string; label: string }> = {
-  en_transito: { cls: 'bg-blue-500/10 text-blue-400 border-blue-400/20',          label: 'En Tránsito'  },
-  en_aduana:   { cls: 'bg-amber-500/10 text-amber-400 border-amber-400/20',       label: 'En Aduana'    },
-  en_bodega:   { cls: 'bg-brand-500/10 text-brand-400 border-brand-400/20',       label: 'En Bodega'    },
-  despachado:  { cls: 'bg-emerald-500/10 text-emerald-500 border-emerald-500/20', label: 'Despachado'   },
+interface EmbarqueResumen {
+  id: number
+  numero: string
+  estado: string
+  forwarder: string
+  awb: string
+  fecha_llegada_est: string | null
+  total_items: number
+  recepcion_id: number | null
+  recepcion_estado: string | null
+  items_marcados: number
 }
 
-const estadoItem: Record<string, { cls: string; icon: JSX.Element }> = {
-  pendiente:   { cls: 'text-amber-400',   icon: <Clock className="w-3.5 h-3.5" />           },
-  recibido:    { cls: 'text-emerald-500', icon: <CheckCircle2 className="w-3.5 h-3.5" />    },
-  faltante:    { cls: 'text-red-400',     icon: <AlertCircle className="w-3.5 h-3.5" />     },
-  danado:      { cls: 'text-red-400',     icon: <AlertCircle className="w-3.5 h-3.5" />     },
-  despachado:  { cls: 'text-purple-400',  icon: <Truck className="w-3.5 h-3.5" />           },
+interface RecepcionItem {
+  id: number
+  embarque_item_id: number
+  recepcion_item_id: number | null
+  numero_parte: string
+  descripcion: string
+  marca: string
+  cantidad: number
+  peso_kg: number | null
+  unit_price_usd: number | null
+  qty_recibida: number
+  qty_danada: number
+  estado_recepcion: string | null
+  observacion: string | null
+  fotos: { id: number; url_foto: string }[]
 }
 
-const DASHBOARD_LOG = [
-  { id: 'EMB-2026-018', carrier: 'LATAM Cargo', origen: 'USA', estado: 'En Aduana',    eta: '25-03-2026', diasTransito: 3,  semaforo: 'amber' },
-  { id: 'EMB-2026-015', carrier: 'Aeropost',    origen: 'USA', estado: 'En Bodega',    eta: '17-03-2026', diasTransito: 11, semaforo: 'brand' },
-  { id: 'EMB-2026-012', carrier: 'Fast Mark',   origen: 'ALE', estado: 'Entregado',    eta: '10-03-2026', diasTransito: 6,  semaforo: 'green' },
+interface Recepcion {
+  id: number
+  embarque_id: number
+  embarque_numero: string
+  estado: string
+  fecha_inicio: string
+  fecha_cierre: string | null
+  observacion_general: string | null
+  items: RecepcionItem[]
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+const ESTADOS = [
+  { val: 'completo',             label: 'Completo',             color: 'text-emerald-400' },
+  { val: 'faltante',             label: 'Faltante',             color: 'text-amber-400' },
+  { val: 'sobrante',             label: 'Sobrante',             color: 'text-blue-400' },
+  { val: 'danado_utilizable',    label: 'Dañado utilizable',    color: 'text-orange-400' },
+  { val: 'danado_no_utilizable', label: 'Dañado no utilizable', color: 'text-red-400' },
+  { val: 'no_llego',             label: 'No llegó',             color: 'text-red-400' },
 ]
 
-export default function BodegaPage() {
-  const totalEmbarques = DEMO_RECEPCION.length
-  const enBodega = DEMO_RECEPCION.filter(e => e.estado === 'en_bodega').length
-  const faltantes = DEMO_RECEPCION.flatMap(e => e.items).filter(i => i.estado === 'faltante').length
+function estadoLabel(val: string | null) {
+  if (!val) return null
+  return ESTADOS.find(e => e.val === val)
+}
+
+function isDanado(estado: string | null) {
+  return estado === 'danado_utilizable' || estado === 'danado_no_utilizable'
+}
+
+function fmtDate(s: string | null) {
+  if (!s) return '—'
+  return new Date(s).toLocaleDateString('es-CL')
+}
+
+function fmtUsd(v: number | null) {
+  if (v == null) return '—'
+  return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2 })
+}
+
+// ── RecepcionItemRow ──────────────────────────────────────────────────────────
+
+function RecepcionItemRow({
+  item, recepcionId, onUpdate,
+}: {
+  item: RecepcionItem
+  recepcionId: number
+  onUpdate: () => void
+}) {
+  const [estado, setEstado]     = useState(item.estado_recepcion || '')
+  const [qtyRec, setQtyRec]     = useState(String(item.qty_recibida || item.cantidad))
+  const [qtyDan, setQtyDan]     = useState(String(item.qty_danada || 0))
+  const [obs, setObs]           = useState(item.observacion || '')
+  const [saving, setSaving]     = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [fotos, setFotos]       = useState(item.fotos || [])
+  const [expanded, setExpanded] = useState(!!item.estado_recepcion)
+
+  const needsFoto = isDanado(estado) && fotos.length === 0
+
+  const save = async () => {
+    if (!estado) { toast.error('Selecciona un estado primero'); return }
+    if (needsFoto) { toast.error('Debes subir al menos 1 foto para ítems dañados'); return }
+    setSaving(true)
+    try {
+      await bodegaAPI.marcarItem(recepcionId, item.id, {
+        embarque_item_id: item.embarque_item_id,
+        estado_recepcion: estado,
+        qty_recibida: parseInt(qtyRec) || 0,
+        qty_danada: parseInt(qtyDan) || 0,
+        observacion: obs || null,
+      })
+      toast.success('Ítem guardado')
+      onUpdate()
+    } catch (e: any) {
+      toast.error(e.response?.data?.detail || 'Error al guardar ítem')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleFoto = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setUploading(true)
+    try {
+      const { data } = await bodegaAPI.subirFoto(recepcionId, item.id, file)
+      setFotos(prev => [...prev, { id: data.foto_id, url_foto: data.url }])
+      toast.success('Foto subida')
+    } catch {
+      toast.error('Error al subir foto')
+    } finally {
+      setUploading(false)
+      e.target.value = ''
+    }
+  }
+
+  const handleDeleteFoto = async (fotoId: number) => {
+    try {
+      await bodegaAPI.eliminarFoto(recepcionId, item.id, fotoId)
+      setFotos(prev => prev.filter(f => f.id !== fotoId))
+      toast.success('Foto eliminada')
+    } catch {
+      toast.error('Error al eliminar foto')
+    }
+  }
+
+  const estInfo = estadoLabel(estado)
+  const isSaved = !!item.estado_recepcion
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div className="min-w-0">
-          <h1 className="text-2xl font-bold" style={{ color: 'var(--text-primary)' }}>Dashboard Logística + Bodega</h1>
-          <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>
-            Módulo 11 — Seguimiento de embarques en tránsito · Recepción · Despacho al cliente
-          </p>
+    <div className={`rounded-xl border transition-all ${isSaved ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-[var(--border)] bg-[var(--surface-50)]'}`}>
+      {/* Row header */}
+      <div className="flex items-center gap-3 p-3 cursor-pointer" onClick={() => setExpanded(v => !v)}>
+        <div className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${isSaved ? 'bg-emerald-500/20' : 'bg-[var(--surface-200)]'}`}>
+          {isSaved ? <CheckCircle2 className="w-4 h-4 text-emerald-400" /> : <Package className="w-4 h-4" style={{ color: 'var(--text-faint)' }} />}
         </div>
-        <button className="btn-secondary flex items-center justify-center gap-2 w-full sm:w-auto shrink-0">
-          <Package className="w-4 h-4" /> Recibir Embarque
-        </button>
-      </div>
-
-      {/* Dashboard logística */}
-      <div className="rounded-2xl border overflow-hidden" style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
-        <div className="px-4 py-3 border-b flex items-center gap-2" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
-          <Activity className="w-4 h-4 text-brand-400" />
-          <h2 className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>Estado de embarques activos</h2>
-        </div>
-        <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
-          {DASHBOARD_LOG.map(e => (
-            <div key={e.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-4 py-3">
-              <div className="flex items-center gap-3">
-                <Ship className="w-4 h-4 text-brand-400 shrink-0" />
-                <div>
-                  <p className="text-xs font-mono font-bold text-brand-400">{e.id}</p>
-                  <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>{e.carrier} · Origen: {e.origen} · ETA: {e.eta}</p>
-                </div>
-              </div>
-              <div className="flex items-center gap-3 shrink-0">
-                <span className="text-xs" style={{ color: 'var(--text-faint)' }}>{e.diasTransito}d en tránsito</span>
-                <span className={`text-xs font-semibold px-2.5 py-1 rounded-full ${
-                  e.semaforo === 'green' ? 'bg-emerald-500/10 text-emerald-500'
-                  : e.semaforo === 'amber' ? 'bg-amber-500/10 text-amber-400'
-                  : 'bg-brand-500/10 text-brand-400'
-                }`}>{e.estado}</span>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Stats */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        {[
-          { label: 'Embarques',   value: totalEmbarques.toString(), sub: 'Con ítems en flujo',     color: 'text-brand-400'   },
-          { label: 'En bodega',   value: enBodega.toString(),       sub: 'Pend. despacho cliente', color: 'text-amber-400'   },
-          { label: 'Faltantes',   value: faltantes.toString(),      sub: 'Alerta a Abastecimiento',color: 'text-red-400'     },
-          { label: 'Despachados', value: '1',                       sub: 'Entregados este mes',    color: 'text-emerald-500' },
-        ].map(s => (
-          <div key={s.label} className="rounded-2xl p-3 sm:p-4 border" style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
-            <p className="text-[10px] uppercase tracking-widest leading-tight" style={{ color: 'var(--text-faint)' }}>{s.label}</p>
-            <p className={`text-lg sm:text-xl font-bold mt-1 ${s.color}`}>{s.value}</p>
-            <p className="text-xs mt-0.5 leading-tight" style={{ color: 'var(--text-muted)' }}>{s.sub}</p>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-xs font-bold text-brand-400">{item.numero_parte || '—'}</span>
+            {estInfo && <span className={`text-[10px] font-semibold ${estInfo.color}`}>{estInfo.label}</span>}
+            {needsFoto && <span className="text-[10px] text-red-400 flex items-center gap-0.5"><Camera className="w-3 h-3" />foto requerida</span>}
           </div>
-        ))}
+          <p className="text-xs truncate" style={{ color: 'var(--text-muted)' }}>{item.descripcion}</p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0 text-xs" style={{ color: 'var(--text-faint)' }}>
+          <span>×{item.cantidad}</span>
+          {item.unit_price_usd && <span className="font-mono text-emerald-400">{fmtUsd(item.unit_price_usd)}</span>}
+          {expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+        </div>
       </div>
 
-      {/* Search */}
-      <div className="relative max-w-sm">
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4" style={{ color: 'var(--text-faint)' }} />
-        <input className="input pl-9 w-full" placeholder="Buscar por embarque o N° parte…" />
-      </div>
+      {/* Expanded form */}
+      {expanded && (
+        <div className="px-4 pb-4 space-y-3 border-t" style={{ borderColor: 'var(--border)' }}>
+          {/* Estado selector */}
+          <div>
+            <label className="text-[10px] uppercase tracking-wider font-semibold mb-1.5 block" style={{ color: 'var(--text-faint)' }}>Estado recepción</label>
+            <div className="flex flex-wrap gap-1.5">
+              {ESTADOS.map(e => (
+                <button key={e.val} onClick={() => setEstado(e.val)}
+                  className={`text-[11px] px-2.5 py-1 rounded-lg border transition-all font-medium ${estado === e.val ? 'border-brand-400 bg-brand-500/10 text-brand-400' : 'border-[var(--border)] hover:border-[var(--border-hover)]'} ${e.color}`}>
+                  {e.label}
+                </button>
+              ))}
+            </div>
+          </div>
 
-      {/* Embarques */}
-      <div className="space-y-4">
-        {DEMO_RECEPCION.map(emb => {
-          const badge = estadoEmbarque[emb.estado] ?? { cls: 'bg-gray-500/10 text-gray-400', label: emb.estado }
-          return (
-            <div key={emb.embarque} className="rounded-2xl border overflow-hidden"
-              style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
-              {/* Cabecera embarque */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-4 py-3 border-b"
-                style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
-                <div className="flex items-center gap-3">
-                  <span className="font-mono font-bold text-sm text-brand-400">{emb.embarque}</span>
-                  <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium border ${badge.cls}`}>
-                    {badge.label}
-                  </span>
-                  <span className="text-xs" style={{ color: 'var(--text-faint)' }}>{emb.carrier}</span>
-                </div>
-                <div className="flex items-center gap-3 text-xs" style={{ color: 'var(--text-muted)' }}>
-                  <span>Esperado: {emb.fechaEsperada}</span>
-                  {emb.fechaReal && <span className="text-emerald-500">Llegó: {emb.fechaReal}</span>}
-                </div>
+          {/* Quantities */}
+          <div className="flex gap-3">
+            <div>
+              <label className="text-[10px] uppercase tracking-wider font-semibold mb-1 block" style={{ color: 'var(--text-faint)' }}>Qty recibida</label>
+              <input type="number" min={0} max={item.cantidad * 2} value={qtyRec}
+                onChange={e => setQtyRec(e.target.value)}
+                className="input w-20 text-center text-sm px-2 py-1" />
+            </div>
+            {isDanado(estado) && (
+              <div>
+                <label className="text-[10px] uppercase tracking-wider font-semibold mb-1 block" style={{ color: 'var(--text-faint)' }}>Qty dañada</label>
+                <input type="number" min={0} max={item.cantidad} value={qtyDan}
+                  onChange={e => setQtyDan(e.target.value)}
+                  className="input w-20 text-center text-sm px-2 py-1" />
               </div>
+            )}
+          </div>
 
-              {/* Items */}
-              <div className="divide-y" style={{ borderColor: 'var(--border)' }}>
-                {emb.items.map((item, i) => {
-                  const st = estadoItem[item.estado] ?? estadoItem.pendiente
-                  return (
-                    <div key={i} className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-4 py-3">
-                      <div className="flex items-center gap-3">
-                        <span className={st.cls}>{st.icon}</span>
-                        <div>
-                          <span className="font-mono text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>{item.parte}</span>
-                          <span className="ml-2 text-xs" style={{ color: 'var(--text-muted)' }}>{item.desc}</span>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-4 text-xs shrink-0">
-                        <span style={{ color: 'var(--text-faint)' }}>{item.cliente}</span>
-                        <span style={{ color: 'var(--text-muted)' }}>
-                          {item.recibido}/{item.cant} uds
-                        </span>
-                        <span className={`font-semibold capitalize ${st.cls}`}>{item.estado}</span>
-                      </div>
+          {/* Observacion */}
+          <div>
+            <label className="text-[10px] uppercase tracking-wider font-semibold mb-1 block" style={{ color: 'var(--text-faint)' }}>Observación</label>
+            <textarea value={obs} onChange={e => setObs(e.target.value)} rows={2}
+              className="input w-full text-xs px-2 py-1.5 resize-none" placeholder="Opcional…" />
+          </div>
+
+          {/* Photos */}
+          {isDanado(estado) && (
+            <div>
+              <div className="flex items-center gap-2 mb-2">
+                <label className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: 'var(--text-faint)' }}>
+                  Fotos {needsFoto && <span className="text-red-400">(obligatorio)</span>}
+                </label>
+                <label className={`cursor-pointer flex items-center gap-1 text-[11px] px-2 py-0.5 rounded border transition-colors ${needsFoto ? 'border-red-400 text-red-400 hover:bg-red-400/10' : 'border-[var(--border)] hover:border-brand-400 text-brand-400'}`}>
+                  {uploading ? <Loader2 className="w-3 h-3 animate-spin" /> : <ImagePlus className="w-3 h-3" />}
+                  Agregar foto
+                  <input type="file" accept="image/*" onChange={handleFoto} className="hidden" />
+                </label>
+              </div>
+              {fotos.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {fotos.map(f => (
+                    <div key={f.id} className="relative group">
+                      <img src={f.url_foto} alt="foto" className="w-16 h-16 object-cover rounded-lg border" style={{ borderColor: 'var(--border)' }} />
+                      <button onClick={() => handleDeleteFoto(f.id)}
+                        className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-red-500 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                        <X className="w-3 h-3" />
+                      </button>
                     </div>
-                  )
-                })}
-              </div>
-
-              {emb.estado === 'en_bodega' && (
-                <div className="px-4 py-3 border-t flex justify-end" style={{ borderColor: 'var(--border)' }}>
-                  <button className="btn-primary text-xs px-4 py-1.5">
-                    <Truck className="w-3.5 h-3.5 inline mr-1.5" />
-                    Despachar al Cliente
-                  </button>
+                  ))}
                 </div>
               )}
             </div>
-          )
-        })}
-      </div>
+          )}
 
-      <div className="flex items-center gap-2 p-3 rounded-xl bg-amber-500/10 border border-amber-500/20">
-        <Package className="w-4 h-4 text-amber-400 shrink-0" />
-        <p className="text-xs text-amber-400">Módulo en desarrollo — datos de demostración. El registro de diferencias y las alertas automáticas a Abastecimiento y Comercial estarán disponibles en la siguiente versión.</p>
+          {/* Save button */}
+          <div className="flex justify-end">
+            <button onClick={save} disabled={saving || !estado || needsFoto}
+              className="btn-primary text-xs px-4 py-1.5 flex items-center gap-1.5 disabled:opacity-50">
+              {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
+              {isSaved ? 'Actualizar' : 'Guardar'}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── RecepcionPanel ────────────────────────────────────────────────────────────
+
+function RecepcionPanel({ recepcionId, onClose, onFinish }: {
+  recepcionId: number
+  onClose: () => void
+  onFinish: () => void
+}) {
+  const [rec, setRec]               = useState<Recepcion | null>(null)
+  const [loading, setLoading]       = useState(true)
+  const [closing, setClosing]       = useState(false)
+  const [obsGeneral, setObsGeneral] = useState('')
+  const [confirmClose, setConfirmClose] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const { data } = await bodegaAPI.getRecepcion(recepcionId)
+      setRec(data)
+      setObsGeneral(data.observacion_general || '')
+    } catch {
+      toast.error('Error al cargar recepción')
+    } finally {
+      setLoading(false)
+    }
+  }, [recepcionId])
+
+  useEffect(() => { load() }, [load])
+
+  const marcados = rec?.items.filter(i => i.estado_recepcion).length ?? 0
+  const total    = rec?.items.length ?? 0
+  const pct      = total > 0 ? Math.round((marcados / total) * 100) : 0
+  const allDone  = marcados === total && total > 0
+
+  const handleCerrar = async () => {
+    setClosing(true)
+    try {
+      await bodegaAPI.cerrarRecepcion(recepcionId, obsGeneral || undefined)
+      toast.success('Recepción cerrada correctamente')
+      onFinish()
+    } catch (e: any) {
+      toast.error(e.response?.data?.detail || 'Error al cerrar recepción')
+    } finally {
+      setClosing(false)
+      setConfirmClose(false)
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-[9999] flex items-start justify-center p-4 pt-10 md:pt-16"
+      style={{ backgroundColor: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)' }}
+      onClick={e => { if (e.target === e.currentTarget) setConfirmClose(true) }}
+    >
+      <div
+        className="relative w-full max-w-2xl max-h-[88vh] flex flex-col rounded-2xl border shadow-2xl overflow-hidden"
+        style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}
+      >
+        {/* Header */}
+        <div className="flex items-center gap-3 px-4 py-3 border-b shrink-0"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+          <div className="flex-1 min-w-0">
+            <h2 className="font-bold text-sm leading-tight" style={{ color: 'var(--text-primary)' }}>
+              {rec ? rec.embarque_numero : `Recepción #${recepcionId}`}
+            </h2>
+            <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
+              {marcados}/{total} ítems marcados
+            </p>
+          </div>
+          {/* Progress bar */}
+          <div className="w-20 shrink-0">
+            <div className="h-1.5 rounded-full bg-[var(--surface-300)] overflow-hidden">
+              <div className="h-full rounded-full bg-brand-500 transition-all duration-300"
+                style={{ width: `${pct}%` }} />
+            </div>
+            <p className="text-[10px] text-center mt-0.5" style={{ color: 'var(--text-faint)' }}>{pct}%</p>
+          </div>
+          <button onClick={() => setConfirmClose(true)}
+            className="p-1.5 rounded-lg hover:bg-red-500/10 text-red-400 hover:text-red-500 transition-colors shrink-0">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Items list — scrollable */}
+        <div className="flex-1 overflow-y-auto px-4 py-4 space-y-2">
+          {loading ? (
+            <div className="flex items-center justify-center py-16">
+              <Loader2 className="w-6 h-6 animate-spin" style={{ color: 'var(--text-faint)' }} />
+            </div>
+          ) : (
+            rec?.items.map(item => (
+              <RecepcionItemRow key={item.id} item={item} recepcionId={recepcionId} onUpdate={load} />
+            ))
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="shrink-0 border-t px-4 py-3 space-y-2.5" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+          <textarea value={obsGeneral} onChange={e => setObsGeneral(e.target.value)}
+            rows={2} placeholder="Observación general de la recepción (opcional)…"
+            className="input w-full text-xs px-2.5 py-1.5 resize-none" />
+          <div className="flex items-center gap-3">
+            {!allDone && (
+              <p className="text-xs text-amber-400 flex-1">
+                ⚠ {total - marcados} ítem(s) sin marcar
+              </p>
+            )}
+            <button onClick={() => setConfirmClose(true)} disabled={closing || total === 0}
+              className={`ml-auto btn-primary text-sm px-5 py-2 flex items-center gap-2 disabled:opacity-50 ${!allDone ? 'opacity-80' : ''}`}>
+              {closing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Archive className="w-4 h-4" />}
+              Cerrar recepción
+            </button>
+          </div>
+        </div>
+
+        {/* Confirm close — absolute inside modal */}
+        {confirmClose && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center rounded-2xl"
+            style={{ backgroundColor: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(2px)' }}>
+            <div className="w-full max-w-sm rounded-2xl border shadow-2xl p-5 space-y-4 mx-4"
+              style={{ backgroundColor: 'var(--surface-200)', borderColor: 'var(--border)' }}>
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0" />
+                <h3 className="font-bold" style={{ color: 'var(--text-primary)' }}>¿Cerrar recepción?</h3>
+              </div>
+              {!allDone && (
+                <p className="text-sm text-amber-400">
+                  Hay {total - marcados} ítem(s) sin marcar. Se generarán reclamos automáticamente para los faltantes/no llegados.
+                </p>
+              )}
+              <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+                Esta acción es irreversible. Los ítems completos pasarán a estado <strong>en bodega</strong>.
+              </p>
+              <div className="flex gap-2 justify-end">
+                <button onClick={() => setConfirmClose(false)} disabled={closing}
+                  className="px-4 py-2 rounded-xl text-sm border transition-colors hover:bg-[var(--surface-300)]"
+                  style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
+                  Cancelar
+                </button>
+                <button onClick={handleCerrar} disabled={closing}
+                  className="btn-primary px-4 py-2 text-sm flex items-center gap-1.5">
+                  {closing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                  Confirmar cierre
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
+  )
+}
+
+// ── EmbarqueCard ──────────────────────────────────────────────────────────────
+
+function EmbarqueCard({ emb, onRefresh, onOpenRec }: {
+  emb: EmbarqueResumen
+  onRefresh: () => void
+  onOpenRec: (recId: number) => void
+}) {
+  const [starting, setStarting] = useState(false)
+
+  const handleRecibir = async () => {
+    setStarting(true)
+    try {
+      const { data } = await bodegaAPI.iniciarRecepcion(emb.id)
+      onOpenRec(data.recepcion_id)
+      toast.success('Recepción iniciada')
+      onRefresh()
+    } catch (e: any) {
+      toast.error(e.response?.data?.detail || 'Error al iniciar recepción')
+    } finally {
+      setStarting(false)
+    }
+  }
+
+  const estadoColor = emb.estado === 'en_recepcion' ? 'text-amber-400' : 'text-blue-400'
+  const estadoLabel = emb.estado === 'en_recepcion' ? 'En recepción' : 'En tránsito'
+  const pct = emb.total_items > 0 ? Math.round((emb.items_marcados / emb.total_items) * 100) : 0
+
+  return (
+    <>
+      <div className="rounded-2xl border p-4 space-y-3 transition-shadow hover:shadow-md"
+        style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
+        <div className="flex items-start gap-3">
+          <div className="w-10 h-10 rounded-xl bg-brand-500/10 flex items-center justify-center shrink-0">
+            <Package className="w-5 h-5 text-brand-400" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-mono font-bold text-sm" style={{ color: 'var(--text-primary)' }}>
+                {emb.numero || `EMB-${emb.id}`}
+              </span>
+              <span className={`text-[11px] font-semibold ${estadoColor}`}>{estadoLabel}</span>
+            </div>
+            <div className="flex items-center gap-3 mt-0.5 flex-wrap text-xs" style={{ color: 'var(--text-muted)' }}>
+              {emb.forwarder && <span>{emb.forwarder}</span>}
+              {emb.awb && <span className="font-mono">AWB: {emb.awb}</span>}
+              {emb.fecha_llegada_est && <span>ETA: {fmtDate(emb.fecha_llegada_est)}</span>}
+            </div>
+          </div>
+          <div className="text-xs shrink-0" style={{ color: 'var(--text-faint)' }}>
+            {emb.total_items} ítems
+          </div>
+        </div>
+
+        {/* Progress for en_recepcion */}
+        {emb.estado === 'en_recepcion' && emb.total_items > 0 && (
+          <div>
+            <div className="flex justify-between text-[10px] mb-1" style={{ color: 'var(--text-faint)' }}>
+              <span>{emb.items_marcados}/{emb.total_items} marcados</span>
+              <span>{pct}%</span>
+            </div>
+            <div className="h-1.5 rounded-full bg-[var(--surface-200)] overflow-hidden">
+              <div className="h-full rounded-full bg-brand-500 transition-all" style={{ width: `${pct}%` }} />
+            </div>
+          </div>
+        )}
+
+        {/* Actions */}
+        <div className="flex justify-end gap-2">
+          {emb.estado === 'en_transito' && (
+            <button onClick={handleRecibir} disabled={starting}
+              className="btn-primary text-xs px-4 py-1.5 flex items-center gap-1.5">
+              {starting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Inbox className="w-3.5 h-3.5" />}
+              Recibir embarque
+            </button>
+          )}
+          {emb.estado === 'en_recepcion' && emb.recepcion_id && (
+            <button onClick={() => onOpenRec(emb.recepcion_id!)}
+              className="btn-primary text-xs px-4 py-1.5 flex items-center gap-1.5">
+              <CheckCircle2 className="w-3.5 h-3.5" />
+              Ver recepción activa
+            </button>
+          )}
+        </div>
+      </div>
+
+    </>
+  )
+}
+
+// ── Historial panel ───────────────────────────────────────────────────────────
+
+function HistorialTab() {
+  const [items, setItems] = useState<EmbarqueResumen[]>([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    bodegaAPI.historialEmbarques()
+      .then(r => setItems(r.data))
+      .catch(() => toast.error('Error al cargar historial'))
+      .finally(() => setLoading(false))
+  }, [])
+
+  if (loading) return (
+    <div className="flex items-center justify-center py-16">
+      <Loader2 className="w-6 h-6 animate-spin" style={{ color: 'var(--text-faint)' }} />
+    </div>
+  )
+  if (!items.length) return (
+    <p className="text-center py-12 text-sm" style={{ color: 'var(--text-faint)' }}>Sin embarques recibidos aún</p>
+  )
+
+  return (
+    <div className="space-y-3">
+      {items.map(emb => (
+        <div key={emb.id} className="rounded-2xl border p-4" style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-xl bg-emerald-500/10 flex items-center justify-center shrink-0">
+              <CheckCircle2 className="w-4.5 h-4.5 text-emerald-400" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <span className="font-mono font-bold text-sm" style={{ color: 'var(--text-primary)' }}>{emb.numero || `EMB-${emb.id}`}</span>
+              <div className="text-xs mt-0.5 flex gap-3 flex-wrap" style={{ color: 'var(--text-muted)' }}>
+                {emb.awb && <span className="font-mono">AWB: {emb.awb}</span>}
+                <span>{emb.total_items} ítems</span>
+              </div>
+            </div>
+            <span className="text-[11px] font-semibold text-emerald-400">Recibido</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ── Main Page ─────────────────────────────────────────────────────────────────
+
+type Tab = 'activos' | 'historial'
+
+export default function BodegaPage() {
+  const [tab, setTab]           = useState<Tab>('activos')
+  const [embarques, setEmbarques] = useState<EmbarqueResumen[]>([])
+  const [loading, setLoading]   = useState(true)
+  const [activeRec, setActiveRec] = useState<number | null>(null)
+
+  const load = useCallback(() => {
+    setLoading(true)
+    bodegaAPI.listEmbarques()
+      .then(r => setEmbarques(r.data))
+      .catch(() => toast.error('Error al cargar embarques'))
+      .finally(() => setLoading(false))
+  }, [])
+
+  useEffect(() => { load() }, [load])
+
+  const enTransito = embarques.filter(e => e.estado === 'en_transito')
+  const enRecepcion = embarques.filter(e => e.estado === 'en_recepcion')
+
+  return (
+    <>
+    <div className="p-4 md:p-6 space-y-6 max-w-4xl mx-auto">
+      {/* Page header */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          <h1 className="text-xl font-bold" style={{ color: 'var(--text-primary)' }}>Bodega — Recepción</h1>
+          <p className="text-sm mt-0.5" style={{ color: 'var(--text-muted)' }}>
+            {enTransito.length} en tránsito · {enRecepcion.length} en recepción abierta
+          </p>
+        </div>
+        <button onClick={load} disabled={loading}
+          className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-xl border transition-colors hover:bg-[var(--surface-200)]"
+          style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
+          <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+          Actualizar
+        </button>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex gap-1 p-1 rounded-xl" style={{ backgroundColor: 'var(--surface-200)' }}>
+        {([['activos', 'Activos', enTransito.length + enRecepcion.length], ['historial', 'Historial recibidos', null]] as const).map(([t, label, cnt]) => (
+          <button key={t} onClick={() => setTab(t as Tab)}
+            className={`flex-1 py-2 text-sm font-medium rounded-lg transition-all flex items-center justify-center gap-1.5 ${tab === t ? 'bg-[var(--surface-100)] shadow-sm' : ''}`}
+            style={{ color: tab === t ? 'var(--text-primary)' : 'var(--text-muted)' }}>
+            {t === 'activos' ? <Package className="w-4 h-4" /> : <History className="w-4 h-4" />}
+            {label}
+            {cnt !== null && cnt > 0 && (
+              <span className="text-[10px] bg-brand-500/10 text-brand-400 rounded-full px-1.5 font-bold">{cnt}</span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* Content */}
+      {tab === 'activos' ? (
+        loading ? (
+          <div className="flex items-center justify-center py-16">
+            <Loader2 className="w-6 h-6 animate-spin" style={{ color: 'var(--text-faint)' }} />
+          </div>
+        ) : embarques.length === 0 ? (
+          <div className="text-center py-16 space-y-2">
+            <Package className="w-10 h-10 mx-auto opacity-20" style={{ color: 'var(--text-muted)' }} />
+            <p className="text-sm" style={{ color: 'var(--text-faint)' }}>Sin embarques activos en bodega</p>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {enRecepcion.length > 0 && (
+              <div>
+                <p className="text-xs uppercase tracking-wider font-semibold mb-2" style={{ color: 'var(--text-faint)' }}>
+                  Recepción abierta ({enRecepcion.length})
+                </p>
+                <div className="space-y-3">
+                  {enRecepcion.map(e => <EmbarqueCard key={e.id} emb={e} onRefresh={load} onOpenRec={setActiveRec} />)}
+                </div>
+              </div>
+            )}
+            {enTransito.length > 0 && (
+              <div>
+                <p className="text-xs uppercase tracking-wider font-semibold mb-2" style={{ color: 'var(--text-faint)' }}>
+                  En tránsito ({enTransito.length})
+                </p>
+                <div className="space-y-3">
+                  {enTransito.map(e => <EmbarqueCard key={e.id} emb={e} onRefresh={load} onOpenRec={setActiveRec} />)}
+                </div>
+              </div>
+            )}
+          </div>
+        )
+      ) : (
+        <HistorialTab />
+      )}
+    </div>
+
+      {/* RecepcionPanel — portal at page level to break stacking context */}
+      {activeRec !== null && createPortal(
+        <RecepcionPanel
+          recepcionId={activeRec}
+          onClose={() => setActiveRec(null)}
+          onFinish={() => { setActiveRec(null); load() }}
+        />,
+        document.body
+      )}
+    </>
   )
 }
