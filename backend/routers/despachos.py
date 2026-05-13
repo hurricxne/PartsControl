@@ -1,7 +1,7 @@
 """Despachos module - cliente delivery from warehouse"""
 import os
 import re
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -16,6 +16,7 @@ from models.models import (
 )
 from auth import get_current_user
 from notificaciones import crear_notificacion
+from routers.compras import business_days_remaining, add_business_days
 
 router = APIRouter(prefix="/despachos", tags=["despachos"])
 
@@ -38,6 +39,43 @@ def _exists_in_docs(value: str) -> bool:
     if not candidate.startswith(_DOCS_DIR + os.sep):
         return False
     return os.path.isfile(candidate)
+
+
+# Pipeline state buckets for the dispatch progress bar
+_STATE_BUCKETS = {
+    "ingresado": "pendiente",
+    "cerrado": "pendiente",
+    "comprado": "en_compras",
+    "preparado": "en_transito",
+    "pre_embarcado": "en_transito",
+    "embarcado": "en_transito",
+    "en_bodega": "en_bodega",
+    "despachado": "despachado",
+    "reclamo_proveedor": "reclamo",
+}
+
+_BUCKET_ORDER = ["pendiente", "en_compras", "en_transito", "en_bodega", "despachado", "reclamo"]
+
+
+def _bucket_of(estado_item: Optional[str]) -> str:
+    return _STATE_BUCKETS.get(estado_item or "", "pendiente")
+
+
+def _item_deadline(item: ItemCotizacion, cot: Cotizacion, oc: OcCliente) -> Optional[date]:
+    """Calculate the item-specific deadline:
+    - If item has plazo_entrega_max AND cotización has created_at:
+        deadline = cotizacion.created_at.date() + plazo_entrega_max business days
+    - Else fallback to oc.fecha_entrega
+    """
+    if item.plazo_entrega_max and cot.created_at:
+        try:
+            ref = cot.created_at.date() if hasattr(cot.created_at, "date") else cot.created_at
+            return add_business_days(ref, int(item.plazo_entrega_max))
+        except Exception:
+            pass
+    if oc.fecha_entrega:
+        return oc.fecha_entrega
+    return None
 
 
 # --- Schemas ---
@@ -116,6 +154,34 @@ def _serialize_oc_card(db: Session, oc: OcCliente):
     despachados = sum(1 for i in items if i.estado_item == "despachado")
     no_dispon = total - en_bodega - despachados
 
+    # Pipeline state breakdown for progress bar
+    progreso_estados = {b: 0 for b in _BUCKET_ORDER}
+    for it in items:
+        progreso_estados[_bucket_of(it.estado_item)] += 1
+
+    # OC-level days remaining (customer-facing deadline)
+    dias_restantes_oc: Optional[int] = None
+    if oc.fecha_entrega:
+        try:
+            dias_restantes_oc = business_days_remaining(oc.fecha_entrega)
+        except Exception:
+            dias_restantes_oc = None
+
+    # Worst-case (most urgent) item deadline — the most constraining promise
+    worst_item_days: Optional[int] = None
+    for it in items:
+        if it.estado_item == "despachado":
+            continue
+        dl = _item_deadline(it, cot, oc)
+        if not dl:
+            continue
+        try:
+            d = business_days_remaining(dl)
+        except Exception:
+            continue
+        if worst_item_days is None or d < worst_item_days:
+            worst_item_days = d
+
     if total == 0:
         progreso = 0
     else:
@@ -149,7 +215,10 @@ def _serialize_oc_card(db: Session, oc: OcCliente):
         "items_despachados": despachados,
         "items_no_disponibles": no_dispon,
         "progreso_pct": progreso,
+        "progreso_estados": progreso_estados,
         "estado": estado,
+        "dias_restantes_oc": dias_restantes_oc,
+        "dias_restantes_critico": worst_item_days,
         "documentos": {
             "excel_oc": True,
             "cot_formal_excel": bool(cot.archivo_formal),
@@ -271,6 +340,7 @@ def oc_cliente_detail(
     )
     qty_already = _qty_already_dispatched(db, oc_id)
 
+    cot = oc.cotizacion
     items_data = []
     for it in items:
         en_reclamo = bool(
@@ -286,6 +356,16 @@ def oc_cliente_detail(
         disponible = 0
         if it.estado_item == "en_bodega":
             disponible = max(cant - qty_d, 0)
+
+        # Per-item deadline & days remaining
+        deadline = _item_deadline(it, cot, oc) if cot else None
+        dias_rest: Optional[int] = None
+        if deadline:
+            try:
+                dias_rest = business_days_remaining(deadline)
+            except Exception:
+                dias_rest = None
+
         items_data.append(
             {
                 "id": it.id,
@@ -297,6 +377,10 @@ def oc_cliente_detail(
                 "qty_disponible": disponible,
                 "estado_item": it.estado_item,
                 "en_reclamo": en_reclamo,
+                "plazo_entrega_max": it.plazo_entrega_max,
+                "plazo_entrega_min": it.plazo_entrega_min,
+                "deadline_item": deadline.isoformat() if deadline else None,
+                "dias_restantes": dias_rest,
             }
         )
 

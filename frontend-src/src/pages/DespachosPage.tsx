@@ -5,6 +5,7 @@ import {
   Truck, Package, CheckCircle2, AlertCircle, Search, X,
   ChevronRight, ChevronDown, Plus, Trash2, Send,
   FileSpreadsheet, FileText, FileDown, Loader2,
+  Clock, AlertTriangle,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 
@@ -63,6 +64,15 @@ async function downloadBlob(
 
 type Tab = 'listas' | 'en_curso' | 'historial'
 
+interface ProgresoEstados {
+  pendiente: number
+  en_compras: number
+  en_transito: number
+  en_bodega: number
+  despachado: number
+  reclamo: number
+}
+
 interface OcCard {
   id: number
   cotizacion_id?: number
@@ -82,6 +92,9 @@ interface OcCard {
   items_despachados: number
   items_no_disponibles: number
   progreso_pct: number
+  progreso_estados?: ProgresoEstados
+  dias_restantes_oc?: number | null
+  dias_restantes_critico?: number | null
   estado: 'listo' | 'parcial' | 'completado' | 'pendiente'
   documentos?: DocumentosOc
 }
@@ -96,6 +109,10 @@ interface ItemRow {
   qty_disponible: number
   estado_item: string
   en_reclamo: boolean
+  plazo_entrega_max?: number | null
+  plazo_entrega_min?: number | null
+  deadline_item?: string | null
+  dias_restantes?: number | null
 }
 
 interface DespachoRow {
@@ -342,11 +359,15 @@ function OcRow({
           <Package className="w-5 h-5" />
         </div>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-1">
+          <div className="flex items-center gap-2 mb-1 flex-wrap">
             <span className="text-xs text-brand-500 font-mono font-semibold">OC-{oc.numero_oc}</span>
             <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${badge.color}`}>
               {badge.label}
             </span>
+            <DiasRestantesBadge
+              dias={oc.dias_restantes_critico ?? oc.dias_restantes_oc ?? null}
+              label="entrega"
+            />
           </div>
           <div className="font-semibold truncate" style={{ color: 'var(--text-primary)' }}>{oc.cliente}</div>
           <div className="text-xs truncate" style={{ color: 'var(--text-muted)' }}>
@@ -355,28 +376,8 @@ function OcRow({
             {oc.cond_pago && ` · ${oc.cond_pago}`}
             {oc.fecha_entrega && ` · Entrega: ${oc.fecha_entrega}`}
           </div>
-          {/* Progress bar */}
-          <div className="mt-2">
-            <div className="flex items-center justify-between text-xs mb-1">
-              <span className="uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>
-                Progreso Despacho
-              </span>
-              <span
-                className={oc.progreso_pct === 100 ? 'text-emerald-500 font-semibold' : ''}
-                style={oc.progreso_pct === 100 ? undefined : { color: 'var(--text-muted)' }}
-              >
-                {oc.items_despachados}/{oc.total_items} · {oc.progreso_pct}%
-              </span>
-            </div>
-            <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--surface-300)' }}>
-              <div
-                className={`h-full transition-all ${
-                  oc.progreso_pct === 100 ? 'bg-emerald-500' : 'bg-brand-500'
-                }`}
-                style={{ width: `${oc.progreso_pct}%` }}
-              />
-            </div>
-          </div>
+          {/* Progress bar multi-segment */}
+          <PipelineProgress oc={oc} />
         </div>
         <div className="shrink-0" style={{ color: 'var(--text-faint)' }}>
           {expanded ? <ChevronDown className="w-5 h-5" /> : <ChevronRight className="w-5 h-5" />}
@@ -422,7 +423,7 @@ function OcRow({
             <div className="text-xs uppercase tracking-wider mb-2" style={{ color: 'var(--text-faint)' }}>
               Items ({detail.items.length})
             </div>
-            <div className="border rounded-xl overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+            <div className="border rounded-xl overflow-x-auto" style={{ borderColor: 'var(--border)' }}>
               <table className="w-full text-sm">
                 <thead style={{ backgroundColor: 'var(--surface-200)' }}>
                   <tr className="text-xs uppercase" style={{ color: 'var(--text-muted)' }}>
@@ -430,32 +431,49 @@ function OcRow({
                     <th className="text-left p-2">Descripción</th>
                     <th className="text-left p-2">Marca</th>
                     <th className="text-right p-2">Cant.</th>
-                    <th className="text-right p-2">Despachado</th>
-                    <th className="text-right p-2">Disponible</th>
+                    <th className="text-right p-2">Desp.</th>
+                    <th className="text-right p-2">Disp.</th>
+                    <th className="text-right p-2">Plazo</th>
+                    <th className="text-center p-2">Días Rest.</th>
                     <th className="text-center p-2">Estado</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {detail.items.map((it: ItemRow) => (
-                    <tr key={it.id} className="border-t" style={{ borderColor: 'var(--border)' }}>
-                      <td className="p-2 font-mono text-xs text-brand-500">{it.numero_parte}</td>
-                      <td className="p-2" style={{ color: 'var(--text-primary)' }}>{it.descripcion}</td>
-                      <td className="p-2 text-xs" style={{ color: 'var(--text-muted)' }}>{it.marca}</td>
-                      <td className="p-2 text-right" style={{ color: 'var(--text-primary)' }}>{it.cantidad}</td>
-                      <td className="p-2 text-right" style={{ color: 'var(--text-muted)' }}>{it.qty_despachada}</td>
-                      <td className="p-2 text-right">
-                        <span
-                          className={it.qty_disponible > 0 ? 'text-emerald-500 font-semibold' : ''}
-                          style={it.qty_disponible > 0 ? undefined : { color: 'var(--text-faint)' }}
-                        >
-                          {it.qty_disponible}
-                        </span>
-                      </td>
-                      <td className="p-2 text-center">
-                        <ItemEstadoBadge estado={it.estado_item} reclamo={it.en_reclamo} />
-                      </td>
-                    </tr>
-                  ))}
+                  {detail.items.map((it: ItemRow) => {
+                    const yaDespachado = it.estado_item === 'despachado'
+                    return (
+                      <tr key={it.id} className="border-t" style={{ borderColor: 'var(--border)' }}>
+                        <td className="p-2 font-mono text-xs text-brand-500">{it.numero_parte}</td>
+                        <td className="p-2" style={{ color: 'var(--text-primary)' }}>{it.descripcion}</td>
+                        <td className="p-2 text-xs" style={{ color: 'var(--text-muted)' }}>{it.marca}</td>
+                        <td className="p-2 text-right" style={{ color: 'var(--text-primary)' }}>{it.cantidad}</td>
+                        <td className="p-2 text-right" style={{ color: 'var(--text-muted)' }}>{it.qty_despachada}</td>
+                        <td className="p-2 text-right">
+                          <span
+                            className={it.qty_disponible > 0 ? 'text-emerald-500 font-semibold' : ''}
+                            style={it.qty_disponible > 0 ? undefined : { color: 'var(--text-faint)' }}
+                          >
+                            {it.qty_disponible}
+                          </span>
+                        </td>
+                        <td className="p-2 text-right text-xs" style={{ color: 'var(--text-muted)' }}>
+                          {it.plazo_entrega_max != null ? `${it.plazo_entrega_max}d` : '—'}
+                        </td>
+                        <td className="p-2 text-center">
+                          {yaDespachado ? (
+                            <span className="text-[11px]" style={{ color: 'var(--text-faint)' }}>
+                              —
+                            </span>
+                          ) : (
+                            <DiasRestantesBadge dias={it.dias_restantes} compact />
+                          )}
+                        </td>
+                        <td className="p-2 text-center">
+                          <ItemEstadoBadge estado={it.estado_item} reclamo={it.en_reclamo} />
+                        </td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
@@ -922,6 +940,112 @@ function DocButton({
         </div>
       </div>
     </button>
+  )
+}
+
+function DiasRestantesBadge({
+  dias,
+  label,
+  compact = false,
+}: {
+  dias: number | null | undefined
+  label?: string
+  compact?: boolean
+}) {
+  if (dias === null || dias === undefined) {
+    return compact ? (
+      <span style={{ color: 'var(--text-faint)' }}>—</span>
+    ) : null
+  }
+  const sufix = label ? ` · ${label}` : ''
+  if (dias < 0) {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-red-500/15 text-red-500">
+        <AlertTriangle className="w-3 h-3" />
+        Vencido {Math.abs(dias)}d
+      </span>
+    )
+  }
+  if (dias === 0) {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-red-500/15 text-red-500">
+        <Clock className="w-3 h-3" />
+        Hoy{sufix}
+      </span>
+    )
+  }
+  let style = 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+  if (dias <= 3) style = 'bg-red-500/15 text-red-500'
+  else if (dias <= 7) style = 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold ${style}`}>
+      <Clock className="w-3 h-3" />
+      {dias}d{sufix}
+    </span>
+  )
+}
+
+const PIPELINE_SEGMENTS: { key: keyof ProgresoEstados; label: string; color: string }[] = [
+  { key: 'pendiente',   label: 'Pendiente',    color: '#94a3b8' },
+  { key: 'en_compras',  label: 'En Compras',   color: '#f59e0b' },
+  { key: 'en_transito', label: 'En Tránsito',  color: '#8b5cf6' },
+  { key: 'en_bodega',   label: 'En Bodega',    color: '#10b981' },
+  { key: 'despachado',  label: 'Despachado',   color: '#1a5cf0' },
+  { key: 'reclamo',     label: 'Reclamo',      color: '#ef4444' },
+]
+
+function PipelineProgress({ oc }: { oc: OcCard }) {
+  const total = oc.total_items
+  const estados = oc.progreso_estados
+  if (!total || total === 0) return null
+
+  const segments = PIPELINE_SEGMENTS.map(s => ({
+    ...s,
+    count: estados?.[s.key] ?? 0,
+  })).filter(s => s.count > 0)
+
+  return (
+    <div className="mt-2 space-y-1.5">
+      <div className="flex items-center justify-between text-[11px]">
+        <span className="uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>
+          Estado de Avance
+        </span>
+        <span
+          className={oc.progreso_pct === 100 ? 'text-emerald-500 font-semibold' : ''}
+          style={oc.progreso_pct === 100 ? undefined : { color: 'var(--text-muted)' }}
+        >
+          {oc.items_despachados}/{total} despachados · {oc.progreso_pct}%
+        </span>
+      </div>
+      <div
+        className="h-2 rounded-full overflow-hidden flex"
+        style={{ backgroundColor: 'var(--surface-300)' }}
+      >
+        {segments.map(s => (
+          <div
+            key={s.key}
+            title={`${s.label}: ${s.count}`}
+            className="h-full transition-all"
+            style={{
+              width: `${(s.count / total) * 100}%`,
+              backgroundColor: s.color,
+            }}
+          />
+        ))}
+      </div>
+      {/* Legend */}
+      <div className="flex flex-wrap gap-x-3 gap-y-1 text-[10px]" style={{ color: 'var(--text-muted)' }}>
+        {segments.map(s => (
+          <span key={s.key} className="inline-flex items-center gap-1">
+            <span
+              className="w-2 h-2 rounded-sm shrink-0"
+              style={{ backgroundColor: s.color }}
+            />
+            {s.label} ({s.count})
+          </span>
+        ))}
+      </div>
+    </div>
   )
 }
 
