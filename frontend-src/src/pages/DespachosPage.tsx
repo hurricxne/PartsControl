@@ -1,16 +1,46 @@
 import { useState, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { despachosAPI } from '../services/api'
+import { despachosAPI, cotizacionesAPI, cotizadorAPI, comprasAPI } from '../services/api'
 import {
   Truck, Package, CheckCircle2, AlertCircle, Search, X,
   ChevronRight, ChevronDown, Plus, Trash2, Send,
+  FileSpreadsheet, FileText, FileDown, Loader2,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
+
+interface DocumentosOc {
+  excel_oc: boolean
+  cot_formal_excel: boolean
+  cot_pdf: boolean
+  cot_original_excel: boolean
+}
+
+async function downloadBlob(
+  fetcher: () => Promise<any>,
+  filename: string,
+  mime: string,
+) {
+  try {
+    const resp = await fetcher()
+    const blob = new Blob([resp.data], { type: mime })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  } catch (e: any) {
+    toast.error(e?.response?.data?.detail || 'Error al descargar documento')
+  }
+}
 
 type Tab = 'listas' | 'en_curso' | 'historial'
 
 interface OcCard {
   id: number
+  cotizacion_id?: number
   numero_oc: string
   numero_cotizacion?: string
   cliente: string
@@ -28,6 +58,7 @@ interface OcCard {
   items_no_disponibles: number
   progreso_pct: number
   estado: 'listo' | 'parcial' | 'completado' | 'pendiente'
+  documentos?: DocumentosOc
 }
 
 interface ItemRow {
@@ -328,6 +359,17 @@ function OcRow({
 
       {expanded && detail && (
         <div className="border-t p-4 space-y-4" style={{ borderColor: 'var(--border)' }}>
+          {/* Documentos */}
+          {detail.cotizacion_id && detail.documentos && (
+            <DocumentosSection
+              cotizacionId={detail.cotizacion_id}
+              ocId={detail.id}
+              docs={detail.documentos}
+              numeroOc={detail.numero_oc}
+              numeroCot={detail.numero_cotizacion}
+            />
+          )}
+
           {/* Datos destinatario */}
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div>
@@ -453,6 +495,140 @@ function OcRow({
         </div>
       )}
     </div>
+  )
+}
+
+function DocumentosSection({
+  cotizacionId,
+  ocId,
+  docs,
+  numeroOc,
+  numeroCot,
+}: {
+  cotizacionId: number
+  ocId: number
+  docs: DocumentosOc
+  numeroOc?: string
+  numeroCot?: string
+}) {
+  const MIME_XLSX = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  const MIME_PDF = 'application/pdf'
+  const tag = numeroOc || `OC-${ocId}`
+  const cotTag = numeroCot || `COT-${cotizacionId}`
+
+  const buttons = [
+    {
+      key: 'excel_oc',
+      label: 'Excel OC',
+      hint: 'Listado de items para picking',
+      icon: <FileSpreadsheet className="w-4 h-4" />,
+      enabled: docs.excel_oc,
+      run: () =>
+        downloadBlob(() => comprasAPI.downloadOcClienteExcel(ocId), `${tag}.xlsx`, MIME_XLSX),
+    },
+    {
+      key: 'cot_formal',
+      label: 'Cotización Formal',
+      hint: 'Excel formal enviado al cliente',
+      icon: <FileSpreadsheet className="w-4 h-4" />,
+      enabled: docs.cot_formal_excel,
+      run: () =>
+        downloadBlob(
+          () => cotizadorAPI.downloadFormal(cotizacionId),
+          `${cotTag}-formal.xlsx`,
+          MIME_XLSX,
+        ),
+    },
+    {
+      key: 'cot_pdf',
+      label: 'Cotización PDF',
+      hint: 'PDF de la cotización formal',
+      icon: <FileText className="w-4 h-4" />,
+      enabled: docs.cot_pdf,
+      run: () =>
+        downloadBlob(
+          () => cotizadorAPI.downloadPdf(cotizacionId),
+          `${cotTag}.pdf`,
+          MIME_PDF,
+        ),
+    },
+    {
+      key: 'cot_original',
+      label: 'Excel Original',
+      hint: 'Archivo Excel cargado al iniciar',
+      icon: <FileDown className="w-4 h-4" />,
+      enabled: docs.cot_original_excel,
+      run: () =>
+        downloadBlob(
+          () => cotizacionesAPI.download(cotizacionId),
+          `${cotTag}-original.xlsx`,
+          MIME_XLSX,
+        ),
+    },
+  ]
+
+  return (
+    <div>
+      <div
+        className="text-xs uppercase tracking-wider mb-2 font-semibold"
+        style={{ color: 'var(--text-faint)' }}
+      >
+        Documentos
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        {buttons.map(({ key, ...rest }) => (
+          <DocButton key={key} {...rest} />
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function DocButton({
+  label,
+  hint,
+  icon,
+  enabled,
+  run,
+}: {
+  label: string
+  hint: string
+  icon: React.ReactNode
+  enabled: boolean
+  run: () => Promise<void>
+}) {
+  const [loading, setLoading] = useState(false)
+  const handle = async () => {
+    if (!enabled || loading) return
+    setLoading(true)
+    try {
+      await run()
+    } finally {
+      setLoading(false)
+    }
+  }
+  return (
+    <button
+      onClick={handle}
+      disabled={!enabled || loading}
+      title={enabled ? hint : 'No disponible'}
+      className="flex items-center gap-2 px-3 py-2.5 rounded-xl border transition-colors text-left disabled:opacity-40 disabled:cursor-not-allowed hover:bg-[var(--surface-200)]"
+      style={{
+        borderColor: 'var(--border)',
+        backgroundColor: 'var(--surface-100)',
+        color: enabled ? 'var(--text-primary)' : 'var(--text-faint)',
+      }}
+    >
+      <span className={enabled ? 'text-emerald-500' : ''} style={enabled ? undefined : { color: 'var(--text-faint)' }}>
+        {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : icon}
+      </span>
+      <div className="flex-1 min-w-0">
+        <div className="text-xs font-semibold truncate">{label}</div>
+        <div className="text-[10px] truncate" style={{ color: 'var(--text-muted)' }}>
+          {enabled ? hint : 'No disponible'}
+        </div>
+      </div>
+    </button>
   )
 }
 

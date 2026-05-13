@@ -109,6 +109,7 @@ def _serialize_oc_card(db: Session, oc: OcCliente):
 
     return {
         "id": oc.id,
+        "cotizacion_id": cot.id,
         "numero_oc": oc.numero_oc,
         "fecha_oc": oc.fecha_oc,
         "fecha_entrega": oc.fecha_entrega.isoformat() if oc.fecha_entrega else None,
@@ -126,6 +127,12 @@ def _serialize_oc_card(db: Session, oc: OcCliente):
         "items_no_disponibles": no_dispon,
         "progreso_pct": progreso,
         "estado": estado,
+        "documentos": {
+            "excel_oc": True,
+            "cot_formal_excel": bool(cot.archivo_formal),
+            "cot_pdf": True,
+            "cot_original_excel": bool(cot.archivo_original),
+        },
     }
 
 
