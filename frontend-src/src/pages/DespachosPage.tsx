@@ -15,6 +15,31 @@ interface DocumentosOc {
   cot_original_excel: boolean
 }
 
+interface DocValue {
+  value: string
+  is_file: boolean
+  filename: string | null
+}
+
+interface EmbarqueDocs {
+  awb: DocValue | null
+  factura_comercial: DocValue | null
+  packing_list: DocValue | null
+  certificado_origen: DocValue | null
+  doc_adicional: DocValue | null
+}
+
+interface EmbarqueResumen {
+  id: number
+  numero: string
+  estado?: string
+  forwarder?: string
+  fecha_despacho?: string
+  fecha_llegada_est?: string | null
+  items_de_esta_oc: number
+  documentos: EmbarqueDocs
+}
+
 async function downloadBlob(
   fetcher: () => Promise<any>,
   filename: string,
@@ -87,6 +112,7 @@ interface DespachoRow {
 interface OcDetail extends OcCard {
   items: ItemRow[]
   despachos: DespachoRow[]
+  embarques?: EmbarqueResumen[]
 }
 
 const estadoLabel: Record<string, { label: string; color: string }> = {
@@ -367,6 +393,7 @@ function OcRow({
               docs={detail.documentos}
               numeroOc={detail.numero_oc}
               numeroCot={detail.numero_cotizacion}
+              embarques={detail.embarques}
             />
           )}
 
@@ -504,12 +531,14 @@ function DocumentosSection({
   docs,
   numeroOc,
   numeroCot,
+  embarques,
 }: {
   cotizacionId: number
   ocId: number
   docs: DocumentosOc
   numeroOc?: string
   numeroCot?: string
+  embarques?: EmbarqueResumen[]
 }) {
   const MIME_XLSX = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
   const MIME_PDF = 'application/pdf'
@@ -568,18 +597,169 @@ function DocumentosSection({
   ]
 
   return (
-    <div>
-      <div
-        className="text-xs uppercase tracking-wider mb-2 font-semibold"
-        style={{ color: 'var(--text-faint)' }}
-      >
-        Documentos
+    <div className="space-y-4">
+      <div>
+        <div
+          className="text-xs uppercase tracking-wider mb-2 font-semibold"
+          style={{ color: 'var(--text-faint)' }}
+        >
+          Documentos de la Cotización
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          {buttons.map(({ key, ...rest }) => (
+            <DocButton key={key} {...rest} />
+          ))}
+        </div>
       </div>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-        {buttons.map(({ key, ...rest }) => (
-          <DocButton key={key} {...rest} />
+      {embarques && embarques.length > 0 && (
+        <div>
+          <div
+            className="text-xs uppercase tracking-wider mb-2 font-semibold"
+            style={{ color: 'var(--text-faint)' }}
+          >
+            Embarques de Importación ({embarques.length})
+          </div>
+          <div className="space-y-2">
+            {embarques.map(emb => (
+              <EmbarqueDocsCard key={emb.id} emb={emb} />
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function EmbarqueDocsCard({ emb }: { emb: EmbarqueResumen }) {
+  const labels: { key: keyof EmbarqueDocs; label: string }[] = [
+    { key: 'awb', label: 'AWB / BL' },
+    { key: 'factura_comercial', label: 'Factura Comercial' },
+    { key: 'packing_list', label: 'Packing List' },
+    { key: 'certificado_origen', label: 'Cert. Origen' },
+    { key: 'doc_adicional', label: 'Otros' },
+  ]
+  return (
+    <div
+      className="border rounded-xl p-3"
+      style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}
+    >
+      <div className="flex flex-wrap items-center gap-2 mb-2 pb-2 border-b" style={{ borderColor: 'var(--border)' }}>
+        <span className="font-mono text-sm font-semibold text-brand-500">{emb.numero}</span>
+        {emb.estado && (
+          <span className="text-xs px-2 py-0.5 rounded-full font-semibold bg-amber-500/15 text-amber-600 dark:text-amber-400">
+            {emb.estado}
+          </span>
+        )}
+        <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+          {emb.items_de_esta_oc} ítem{emb.items_de_esta_oc === 1 ? '' : 's'} de esta OC
+        </span>
+        {emb.forwarder && (
+          <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            · {emb.forwarder}
+          </span>
+        )}
+        {emb.fecha_llegada_est && (
+          <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            · ETA: {emb.fecha_llegada_est}
+          </span>
+        )}
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
+        {labels.map(({ key, label }) => (
+          <EmbDocField key={key} label={label} doc={emb.documentos[key]} />
         ))}
       </div>
+    </div>
+  )
+}
+
+function EmbDocField({ label, doc }: { label: string; doc: DocValue | null }) {
+  const [loading, setLoading] = useState(false)
+
+  const handleDownload = async () => {
+    if (!doc?.filename) return
+    setLoading(true)
+    try {
+      // Auth download via fetch + Bearer token (file goes through /api/despachos/docs/{filename})
+      const token = (() => {
+        try {
+          return JSON.parse(localStorage.getItem('machparts-auth') || '{}')?.state?.token || ''
+        } catch {
+          return ''
+        }
+      })()
+      const res = await fetch(`/api/despachos/docs/${encodeURIComponent(doc.filename)}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || 'Error al descargar')
+      }
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = doc.filename
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (e: any) {
+      toast.error(e?.message || 'Error al descargar')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div>
+      <div
+        className="text-[10px] uppercase tracking-wider mb-0.5"
+        style={{ color: 'var(--text-faint)' }}
+      >
+        {label}
+      </div>
+      {!doc ? (
+        <div
+          className="text-xs px-2 py-1.5 rounded-lg border border-dashed"
+          style={{ borderColor: 'var(--border)', color: 'var(--text-faint)' }}
+        >
+          —
+        </div>
+      ) : doc.is_file ? (
+        <button
+          onClick={handleDownload}
+          disabled={loading}
+          className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded-lg border transition-colors hover:bg-[var(--surface-200)] disabled:opacity-50 text-left"
+          style={{
+            borderColor: 'var(--border)',
+            backgroundColor: 'var(--surface)',
+            color: 'var(--text-primary)',
+          }}
+        >
+          {loading ? (
+            <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-500 shrink-0" />
+          ) : (
+            <FileText className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+          )}
+          <span className="text-[11px] truncate flex-1" title={doc.value}>
+            {doc.value}
+          </span>
+          <FileDown className="w-3 h-3 shrink-0 opacity-60" />
+        </button>
+      ) : (
+        <div
+          className="text-xs px-2 py-1.5 rounded-lg border"
+          style={{
+            borderColor: 'var(--border)',
+            backgroundColor: 'var(--surface)',
+            color: 'var(--text-primary)',
+          }}
+          title={doc.value}
+        >
+          <span className="break-all">{doc.value}</span>
+        </div>
+      )}
     </div>
   )
 }
