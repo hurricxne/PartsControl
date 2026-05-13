@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { despachosAPI } from '../services/api'
 import {
   Truck, Package, CheckCircle2, AlertCircle, Search, X,
-  ChevronRight, ChevronDown, Plus, FileText, Trash2, Send,
+  ChevronRight, ChevronDown, Plus, Trash2, Send,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 
@@ -59,10 +59,10 @@ interface OcDetail extends OcCard {
 }
 
 const estadoLabel: Record<string, { label: string; color: string }> = {
-  listo: { label: 'Listo para despacho', color: 'bg-emerald-500/20 text-emerald-300' },
-  parcial: { label: 'Parcial', color: 'bg-amber-500/20 text-amber-300' },
-  completado: { label: 'Completado', color: 'bg-blue-500/20 text-blue-300' },
-  pendiente: { label: 'Pendiente bodega', color: 'bg-zinc-500/20 text-zinc-400' },
+  listo: { label: 'Listo para despacho', color: 'bg-emerald-500/15 text-emerald-500 dark:text-emerald-400' },
+  parcial: { label: 'Parcial', color: 'bg-amber-500/15 text-amber-600 dark:text-amber-400' },
+  completado: { label: 'Completado', color: 'bg-blue-500/15 text-blue-600 dark:text-blue-400' },
+  pendiente: { label: 'Pendiente bodega', color: 'bg-slate-500/15 text-slate-500' },
 }
 
 export default function DespachosPage() {
@@ -115,28 +115,28 @@ export default function DespachosPage() {
           label="OCs Listas"
           value={counts?.ocs_listas ?? 0}
           icon={<Package className="w-5 h-5" />}
-          color="text-blue-400"
+          color="text-brand-500"
           sub="Con ítems en bodega"
         />
         <KpiCard
           label="Items Disponibles"
           value={counts?.items_listos ?? 0}
           icon={<CheckCircle2 className="w-5 h-5" />}
-          color="text-emerald-400"
+          color="text-emerald-500"
           sub="Listos para despacho"
         />
         <KpiCard
           label="Items Despachados"
           value={counts?.items_despachados ?? 0}
           icon={<Truck className="w-5 h-5" />}
-          color="text-purple-400"
+          color="text-purple-500"
           sub="Total histórico"
         />
         <KpiCard
           label="OCs En Curso"
           value={ocs.filter((o: OcCard) => o.estado === 'parcial').length}
           icon={<AlertCircle className="w-5 h-5" />}
-          color="text-amber-400"
+          color="text-amber-500"
           sub="Con despacho abierto"
         />
       </div>
@@ -156,18 +156,22 @@ export default function DespachosPage() {
 
       {/* Search */}
       <div className="relative">
-        <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
+        <Search
+          className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2"
+          style={{ color: 'var(--text-faint)' }}
+        />
         <input
           type="text"
           value={search}
           onChange={e => setSearch(e.target.value)}
           placeholder="Buscar por cliente, N° COT u OC..."
-          className="w-full pl-10 pr-10 py-2.5 bg-zinc-800/50 border border-zinc-700 rounded-lg text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-blue-500"
+          className="input pl-10 pr-10"
         />
         {search && (
           <button
             onClick={() => setSearch('')}
-            className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300"
+            className="absolute right-3 top-1/2 -translate-y-1/2 hover:opacity-100 opacity-60"
+            style={{ color: 'var(--text-muted)' }}
           >
             <X className="w-4 h-4" />
           </button>
@@ -176,9 +180,11 @@ export default function DespachosPage() {
 
       {/* List */}
       {isLoading ? (
-        <div className="text-center text-zinc-500 py-12">Cargando...</div>
+        <div className="text-center py-12" style={{ color: 'var(--text-faint)' }}>
+          Cargando...
+        </div>
       ) : ocs.length === 0 ? (
-        <div className="text-center text-zinc-500 py-12">
+        <div className="text-center py-12" style={{ color: 'var(--text-faint)' }}>
           No hay OCs {tab === 'listas' ? 'listas para despacho' : tab === 'en_curso' ? 'con despachos en curso' : 'en historial'}
         </div>
       ) : (
@@ -223,13 +229,18 @@ export default function DespachosPage() {
 
 function KpiCard({ label, value, icon, color, sub }: any) {
   return (
-    <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-4">
+    <div className="card p-4">
       <div className="flex items-center justify-between mb-2">
-        <span className="text-xs uppercase tracking-wider text-zinc-500">{label}</span>
+        <span
+          className="text-xs uppercase tracking-wider"
+          style={{ color: 'var(--text-faint)' }}
+        >
+          {label}
+        </span>
         <span className={color}>{icon}</span>
       </div>
       <div className={`text-3xl font-bold ${color}`}>{value}</div>
-      <div className="text-xs text-zinc-400 mt-1">{sub}</div>
+      <div className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>{sub}</div>
     </div>
   )
 }
@@ -238,11 +249,16 @@ function TabBtn({ active, onClick, children }: any) {
   return (
     <button
       onClick={onClick}
-      className={`px-4 py-2 rounded-lg text-sm font-medium transition ${
+      className={`px-4 py-2 rounded-xl text-sm font-semibold border transition-colors ${
         active
-          ? 'bg-blue-500/20 text-blue-300 border border-blue-500/40'
-          : 'bg-zinc-900/60 text-zinc-400 border border-zinc-800 hover:text-zinc-200'
+          ? 'bg-brand-500/15 text-brand-500 border-brand-500/40'
+          : 'hover:bg-[var(--surface-200)]'
       }`}
+      style={
+        active
+          ? undefined
+          : { backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)', color: 'var(--text-muted)' }
+      }
     >
       {children}
     </button>
@@ -260,23 +276,23 @@ function OcRow({
 }: any) {
   const badge = estadoLabel[oc.estado] ?? estadoLabel.pendiente
   return (
-    <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl overflow-hidden">
+    <div className="card overflow-hidden">
       <button
         onClick={onExpand}
-        className="w-full p-4 flex items-center gap-4 hover:bg-zinc-900/80 transition text-left"
+        className="w-full p-4 flex items-center gap-4 hover:bg-[var(--surface-200)] transition text-left"
       >
-        <div className="w-10 h-10 rounded-lg bg-blue-500/10 flex items-center justify-center text-blue-400 shrink-0">
+        <div className="w-10 h-10 rounded-lg bg-brand-500/10 flex items-center justify-center text-brand-500 shrink-0">
           <Package className="w-5 h-5" />
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1">
-            <span className="text-xs text-blue-400 font-mono">OC-{oc.numero_oc}</span>
-            <span className={`text-xs px-2 py-0.5 rounded ${badge.color}`}>
+            <span className="text-xs text-brand-500 font-mono font-semibold">OC-{oc.numero_oc}</span>
+            <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${badge.color}`}>
               {badge.label}
             </span>
           </div>
-          <div className="font-semibold text-zinc-100 truncate">{oc.cliente}</div>
-          <div className="text-xs text-zinc-500 truncate">
+          <div className="font-semibold truncate" style={{ color: 'var(--text-primary)' }}>{oc.cliente}</div>
+          <div className="text-xs truncate" style={{ color: 'var(--text-muted)' }}>
             {oc.numero_cotizacion} · OC #{oc.numero_oc}
             {oc.fecha_oc && ` · ${oc.fecha_oc}`}
             {oc.cond_pago && ` · ${oc.cond_pago}`}
@@ -285,51 +301,62 @@ function OcRow({
           {/* Progress bar */}
           <div className="mt-2">
             <div className="flex items-center justify-between text-xs mb-1">
-              <span className="text-zinc-500 uppercase tracking-wider">Progreso Despacho</span>
-              <span className={oc.progreso_pct === 100 ? 'text-emerald-400' : 'text-zinc-400'}>
+              <span className="uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>
+                Progreso Despacho
+              </span>
+              <span
+                className={oc.progreso_pct === 100 ? 'text-emerald-500 font-semibold' : ''}
+                style={oc.progreso_pct === 100 ? undefined : { color: 'var(--text-muted)' }}
+              >
                 {oc.items_despachados}/{oc.total_items} · {oc.progreso_pct}%
               </span>
             </div>
-            <div className="h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+            <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--surface-300)' }}>
               <div
                 className={`h-full transition-all ${
-                  oc.progreso_pct === 100 ? 'bg-emerald-500' : 'bg-blue-500'
+                  oc.progreso_pct === 100 ? 'bg-emerald-500' : 'bg-brand-500'
                 }`}
                 style={{ width: `${oc.progreso_pct}%` }}
               />
             </div>
           </div>
         </div>
-        <div className="text-zinc-500 shrink-0">
+        <div className="shrink-0" style={{ color: 'var(--text-faint)' }}>
           {expanded ? <ChevronDown className="w-5 h-5" /> : <ChevronRight className="w-5 h-5" />}
         </div>
       </button>
 
       {expanded && detail && (
-        <div className="border-t border-zinc-800 p-4 space-y-4">
+        <div className="border-t p-4 space-y-4" style={{ borderColor: 'var(--border)' }}>
           {/* Datos destinatario */}
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div>
-              <div className="text-xs uppercase tracking-wider text-zinc-500 mb-1">Destinatario</div>
-              <div className="text-zinc-200">{detail.contacto || '—'}</div>
-              <div className="text-zinc-400 text-xs">{detail.telefono || ''}</div>
-              <div className="text-zinc-400 text-xs">{detail.email || ''}</div>
+              <div className="text-xs uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>
+                Destinatario
+              </div>
+              <div style={{ color: 'var(--text-primary)' }}>{detail.contacto || '—'}</div>
+              <div className="text-xs" style={{ color: 'var(--text-muted)' }}>{detail.telefono || ''}</div>
+              <div className="text-xs" style={{ color: 'var(--text-muted)' }}>{detail.email || ''}</div>
             </div>
             <div>
-              <div className="text-xs uppercase tracking-wider text-zinc-500 mb-1">Dirección de Entrega</div>
-              <div className="text-zinc-200 text-xs">{detail.direccion || 'Sin dirección'}</div>
+              <div className="text-xs uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>
+                Dirección de Entrega
+              </div>
+              <div className="text-xs" style={{ color: 'var(--text-primary)' }}>
+                {detail.direccion || 'Sin dirección'}
+              </div>
             </div>
           </div>
 
           {/* Items */}
           <div>
-            <div className="text-xs uppercase tracking-wider text-zinc-500 mb-2">
+            <div className="text-xs uppercase tracking-wider mb-2" style={{ color: 'var(--text-faint)' }}>
               Items ({detail.items.length})
             </div>
-            <div className="border border-zinc-800 rounded-lg overflow-hidden">
+            <div className="border rounded-xl overflow-hidden" style={{ borderColor: 'var(--border)' }}>
               <table className="w-full text-sm">
-                <thead className="bg-zinc-800/50 text-xs uppercase text-zinc-400">
-                  <tr>
+                <thead style={{ backgroundColor: 'var(--surface-200)' }}>
+                  <tr className="text-xs uppercase" style={{ color: 'var(--text-muted)' }}>
                     <th className="text-left p-2">N° Parte</th>
                     <th className="text-left p-2">Descripción</th>
                     <th className="text-left p-2">Marca</th>
@@ -341,14 +368,17 @@ function OcRow({
                 </thead>
                 <tbody>
                   {detail.items.map((it: ItemRow) => (
-                    <tr key={it.id} className="border-t border-zinc-800">
-                      <td className="p-2 font-mono text-xs text-blue-300">{it.numero_parte}</td>
-                      <td className="p-2 text-zinc-300">{it.descripcion}</td>
-                      <td className="p-2 text-zinc-400 text-xs">{it.marca}</td>
-                      <td className="p-2 text-right text-zinc-300">{it.cantidad}</td>
-                      <td className="p-2 text-right text-zinc-400">{it.qty_despachada}</td>
+                    <tr key={it.id} className="border-t" style={{ borderColor: 'var(--border)' }}>
+                      <td className="p-2 font-mono text-xs text-brand-500">{it.numero_parte}</td>
+                      <td className="p-2" style={{ color: 'var(--text-primary)' }}>{it.descripcion}</td>
+                      <td className="p-2 text-xs" style={{ color: 'var(--text-muted)' }}>{it.marca}</td>
+                      <td className="p-2 text-right" style={{ color: 'var(--text-primary)' }}>{it.cantidad}</td>
+                      <td className="p-2 text-right" style={{ color: 'var(--text-muted)' }}>{it.qty_despachada}</td>
                       <td className="p-2 text-right">
-                        <span className={it.qty_disponible > 0 ? 'text-emerald-400 font-semibold' : 'text-zinc-600'}>
+                        <span
+                          className={it.qty_disponible > 0 ? 'text-emerald-500 font-semibold' : ''}
+                          style={it.qty_disponible > 0 ? undefined : { color: 'var(--text-faint)' }}
+                        >
                           {it.qty_disponible}
                         </span>
                       </td>
@@ -365,21 +395,24 @@ function OcRow({
           {/* Despachos */}
           {detail.despachos.length > 0 && (
             <div>
-              <div className="text-xs uppercase tracking-wider text-zinc-500 mb-2">
+              <div className="text-xs uppercase tracking-wider mb-2" style={{ color: 'var(--text-faint)' }}>
                 Despachos ({detail.despachos.length})
               </div>
               <div className="space-y-2">
                 {detail.despachos.map((d: DespachoRow) => (
                   <div
                     key={d.id}
-                    className="flex items-center justify-between p-3 bg-zinc-800/30 border border-zinc-800 rounded-lg"
+                    className="flex items-center justify-between p-3 border rounded-xl"
+                    style={{ backgroundColor: 'var(--surface-200)', borderColor: 'var(--border)' }}
                   >
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
-                        <span className="font-mono text-sm text-zinc-200">{d.numero_despacho}</span>
+                        <span className="font-mono text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+                          {d.numero_despacho}
+                        </span>
                         <DespachoEstadoBadge estado={d.estado} />
                       </div>
-                      <div className="text-xs text-zinc-500 mt-0.5">
+                      <div className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
                         {d.items_count} ítems
                         {d.transportista && ` · ${d.transportista}`}
                         {d.numero_guia && ` · Guía: ${d.numero_guia}`}
@@ -390,13 +423,13 @@ function OcRow({
                       <div className="flex gap-2 shrink-0">
                         <button
                           onClick={() => onCerrarDespacho(d.id)}
-                          className="px-3 py-1.5 text-xs bg-emerald-500/20 text-emerald-300 rounded hover:bg-emerald-500/30 flex items-center gap-1"
+                          className="px-3 py-1.5 text-xs bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 rounded-lg hover:bg-emerald-500/25 flex items-center gap-1 font-semibold"
                         >
                           <Send className="w-3 h-3" /> Confirmar
                         </button>
                         <button
                           onClick={() => onAnularDespacho(d.id)}
-                          className="px-3 py-1.5 text-xs bg-red-500/10 text-red-400 rounded hover:bg-red-500/20"
+                          className="px-3 py-1.5 text-xs bg-red-500/10 text-red-500 rounded-lg hover:bg-red-500/20"
                         >
                           <Trash2 className="w-3 h-3" />
                         </button>
@@ -412,7 +445,7 @@ function OcRow({
           {detail.items.some((it: ItemRow) => it.qty_disponible > 0) && (
             <button
               onClick={onCrearDespacho}
-              className="w-full py-2.5 bg-blue-500/20 text-blue-300 border border-blue-500/40 rounded-lg hover:bg-blue-500/30 flex items-center justify-center gap-2 font-medium"
+              className="btn-primary w-full justify-center"
             >
               <Plus className="w-4 h-4" /> Crear Despacho
             </button>
@@ -425,26 +458,26 @@ function OcRow({
 
 function ItemEstadoBadge({ estado, reclamo }: { estado: string; reclamo: boolean }) {
   if (reclamo) {
-    return <span className="text-xs px-2 py-0.5 rounded bg-red-500/20 text-red-300">Reclamo</span>
+    return <span className="text-xs px-2 py-0.5 rounded-full font-semibold bg-red-500/15 text-red-500">Reclamo</span>
   }
   const map: Record<string, { label: string; color: string }> = {
-    en_bodega: { label: 'En Bodega', color: 'bg-emerald-500/20 text-emerald-300' },
-    despachado: { label: 'Despachado', color: 'bg-blue-500/20 text-blue-300' },
-    embarcado: { label: 'En Tránsito', color: 'bg-amber-500/20 text-amber-300' },
-    reclamo_proveedor: { label: 'Reclamo', color: 'bg-red-500/20 text-red-300' },
+    en_bodega: { label: 'En Bodega', color: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' },
+    despachado: { label: 'Despachado', color: 'bg-blue-500/15 text-blue-600 dark:text-blue-400' },
+    embarcado: { label: 'En Tránsito', color: 'bg-amber-500/15 text-amber-600 dark:text-amber-400' },
+    reclamo_proveedor: { label: 'Reclamo', color: 'bg-red-500/15 text-red-500' },
   }
-  const cfg = map[estado] ?? { label: estado, color: 'bg-zinc-500/20 text-zinc-400' }
-  return <span className={`text-xs px-2 py-0.5 rounded ${cfg.color}`}>{cfg.label}</span>
+  const cfg = map[estado] ?? { label: estado, color: 'bg-slate-500/15 text-slate-500' }
+  return <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${cfg.color}`}>{cfg.label}</span>
 }
 
 function DespachoEstadoBadge({ estado }: { estado: string }) {
   const map: Record<string, { label: string; color: string }> = {
-    en_preparacion: { label: 'En Preparación', color: 'bg-amber-500/20 text-amber-300' },
-    despachado: { label: 'Despachado', color: 'bg-emerald-500/20 text-emerald-300' },
-    anulado: { label: 'Anulado', color: 'bg-zinc-500/20 text-zinc-400' },
+    en_preparacion: { label: 'En Preparación', color: 'bg-amber-500/15 text-amber-600 dark:text-amber-400' },
+    despachado: { label: 'Despachado', color: 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' },
+    anulado: { label: 'Anulado', color: 'bg-slate-500/15 text-slate-500' },
   }
-  const cfg = map[estado] ?? { label: estado, color: 'bg-zinc-500/20 text-zinc-400' }
-  return <span className={`text-xs px-2 py-0.5 rounded ${cfg.color}`}>{cfg.label}</span>
+  const cfg = map[estado] ?? { label: estado, color: 'bg-slate-500/15 text-slate-500' }
+  return <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${cfg.color}`}>{cfg.label}</span>
 }
 
 function CrearDespachoModal({ oc, onClose, onCreated }: any) {
@@ -501,21 +534,32 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
 
   return (
     <div
-      className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
+      className="fixed inset-0 flex items-center justify-center z-50 p-4"
+      style={{ backgroundColor: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)' }}
       onClick={onClose}
     >
       <div
-        className="bg-zinc-900 border border-zinc-800 rounded-xl max-w-3xl w-full max-h-[90vh] overflow-hidden flex flex-col"
+        className="max-w-3xl w-full max-h-[90vh] overflow-hidden flex flex-col rounded-2xl border shadow-2xl"
+        style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}
         onClick={e => e.stopPropagation()}
       >
-        <div className="p-4 border-b border-zinc-800 flex items-center justify-between">
+        <div
+          className="p-4 border-b flex items-center justify-between"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+        >
           <div>
-            <h2 className="text-lg font-semibold text-zinc-100">Nuevo Despacho</h2>
-            <p className="text-xs text-zinc-500">
+            <h2 className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>
+              Nuevo Despacho
+            </h2>
+            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
               OC {oc.numero_oc} · {oc.cliente}
             </p>
           </div>
-          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300">
+          <button
+            onClick={onClose}
+            className="p-1.5 rounded-lg hover:bg-[var(--surface-300)]"
+            style={{ color: 'var(--text-muted)' }}
+          >
             <X className="w-5 h-5" />
           </button>
         </div>
@@ -547,48 +591,58 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
             />
           </div>
           <div>
-            <label className="text-xs uppercase tracking-wider text-zinc-500 mb-1 block">
+            <label
+              className="block text-xs font-semibold uppercase tracking-wider mb-1.5"
+              style={{ color: 'var(--text-faint)' }}
+            >
               Observaciones
             </label>
             <textarea
               value={observaciones}
               onChange={e => setObservaciones(e.target.value)}
               rows={2}
-              className="w-full px-3 py-2 bg-zinc-800/50 border border-zinc-700 rounded-lg text-sm text-zinc-100 focus:outline-none focus:border-blue-500"
+              className="input resize-none"
               placeholder="Opcional..."
             />
           </div>
 
           {/* Items disponibles */}
           <div>
-            <div className="text-xs uppercase tracking-wider text-zinc-500 mb-2">
+            <div
+              className="text-xs uppercase tracking-wider mb-2 font-semibold"
+              style={{ color: 'var(--text-faint)' }}
+            >
               Items disponibles ({disponibles.length})
             </div>
             {disponibles.length === 0 ? (
-              <div className="text-center text-zinc-500 py-4">
+              <div className="text-center py-4" style={{ color: 'var(--text-faint)' }}>
                 No hay items disponibles para despacho
               </div>
             ) : (
-              <div className="border border-zinc-800 rounded-lg overflow-hidden">
+              <div className="border rounded-xl overflow-hidden" style={{ borderColor: 'var(--border)' }}>
                 {disponibles.map((it: ItemRow) => {
                   const selected = selectedItems[it.id] !== undefined
                   return (
                     <div
                       key={it.id}
-                      className={`p-3 flex items-center gap-3 border-b border-zinc-800 last:border-0 ${
-                        selected ? 'bg-blue-500/5' : ''
-                      }`}
+                      className="p-3 flex items-center gap-3 border-b last:border-0 transition-colors"
+                      style={{
+                        borderColor: 'var(--border)',
+                        backgroundColor: selected ? 'rgba(26, 92, 240, 0.06)' : 'transparent',
+                      }}
                     >
                       <input
                         type="checkbox"
                         checked={selected}
                         onChange={() => toggleItem(it)}
-                        className="w-4 h-4 accent-blue-500"
+                        className="w-4 h-4 accent-brand-500"
                       />
                       <div className="flex-1 min-w-0">
-                        <div className="font-mono text-xs text-blue-300">{it.numero_parte}</div>
-                        <div className="text-sm text-zinc-200 truncate">{it.descripcion}</div>
-                        <div className="text-xs text-zinc-500">{it.marca}</div>
+                        <div className="font-mono text-xs text-brand-500 font-semibold">{it.numero_parte}</div>
+                        <div className="text-sm truncate" style={{ color: 'var(--text-primary)' }}>
+                          {it.descripcion}
+                        </div>
+                        <div className="text-xs" style={{ color: 'var(--text-muted)' }}>{it.marca}</div>
                       </div>
                       {selected ? (
                         <input
@@ -599,10 +653,13 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
                           onChange={e =>
                             updateQty(it.id, Math.min(it.qty_disponible, Number(e.target.value) || 0))
                           }
-                          className="w-20 px-2 py-1 bg-zinc-800 border border-zinc-700 rounded text-sm text-zinc-100 text-right"
+                          className="input w-20 text-right py-1.5 px-2"
                         />
                       ) : (
-                        <span className="text-sm text-zinc-400 w-20 text-right">
+                        <span
+                          className="text-sm w-20 text-right"
+                          style={{ color: 'var(--text-muted)' }}
+                        >
                           /{it.qty_disponible} disp.
                         </span>
                       )}
@@ -614,21 +671,21 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
           </div>
         </div>
 
-        <div className="p-4 border-t border-zinc-800 flex items-center justify-between">
-          <div className="text-sm text-zinc-400">
+        <div
+          className="p-4 border-t flex items-center justify-between"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+        >
+          <div className="text-sm" style={{ color: 'var(--text-muted)' }}>
             {seleccionTotal} ítem{seleccionTotal === 1 ? '' : 's'} seleccionado{seleccionTotal === 1 ? '' : 's'}
           </div>
           <div className="flex gap-2">
-            <button
-              onClick={onClose}
-              className="px-4 py-2 text-sm text-zinc-400 hover:text-zinc-200"
-            >
+            <button onClick={onClose} className="btn-secondary text-sm">
               Cancelar
             </button>
             <button
               onClick={() => createMut.mutate()}
               disabled={seleccionTotal === 0 || createMut.isPending}
-              className="px-4 py-2 text-sm bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:bg-zinc-700 disabled:text-zinc-500 flex items-center gap-2"
+              className="btn-primary text-sm"
             >
               <Plus className="w-4 h-4" />
               {createMut.isPending ? 'Creando...' : 'Crear Despacho'}
@@ -643,13 +700,18 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
 function Input({ label, value, onChange, placeholder }: any) {
   return (
     <div>
-      <label className="text-xs uppercase tracking-wider text-zinc-500 mb-1 block">{label}</label>
+      <label
+        className="block text-xs font-semibold uppercase tracking-wider mb-1.5"
+        style={{ color: 'var(--text-faint)' }}
+      >
+        {label}
+      </label>
       <input
         type="text"
         value={value}
         onChange={e => onChange(e.target.value)}
         placeholder={placeholder}
-        className="w-full px-3 py-2 bg-zinc-800/50 border border-zinc-700 rounded-lg text-sm text-zinc-100 focus:outline-none focus:border-blue-500"
+        className="input"
       />
     </div>
   )

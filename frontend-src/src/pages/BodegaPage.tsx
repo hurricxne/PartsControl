@@ -308,7 +308,7 @@ function RecepcionPanel({ recepcionId, onClose, onFinish }: {
     <div
       className="fixed inset-0 z-[9999] flex items-start justify-center p-4 pt-10 md:pt-16"
       style={{ backgroundColor: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)' }}
-      onClick={e => { if (e.target === e.currentTarget) setConfirmClose(true) }}
+      onClick={e => { if (e.target === e.currentTarget) onClose() }}
     >
       <div
         className="relative w-full max-w-2xl max-h-[88vh] flex flex-col rounded-2xl border shadow-2xl overflow-hidden"
@@ -333,8 +333,10 @@ function RecepcionPanel({ recepcionId, onClose, onFinish }: {
             </div>
             <p className="text-[10px] text-center mt-0.5" style={{ color: 'var(--text-faint)' }}>{pct}%</p>
           </div>
-          <button onClick={() => setConfirmClose(true)}
-            className="p-1.5 rounded-lg hover:bg-red-500/10 text-red-400 hover:text-red-500 transition-colors shrink-0">
+          <button onClick={onClose}
+            title="Salir sin cerrar recepción"
+            className="p-1.5 rounded-lg hover:bg-[var(--surface-300)] transition-colors shrink-0"
+            style={{ color: 'var(--text-muted)' }}>
             <X className="w-5 h-5" />
           </button>
         </div>
