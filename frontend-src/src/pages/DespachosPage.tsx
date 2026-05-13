@@ -675,91 +675,204 @@ function EmbarqueDocsCard({ emb }: { emb: EmbarqueResumen }) {
 
 function EmbDocField({ label, doc }: { label: string; doc: DocValue | null }) {
   const [loading, setLoading] = useState(false)
+  const [showTextModal, setShowTextModal] = useState(false)
 
-  const handleDownload = async () => {
-    if (!doc?.filename) return
-    setLoading(true)
-    try {
-      // Auth download via fetch + Bearer token (file goes through /api/despachos/docs/{filename})
-      const token = (() => {
-        try {
-          return JSON.parse(localStorage.getItem('machparts-auth') || '{}')?.state?.token || ''
-        } catch {
-          return ''
+  const handleClick = async () => {
+    if (!doc) return
+    if (doc.is_file && doc.filename) {
+      // Real file: download via authenticated endpoint
+      setLoading(true)
+      try {
+        const token = (() => {
+          try {
+            return JSON.parse(localStorage.getItem('machparts-auth') || '{}')?.state?.token || ''
+          } catch {
+            return ''
+          }
+        })()
+        const res = await fetch(`/api/despachos/docs/${encodeURIComponent(doc.filename)}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}))
+          throw new Error(err.detail || 'Error al descargar')
         }
-      })()
-      const res = await fetch(`/api/despachos/docs/${encodeURIComponent(doc.filename)}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail || 'Error al descargar')
+        const blob = await res.blob()
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = doc.filename
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        setTimeout(() => URL.revokeObjectURL(url), 1000)
+      } catch (e: any) {
+        toast.error(e?.message || 'Error al descargar')
+      } finally {
+        setLoading(false)
       }
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = doc.filename
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      setTimeout(() => URL.revokeObjectURL(url), 1000)
-    } catch (e: any) {
-      toast.error(e?.message || 'Error al descargar')
-    } finally {
-      setLoading(false)
+    } else {
+      // Text value: open modal with content + copy
+      setShowTextModal(true)
     }
   }
 
+  const isFile = doc?.is_file
+
   return (
-    <div>
-      <div
-        className="text-[10px] uppercase tracking-wider mb-0.5"
-        style={{ color: 'var(--text-faint)' }}
-      >
-        {label}
+    <>
+      <div>
+        <div
+          className="text-[10px] uppercase tracking-wider mb-0.5"
+          style={{ color: 'var(--text-faint)' }}
+        >
+          {label}
+        </div>
+        {!doc ? (
+          <div
+            className="text-xs px-2 py-1.5 rounded-lg border border-dashed"
+            style={{ borderColor: 'var(--border)', color: 'var(--text-faint)' }}
+          >
+            —
+          </div>
+        ) : (
+          <button
+            onClick={handleClick}
+            disabled={loading}
+            title={isFile ? 'Descargar archivo' : 'Ver contenido'}
+            className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded-lg border transition-colors hover:bg-[var(--surface-200)] disabled:opacity-50 text-left"
+            style={{
+              borderColor: 'var(--border)',
+              backgroundColor: 'var(--surface)',
+              color: 'var(--text-primary)',
+            }}
+          >
+            {loading ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-500 shrink-0" />
+            ) : (
+              <FileText
+                className={`w-3.5 h-3.5 shrink-0 ${isFile ? 'text-emerald-500' : 'text-brand-500'}`}
+              />
+            )}
+            <span className="text-[11px] truncate flex-1" title={doc.value}>
+              {doc.value}
+            </span>
+            <FileDown className="w-3 h-3 shrink-0 opacity-60" />
+          </button>
+        )}
       </div>
-      {!doc ? (
-        <div
-          className="text-xs px-2 py-1.5 rounded-lg border border-dashed"
-          style={{ borderColor: 'var(--border)', color: 'var(--text-faint)' }}
-        >
-          —
-        </div>
-      ) : doc.is_file ? (
-        <button
-          onClick={handleDownload}
-          disabled={loading}
-          className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded-lg border transition-colors hover:bg-[var(--surface-200)] disabled:opacity-50 text-left"
-          style={{
-            borderColor: 'var(--border)',
-            backgroundColor: 'var(--surface)',
-            color: 'var(--text-primary)',
-          }}
-        >
-          {loading ? (
-            <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-500 shrink-0" />
-          ) : (
-            <FileText className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
-          )}
-          <span className="text-[11px] truncate flex-1" title={doc.value}>
-            {doc.value}
-          </span>
-          <FileDown className="w-3 h-3 shrink-0 opacity-60" />
-        </button>
-      ) : (
-        <div
-          className="text-xs px-2 py-1.5 rounded-lg border"
-          style={{
-            borderColor: 'var(--border)',
-            backgroundColor: 'var(--surface)',
-            color: 'var(--text-primary)',
-          }}
-          title={doc.value}
-        >
-          <span className="break-all">{doc.value}</span>
-        </div>
+
+      {showTextModal && doc && (
+        <TextDocModal
+          label={label}
+          value={doc.value}
+          onClose={() => setShowTextModal(false)}
+        />
       )}
+    </>
+  )
+}
+
+function TextDocModal({
+  label,
+  value,
+  onClose,
+}: {
+  label: string
+  value: string
+  onClose: () => void
+}) {
+  const [copied, setCopied] = useState(false)
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      toast.error('No se pudo copiar')
+    }
+  }
+
+  const downloadTxt = () => {
+    const blob = new Blob([value], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${label.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}.txt`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-[9999] flex items-center justify-center p-4"
+      style={{ backgroundColor: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)' }}
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-lg rounded-2xl border shadow-2xl overflow-hidden"
+        style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div
+          className="p-4 border-b flex items-center justify-between"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+        >
+          <div>
+            <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>
+              {label}
+            </h3>
+            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+              Contenido registrado (referencia / tracking)
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1.5 rounded-lg hover:bg-[var(--surface-300)]"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <div className="p-4">
+          <pre
+            className="text-sm whitespace-pre-wrap break-all p-3 rounded-lg border"
+            style={{
+              backgroundColor: 'var(--surface)',
+              borderColor: 'var(--border)',
+              color: 'var(--text-primary)',
+              fontFamily: 'inherit',
+            }}
+          >
+            {value}
+          </pre>
+        </div>
+        <div
+          className="p-3 border-t flex items-center justify-end gap-2"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+        >
+          <button onClick={downloadTxt} className="btn-secondary text-sm">
+            <FileDown className="w-4 h-4" />
+            Descargar .txt
+          </button>
+          <button onClick={copy} className="btn-primary text-sm">
+            {copied ? (
+              <>
+                <CheckCircle2 className="w-4 h-4" />
+                Copiado
+              </>
+            ) : (
+              <>
+                <FileText className="w-4 h-4" />
+                Copiar
+              </>
+            )}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
