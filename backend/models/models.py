@@ -427,3 +427,37 @@ class ReclamoProveedor(Base):
 
     item_cotizacion = relationship("ItemCotizacion")
     recepcion_item = relationship("RecepcionEmbarqueItem")
+
+
+class Despacho(Base):
+    """Cliente dispatch from warehouse"""
+    __tablename__ = "despachos"
+    id = Column(Integer, primary_key=True, index=True)
+    numero_despacho = Column(String(50), unique=True, index=True)
+    oc_cliente_id = Column(Integer, ForeignKey("oc_cliente.id"))
+    numero_guia = Column(String(100), nullable=True)
+    transportista = Column(String(255), nullable=True)
+    contacto_destinatario = Column(String(255), nullable=True)
+    direccion_entrega = Column(String(500), nullable=True)
+    observaciones = Column(Text, nullable=True)
+    estado = Column(String(20), default="en_preparacion")
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_despacho = Column(DateTime(timezone=True), nullable=True)
+    usuario_creacion_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    oc_cliente = relationship("OcCliente")
+    usuario_creacion = relationship("User", foreign_keys=[usuario_creacion_id])
+    items = relationship("DespachoItem", back_populates="despacho",
+                         cascade="all, delete-orphan")
+
+
+class DespachoItem(Base):
+    """Item included in a dispatch"""
+    __tablename__ = "despacho_items"
+    id = Column(Integer, primary_key=True, index=True)
+    despacho_id = Column(Integer, ForeignKey("despachos.id", ondelete="CASCADE"))
+    item_cotizacion_id = Column(Integer, ForeignKey("items_cotizacion.id"))
+    qty_despachada = Column(Float, default=0)
+
+    despacho = relationship("Despacho", back_populates="items")
+    item_cotizacion = relationship("ItemCotizacion")

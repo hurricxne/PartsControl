@@ -5,7 +5,7 @@ import {
   Activity, Bell, Sun, Moon, Menu, PanelLeftClose, PanelLeftOpen,
   FileText, TrendingUp, Ship, DollarSign, Users, BarChart3,
   ShoppingCart, Package, Receipt, Settings, UserCog,
-  FileSignature, PackageSearch, Banknote, Calculator, Building2, Anchor,
+  FileSignature, PackageSearch, Banknote, Calculator, Building2, Anchor, Truck,
 } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
 import { useTheme } from '../context/ThemeContext'
@@ -55,6 +55,7 @@ const navGroups: NavGroup[] = [
       { to: '/embarques',      icon: Anchor, label: 'Pre-Embarques', exact: false, badgeKey: 'embarques' },
       { to: '/embarques-list', icon: Ship,   label: 'Embarques',     exact: false },
       { to: '/bodega',         icon: Package, label: 'Bodega',       exact: false },
+      { to: '/despachos',      icon: Truck,   label: 'Despachos',    exact: false },
     ],
   },
   {
@@ -96,6 +97,7 @@ const pageLabels: Record<string, string> = {
   '/embarques':           'Pre-Embarques',
   '/embarques-list':      'Embarques',
   '/bodega':              'Bodega',
+  '/despachos':           'Despachos',
   '/ventas-contab':       'Ventas — Contabilidad',
   '/embarques-pricing':   'Embarques Pricing',
   '/facturas':            'Facturas y Cobranzas',

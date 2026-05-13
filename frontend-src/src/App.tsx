@@ -14,6 +14,7 @@ import ClientesPage from './pages/ClientesPage'
 import ReportesPage from './pages/ReportesPage'
 import ComprasPage from './pages/ComprasPage'
 import BodegaPage from './pages/BodegaPage'
+import DespachosPage from './pages/DespachosPage'
 import FacturasPage from './pages/FacturasPage'
 import ConfiguracionPage from './pages/ConfiguracionPage'
 import CierreVentaPage from './pages/CierreVentaPage'
@@ -60,6 +61,7 @@ export default function App() {
         <Route path="reportes"      element={<ReportesPage />} />
         <Route path="compras"       element={<ComprasPage />} />
         <Route path="bodega"        element={<BodegaPage />} />
+        <Route path="despachos"     element={<DespachosPage />} />
         <Route path="facturas"      element={<FacturasPage />} />
         <Route path="configuracion" element={<ConfiguracionPage />} />
         <Route path="cierre-venta"  element={<CierreVentaPage />} />

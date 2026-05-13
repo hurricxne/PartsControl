@@ -210,3 +210,19 @@ export const bodegaAPI = {
   listoParaDespachar: () => api.get('/bodega/ventas/listo-para-despachar'),
   alertasPlazo: () => api.get('/bodega/ventas/alertas-plazo-critico'),
 }
+
+// --- Despachos ---
+export const despachosAPI = {
+  getCounts: () => api.get('/despachos/counts').then(r => r.data),
+  listOcClientes: (tab: string, q?: string) =>
+    api.get('/despachos/oc-clientes', { params: { tab, q: q || undefined } }).then(r => r.data),
+  getOcDetail: (ocId: number) =>
+    api.get(`/despachos/oc-clientes/${ocId}`).then(r => r.data),
+  create: (payload: any) =>
+    api.post('/despachos/', payload).then(r => r.data),
+  get: (id: number) => api.get(`/despachos/${id}`).then(r => r.data),
+  update: (id: number, data: Record<string, any>) =>
+    api.put(`/despachos/${id}`, data).then(r => r.data),
+  cerrar: (id: number) => api.post(`/despachos/${id}/cerrar`).then(r => r.data),
+  anular: (id: number) => api.delete(`/despachos/${id}`).then(r => r.data),
+}

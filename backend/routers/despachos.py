@@ -1,0 +1,490 @@
+"""Despachos module - cliente delivery from warehouse"""
+from datetime import datetime
+from typing import Optional, List
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+
+from database import get_db
+from models.models import (
+    Despacho, DespachoItem, OcCliente, Cotizacion, ItemCotizacion,
+    Cliente, User, ReclamoProveedor,
+)
+from auth import get_current_user
+from notificaciones import crear_notificacion
+
+router = APIRouter(prefix="/despachos", tags=["despachos"])
+
+
+# --- Schemas ---
+class DespachoItemIn(BaseModel):
+    item_cotizacion_id: int
+    qty_despachada: float
+
+
+class DespachoCreate(BaseModel):
+    oc_cliente_id: int
+    numero_guia: Optional[str] = None
+    transportista: Optional[str] = None
+    contacto_destinatario: Optional[str] = None
+    direccion_entrega: Optional[str] = None
+    observaciones: Optional[str] = None
+    items: List[DespachoItemIn]
+
+
+class DespachoUpdate(BaseModel):
+    numero_guia: Optional[str] = None
+    transportista: Optional[str] = None
+    contacto_destinatario: Optional[str] = None
+    direccion_entrega: Optional[str] = None
+    observaciones: Optional[str] = None
+
+
+# --- Helpers ---
+def _next_numero_despacho(db: Session) -> str:
+    year = datetime.now().year
+    prefix = f"DSP-{year}-"
+    last = (
+        db.query(Despacho)
+        .filter(Despacho.numero_despacho.like(f"{prefix}%"))
+        .order_by(Despacho.id.desc())
+        .first()
+    )
+    n = 0
+    if last and last.numero_despacho:
+        try:
+            n = int(last.numero_despacho.split("-")[-1])
+        except Exception:
+            n = 0
+    return f"{prefix}{n + 1:04d}"
+
+
+def _qty_already_dispatched(db: Session, oc_id: int):
+    """Return dict {item_cotizacion_id: total_qty_despachada} for non-cancelled despachos"""
+    rows = (
+        db.query(DespachoItem.item_cotizacion_id, DespachoItem.qty_despachada)
+        .join(Despacho, Despacho.id == DespachoItem.despacho_id)
+        .filter(Despacho.oc_cliente_id == oc_id, Despacho.estado != "anulado")
+        .all()
+    )
+    result = {}
+    for item_id, qty in rows:
+        result[item_id] = result.get(item_id, 0) + (qty or 0)
+    return result
+
+
+def _serialize_oc_card(db: Session, oc: OcCliente):
+    """Serialize OC-Cliente for the dispatch list view"""
+    cot = oc.cotizacion
+    if not cot:
+        return None
+    cliente = None
+    if cot.rut_cliente:
+        cliente = db.query(Cliente).filter(Cliente.rut == cot.rut_cliente).first()
+
+    items = (
+        db.query(ItemCotizacion)
+        .filter(ItemCotizacion.cotizacion_id == cot.id)
+        .all()
+    )
+    total = len(items)
+    en_bodega = sum(1 for i in items if i.estado_item == "en_bodega")
+    despachados = sum(1 for i in items if i.estado_item == "despachado")
+    no_dispon = total - en_bodega - despachados
+
+    if total == 0:
+        progreso = 0
+    else:
+        progreso = int(despachados * 100 / total)
+
+    if total and despachados == total:
+        estado = "completado"
+    elif despachados > 0 and en_bodega > 0:
+        estado = "parcial"
+    elif en_bodega > 0:
+        estado = "listo"
+    else:
+        estado = "pendiente"
+
+    return {
+        "id": oc.id,
+        "numero_oc": oc.numero_oc,
+        "fecha_oc": oc.fecha_oc,
+        "fecha_entrega": oc.fecha_entrega.isoformat() if oc.fecha_entrega else None,
+        "cond_pago": oc.cond_pago,
+        "cliente": cot.cliente,
+        "rut_cliente": cot.rut_cliente,
+        "direccion": (cliente.direccion if cliente else None) or cot.direccion_cliente,
+        "contacto": (cliente.contacto if cliente else None) or cot.contacto_cliente,
+        "telefono": (cliente.telefono if cliente else None) or cot.telefono_cliente,
+        "email": (cliente.email if cliente else None) or cot.email_cliente,
+        "numero_cotizacion": cot.numero,
+        "total_items": total,
+        "items_en_bodega": en_bodega,
+        "items_despachados": despachados,
+        "items_no_disponibles": no_dispon,
+        "progreso_pct": progreso,
+        "estado": estado,
+    }
+
+
+# --- Endpoints ---
+@router.get("/counts")
+def counts(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ocs = db.query(OcCliente).join(OcCliente.cotizacion).all()
+    ocs_listas = 0
+    items_listos = 0
+    items_despachados = 0
+    for oc in ocs:
+        if not oc.cotizacion:
+            continue
+        items = (
+            db.query(ItemCotizacion)
+            .filter(ItemCotizacion.cotizacion_id == oc.cotizacion_id)
+            .all()
+        )
+        en_b = sum(1 for i in items if i.estado_item == "en_bodega")
+        desp = sum(1 for i in items if i.estado_item == "despachado")
+        if en_b > 0:
+            ocs_listas += 1
+        items_listos += en_b
+        items_despachados += desp
+    return {
+        "ocs_listas": ocs_listas,
+        "items_listos": items_listos,
+        "items_despachados": items_despachados,
+    }
+
+
+@router.get("/oc-clientes")
+def oc_clientes(
+    tab: str = "listas",
+    q: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List OCs by tab: listas | en_curso | historial"""
+    ocs = db.query(OcCliente).join(OcCliente.cotizacion).all()
+    result = []
+    for oc in ocs:
+        card = _serialize_oc_card(db, oc)
+        if not card:
+            continue
+
+        if tab == "listas":
+            if card["items_en_bodega"] == 0:
+                continue
+            if card["estado"] == "completado":
+                continue
+        elif tab == "en_curso":
+            tiene_abierto = (
+                db.query(Despacho)
+                .filter(
+                    Despacho.oc_cliente_id == oc.id,
+                    Despacho.estado == "en_preparacion",
+                )
+                .first()
+            )
+            if not tiene_abierto:
+                continue
+        elif tab == "historial":
+            tiene_cerrado = (
+                db.query(Despacho)
+                .filter(
+                    Despacho.oc_cliente_id == oc.id,
+                    Despacho.estado == "despachado",
+                )
+                .first()
+            )
+            if not tiene_cerrado:
+                continue
+        else:
+            raise HTTPException(400, f"tab inválido: {tab}")
+
+        if q:
+            ql = q.lower()
+            haystack = " ".join(
+                [
+                    card.get("cliente") or "",
+                    card.get("numero_oc") or "",
+                    card.get("numero_cotizacion") or "",
+                    card.get("rut_cliente") or "",
+                ]
+            ).lower()
+            if ql not in haystack:
+                continue
+
+        result.append(card)
+    # Sort by fecha_entrega ascending (urgent first), nulls last
+    result.sort(key=lambda c: (c.get("fecha_entrega") is None, c.get("fecha_entrega") or ""))
+    return result
+
+
+@router.get("/oc-clientes/{oc_id}")
+def oc_cliente_detail(
+    oc_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    oc = db.query(OcCliente).filter(OcCliente.id == oc_id).first()
+    if not oc:
+        raise HTTPException(404, "OC no encontrada")
+    card = _serialize_oc_card(db, oc)
+    if not card:
+        raise HTTPException(404, "OC sin cotización asociada")
+
+    items = (
+        db.query(ItemCotizacion)
+        .filter(ItemCotizacion.cotizacion_id == oc.cotizacion_id)
+        .all()
+    )
+    qty_already = _qty_already_dispatched(db, oc_id)
+
+    items_data = []
+    for it in items:
+        en_reclamo = bool(
+            db.query(ReclamoProveedor)
+            .filter(
+                ReclamoProveedor.item_cotizacion_id == it.id,
+                ReclamoProveedor.estado.in_(["pendiente", "reclamado"]),
+            )
+            .first()
+        )
+        cant = it.cantidad or 0
+        qty_d = qty_already.get(it.id, 0)
+        disponible = 0
+        if it.estado_item == "en_bodega":
+            disponible = max(cant - qty_d, 0)
+        items_data.append(
+            {
+                "id": it.id,
+                "numero_parte": it.numero_parte,
+                "descripcion": it.descripcion,
+                "marca": it.marca,
+                "cantidad": cant,
+                "qty_despachada": qty_d,
+                "qty_disponible": disponible,
+                "estado_item": it.estado_item,
+                "en_reclamo": en_reclamo,
+            }
+        )
+
+    despachos_data = []
+    despachos = (
+        db.query(Despacho)
+        .filter(Despacho.oc_cliente_id == oc_id)
+        .order_by(Despacho.id.desc())
+        .all()
+    )
+    for d in despachos:
+        despachos_data.append(
+            {
+                "id": d.id,
+                "numero_despacho": d.numero_despacho,
+                "numero_guia": d.numero_guia,
+                "transportista": d.transportista,
+                "estado": d.estado,
+                "fecha_creacion": d.fecha_creacion.isoformat() if d.fecha_creacion else None,
+                "fecha_despacho": d.fecha_despacho.isoformat() if d.fecha_despacho else None,
+                "items_count": len(d.items),
+            }
+        )
+
+    card["items"] = items_data
+    card["despachos"] = despachos_data
+    return card
+
+
+@router.post("/")
+def create_despacho(
+    payload: DespachoCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    oc = db.query(OcCliente).filter(OcCliente.id == payload.oc_cliente_id).first()
+    if not oc:
+        raise HTTPException(404, "OC Cliente no encontrada")
+    if not payload.items:
+        raise HTTPException(400, "Debe incluir al menos 1 ítem")
+
+    item_ids = [i.item_cotizacion_id for i in payload.items]
+    items_db = (
+        db.query(ItemCotizacion)
+        .filter(
+            ItemCotizacion.id.in_(item_ids),
+            ItemCotizacion.cotizacion_id == oc.cotizacion_id,
+        )
+        .all()
+    )
+    if len(items_db) != len(set(item_ids)):
+        raise HTTPException(400, "Hay ítems que no pertenecen a esta OC")
+
+    items_by_id = {i.id: i for i in items_db}
+    qty_already = _qty_already_dispatched(db, oc.id)
+
+    for item_in in payload.items:
+        it = items_by_id.get(item_in.item_cotizacion_id)
+        if not it:
+            raise HTTPException(400, f"Ítem {item_in.item_cotizacion_id} no encontrado")
+        if it.estado_item != "en_bodega":
+            raise HTTPException(
+                400,
+                f"Ítem {it.numero_parte} no está disponible para despacho (estado: {it.estado_item})",
+            )
+        if item_in.qty_despachada <= 0:
+            raise HTTPException(400, f"Cantidad inválida para {it.numero_parte}")
+        disponible = (it.cantidad or 0) - qty_already.get(it.id, 0)
+        if item_in.qty_despachada > disponible + 0.001:
+            raise HTTPException(
+                400,
+                f"Cantidad excede disponible para {it.numero_parte} (disp: {disponible})",
+            )
+
+    despacho = Despacho(
+        numero_despacho=_next_numero_despacho(db),
+        oc_cliente_id=payload.oc_cliente_id,
+        numero_guia=payload.numero_guia,
+        transportista=payload.transportista,
+        contacto_destinatario=payload.contacto_destinatario,
+        direccion_entrega=payload.direccion_entrega,
+        observaciones=payload.observaciones,
+        estado="en_preparacion",
+        usuario_creacion_id=getattr(current_user, "id", None),
+    )
+    db.add(despacho)
+    db.flush()
+
+    for item_in in payload.items:
+        db.add(
+            DespachoItem(
+                despacho_id=despacho.id,
+                item_cotizacion_id=item_in.item_cotizacion_id,
+                qty_despachada=item_in.qty_despachada,
+            )
+        )
+
+    db.commit()
+    db.refresh(despacho)
+    return {"id": despacho.id, "numero_despacho": despacho.numero_despacho}
+
+
+@router.get("/{despacho_id}")
+def get_despacho(
+    despacho_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    d = db.query(Despacho).filter(Despacho.id == despacho_id).first()
+    if not d:
+        raise HTTPException(404, "Despacho no encontrado")
+    oc = d.oc_cliente
+    cot = oc.cotizacion if oc else None
+
+    items_data = []
+    for di in d.items:
+        it = di.item_cotizacion
+        items_data.append(
+            {
+                "id": di.id,
+                "item_cotizacion_id": di.item_cotizacion_id,
+                "numero_parte": it.numero_parte if it else None,
+                "descripcion": it.descripcion if it else None,
+                "marca": it.marca if it else None,
+                "qty_despachada": di.qty_despachada,
+            }
+        )
+
+    return {
+        "id": d.id,
+        "numero_despacho": d.numero_despacho,
+        "oc_cliente_id": d.oc_cliente_id,
+        "numero_oc": oc.numero_oc if oc else None,
+        "cliente": cot.cliente if cot else None,
+        "numero_guia": d.numero_guia,
+        "transportista": d.transportista,
+        "contacto_destinatario": d.contacto_destinatario,
+        "direccion_entrega": d.direccion_entrega,
+        "observaciones": d.observaciones,
+        "estado": d.estado,
+        "fecha_creacion": d.fecha_creacion.isoformat() if d.fecha_creacion else None,
+        "fecha_despacho": d.fecha_despacho.isoformat() if d.fecha_despacho else None,
+        "items": items_data,
+    }
+
+
+@router.put("/{despacho_id}")
+def update_despacho(
+    despacho_id: int,
+    payload: DespachoUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    d = db.query(Despacho).filter(Despacho.id == despacho_id).first()
+    if not d:
+        raise HTTPException(404, "Despacho no encontrado")
+    if d.estado != "en_preparacion":
+        raise HTTPException(400, "Solo se pueden editar despachos en preparación")
+    data = payload.dict(exclude_unset=True)
+    for field, value in data.items():
+        setattr(d, field, value)
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/{despacho_id}/cerrar")
+def cerrar_despacho(
+    despacho_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    d = db.query(Despacho).filter(Despacho.id == despacho_id).first()
+    if not d:
+        raise HTTPException(404, "Despacho no encontrado")
+    if d.estado != "en_preparacion":
+        raise HTTPException(400, "Solo se pueden cerrar despachos en preparación")
+
+    for di in d.items:
+        it = di.item_cotizacion
+        if it and it.estado_item == "en_bodega":
+            it.estado_item = "despachado"
+
+    d.estado = "despachado"
+    d.fecha_despacho = datetime.now()
+
+    oc = d.oc_cliente
+    if oc and oc.cotizacion:
+        try:
+            crear_notificacion(
+                db,
+                rol="ventas",
+                severidad="info",
+                titulo=f"Despacho {d.numero_despacho} completado",
+                mensaje=f"OC {oc.numero_oc} - {oc.cotizacion.cliente} · {len(d.items)} ítems despachados",
+                entidad_tipo="despacho",
+                entidad_id=d.id,
+                link=f"/despachos?id={d.id}",
+                regla=f"despacho_completado_{d.id}",
+            )
+        except Exception:
+            # don't fail the dispatch if notification fails
+            pass
+
+    db.commit()
+    return {"ok": True, "numero_despacho": d.numero_despacho}
+
+
+@router.delete("/{despacho_id}")
+def anular_despacho(
+    despacho_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    d = db.query(Despacho).filter(Despacho.id == despacho_id).first()
+    if not d:
+        raise HTTPException(404, "Despacho no encontrado")
+    if d.estado != "en_preparacion":
+        raise HTTPException(400, "Solo se pueden anular despachos en preparación")
+    d.estado = "anulado"
+    db.commit()
+    return {"ok": True}

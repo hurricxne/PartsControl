@@ -9,6 +9,7 @@ from database import Base, engine
 from routers import auth, cotizaciones, cotizador, compras, clientes, ventas, facturas
 from routers.worker import worker_router, scraping_router
 from routers import notificaciones, bodega
+from routers import despachos
 
 # Create / migrate tables
 Base.metadata.create_all(bind=engine)
@@ -42,6 +43,7 @@ app.include_router(scraping_router,       prefix="/api")
 app.include_router(facturas.router,       prefix="/api")
 app.include_router(notificaciones.router, prefix="/api")
 app.include_router(bodega.router,         prefix="/api")
+app.include_router(despachos.router,      prefix="/api")
 
 
 @app.get("/api/health")
