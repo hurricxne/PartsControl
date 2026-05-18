@@ -32,8 +32,8 @@ const COLS: { key: keyof ManualRow; label: string; width: number; type?: string;
   { key: 'descripcion',            label: 'Description', width: 200, placeholder: 'CONE-SPL T' },
   { key: 'marca',                  label: 'Brand',       width: 80,  placeholder: 'CAT' },
   { key: 'cantidad',               label: 'Qty',         width: 70,  type: 'number', placeholder: '1' },
-  { key: 'peso_unit_lbs',          label: 'Unit Weight', width: 100, type: 'number', placeholder: '298' },
-  { key: 'precio_unit_cotizacion', label: 'Unit Price',  width: 110, type: 'number', placeholder: '11517.58' },
+  { key: 'peso_unit_lbs',          label: 'Unit Weight', width: 100, type: 'number', placeholder: '0' },
+  { key: 'precio_unit_cotizacion', label: 'Unit Price',  width: 110, type: 'number', placeholder: '0.00' },
 ]
 
 // Parse tab-separated text (Excel copy) → rows
@@ -44,6 +44,31 @@ const COLS: { key: keyof ManualRow; label: string; width: number; type?: string;
 //
 // Detection: if cells[0] is a small integer (≤999) → Item# column present (offset=0)
 //            otherwise it's a Part Number → offset=-1 shifts all indices left by 1
+
+// Normaliza numeros copiados desde Excel (cualquier locale):
+//   "1.234,56" (es/CL) -> "1234.56"
+//   "1,234.56" (en-US) -> "1234.56"
+//   "162,3"            -> "162.3"
+//   "11.517,58"        -> "11517.58"
+//   "298"              -> "298"
+//   "298.5"            -> "298.5"
+//
+// Logica: el separador decimal es el que aparece MAS A LA DERECHA
+// (logica robusta para evitar confundir el separador de miles).
+function normalizeNumeric(raw: string): string {
+  if (!raw) return ''
+  const s = raw.trim().replace(/\s/g, '')
+  const lastComma = s.lastIndexOf(',')
+  const lastDot = s.lastIndexOf('.')
+  if (lastComma === -1 && lastDot === -1) return s
+  if (lastComma > lastDot) {
+    // Coma a la derecha = coma decimal (es/CL): quitar puntos miles, reemplazar coma por punto
+    return s.replace(/\./g, '').replace(',', '.')
+  }
+  // Punto a la derecha = punto decimal (en-US): quitar comas miles
+  return s.replace(/,/g, '')
+}
+
 function parseTabText(text: string, startId: number): ManualRow[] {
   const lines = text.trim().split(/\r?\n/).filter(l => l.trim())
   const parsed: ManualRow[] = []
@@ -71,10 +96,10 @@ function parseTabText(text: string, startId: number): ManualRow[] {
       numero_parte:           cells[1 + o] || '',
       descripcion:            cells[2 + o] || '',
       marca:                  cells[3 + o] || 'CAT',
-      cantidad:               cells[4 + o] || '1',
+      cantidad:               normalizeNumeric(cells[4 + o] || '') || '1',
       // col 5+o = Available (skipped)
-      peso_unit_lbs:          cells[6 + o] || '',
-      precio_unit_cotizacion: cells[7 + o] || '',
+      peso_unit_lbs:          normalizeNumeric(cells[6 + o] || ''),
+      precio_unit_cotizacion: normalizeNumeric(cells[7 + o] || ''),
     })
   }
   return parsed
