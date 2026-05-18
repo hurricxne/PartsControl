@@ -94,7 +94,7 @@ def list_embarques_bodega(
     """Returns embarques in en_transito or en_recepcion states."""
     embarques = (
         db.query(Embarque)
-        .filter(Embarque.estado.in_(["en_transito", "en_recepcion"]))
+        .filter(Embarque.estado.in_(["en_transito", "en_aduana", "en_recepcion"]))
         .order_by(Embarque.created_at.desc())
         .all()
     )
@@ -133,7 +133,7 @@ def historial_embarques(
 ):
     embarques = (
         db.query(Embarque)
-        .filter(Embarque.estado == "recibido")
+        .filter(Embarque.estado.in_(["en_bodega", "despachado"]))
         .order_by(Embarque.updated_at.desc())
         .limit(50)
         .all()
@@ -198,7 +198,7 @@ def iniciar_recepcion(
     e = db.query(Embarque).filter(Embarque.id == embarque_id).first()
     if not e:
         raise HTTPException(404, "Embarque no encontrado")
-    if e.estado not in ("en_transito", "en_recepcion"):
+    if e.estado not in ("en_transito", "en_aduana", "en_recepcion"):
         raise HTTPException(400, f"Embarque en estado '{e.estado}', no se puede iniciar recepción")
 
     existing = db.query(RecepcionEmbarque).filter(
@@ -545,10 +545,10 @@ def cerrar_recepcion(
     if body.observacion_general:
         rec.observacion_general = body.observacion_general
 
-    # Advance embarque to recibido
+    # Advance embarque to en_bodega (estado final manual; despachado se setea auto al despachar todo)
     emb = db.query(Embarque).filter(Embarque.id == rec.embarque_id).first()
     if emb:
-        emb.estado = "recibido"
+        emb.estado = "en_bodega"
 
     db.commit()
 

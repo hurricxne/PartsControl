@@ -72,14 +72,14 @@ function fmtKg(lbs?: number | null, qty = 1) {
 }
 
 const BADGE: Record<string, { cls: string; label: string }> = {
-  en_transito: { cls: 'bg-blue-500/10 text-blue-400 border-blue-400/20',          label: 'En tránsito' },
-  armando:     { cls: 'bg-gray-500/10 text-gray-400 border-gray-500/20',          label: 'Armando'    },
-  despachado:  { cls: 'bg-blue-500/10 text-blue-400 border-blue-400/20',          label: 'Despachado' },
-  en_aduana:   { cls: 'bg-amber-500/10 text-amber-400 border-amber-400/20',       label: 'En Aduana'  },
-  en_bodega:   { cls: 'bg-brand-500/10 text-brand-400 border-brand-400/20',       label: 'En Bodega'  },
-  entregado:   { cls: 'bg-emerald-500/10 text-emerald-500 border-emerald-500/20', label: 'Entregado'  },
+  en_bodega_proveedor: { cls: 'bg-gray-500/10 text-gray-400 border-gray-500/20',         label: 'En Bodega Proveedor' },
+  en_transito:         { cls: 'bg-blue-500/10 text-blue-400 border-blue-400/20',         label: 'En Tránsito'         },
+  en_aduana:           { cls: 'bg-amber-500/10 text-amber-400 border-amber-400/20',      label: 'En Aduana'           },
+  en_bodega:           { cls: 'bg-brand-500/10 text-brand-400 border-brand-400/20',      label: 'En Bodega'           },
+  despachado:          { cls: 'bg-emerald-500/10 text-emerald-500 border-emerald-500/20', label: 'Despachado'          },
 }
-const ESTADOS = ['en_transito', 'armando', 'despachado', 'en_aduana', 'en_bodega', 'entregado']
+// Estados seleccionables manualmente (despachado se setea automaticamente)
+const ESTADOS = ['en_bodega_proveedor', 'en_transito', 'en_aduana', 'en_bodega']
 
 function getToken() {
   try {
@@ -258,7 +258,7 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
     doc_adicional:      toDocFile(emb.doc_adicional),
   })
 
-  const badge = BADGE[emb.estado] ?? BADGE.en_transito
+  const badge = BADGE[emb.estado] ?? BADGE.en_bodega_proveedor
 
   const fetchDetail = useCallback(async () => {
     setLoadingDetail(true)
@@ -366,7 +366,7 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
               ) : (
                 <button onClick={() => setEditEstado(true)}
                   className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium border cursor-pointer hover:opacity-80 ${badge.cls}`}>
-                  {emb.estado === 'entregado' ? <CheckCircle2 className="w-3 h-3" /> : <Clock className="w-3 h-3" />}
+                  {emb.estado === 'despachado' ? <CheckCircle2 className="w-3 h-3" /> : <Clock className="w-3 h-3" />}
                   {badge.label}
                 </button>
               )}
@@ -581,8 +581,9 @@ export default function EmbarquesPage() {
 
   useEffect(() => { load() }, [load])
 
-  const enTransito  = embarques.filter(e => ['en_transito','despachado','en_aduana'].includes(e.estado)).length
-  const entregados  = embarques.filter(e => e.estado === 'entregado').length
+  const enTransito  = embarques.filter(e => ['en_bodega_proveedor','en_transito','en_aduana'].includes(e.estado)).length
+  const enBodega    = embarques.filter(e => e.estado === 'en_bodega').length
+  const despachados = embarques.filter(e => e.estado === 'despachado').length
 
   return (
     <div className="space-y-6">
@@ -599,11 +600,12 @@ export default function EmbarquesPage() {
       </div>
 
       {!loading && (
-        <div className="grid grid-cols-3 gap-3">
+        <div className="grid grid-cols-4 gap-3">
           {[
-            { l: 'Total',       v: embarques.length, c: 'text-brand-400'    },
-            { l: 'En tránsito', v: enTransito,        c: 'text-amber-400'   },
-            { l: 'Entregados',  v: entregados,        c: 'text-emerald-400' },
+            { l: 'Total',        v: embarques.length, c: 'text-brand-400'    },
+            { l: 'En tránsito',  v: enTransito,       c: 'text-amber-400'    },
+            { l: 'En bodega',    v: enBodega,         c: 'text-brand-400'    },
+            { l: 'Despachados',  v: despachados,      c: 'text-emerald-400'  },
           ].map(s => (
             <div key={s.l} className="rounded-2xl p-4 border"
               style={{ backgroundColor: 'var(--surface-50)', borderColor: 'var(--border)' }}>

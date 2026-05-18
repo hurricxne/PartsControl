@@ -1040,7 +1040,7 @@ def cerrar_pre_embarque(
     numero = _next_emb_numero(db)
     emb = Embarque(
         numero=numero,
-        estado="en_transito",
+        estado="en_bodega_proveedor",  # estado inicial; el usuario lo cambia manualmente
         forwarder=body.forwarder,
         awb=body.awb,
         fecha_despacho=body.fecha_despacho,

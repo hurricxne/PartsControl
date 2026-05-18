@@ -618,13 +618,44 @@ def cerrar_despacho(
     if d.estado != "en_preparacion":
         raise HTTPException(400, "Solo se pueden cerrar despachos en preparación")
 
+    # Recolectar embarques afectados para evaluar auto-transición a "despachado"
+    embarque_ids_afectados = set()
     for di in d.items:
         it = di.item_cotizacion
         if it and it.estado_item == "en_bodega":
             it.estado_item = "despachado"
+            # Buscar el embarque que trajo este item
+            ei = (
+                db.query(EmbarqueItem)
+                .filter(EmbarqueItem.item_cotizacion_id == it.id)
+                .first()
+            )
+            if ei:
+                embarque_ids_afectados.add(ei.embarque_id)
 
     d.estado = "despachado"
     d.fecha_despacho = datetime.now()
+
+    # Auto-transición: si TODOS los items de un embarque están despachados,
+    # marcar el embarque como "despachado"
+    db.flush()
+    for emb_id in embarque_ids_afectados:
+        item_ids_emb = [
+            r[0] for r in db.query(EmbarqueItem.item_cotizacion_id)
+            .filter(EmbarqueItem.embarque_id == emb_id).all()
+        ]
+        if not item_ids_emb:
+            continue
+        items_emb = (
+            db.query(ItemCotizacion)
+            .filter(ItemCotizacion.id.in_(item_ids_emb))
+            .all()
+        )
+        todos_despachados = all(i.estado_item == "despachado" for i in items_emb)
+        if todos_despachados:
+            emb = db.query(Embarque).filter(Embarque.id == emb_id).first()
+            if emb and emb.estado != "despachado":
+                emb.estado = "despachado"
 
     oc = d.oc_cliente
     if oc and oc.cotizacion:
