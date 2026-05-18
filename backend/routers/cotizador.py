@@ -877,8 +877,17 @@ async def _scrape_finning_for_cotizacion(cotizacion_id: int, db_url: str):
             db.commit()
 
         cot.items_encontrados = encontrados
-        cot.estado = EstadoCotizacion.COMPLETADA
+        cot.estado = EstadoCotizacion.COMPLETADO
         cot.total_items = len(items)
+        # Si el scraper devolvió 0 encontrados y > 0 procesados, probablemente
+        # Akamai bloqueó (parts.cat.com tiene anti-bot). Lo marcamos como ERROR
+        # con un mensaje claro para que el frontend lo muestre.
+        if len(items) > 0 and encontrados == 0:
+            cot.estado = EstadoCotizacion.ERROR
+            cot.error_msg = (
+                "El portal Finning bloqueó la búsqueda automática (anti-bot Akamai). "
+                "Reintentá más tarde o ingresá los precios manualmente."
+            )
         db.commit()
     except Exception as e:
         try:
@@ -938,10 +947,44 @@ def finning_progress(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Retorna el progreso del scraping Finning."""
+    """Retorna el progreso del scraping Finning.
+
+    Schema esperado por el frontend (CotizadorEditor.tsx):
+      - completado: bool  (true cuando estado != PROCESANDO/ESPERANDO_AGENTE)
+      - total:      int
+      - con_precio: int
+      - sin_precio: int
+      - pct:        int (0-100)
+      - estado:     enum string
+      - error_msg:  str | null
+    """
     cotizacion = _check_ownership(cotizacion_id, current_user, db)
+
+    # Contar items con precio real (precio_cat NOT NULL/0)
+    items = (
+        db.query(ItemCotizacion)
+        .filter(ItemCotizacion.cotizacion_id == cotizacion_id)
+        .all()
+    )
+    total = len(items)
+    con_precio = sum(1 for i in items if i.precio_cat)
+    sin_precio = total - con_precio
+    pct = int((con_precio / total) * 100) if total > 0 else 0
+
+    estado_val = cotizacion.estado
+    estado_str = estado_val.value if hasattr(estado_val, "value") else str(estado_val)
+    en_proceso = estado_str in ("procesando", "esperando_agente")
+    completado = not en_proceso
+
     return {
-        "estado": cotizacion.estado,
+        "completado": completado,
+        "total": total,
+        "con_precio": con_precio,
+        "sin_precio": sin_precio,
+        "pct": pct,
+        "estado": estado_str,
+        "error_msg": cotizacion.error_msg,
+        # backward compat
         "total_items": cotizacion.total_items or 0,
         "items_procesados": cotizacion.items_procesados or 0,
         "items_encontrados": cotizacion.items_encontrados or 0,
