@@ -1020,6 +1020,12 @@ def cerrar_pre_embarque(
         raise HTTPException(404, "Pre-embarque no encontrado")
     if pre.estado == "embarcado":
         raise HTTPException(400, "Pre-embarque ya fue embarcado")
+    # No se puede cerrar un pre-embarque sin items: rompía silenciosamente
+    if not pre.items or len(pre.items) == 0:
+        raise HTTPException(
+            400,
+            "No se puede generar un embarque sin items. Agregá items al pre-embarque antes de cerrarlo.",
+        )
 
     # Build factura_comercial: "OCP-2026-001: INV-001, OCP-2026-002: INV-002"
     factura_str = None

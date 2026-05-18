@@ -62,18 +62,19 @@ function parseTabText(text: string, startId: number): ManualRow[] {
     const hasItemCol = /^\d+$/.test(cells[0]) && parseInt(cells[0]) <= 999
     const o = hasItemCol ? 0 : -1  // offset applied to every column index
 
+    // Column layout expected (sin Location):
+    //   0:Item# (opcional)  1:N°Parte  2:Descripción  3:Marca
+    //   4:Qty Required  5:Available (skip)  6:Unit Weight  7:Unit Price
     parsed.push({
       id: idCounter++,
       item_num:               hasItemCol ? cells[0] : String(parsed.length + 1),
       numero_parte:           cells[1 + o] || '',
       descripcion:            cells[2 + o] || '',
       marca:                  cells[3 + o] || 'CAT',
-      // col 4+o = Location (skipped), col 5+o = Qty Required
-      cantidad:               cells[5 + o] || '1',
-      // col 6+o = Available (skipped), col 7+o = Unit Weight
-      peso_unit_lbs:          cells[7 + o] || '',
-      // col 8+o = Unit Price
-      precio_unit_cotizacion: cells[8 + o] || '',
+      cantidad:               cells[4 + o] || '1',
+      // col 5+o = Available (skipped)
+      peso_unit_lbs:          cells[6 + o] || '',
+      precio_unit_cotizacion: cells[7 + o] || '',
     })
   }
   return parsed
@@ -235,7 +236,7 @@ export default function CotizacionManual() {
         <ClipboardPaste className="w-4 h-4 flex-shrink-0" />
         <span className="flex-1 min-w-0">
           <strong>Tip:</strong> Copia las filas desde Excel y usa el botón o presiona <kbd className="px-1.5 py-0.5 rounded text-xs font-mono" style={{ background: 'rgba(255,255,255,0.12)' }}>Ctrl+V</kbd> con la tabla enfocada.
-          Columnas esperadas: <span className="text-xs opacity-70">Item · Part Number · Description · Brand · Location · Qty · Available · Unit Weight · Unit Price</span>
+          Columnas esperadas: <span className="text-xs opacity-70">Item · Part Number · Description · Brand · Qty · Available · Unit Weight · Unit Price</span>
         </span>
         <button
           type="button"

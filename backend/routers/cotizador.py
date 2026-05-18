@@ -549,12 +549,12 @@ def _generar_excel_formal(cotizacion: Cotizacion, resultado: dict, output_path: 
         st(cf, bg=bg, align="right", size=9)
         cf.number_format = '#,##0'
 
-        # G: plazo de entrega
+        # G: plazo de entrega — fallback a defaults de config
         cg = ws[f"G{row}"]
-        _mn = item.get("plazo_entrega_min")
-        _mx = item.get("plazo_entrega_max")
+        _mn = item.get("plazo_entrega_min") or config.get("plazo_min_default")
+        _mx = item.get("plazo_entrega_max") or config.get("plazo_max_default")
         if _mn and _mx:
-            _plazo_txt = f"{_mn}-{_mx} días hábiles"
+            _plazo_txt = f"de {_mn} a {_mx} días hábiles"
         elif _mn:
             _plazo_txt = f"{_mn} días hábiles"
         elif _mx:
@@ -1041,10 +1041,11 @@ def _generar_pdf_formal(cotizacion, resultado: dict, output_path: str, config: d
     for i, item in enumerate(items_calc):
         bg = GRIS if i % 2 == 0 else white
         n_parte = str(item.get("numero_parte") or "")
-        _mn = item.get("plazo_entrega_min")
-        _mx = item.get("plazo_entrega_max")
+        # Plazo de entrega — fallback a defaults de config
+        _mn = item.get("plazo_entrega_min") or config.get("plazo_min_default")
+        _mx = item.get("plazo_entrega_max") or config.get("plazo_max_default")
         if _mn and _mx:
-            _plazo_txt = f"{_mn}-{_mx} días hábiles"
+            _plazo_txt = f"de {_mn} a {_mx} días hábiles"
         elif _mn:
             _plazo_txt = f"{_mn} días hábiles"
         elif _mx:
