@@ -12,7 +12,8 @@ Endpoints:
 """
 import os
 import uuid
-from fastapi import APIRouter, Depends, HTTPException
+import asyncio
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from typing import Optional, List
@@ -20,10 +21,11 @@ from pydantic import BaseModel
 from database import get_db
 from models.models import (
     Cotizacion, ItemCotizacion, ConfiguracionCotizador,
-    EstadoCotizacion, User
+    EstadoCotizacion, User, PartsCache,
 )
 from auth import get_current_user
 from services.pricing_service import calcular_cotizacion
+from services.scraper import scrape_parts_batch
 
 router = APIRouter(prefix="/cotizador", tags=["cotizador"])
 
@@ -784,19 +786,150 @@ def actualizar_estados_items(
     return {"ok": True, "updated": updated}
 
 
+async def _scrape_finning_for_cotizacion(cotizacion_id: int, db_url: str):
+    """Background task: scrapea precios Finning (parts.cat.com/es/finningchile)
+    para los items de una cotización ya existente en BD.
+
+    Usa el mismo scraper que el upload Excel (services.scraper.scrape_parts_batch),
+    con cache (PartsCache) para evitar duplicados.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    engine = create_engine(db_url, pool_pre_ping=True)
+    SessionLocal = sessionmaker(bind=engine)
+    db = SessionLocal()
+
+    try:
+        cot = db.query(Cotizacion).filter(Cotizacion.id == cotizacion_id).first()
+        if not cot:
+            return
+
+        cot.estado = EstadoCotizacion.PROCESANDO
+        cot.items_procesados = 0
+        cot.items_encontrados = 0
+        db.commit()
+
+        items = (
+            db.query(ItemCotizacion)
+            .filter(ItemCotizacion.cotizacion_id == cotizacion_id)
+            .all()
+        )
+        part_numbers = [it.numero_parte for it in items if it.numero_parte]
+
+        # Cache check
+        cached = {}
+        for np in part_numbers:
+            entry = db.query(PartsCache).filter(PartsCache.numero_parte == np).first()
+            if entry:
+                cached[np] = entry
+
+        to_scrape = [np for np in part_numbers if np not in cached]
+
+        scraped = {}
+        if to_scrape:
+            results = await scrape_parts_batch(to_scrape)
+            for r in results:
+                np = r["numero_parte"]
+                scraped[np] = r
+                entry = db.query(PartsCache).filter(PartsCache.numero_parte == np).first()
+                if not entry:
+                    entry = PartsCache(numero_parte=np)
+                    db.add(entry)
+                entry.nombre_cat = r.get("nombre_cat")
+                entry.precio_cat = r.get("precio_cat")
+                entry.moneda_cat = r.get("moneda_cat", "CLP")
+                entry.retiro_estimado = r.get("retiro_estimado")
+                entry.url_cat = r.get("url_cat")
+                entry.imagen_url = r.get("imagen_url")
+                entry.encontrado = r.get("encontrado", 0)
+                db.commit()
+
+        # Update items with results
+        encontrados = 0
+        for item in items:
+            np = item.numero_parte
+            data = None
+            if np in cached:
+                c = cached[np]
+                data = {
+                    "nombre_cat": c.nombre_cat,
+                    "precio_cat": c.precio_cat,
+                    "moneda_cat": c.moneda_cat,
+                    "retiro_estimado": c.retiro_estimado,
+                    "url_cat": c.url_cat,
+                    "imagen_url": c.imagen_url,
+                    "encontrado": c.encontrado,
+                }
+            elif np in scraped:
+                data = scraped[np]
+            if data:
+                item.nombre_cat = data.get("nombre_cat")
+                item.precio_cat = data.get("precio_cat")
+                item.moneda_cat = data.get("moneda_cat", "CLP")
+                item.retiro_estimado = data.get("retiro_estimado")
+                item.url_cat = data.get("url_cat")
+                item.imagen_url = data.get("imagen_url")
+                item.encontrado = data.get("encontrado", 0)
+                if data.get("encontrado"):
+                    encontrados += 1
+            cot.items_procesados = (cot.items_procesados or 0) + 1
+            db.commit()
+
+        cot.items_encontrados = encontrados
+        cot.estado = EstadoCotizacion.COMPLETADA
+        cot.total_items = len(items)
+        db.commit()
+    except Exception as e:
+        try:
+            cot = db.query(Cotizacion).filter(Cotizacion.id == cotizacion_id).first()
+            if cot:
+                cot.estado = EstadoCotizacion.ERROR
+                cot.error_msg = str(e)[:500]
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
 @router.post("/{cotizacion_id}/buscar-finning")
 def buscar_finning(
     cotizacion_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Inicia búsqueda de precios Finning para items de la cotización."""
+    """Dispara búsqueda real de precios Finning para los items de una cotización.
+
+    Usa el mismo scraper que el upload Excel inicial (Playwright + parts.cat.com/es/finningchile).
+    El scraping corre en background; el frontend hace polling vía /finning-progress.
+    """
     cotizacion = _check_ownership(cotizacion_id, current_user, db)
-    # Mark as pending for agent worker
-    cotizacion.estado = "ESPERANDO_AGENTE"
+    items = (
+        db.query(ItemCotizacion)
+        .filter(ItemCotizacion.cotizacion_id == cotizacion_id)
+        .all()
+    )
+    if not items:
+        raise HTTPException(400, "La cotización no tiene items")
+
+    cotizacion.estado = EstadoCotizacion.PROCESANDO
     cotizacion.items_procesados = 0
+    cotizacion.items_encontrados = 0
+    cotizacion.total_items = len(items)
     db.commit()
-    return {"ok": True, "message": "Búsqueda iniciada. El agente procesará los items."}
+
+    from config import settings
+    background_tasks.add_task(
+        asyncio.run,
+        _scrape_finning_for_cotizacion(cotizacion_id, settings.DATABASE_URL),
+    )
+    return {
+        "ok": True,
+        "message": f"Búsqueda iniciada para {len(items)} items.",
+        "total_items": len(items),
+    }
 
 
 @router.get("/{cotizacion_id}/finning-progress")
