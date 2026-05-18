@@ -879,10 +879,13 @@ async def _scrape_finning_for_cotizacion(cotizacion_id: int, db_url: str):
         cot.items_encontrados = encontrados
         cot.estado = EstadoCotizacion.COMPLETADO
         cot.total_items = len(items)
-        # Si el scraper devolvió 0 encontrados y > 0 procesados, probablemente
-        # Akamai bloqueó (parts.cat.com tiene anti-bot). Lo marcamos como ERROR
-        # con un mensaje claro para que el frontend lo muestre.
-        if len(items) > 0 and encontrados == 0:
+        # Limpiar error_msg residual de corridas anteriores si esta fue exitosa
+        if encontrados > 0:
+            cot.error_msg = None
+        elif len(items) > 0:
+            # 0 encontrados de N items procesados: probablemente Akamai bloqueó
+            # (parts.cat.com tiene anti-bot Akamai). Marcamos ERROR con mensaje
+            # visible en la UI.
             cot.estado = EstadoCotizacion.ERROR
             cot.error_msg = (
                 "El portal Finning bloqueó la búsqueda automática (anti-bot Akamai). "
