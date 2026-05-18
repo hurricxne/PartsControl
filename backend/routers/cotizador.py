@@ -616,9 +616,10 @@ def _generar_excel_formal(cotizacion: Cotizacion, resultado: dict, output_path: 
         conds = [l.strip() for l in cotizacion.terminos_condiciones.splitlines() if l.strip()]
     else:
         tc = config.get("tipo_cambio_usd", 940)
+        plazo_txt = _compute_plazo_text(items_calc, config)
         conds = [
             "1.- Validez de la cotización 30 días corridos desde la fecha de emisión.",
-            "2.- Plazo de entrega sujeto a disponibilidad de stock en proveedor.",
+            f"2.- {plazo_txt}",
             "3.- Precios expresados en CLP. IVA no incluido.",
             "4.- Repuestos genuinos, en su packing original.",
             f"5.- Tipo de cambio referencial: ${tc:,.0f} CLP/USD.",
@@ -650,6 +651,18 @@ def _generar_excel_formal(cotizacion: Cotizacion, resultado: dict, output_path: 
         value(ws[f"E{r}"], v2)
 
     wb.save(output_path)
+
+
+def _compute_plazo_text(items_calc: list, config: dict) -> str:
+    """Devuelve la frase de plazo de entrega usando los plazos minimo/maximo
+    de los items (con fallback a config.plazo_min_default / plazo_max_default).
+    Ejemplo: 'Plazo de entrega de 7 a 10 días.'
+    """
+    mins = [it.get("plazo_entrega_min") for it in items_calc if it.get("plazo_entrega_min")]
+    maxs = [it.get("plazo_entrega_max") for it in items_calc if it.get("plazo_entrega_max")]
+    pmin = min(mins) if mins else (config.get("plazo_min_default") or 30)
+    pmax = max(maxs) if maxs else (config.get("plazo_max_default") or 45)
+    return f"Plazo de entrega de {pmin} a {pmax} días."
 
 
 DEFAULT_TERMINOS = """• Precios en CLP no incluyen IVA.
@@ -1306,11 +1319,12 @@ def _generar_pdf_formal(cotizacion, resultado: dict, output_path: str, config: d
         conds = [l.strip() for l in cotizacion.terminos_condiciones.splitlines() if l.strip()]
     else:
         tc = config.get("tipo_cambio_usd", 940)
+        plazo_txt = _compute_plazo_text(items_calc, config)
         conds = [
             "1. Validez de la cotización: 30 días corridos desde la fecha de emisión.",
             "2. Precios expresados en CLP. IVA no incluido.",
             "3. Forma de pago: 50% anticipo, saldo contra entrega.",
-            "4. Plazo de entrega sujeto a disponibilidad de stock en proveedor.",
+            f"4. {plazo_txt}",
             "5. Repuestos genuinos en su packing original.",
             f"6. Tipo de cambio referencial: ${tc:,.0f} CLP/USD.",
         ]

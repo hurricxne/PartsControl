@@ -167,8 +167,14 @@ export default function CotizadorEditor() {
     setMeta({ numero: data.numero || '', cliente: data.cliente || '', referencia: data.referencia || '', fase_comercial: data.fase_comercial || '', rut_cliente: data.rut_cliente || '', contacto_cliente: data.contacto_cliente || '', email_cliente: data.email_cliente || '', telefono_cliente: data.telefono_cliente || '', direccion_cliente: data.direccion_cliente || '' })
     setEsFormal(!!data.es_formal)
     setVersionCount(data.version_count || 0)
-    // Load terminos (stored or default)
-    const DEFAULT_TERMINOS = '• Precios en CLP no incluyen IVA.\n• Forma de pago: 50% anticipo, 50% contra entrega.\n• Plazo de entrega sujeto a confirmación de stock.\n• Garantía: 6 meses por defectos de fabricación.'
+    // Load terminos (stored or default) - plazo dinamico desde items o config
+    const plazos_min = raw.map((r: any) => Number(r.plazo_entrega_min)).filter((n: number) => Number.isFinite(n) && n > 0)
+    const plazos_max = raw.map((r: any) => Number(r.plazo_entrega_max)).filter((n: number) => Number.isFinite(n) && n > 0)
+    const cfg = data.config || {}
+    const pmin = plazos_min.length > 0 ? Math.min(...plazos_min) : (cfg.plazo_min_default || 30)
+    const pmax = plazos_max.length > 0 ? Math.max(...plazos_max) : (cfg.plazo_max_default || 45)
+    const plazoTxt = `Plazo de entrega de ${pmin} a ${pmax} días.`
+    const DEFAULT_TERMINOS = `• Precios en CLP no incluyen IVA.\n• Forma de pago: 50% anticipo, 50% contra entrega.\n• ${plazoTxt}\n• Garantía: 6 meses por defectos de fabricación.`
     setTerminos(data.terminos_condiciones || DEFAULT_TERMINOS)
     setCForm({
       rut: data.rut_cliente || '',

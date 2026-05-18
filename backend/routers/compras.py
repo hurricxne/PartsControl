@@ -1395,12 +1395,13 @@ def get_embarque(
         d["numero_oc_cliente"] = occ.numero_oc if occ else ""
 
         # A-3.4: Invoice (factura proveedor)
+        # Modelo FacturaProveedor usa ocp_id (FK) e invoice_no
         factura = None
         if ocp_id:
             factura = db.query(FacturaProveedor).filter(
-                FacturaProveedor.oc_proveedor_id == ocp_id
+                FacturaProveedor.ocp_id == ocp_id
             ).first()
-        d["numero_factura"] = factura.numero_factura if factura else ""
+        d["numero_factura"] = factura.invoice_no if factura else ""
 
         items_out.append(d)
 
@@ -1667,19 +1668,19 @@ def update_precio_usd(
     else:
         # Create a standalone FacturaProveedorItem
         # Find or create a FacturaProveedor for the OCP
+        # NOTA: el modelo usa ocp_id (no oc_proveedor_id) e invoice_no (no numero_factura)
         factura = None
         if ocp_item and ocp_item.oc_proveedor_id:
             factura = (
                 db.query(FacturaProveedor)
-                .filter(FacturaProveedor.oc_proveedor_id == ocp_item.oc_proveedor_id)
+                .filter(FacturaProveedor.ocp_id == ocp_item.oc_proveedor_id)
                 .first()
             )
         if not factura:
             # Create a placeholder factura
             factura = FacturaProveedor(
-                oc_proveedor_id=ocp_item.oc_proveedor_id if ocp_item else None,
-                numero_factura=f"AUTO-{item_id}",
-                estado="borrador",
+                ocp_id=ocp_item.oc_proveedor_id if ocp_item else None,
+                invoice_no=f"AUTO-{item_id}",
             )
             db.add(factura)
             db.flush()
