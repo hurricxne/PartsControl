@@ -171,8 +171,12 @@ export const facturasAPI = {
   updateItem: (facturaId: number, itemId: number, data: Record<string, any>) =>
     api.patch(`/facturas/${facturaId}/items/${itemId}`, data),
   remove: (id: number) => api.delete(`/facturas/${id}`),
-  validarPreEmbarque: (preEmbarqueId: number) =>
-    api.get(`/facturas/validar-pre-embarque/${preEmbarqueId}`),
+  validarPreEmbarque: (preEmbarqueId: number, invoxOcpIds?: number[]) =>
+    api.get(`/facturas/validar-pre-embarque/${preEmbarqueId}`, {
+      params: invoxOcpIds && invoxOcpIds.length > 0
+        ? { invox_ocp_ids: invoxOcpIds.join(',') }
+        : undefined,
+    }),
 }
 
 

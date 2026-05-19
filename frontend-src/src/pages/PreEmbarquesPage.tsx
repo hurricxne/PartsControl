@@ -180,7 +180,10 @@ function CerrarEmbarqueModal({ pre, onClose, onSuccess }: {
     try {
     // ── Validar facturas de proveedor ─────────────────────────────────────
     try {
-      const { data: val } = await facturasAPI.validarPreEmbarque(pre.id)
+      // Considerar las OCPs con N° INVOX tipeado como "factura registrada"
+      // (el PDF puede subirse despues).
+      const invoxOcpIds = invoxItems.map(ii => ii.oc_proveedor_id)
+      const { data: val } = await facturasAPI.validarPreEmbarque(pre.id, invoxOcpIds)
       if (!val.ok) {
         const lines = val.discrepancias
           .map((d: any) => `• ${d.numero_parte}: ${d.motivo}`)
@@ -721,7 +724,9 @@ function GenEmbarqueModal({ items, onClose, onSuccess }: {
 
       // Validate facturas before cerrar
       try {
-        const { data: val } = await facturasAPI.validarPreEmbarque(pre.id)
+        // OCPs con N° INVOX tipeado se consideran factura registrada (PDF opcional)
+        const invoxOcpIds = invox_items.map(ii => ii.oc_proveedor_id)
+        const { data: val } = await facturasAPI.validarPreEmbarque(pre.id, invoxOcpIds)
         if (!val.ok) {
           const lines = val.discrepancias
             .map((d: any) => `• ${d.numero_parte}: ${d.motivo}`)

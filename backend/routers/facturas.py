@@ -360,16 +360,31 @@ def eliminar_factura(
 @router.get("/validar-pre-embarque/{pre_embarque_id}")
 def validar_pre_embarque(
     pre_embarque_id: int,
+    invox_ocp_ids: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
     Verifica que todos los ítems del pre-embarque tienen qty_facturada
     coincidente con su cantidad en el sistema.
+
+    Parametro opcional invox_ocp_ids (CSV de IDs de OcProveedor): los items
+    cuya OCP esta en esta lista se consideran "registrados" aunque no haya
+    FacturaProveedorItem en BD (el usuario tipeo el N° INVOX manualmente).
+    El PDF de la factura puede subirse despues.
+
     Retorna: {ok: bool, discrepancias: [{numero_parte, qty_sistema, qty_facturada}]}
     """
     pe_items = db.query(PreEmbarqueItem).filter_by(pre_embarque_id=pre_embarque_id).all()
     discrepancias = []
+
+    # Parsear OCP ids con invox provisto
+    ocps_con_invox: set = set()
+    if invox_ocp_ids:
+        for s in invox_ocp_ids.split(","):
+            s = s.strip()
+            if s.isdigit():
+                ocps_con_invox.add(int(s))
 
     for pe_item in pe_items:
         ic = db.query(ItemCotizacion).filter_by(id=pe_item.item_cotizacion_id).first()
@@ -381,6 +396,7 @@ def validar_pre_embarque(
         # via ocp_item → item_cotizacion
         ocp_items = db.query(OcProveedorItem).filter_by(item_cotizacion_id=ic.id).all()
         ocp_item_ids = [o.id for o in ocp_items]
+        ocp_ids = {o.oc_proveedor_id for o in ocp_items if o.oc_proveedor_id}
 
         facturas_items = []
         if ocp_item_ids:
@@ -389,6 +405,11 @@ def validar_pre_embarque(
             ).all()
 
         if not facturas_items:
+            # Sin FacturaProveedorItem en BD: solo es discrepancia si tampoco
+            # se provee N° INVOX manualmente para alguna OCP del item.
+            if ocp_ids & ocps_con_invox:
+                # Hay invox provisto -> considerar registrada (PDF puede subirse despues)
+                continue
             # Sin factura registrada → discrepancia
             discrepancias.append({
                 "numero_parte":   ic.numero_parte,
