@@ -80,6 +80,20 @@ const BADGE: Record<string, { cls: string; label: string }> = {
 }
 // Estados seleccionables manualmente (despachado se setea automaticamente)
 const ESTADOS = ['en_bodega_proveedor', 'en_transito', 'en_aduana', 'en_bodega']
+// Orden secuencial para validar transiciones
+const ESTADO_ORDER: Record<string, number> = {
+  en_bodega_proveedor: 1,
+  en_transito: 2,
+  en_aduana: 3,
+  en_bodega: 4,
+  despachado: 5,
+}
+// Estados terminales: no se puede retroceder ni editar manualmente
+const ESTADOS_TERMINALES = new Set(['en_bodega', 'despachado'])
+function estadosPermitidos(actual: string): string[] {
+  const rankActual = ESTADO_ORDER[actual] ?? 0
+  return ESTADOS.filter(e => (ESTADO_ORDER[e] ?? 0) >= rankActual)
+}
 
 function getToken() {
   try {
@@ -297,10 +311,17 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
     setSavingEstado(true)
     try {
       await comprasAPI.actualizarEmbarque(emb.id, { estado: estadoEdit })
-      toast.success('Estado actualizado')
+      if (estadoEdit === 'en_bodega') {
+        toast.success('Embarque marcado como En Bodega — ítems disponibles en Despachos')
+      } else {
+        toast.success('Estado actualizado')
+      }
       onRefresh()
       setEditEstado(false)
-    } catch { toast.error('Error') } finally { setSavingEstado(false) }
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      toast.error(typeof detail === 'string' ? detail : 'Error al actualizar estado')
+    } finally { setSavingEstado(false) }
   }
 
   const saveDoc = async (field: keyof typeof docs, val: DocFile | null) => {
@@ -352,7 +373,9 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
                 <div className="flex items-center gap-1">
                   <select className="input text-xs py-0.5 px-1.5 h-6"
                     value={estadoEdit} onChange={e => setEstadoEdit(e.target.value)}>
-                    {ESTADOS.map(e => <option key={e} value={e}>{BADGE[e]?.label ?? e}</option>)}
+                    {estadosPermitidos(emb.estado).map(e => (
+                      <option key={e} value={e}>{BADGE[e]?.label ?? e}</option>
+                    ))}
                   </select>
                   <button onClick={saveEstado} disabled={savingEstado}
                     className="p-1 rounded text-emerald-400 hover:bg-emerald-500/10">
@@ -364,8 +387,15 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
                   </button>
                 </div>
               ) : (
-                <button onClick={() => setEditEstado(true)}
-                  className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium border cursor-pointer hover:opacity-80 ${badge.cls}`}>
+                <button
+                  onClick={() => !ESTADOS_TERMINALES.has(emb.estado) && setEditEstado(true)}
+                  disabled={ESTADOS_TERMINALES.has(emb.estado)}
+                  title={ESTADOS_TERMINALES.has(emb.estado)
+                    ? 'Estado final — no se puede modificar manualmente'
+                    : 'Click para cambiar estado'}
+                  className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium border ${
+                    ESTADOS_TERMINALES.has(emb.estado) ? 'cursor-not-allowed' : 'cursor-pointer hover:opacity-80'
+                  } ${badge.cls}`}>
                   {emb.estado === 'despachado' ? <CheckCircle2 className="w-3 h-3" /> : <Clock className="w-3 h-3" />}
                   {badge.label}
                 </button>

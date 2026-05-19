@@ -1431,12 +1431,73 @@ def actualizar_embarque(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Actualiza metadata y/o documentos de un embarque."""
+    """Actualiza metadata y/o documentos de un embarque.
+
+    Reglas de máquina de estados:
+    - Orden:  en_bodega_proveedor < en_transito < en_aduana < en_bodega < despachado
+    - No se puede retroceder desde 'en_bodega' o 'despachado' (estados terminales/finales)
+    - 'despachado' solo se setea automáticamente al cerrar todos los despachos
+    - Cuando se cambia a 'en_bodega' desde EmbarquesPage: los items vinculados pasan
+      automáticamente a estado_item='en_bodega' para quedar disponibles en Despachos
+    """
     emb = db.query(Embarque).filter(Embarque.id == emb_id).first()
     if not emb:
         raise HTTPException(404, "Embarque no encontrado")
-    for field, value in body.dict(exclude_none=True).items():
+
+    estado_anterior = emb.estado
+    data = body.dict(exclude_none=True)
+    nuevo_estado = data.get("estado")
+
+    ESTADO_ORDER = {
+        "en_bodega_proveedor": 1,
+        "en_transito": 2,
+        "en_aduana": 3,
+        "en_bodega": 4,
+        "despachado": 5,
+    }
+
+    # Validación de transición de estado
+    if nuevo_estado and nuevo_estado != estado_anterior:
+        # No permitir retroceso desde estados terminales
+        if estado_anterior in ("en_bodega", "despachado"):
+            anterior_rank = ESTADO_ORDER.get(estado_anterior, 99)
+            nuevo_rank = ESTADO_ORDER.get(nuevo_estado, 0)
+            if nuevo_rank < anterior_rank:
+                raise HTTPException(
+                    400,
+                    f"No se puede cambiar el estado del embarque a '{nuevo_estado}'. "
+                    f"Una vez en '{estado_anterior}' no se puede volver a un estado anterior.",
+                )
+        # No permitir setear manualmente "despachado" (solo auto)
+        if nuevo_estado == "despachado" and estado_anterior != "despachado":
+            raise HTTPException(
+                400,
+                "El estado 'despachado' se setea automáticamente cuando todos los items "
+                "del embarque son despachados. No se puede asignar manualmente.",
+            )
+
+    # Aplicar campos
+    for field, value in data.items():
         setattr(emb, field, value or None)
+
+    # Auto-transición de items cuando el embarque entra a 'en_bodega'
+    if nuevo_estado == "en_bodega" and estado_anterior != "en_bodega":
+        from models.models import EmbarqueItem
+        item_ids = [
+            r[0] for r in db.query(EmbarqueItem.item_cotizacion_id)
+            .filter(EmbarqueItem.embarque_id == emb.id).all()
+        ]
+        if item_ids:
+            items = (
+                db.query(ItemCotizacion)
+                .filter(ItemCotizacion.id.in_(item_ids))
+                .all()
+            )
+            for it in items:
+                # Solo promover items que aun no esten en_bodega/despachado
+                if it.estado_item in ("embarcado", "pre_embarcado", "preparado", "comprado"):
+                    it.estado_item = "en_bodega"
+
     db.commit()
     return {"ok": True}
 
