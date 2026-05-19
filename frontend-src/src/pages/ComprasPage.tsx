@@ -42,7 +42,8 @@ interface OcCliente {
 
 interface OcProveedor {
   id: number
-  numero: string
+  numero: string       // correlativo interno OCP-2026-XXXX
+  numero_oc?: string   // N° manual del proveedor (lo que el usuario tipea)
   proveedor: string
   pais: string
   moneda: string
@@ -298,7 +299,7 @@ function AsignarModal({
             ) : (
               <select className="input w-full" value={ocpId} onChange={e => setOcpId(Number(e.target.value))}>
                 {ocProveedores.map(o => (
-                  <option key={o.id} value={o.id}>{o.numero} — {o.proveedor}</option>
+                  <option key={o.id} value={o.id}>{(o.numero_oc || o.numero)} — {o.proveedor}</option>
                 ))}
               </select>
             )}
