@@ -79,7 +79,9 @@ def _item_detail(ei: EmbarqueItem, db: Session) -> dict:
         "total_usd": total_usd,
         "numero_oc_cliente": occ.numero_oc if occ else None,
         "invoice_no": invoice_no,
+        # OCP: numero = correlativo interno (OCP-2026-XXX); numero_oc = el manual del proveedor
         "ocp_numero": ocp.numero if ocp else None,
+        "ocp_numero_oc": ocp.numero_oc if ocp else None,
         "ocp_proveedor": ocp.proveedor if ocp else None,
     }
 
@@ -91,13 +93,42 @@ def list_embarques_bodega(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Returns embarques in en_transito or en_recepcion states."""
-    embarques = (
-        db.query(Embarque)
-        .filter(Embarque.estado.in_(["en_transito", "en_aduana", "en_recepcion"]))
-        .order_by(Embarque.created_at.desc())
+    """Returns embarques pendientes de recepción física en Bodega.
+
+    Incluye embarques en estados: en_transito, en_aduana, en_bodega, en_recepcion.
+    Para que en_bodega y despachado NO aparezcan aquí cuando ya fueron
+    recepcionados físicamente, se excluyen los que tienen RecepcionEmbarque
+    con estado='cerrada'. La excepción es en_recepcion, que siempre aparece
+    porque sigue en progreso.
+
+    Caso de uso: Logística marca el Embarque como "en_bodega" desde
+    EmbarquesPage al verlo llegar físicamente. Bodega lo ve aquí como
+    pendiente de recepcionar, abre el panel de recepción, marca cada item
+    (completo / dañado / faltante / etc.), y cierra. Solo entonces los items
+    pasan a estado en_bodega y aparecen en Despachos.
+    """
+    # IDs de embarques con recepción YA cerrada → no son pendientes
+    closed_emb_ids = {
+        r[0]
+        for r in db.query(RecepcionEmbarque.embarque_id)
+        .filter(RecepcionEmbarque.estado == "cerrada")
+        .distinct()
         .all()
+    }
+
+    q = db.query(Embarque).filter(
+        Embarque.estado.in_(["en_transito", "en_aduana", "en_bodega", "en_recepcion"])
     )
+    if closed_emb_ids:
+        # Excluir los que ya tienen recepción cerrada (excepto si están en_recepcion)
+        from sqlalchemy import or_, and_, not_
+        q = q.filter(
+            or_(
+                Embarque.estado == "en_recepcion",
+                not_(Embarque.id.in_(closed_emb_ids)),
+            )
+        )
+    embarques = q.order_by(Embarque.created_at.desc()).all()
     result = []
     for e in embarques:
         recepcion = db.query(RecepcionEmbarque).filter(
@@ -131,13 +162,35 @@ def historial_embarques(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    embarques = (
-        db.query(Embarque)
-        .filter(Embarque.estado.in_(["en_bodega", "despachado"]))
-        .order_by(Embarque.updated_at.desc())
-        .limit(50)
+    """Embarques ya recepcionados o despachados.
+
+    Aparecen acá solo los embarques que tienen una RecepcionEmbarque con
+    estado='cerrada' (= Bodega completó la recepción) o cuyo Embarque está
+    en estado 'despachado' (auto al despachar todos los items).
+    """
+    closed_emb_ids = {
+        r[0]
+        for r in db.query(RecepcionEmbarque.embarque_id)
+        .filter(RecepcionEmbarque.estado == "cerrada")
+        .distinct()
         .all()
-    )
+    }
+
+    from sqlalchemy import or_
+
+    q = db.query(Embarque)
+    if closed_emb_ids:
+        q = q.filter(
+            or_(
+                Embarque.id.in_(closed_emb_ids),
+                Embarque.estado == "despachado",
+            )
+        )
+    else:
+        # Sin recepciones cerradas, solo los despachados (raro pero posible)
+        q = q.filter(Embarque.estado == "despachado")
+
+    embarques = q.order_by(Embarque.updated_at.desc()).limit(50).all()
     return [
         {
             "id": e.id,
@@ -198,7 +251,7 @@ def iniciar_recepcion(
     e = db.query(Embarque).filter(Embarque.id == embarque_id).first()
     if not e:
         raise HTTPException(404, "Embarque no encontrado")
-    if e.estado not in ("en_transito", "en_aduana", "en_recepcion"):
+    if e.estado not in ("en_transito", "en_aduana", "en_bodega", "en_recepcion"):
         raise HTTPException(400, f"Embarque en estado '{e.estado}', no se puede iniciar recepción")
 
     existing = db.query(RecepcionEmbarque).filter(
@@ -662,6 +715,7 @@ def list_reclamos(
             "descripcion": item.descripcion if item else None,
             "proveedor_nombre": ocp.proveedor if ocp else None,
             "oc_proveedor_numero": ocp.numero if ocp else None,
+            "numero_oc_prov": ocp.numero_oc if ocp else None,
             "fotos": [{"id": f.id, "url": f.url_foto} for f in fotos],
         })
     return result

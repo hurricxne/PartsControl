@@ -19,6 +19,7 @@ interface OcClienteItem {
   estado_item: string
   oc_proveedor_id: number | null
   oc_proveedor_numero: string | null
+  numero_oc_prov: string | null
   plazo_entrega_max: number | null
   plazo_dias_prov: number | null
   dias_restantes: number | null
@@ -664,8 +665,10 @@ function OcClienteCard({
                               </span>
                             </td>
                             <td className="px-3 py-2.5 text-xs" style={{ color: isAssigned ? 'var(--text-muted)' : 'var(--text-faint)' }}>
-                              {item.oc_proveedor_numero
-                                ? <span className="font-mono font-semibold text-brand-400">{item.oc_proveedor_numero}</span>
+                              {item.numero_oc_prov || item.oc_proveedor_numero
+                                ? <span className="font-mono font-semibold text-brand-400">
+                                    {item.numero_oc_prov || item.oc_proveedor_numero}
+                                  </span>
                                 : <span className="italic">Sin asignar</span>}
                             </td>
                           </tr>
@@ -723,6 +726,7 @@ interface Reclamo {
   descripcion: string
   proveedor_nombre: string
   oc_proveedor_numero: string
+  numero_oc_prov?: string
 }
 
 export default function ComprasPage() {
@@ -929,7 +933,7 @@ export default function ComprasPage() {
                               <div className="text-[11px] mt-0.5 space-x-2" style={{ color: 'var(--text-faint)' }}>
                                 <span>Proveedor: {r.proveedor_nombre}</span>
                                 <span>·</span>
-                                <span>OCP: {r.oc_proveedor_numero}</span>
+                                <span>OCP: {r.numero_oc_prov || r.oc_proveedor_numero}</span>
                               </div>
                             </div>
                             <div className="shrink-0 text-right">

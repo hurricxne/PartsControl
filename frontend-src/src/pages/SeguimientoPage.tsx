@@ -619,7 +619,7 @@ function OcpGroupCard({
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="font-mono font-bold text-sm text-brand-400">{group.oc_proveedor_numero || group.numero}</span>
+            <span className="font-mono font-bold text-sm text-brand-400">{group.numero_oc_prov || group.oc_proveedor_numero || group.numero}</span>
           </div>
           <p className="text-sm font-medium mt-0.5" style={{ color: 'var(--text-primary)' }}>
             {group.oc_proveedor_nombre || group.proveedor}

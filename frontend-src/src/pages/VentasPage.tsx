@@ -324,11 +324,15 @@ function VentaCard({ venta }: { venta: Venta }) {
                         <EstadoBadge estado={item.estado_item} />
                       </td>
                       <td className="px-3 py-2 whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>
-                        {item.ocp_numero ? (
+                        {(item.ocp_numero_oc || item.ocp_numero) ? (
                           <div>
-                            <p className="font-semibold" style={{ color: 'var(--text-primary)' }}>{item.ocp_numero}</p>
+                            <p className="font-semibold" style={{ color: 'var(--text-primary)' }}>
+                              {item.ocp_numero_oc || item.ocp_numero}
+                            </p>
                             {item.ocp_proveedor && <p className="text-[10px]">{item.ocp_proveedor}</p>}
-                            {item.ocp_numero_oc && <p className="text-[10px]">OC: {item.ocp_numero_oc}</p>}
+                            {item.ocp_numero_oc && item.ocp_numero && (
+                              <p className="text-[10px]" style={{ color: 'var(--text-faint)' }}>{item.ocp_numero}</p>
+                            )}
                           </div>
                         ) : '—'}
                       </td>

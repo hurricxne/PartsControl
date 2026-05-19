@@ -59,7 +59,7 @@ interface PreEmbarque {
   notas: string
   doc_adicional: string
   total_items: number
-  proveedores: { oc_proveedor_id: number; oc_proveedor_numero: string; oc_proveedor_nombre: string; oc_proveedor_pais: string; item_count: number }[]
+  proveedores: { oc_proveedor_id: number; oc_proveedor_numero: string; numero_oc_prov?: string; oc_proveedor_nombre: string; oc_proveedor_pais: string; item_count: number }[]
   items: PrepItem[]
   embarque_id: number | null
   embarque_numero: string | null
@@ -162,7 +162,7 @@ function CerrarEmbarqueModal({ pre, onClose, onSuccess }: {
       if (!map.has(item.oc_proveedor_id)) {
         map.set(item.oc_proveedor_id, {
           id: item.oc_proveedor_id,
-          numero: item.oc_proveedor_numero || item.numero_oc_prov || ('OCP-' + item.oc_proveedor_id),
+          numero: item.numero_oc_prov || item.oc_proveedor_numero || ('OCP-' + item.oc_proveedor_id),
           nombre: item.oc_proveedor_nombre || '—',
           itemCount: 0,
         })
@@ -608,7 +608,7 @@ function GenEmbarqueModal({ items, onClose, onSuccess }: {
       if (!map.has(item.oc_proveedor_id)) {
         map.set(item.oc_proveedor_id, {
           id: item.oc_proveedor_id,
-          numero: item.oc_proveedor_numero || item.numero_oc_prov || ('OCP-' + item.oc_proveedor_id),
+          numero: item.numero_oc_prov || item.oc_proveedor_numero || ('OCP-' + item.oc_proveedor_id),
           nombre: item.oc_proveedor_nombre || '—',
           itemCount: 0,
         })
@@ -1085,7 +1085,7 @@ function PreEmbarqueCard({ pre, availableItems, onRefresh }: { pre: PreEmbarque;
                     <span key={pv.oc_proveedor_id}
                       className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border font-mono"
                       style={{ borderColor: 'var(--border)', color: 'var(--text-muted)', backgroundColor: 'var(--surface-200)' }}>
-                      <span className="text-brand-400 font-semibold">{pv.oc_proveedor_numero}</span>
+                      <span className="text-brand-400 font-semibold">{pv.numero_oc_prov || pv.oc_proveedor_numero}</span>
                       <span style={{ color: 'var(--text-faint)' }}>·</span>
                       {pv.oc_proveedor_nombre || '—'}
                       <span className="ml-0.5 text-[9px]" style={{ color: 'var(--text-faint)' }}>({pv.item_count})</span>
@@ -1205,8 +1205,10 @@ function PreEmbarqueCard({ pre, availableItems, onRefresh }: { pre: PreEmbarque;
                     <td className="px-3 py-2.5 max-w-[160px] truncate" style={{ color: 'var(--text-primary)' }}>{item.descripcion}</td>
                     <td className="px-3 py-2.5 whitespace-nowrap">
                       <p className="font-semibold" style={{ color: 'var(--text-primary)' }}>{item.oc_proveedor_nombre || '—'}</p>
-                      {item.oc_proveedor_numero && (
-                        <p className="text-[10px] font-mono" style={{ color: 'var(--text-faint)' }}>{item.oc_proveedor_numero}</p>
+                      {(item.numero_oc_prov || item.oc_proveedor_numero) && (
+                        <p className="text-[10px] font-mono" style={{ color: 'var(--text-faint)' }}>
+                          {item.numero_oc_prov || item.oc_proveedor_numero}
+                        </p>
                       )}
                     </td>
                     <td className="px-3 py-2.5 text-center" style={{ color: 'var(--text-muted)' }}>{item.cantidad}</td>

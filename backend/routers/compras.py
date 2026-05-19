@@ -1480,23 +1480,11 @@ def actualizar_embarque(
     for field, value in data.items():
         setattr(emb, field, value or None)
 
-    # Auto-transición de items cuando el embarque entra a 'en_bodega'
-    if nuevo_estado == "en_bodega" and estado_anterior != "en_bodega":
-        from models.models import EmbarqueItem
-        item_ids = [
-            r[0] for r in db.query(EmbarqueItem.item_cotizacion_id)
-            .filter(EmbarqueItem.embarque_id == emb.id).all()
-        ]
-        if item_ids:
-            items = (
-                db.query(ItemCotizacion)
-                .filter(ItemCotizacion.id.in_(item_ids))
-                .all()
-            )
-            for it in items:
-                # Solo promover items que aun no esten en_bodega/despachado
-                if it.estado_item in ("embarcado", "pre_embarcado", "preparado", "comprado"):
-                    it.estado_item = "en_bodega"
+    # NOTA: NO se auto-promueven items al pasar a "en_bodega" desde EmbarquesPage.
+    # El estado "en_bodega" del Embarque solo indica que llego fisicamente.
+    # Para promover los items y que aparezcan en Despachos, Bodega debe abrir
+    # y cerrar la recepcion fisica (RecepcionEmbarque) -- ahi recien items
+    # pasan a estado_item="en_bodega" (o reclamo_proveedor si hay danos/faltantes).
 
     db.commit()
     return {"ok": True}
