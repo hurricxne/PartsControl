@@ -907,11 +907,8 @@ def get_items_preparados(
     return result
 
 
-@router.post("/pre-embarques", status_code=201)
-
-
 def _clone_item_cotizacion(item, qty: float, estado: str, db):
-    """Clone an ItemCotizacion with a new quantity and estado."""
+    """Clone an ItemCotizacion with a new quantity and estado. (helper interno)"""
     from models.models import ItemCotizacion as _IC
     new_item = _IC(
         cotizacion_id         = item.cotizacion_id,
@@ -955,6 +952,8 @@ def _clone_item_cotizacion(item, qty: float, estado: str, db):
 
     return new_item
 
+
+@router.post("/pre-embarques", status_code=201)
 def crear_pre_embarque(
     body: PreEmbarqueCreate,
     db: Session = Depends(get_db),

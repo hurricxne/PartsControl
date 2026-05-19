@@ -7,6 +7,23 @@ import {
 import toast from 'react-hot-toast'
 import { comprasAPI, facturasAPI } from '../services/api'
 
+// Normaliza errores de FastAPI a string seguro para toast.error/UI.
+// Maneja: string plano, objeto Pydantic validation array, objeto detail solo, axios error.
+function formatApiError(err: any, fallback: string): string {
+  const detail = err?.response?.data?.detail
+  if (typeof detail === 'string' && detail) return detail
+  if (Array.isArray(detail)) {
+    const msgs = detail
+      .map((d: any) => (typeof d === 'string' ? d : d?.msg || ''))
+      .filter(Boolean)
+    if (msgs.length) return msgs.join(' · ')
+  }
+  if (detail && typeof detail === 'object') {
+    return detail.msg || JSON.stringify(detail).slice(0, 200)
+  }
+  return err?.message || fallback
+}
+
 interface PrepItem {
   id: number
   item_num: number
@@ -186,7 +203,7 @@ function CerrarEmbarqueModal({ pre, onClose, onSuccess }: {
       toast.success('Embarque ' + data.numero + ' generado desde ' + pre.numero)
       onSuccess()
     } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Error al generar embarque')
+      toast.error(formatApiError(err, 'Error al generar embarque'))
     } finally { setSaving(false) }
   }
 
@@ -444,7 +461,7 @@ function GenPreEmbarqueModal({ selectedItems, onClose, onSuccess }: {
       }
       toast.success(data.numero + ' creado')
       onSuccess()
-    } catch { toast.error('Error al crear pre-embarque') }
+    } catch (err: any) { toast.error(formatApiError(err, 'Error al crear pre-embarque')) }
     finally { setSaving(false) }
   }
 
@@ -728,7 +745,7 @@ function GenEmbarqueModal({ items, onClose, onSuccess }: {
       toast.success('Embarque generado correctamente')
       onSuccess()
     } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Error al generar embarque')
+      toast.error(formatApiError(err, 'Error al generar embarque'))
     } finally { setSaving(false) }
   }
 
@@ -1026,7 +1043,7 @@ function PreEmbarqueCard({ pre, availableItems, onRefresh }: { pre: PreEmbarque;
       await comprasAPI.addItemPreEmbarque(pre.id, itemId)
       toast.success('Item agregado al pre-embarque')
       onRefresh()
-    } catch (e: any) { toast.error(e?.response?.data?.detail || 'Error al agregar item') }
+    } catch (e: any) { toast.error(formatApiError(e, 'Error al agregar item')) }
     finally { setLoadingItem(null) }
   }
 
