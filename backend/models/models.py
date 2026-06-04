@@ -24,6 +24,7 @@ class User(Base):
     nombre = Column(String(255), nullable=False)
     hashed_password = Column(String(255), nullable=False)
     is_active = Column(Integer, default=1)
+    empresa = Column(String(50), nullable=False, server_default='mineria')
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     cotizaciones = relationship("Cotizacion", back_populates="user")

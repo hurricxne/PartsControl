@@ -75,3 +75,6 @@ Thumbs.db
 *.sqlite
 *.sqlite3
 *.db
+
+# Documentos de despacho subidos en runtime
+backend/static/despachos/

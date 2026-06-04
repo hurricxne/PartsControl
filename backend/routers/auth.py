@@ -37,7 +37,7 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
     return {
         "access_token": token,
         "token_type": "bearer",
-        "user": {"id": user.id, "email": user.email, "nombre": user.nombre}
+        "user": {"id": user.id, "email": user.email, "nombre": user.nombre, "empresa": user.empresa or "mineria"}
     }
 
 
@@ -58,4 +58,4 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
 
 @router.get("/me")
 def me(current_user: User = Depends(get_current_user)):
-    return {"id": current_user.id, "email": current_user.email, "nombre": current_user.nombre}
+    return {"id": current_user.id, "email": current_user.email, "nombre": current_user.nombre, "empresa": current_user.empresa or "mineria"}

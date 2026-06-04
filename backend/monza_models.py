@@ -1,0 +1,414 @@
+from sqlalchemy import Column, Integer, String, Float, DateTime, Date, Boolean, Text, JSON, ForeignKey, Numeric
+from sqlalchemy.orm import relationship
+from datetime import datetime
+from models.models import Base, User
+
+
+# ── Clientes ──────────────────────────────────────────────────────────────────
+
+class MonzaCliente(Base):
+    __tablename__ = "monza_clientes"
+
+    id = Column(Integer, primary_key=True)
+    nombre = Column(String(200), nullable=False)
+    rut = Column(String(20), nullable=True)
+    telefono = Column(String(30), nullable=True)
+    email = Column(String(100), nullable=True)
+    vehiculos = Column(JSON, default=list)
+    etiquetas = Column(JSON, default=list)
+    ltv = Column(Float, default=0)
+    leads_total = Column(Integer, default=0)
+    vendidos_total = Column(Integer, default=0)
+    # Columnas migradas desde Postgres
+    code = Column(String(50), nullable=True)
+    customer_since = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+    pg_id = Column(String(30), nullable=True, unique=True)
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
+    fecha_actualizacion = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    leads = relationship("MonzaLead", back_populates="cliente")
+    markups = relationship("MonzaMarkup", back_populates="cliente", cascade="all, delete-orphan")
+    cliente_tags = relationship("MonzaClienteTag", back_populates="cliente", cascade="all, delete-orphan")
+
+
+# ── Asesores comerciales ───────────────────────────────────────────────────────
+
+class MonzaAsesor(Base):
+    __tablename__ = "monza_asesores"
+
+    id = Column(Integer, primary_key=True)
+    slug = Column(String(50), nullable=False, unique=True)
+    nombre = Column(String(200), nullable=False)
+    email = Column(String(100), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    activo = Column(Boolean, default=True)
+    pg_id = Column(String(30), nullable=True, unique=True)
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+
+# ── Tags / etiquetas ──────────────────────────────────────────────────────────
+
+class MonzaTag(Base):
+    __tablename__ = "monza_tags"
+
+    id = Column(Integer, primary_key=True)
+    label = Column(String(100), nullable=False, unique=True)
+    color_token = Column(String(100), nullable=True)
+    activo = Column(Boolean, default=True)
+    pg_id = Column(String(30), nullable=True, unique=True)
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
+
+    cliente_tags = relationship("MonzaClienteTag", back_populates="tag")
+
+
+class MonzaClienteTag(Base):
+    __tablename__ = "monza_cliente_tags"
+
+    cliente_id = Column(Integer, ForeignKey("monza_clientes.id"), primary_key=True)
+    tag_id = Column(Integer, ForeignKey("monza_tags.id"), primary_key=True)
+    asignado_en = Column(DateTime, default=datetime.utcnow)
+
+    cliente = relationship("MonzaCliente", back_populates="cliente_tags")
+    tag = relationship("MonzaTag", back_populates="cliente_tags")
+
+
+# ── Markup matrix ─────────────────────────────────────────────────────────────
+
+class MonzaMarkup(Base):
+    __tablename__ = "monza_markups"
+
+    id = Column(Integer, primary_key=True)
+    cliente_id = Column(Integer, ForeignKey("monza_clientes.id"), nullable=False)
+    calidad = Column(String(20), nullable=False)  # genuino/oem/aftermarket
+    valor = Column(Numeric(8, 4), nullable=False)
+
+    cliente = relationship("MonzaCliente", back_populates="markups")
+
+
+# ── Proveedores y catálogo ────────────────────────────────────────────────────
+
+class MonzaProveedor(Base):
+    __tablename__ = "monza_proveedores"
+
+    id = Column(Integer, primary_key=True)
+    code = Column(String(50), nullable=False, unique=True)
+    nombre = Column(String(200), nullable=False)
+    pais = Column(String(10), nullable=True)
+    formato = Column(String(20), nullable=True)
+    linea_default = Column(String(20), nullable=True)
+    notas = Column(Text, nullable=True)
+    activo = Column(Boolean, default=True)
+    pg_id = Column(String(30), nullable=True, unique=True)
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
+
+    listas = relationship("MonzaListaPrecios", back_populates="proveedor")
+
+
+class MonzaListaPrecios(Base):
+    __tablename__ = "monza_listas_precios"
+
+    id = Column(Integer, primary_key=True)
+    proveedor_id = Column(Integer, ForeignKey("monza_proveedores.id"), nullable=False)
+    code = Column(String(50), nullable=False)
+    nombre = Column(String(200), nullable=True)
+    lead_time_dias = Column(Integer, nullable=True)
+    delivery_profile = Column(String(200), nullable=True)
+    notas = Column(Text, nullable=True)
+    activo = Column(Boolean, default=True)
+    pg_id = Column(String(30), nullable=True, unique=True)
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
+
+    proveedor = relationship("MonzaProveedor", back_populates="listas")
+    partes = relationship("MonzaParteCatalogo", back_populates="lista")
+
+
+class MonzaParteCatalogo(Base):
+    __tablename__ = "monza_partes_catalogo"
+
+    id = Column(Integer, primary_key=True)
+    lista_id = Column(Integer, ForeignKey("monza_listas_precios.id"), nullable=False)
+    sku = Column(String(100), nullable=False)
+    descripcion = Column(String(500), nullable=False)
+    marca = Column(String(100), nullable=True)
+    calidad = Column(String(20), nullable=False, default="GENUINO")  # GENUINO/OEM/AFTERMARKET
+    costo = Column(Numeric(12, 4), nullable=False)
+    moneda = Column(String(5), nullable=False, default="EUR")
+    peso_real_kg = Column(Numeric(12, 4), nullable=True)
+    peso_vol_kg = Column(Numeric(12, 4), nullable=True)
+    pfand = Column(Numeric(12, 4), nullable=True)
+    moq = Column(Integer, nullable=True)
+    nueva_parte_sku = Column(String(100), nullable=True)
+    disponible = Column(Boolean, default=True)
+    pg_id = Column(String(30), nullable=True, unique=True)
+    ultima_importacion = Column(DateTime, nullable=True)
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
+
+    lista = relationship("MonzaListaPrecios", back_populates="partes")
+
+
+# ── Leads ─────────────────────────────────────────────────────────────────────
+
+class MonzaLead(Base):
+    __tablename__ = "monza_leads"
+
+    id = Column(Integer, primary_key=True)
+    numero = Column(String(20), unique=True, nullable=False)  # L-2026-0001
+    cliente_id = Column(Integer, ForeignKey("monza_clientes.id"), nullable=True)
+    vehiculo = Column(String(200), nullable=True)
+    vin = Column(String(50), nullable=True)
+    canal_origen = Column(String(50), default="WhatsApp")
+    asesor_id = Column(Integer, ForeignKey("monza_asesores.id"), nullable=True)
+    estado = Column(String(30), default="pendiente")  # pendiente/en_proceso/vendido/rechazado
+    comentario = Column(Text, nullable=True)
+    linea = Column(String(20), nullable=True)  # autos/maquinaria
+    total_estimado = Column(Float, default=0)
+    sin_contactar_dias = Column(Integer, default=0)
+    # Columnas migradas
+    origen_crm = Column(String(30), nullable=True)
+    vehicle_label = Column(String(200), nullable=True)
+    pg_id = Column(String(30), nullable=True, unique=True)
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
+    fecha_actualizacion = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    cliente = relationship("MonzaCliente", back_populates="leads")
+    asesor = relationship("MonzaAsesor", foreign_keys=[asesor_id])
+    items = relationship("MonzaLeadItem", back_populates="lead", cascade="all, delete-orphan")
+    actividades = relationship("MonzaLeadActividad", back_populates="lead", cascade="all, delete-orphan",
+                               order_by="MonzaLeadActividad.fecha.desc()")
+    proximos_pasos = relationship("MonzaProximoPaso", back_populates="lead", cascade="all, delete-orphan")
+    cotizaciones = relationship("MonzaCotizacion", back_populates="lead")
+
+
+class MonzaLeadItem(Base):
+    __tablename__ = "monza_lead_items"
+
+    id = Column(Integer, primary_key=True)
+    lead_id = Column(Integer, ForeignKey("monza_leads.id"), nullable=False)
+    descripcion = Column(String(300), nullable=False)
+    numero_parte = Column(String(100), nullable=True)
+    marca = Column(String(100), nullable=True)
+    procedencia = Column(String(100), nullable=True)
+    calidad = Column(String(30), default="sin_calificar")  # sin_calificar/genuine/oem/aftermarket
+    cantidad = Column(Integer, default=1)
+    precio_clp = Column(Float, nullable=True)  # precio calculado/aplicado (sin IVA, por unidad)
+    supplier_part_pg_id = Column(String(30), nullable=True)
+    plazo_entrega = Column(String(100), nullable=True)
+
+    lead = relationship("MonzaLead", back_populates="items")
+
+
+class MonzaLeadActividad(Base):
+    __tablename__ = "monza_lead_actividades"
+
+    id = Column(Integer, primary_key=True)
+    lead_id = Column(Integer, ForeignKey("monza_leads.id"), nullable=False)
+    tipo = Column(String(30))  # lead_creado/llamada/whatsapp/email/visita/nota/cotizacion
+    descripcion = Column(Text)
+    usuario = Column(String(100))
+    usuario_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    fecha = Column(DateTime, default=datetime.utcnow)
+
+    lead = relationship("MonzaLead", back_populates="actividades")
+
+
+class MonzaProximoPaso(Base):
+    __tablename__ = "monza_proximos_pasos"
+
+    id = Column(Integer, primary_key=True)
+    lead_id = Column(Integer, ForeignKey("monza_leads.id"), nullable=False)
+    tipo = Column(String(20))  # llamada/whatsapp/email/visita
+    cuando = Column(DateTime, nullable=True)
+    asesor_id = Column(Integer, ForeignKey("monza_asesores.id"), nullable=True)
+    completado = Column(Boolean, default=False)
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
+
+    lead = relationship("MonzaLead", back_populates="proximos_pasos")
+    asesor = relationship("MonzaAsesor", foreign_keys=[asesor_id])
+
+
+# ── Cotizaciones ──────────────────────────────────────────────────────────────
+
+class MonzaCotizacion(Base):
+    __tablename__ = "monza_cotizaciones"
+
+    id = Column(Integer, primary_key=True)
+    numero = Column(String(20), unique=True, nullable=False)  # COT-2026-0001
+    lead_id = Column(Integer, ForeignKey("monza_leads.id"), nullable=True)
+    cliente_id = Column(Integer, ForeignKey("monza_clientes.id"), nullable=False)
+    estado = Column(String(20), default="propuesta")  # propuesta/enviada/vendida/rechazada
+    forma_pago = Column(String(100), nullable=True)
+    tipo_cotizacion = Column(String(100), nullable=True)
+    linea = Column(String(20), nullable=True)  # autos/maquinaria
+    vehiculo = Column(String(200), nullable=True)
+    anio = Column(String(10), nullable=True)
+    total_neto = Column(Float, default=0)
+    iva_monto = Column(Float, default=0)
+    total_bruto = Column(Float, default=0)
+    fecha_venta = Column(DateTime, nullable=True)
+    fecha_entrega_est = Column(Date, nullable=True)
+    oc_cliente = Column(String(100), nullable=True)
+    vin = Column(String(50), nullable=True)
+    asesor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    condiciones_servicio = Column(Text, nullable=True)
+    fecha_despacho = Column(Date, nullable=True)
+    numero_factura = Column(String(50), nullable=True)
+    tipo_documento = Column(String(20), nullable=True)
+    documento_path = Column(String(255), nullable=True)
+    # Snapshot de config al momento de crear
+    tc_usd_clp = Column(Float, nullable=True)
+    tc_eur_clp = Column(Float, nullable=True)
+    tarifa_aerea = Column(Float, nullable=True)
+    iva_pct = Column(Float, nullable=True)
+    archivo_pdf = Column(String(200), nullable=True)
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
+
+    lead = relationship("MonzaLead", back_populates="cotizaciones")
+    cliente = relationship("MonzaCliente")
+    asesor = relationship("User", foreign_keys=[asesor_id])
+    items = relationship("MonzaCotizacionItem", back_populates="cotizacion", cascade="all, delete-orphan")
+
+
+class MonzaCotizacionItem(Base):
+    __tablename__ = "monza_cotizacion_items"
+
+    id = Column(Integer, primary_key=True)
+    cotizacion_id = Column(Integer, ForeignKey("monza_cotizaciones.id"), nullable=False)
+    descripcion = Column(String(300), nullable=False)
+    numero_parte = Column(String(100), nullable=True)
+    marca = Column(String(100), nullable=True)
+    procedencia = Column(String(100), nullable=True)
+    calidad = Column(String(30), nullable=True)
+    cantidad = Column(Integer, default=1)
+    costo = Column(Float, nullable=True)
+    moneda = Column(String(10), default="EUR")
+    peso_kg = Column(Float, default=0)
+    tc_aplicado = Column(Float, nullable=True)
+    tarifa_aerea = Column(Float, nullable=True)
+    markup_pct = Column(Float, default=0)  # decimal, ej 0.28 = 28%
+    precio_unitario_clp = Column(Float, nullable=True)  # neto sin IVA por unidad
+    subtotal_clp = Column(Float, nullable=True)
+    plazo_entrega = Column(String(100), nullable=True)
+    estado_linea = Column(String(30), default="cotizado")  # cotizado por_comprar comprado en_transito en_bodega despachado reclamo
+    oc_proveedor_id = Column(Integer, nullable=True)
+
+    cotizacion = relationship("MonzaCotizacion", back_populates="items")
+
+
+# ── Configuración ─────────────────────────────────────────────────────────────
+
+class MonzaConfig(Base):
+    __tablename__ = "monza_config"
+
+    id = Column(Integer, primary_key=True)
+    tc_usd_clp = Column(Float, default=950)
+    tc_eur_clp = Column(Float, default=1100)
+    tarifa_aerea_por_kg = Column(Float, default=4.5)
+    moneda_tarifa = Column(String(10), default="EUR")  # EUR/USD
+    iva_pct = Column(Float, default=19)
+    # Datos empresa MonzaParts (para PDF)
+    razon_social = Column(String(200), default="MonzaParts SpA")
+    rut_empresa = Column(String(20), default="78.121.316-0")
+    direccion = Column(String(200), default="Roger de Flor 2996")
+    giro = Column(String(200), default="Venta de repuestos automotrices")
+    email_empresa = Column(String(100), default="logistica@monzaparts.cl")
+    banco = Column(String(100), nullable=True)
+    tipo_cuenta = Column(String(50), nullable=True)
+    numero_cuenta = Column(String(50), nullable=True)
+    condiciones_default = Column(Text, default=(
+        "1.- Validez de la cotización 5 días y sujeta a disponibilidad de los repuestos.\n"
+        "2.- Se considera entrega a cliente en terreno.\n"
+        "3.- Repuestos genuinos, en su packing original."
+    ))
+    ultima_actualizacion = Column(DateTime, default=datetime.utcnow)
+    usuario_email = Column(String(100), nullable=True)
+
+
+# ── Logs de operaciones CRUD ──────────────────────────────────────────────────
+
+class MonzaLog(Base):
+    __tablename__ = "monza_logs"
+
+    id          = Column(Integer, primary_key=True)
+    user_email  = Column(String(100), nullable=True)
+    accion      = Column(String(20), nullable=False)   # CREATE UPDATE DELETE UPLOAD LOGIN
+    entidad     = Column(String(30), nullable=False)   # lead cotizacion cliente item
+    entidad_id  = Column(Integer, nullable=True)
+    entidad_ref = Column(String(200), nullable=True)   # numero/nombre para display
+    detalle     = Column(Text, nullable=True)
+    ip          = Column(String(60), nullable=True)
+    fecha       = Column(DateTime, default=datetime.utcnow)
+
+
+# ── Abastecimiento: Proveedores de compra y OC de proveedor ───────────────────
+
+class MonzaProvAbast(Base):
+    """Proveedor de compra para abastecimiento (distinto del catálogo de precios)."""
+    __tablename__ = "monza_prov_abastecimiento"
+
+    id        = Column(Integer, primary_key=True)
+    nombre    = Column(String(200), nullable=False)
+    pais      = Column(String(100), nullable=True)
+    moneda    = Column(String(10), default="EUR")
+    contacto  = Column(String(200), nullable=True)
+    email     = Column(String(150), nullable=True)
+    telefono  = Column(String(60), nullable=True)
+    notas     = Column(Text, nullable=True)
+    activo    = Column(Integer, default=1)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class MonzaOcProveedor(Base):
+    __tablename__ = "monza_oc_proveedor"
+
+    id               = Column(Integer, primary_key=True)
+    numero           = Column(String(50), nullable=True)
+    proveedor_id     = Column(Integer, nullable=True)
+    proveedor_nombre = Column(String(200), nullable=True)
+    pais             = Column(String(100), nullable=True)
+    moneda           = Column(String(10), default="EUR")
+    estado           = Column(String(30), default="emitida")  # emitida en_transito recibida cancelada
+    plazo_dias       = Column(Integer, nullable=True)
+    awb              = Column(String(100), nullable=True)
+    notas            = Column(Text, nullable=True)
+    asesor_email     = Column(String(150), nullable=True)
+    created_at       = Column(DateTime, default=datetime.utcnow)
+    updated_at       = Column(DateTime, nullable=True)
+
+
+# ── Bodega: Reclamos a proveedor ──────────────────────────────────────────────
+
+class MonzaReclamo(Base):
+    __tablename__ = "monza_reclamos"
+
+    id               = Column(Integer, primary_key=True)
+    item_id          = Column(Integer, nullable=True)
+    oc_proveedor_id  = Column(Integer, nullable=True)
+    cot_numero       = Column(String(50), nullable=True)
+    descripcion      = Column(String(300), nullable=True)
+    motivo           = Column(String(30), nullable=False)   # danado faltante no_llego
+    qty_afectada     = Column(Integer, default=0)
+    estado           = Column(String(20), default="pendiente")  # pendiente reclamado resuelto anulado
+    observacion      = Column(Text, nullable=True)
+    user_email       = Column(String(150), nullable=True)
+    fecha_creacion   = Column(DateTime, default=datetime.utcnow)
+    fecha_resolucion = Column(DateTime, nullable=True)
+
+
+# -- Notificaciones in-app --------------------------------------------------
+
+class MonzaNotificacion(Base):
+    __tablename__ = "monza_notificaciones"
+
+    id         = Column(Integer, primary_key=True)
+    titulo     = Column(String(200), nullable=False)
+    mensaje    = Column(String(400), nullable=True)
+    tipo       = Column(String(20), default="info")   # info success warning danger
+    entidad    = Column(String(30), nullable=True)
+    entidad_id = Column(Integer, nullable=True)
+    link       = Column(String(200), nullable=True)
+    leida      = Column(Integer, default=0)
+    fecha      = Column(DateTime, default=datetime.utcnow)
+

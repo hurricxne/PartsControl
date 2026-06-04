@@ -72,7 +72,7 @@ export default function LoginPage() {
       }
       setAuth(data.access_token, data.user)
       toast.success(`Bienvenido, ${data.user.nombre}`)
-      navigate('/', { replace: true })
+      navigate(userEmpresa === 'automotriz' ? '/monzaparts/leads' : '/', { replace: true })
     } catch (err: any) {
       toast.error(err.response?.data?.detail || 'Error al iniciar sesión')
     } finally {

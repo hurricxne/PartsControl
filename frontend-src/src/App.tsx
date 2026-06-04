@@ -36,6 +36,23 @@ function PrivateRoute({ children }: { children: React.ReactNode }) {
   return isAuthenticated ? <>{children}</> : <Navigate to="/login" replace />
 }
 
+
+// MonzaParts
+import MonzaDashboardPage from './pages/MonzaDashboardPage'
+import MonzaLayout from './pages/MonzaLayout'
+import MonzaLeadsPage from './pages/MonzaLeadsPage'
+import MonzaCotizadorPage from './pages/MonzaCotizadorPage'
+import MonzaCotizacionesPage from './pages/MonzaCotizacionesPage'
+import MonzaVentasPage from './pages/MonzaVentasPage'
+import MonzaConfigPage from './pages/MonzaConfigPage'
+import MonzaDespachosPage from './pages/MonzaDespachosPage'
+import MonzaLogsPage from './pages/MonzaLogsPage'
+import MonzaAbastecimientoPage from './pages/MonzaAbastecimientoPage'
+import MonzaSeguimientoPage from './pages/MonzaSeguimientoPage'
+import MonzaLogisticaPage from './pages/MonzaLogisticaPage'
+import MonzaBodegaPage from './pages/MonzaBodegaPage'
+import MonzaPerfilPage from './pages/MonzaPerfilPage'
+
 export default function App() {
   return (
     <Routes>
@@ -71,6 +88,32 @@ export default function App() {
         <Route path="usuarios"      element={<UsuariosPage />} />
         <Route path="proveedores"   element={<ProveedoresPage />} />
       </Route>
+
+      {/* MonzaParts */}
+      <Route
+        path="/monzaparts"
+        element={
+          <PrivateRoute>
+            <MonzaLayout />
+          </PrivateRoute>
+        }
+      >
+        <Route index element={<MonzaDashboardPage />} />
+        <Route path="dashboard" element={<MonzaDashboardPage />} />
+        <Route path="leads" element={<MonzaLeadsPage />} />
+        <Route path="cotizador" element={<MonzaCotizadorPage />} />
+        <Route path="cotizaciones" element={<MonzaCotizacionesPage />} />
+        <Route path="ventas" element={<MonzaVentasPage />} />
+        <Route path="abastecimiento" element={<MonzaAbastecimientoPage />} />
+        <Route path="seguimiento" element={<MonzaSeguimientoPage />} />
+        <Route path="logistica" element={<MonzaLogisticaPage />} />
+        <Route path="bodega" element={<MonzaBodegaPage />} />
+        <Route path="perfil" element={<MonzaPerfilPage />} />
+        <Route path="despachos"      element={<MonzaDespachosPage />} />
+        <Route path="logs"           element={<MonzaLogsPage />} />
+        <Route path="configuracion" element={<MonzaConfigPage />} />
+      </Route>
+
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )

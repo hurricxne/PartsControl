@@ -1,0 +1,428 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+import { Search, TrendingUp, ChevronDown, ChevronRight, Truck, X } from "lucide-react";
+import { useMonzaTheme } from "./MonzaLayout";
+import { monzaVentasAPI, monzaCotizacionesAPI, monzaDespachosAPI } from "../services/monzaApi";
+import toast from "react-hot-toast";
+
+interface Venta {
+  id: number; numero: string; estado: string; linea?: string; vehiculo?: string;
+  oc_cliente?: string; fecha_venta?: string; fecha_entrega_est?: string;
+  total_bruto: number; items_count: number; asesor?: string; fecha_creacion: string;
+  cliente?: { nombre: string; rut?: string };
+  lead_numero?: string;
+}
+interface KPIs { vendidas_mes: number; total_mes: number; pendientes_entrega: number; }
+interface CotItem { id: number; descripcion: string; numero_parte?: string; marca?: string; cantidad: number; precio_unitario_clp?: number; subtotal_clp?: number; plazo_entrega?: string; calidad?: string; }
+
+const LINEA_CONFIG: Record<string, { bg: string; color: string; label: string }> = {
+  autos: { bg: "#DBEAFE", color: "#1D4ED8", label: "Autos" },
+  maquinaria: { bg: "#FEF3C7", color: "#D97706", label: "Maquinaria" },
+};
+const ESTADO_COLORS: Record<string, { bg: string; color: string }> = {
+  vendida: { bg: "#DCFCE7", color: "#15803D" },
+  enviada: { bg: "#DBEAFE", color: "#1D4ED8" },
+  propuesta: { bg: "#F1F5F9", color: "#475569" },
+};
+
+function fmt(n: number) { return `$${n.toLocaleString("es-CL")}`; }
+function fmtDate(d?: string) { return d ? new Date(d).toLocaleDateString("es-CL") : "Sin fecha"; }
+
+function slaLabel(fecha?: string): { label: string; bg: string; color: string } {
+  if (!fecha) return { label: "Sin fecha", bg: "#F1F5F9", color: "#94A3B8" };
+  const days = Math.floor((new Date(fecha).getTime() - Date.now()) / 86400000);
+  if (days < 0) return { label: `Vencido ${Math.abs(days)}d`, bg: "#FEE2E2", color: "#B91C1C" };
+  if (days === 0) return { label: "Hoy", bg: "#FEF3C7", color: "#D97706" };
+  if (days <= 3) return { label: `${days} día${days !== 1 ? "s" : ""}`, bg: "#FEF3C7", color: "#D97706" };
+  return { label: `${days} días`, bg: "#DCFCE7", color: "#15803D" };
+}
+
+// ── DespacharModal ────────────────────────────────────────────────────────────
+interface DespacharModalProps {
+  venta: Venta;
+  onClose: () => void;
+  onDone: () => void;
+}
+function DespacharModal({ venta, onClose, onDone }: DespacharModalProps) {
+  const { dark } = useMonzaTheme();
+  const [numDoc, setNumDoc] = useState("");
+  const [tipoDoc, setTipoDoc] = useState("factura");
+  const [fechaDespacho, setFechaDespacho] = useState(() => new Date().toISOString().split("T")[0]);
+  const [file, setFile] = useState<File | null>(null);
+  const [saving, setSaving] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const bg    = dark ? "#131b3e" : "white";
+  const bd    = dark ? "#1e2a4a" : "#E2E8F0";
+  const txt   = dark ? "white"   : "#1E293B";
+  const sub   = dark ? "#8899cc" : "#64748B";
+  const inputStyle = { width: "100%", padding: "8px 10px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: dark ? "#0d1321" : "#F8FAFC", color: txt };
+
+  const handleSubmit = async () => {
+    setSaving(true);
+    try {
+      await monzaCotizacionesAPI.update(venta.id, {
+        estado: "despachado",
+        numero_factura: numDoc || undefined,
+        tipo_documento: tipoDoc,
+        fecha_despacho: fechaDespacho,
+      });
+      if (file) {
+        await monzaDespachosAPI.uploadDocumento(venta.id, file, tipoDoc);
+      }
+      toast.success(`${venta.numero} marcado como despachado`);
+      onDone();
+    } catch {
+      toast.error("Error al despachar");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+      <div style={{ background: bg, border: `1px solid ${bd}`, borderRadius: 14, width: 460, boxShadow: "0 20px 60px rgba(0,0,0,0.4)", overflow: "hidden" }}>
+        {/* Header */}
+        <div style={{ background: dark ? "#0a0e1f" : "#F8FAFC", borderBottom: `1px solid ${bd}`, padding: "14px 20px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Truck size={18} color="#10B981" />
+            <span style={{ fontWeight: 700, fontSize: 15, color: txt }}>Marcar como Despachado</span>
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: sub, display: "flex" }}><X size={18} /></button>
+        </div>
+
+        {/* Body */}
+        <div style={{ padding: "18px 20px", display: "flex", flexDirection: "column", gap: 14 }}>
+          {/* Info venta */}
+          <div style={{ background: dark ? "#0d1321" : "#F0FDF4", border: `1px solid ${dark ? "#1e2a4a" : "#BBF7D0"}`, borderRadius: 8, padding: "10px 14px", fontSize: 12 }}>
+            <div style={{ fontWeight: 700, color: txt, marginBottom: 2 }}>{venta.numero} — {venta.cliente?.nombre || "Sin cliente"}</div>
+            <div style={{ color: sub }}>{venta.vehiculo || "Sin vehículo"} · Monto: {fmt(venta.total_bruto)}</div>
+          </div>
+
+          {/* Tipo documento */}
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Tipo de documento</label>
+            <select value={tipoDoc} onChange={(e) => setTipoDoc(e.target.value)} style={{ ...inputStyle }}>
+              <option value="factura">Factura</option>
+              <option value="boleta">Boleta</option>
+              <option value="ticket">Ticket de despacho</option>
+              <option value="guia">Guía de despacho</option>
+              <option value="otro">Otro</option>
+            </select>
+          </div>
+
+          {/* Número documento */}
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>N° de documento (opcional)</label>
+            <input value={numDoc} onChange={(e) => setNumDoc(e.target.value)} placeholder="Ej: 001-12345" style={{ ...inputStyle }} />
+          </div>
+
+          {/* Fecha despacho */}
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Fecha de despacho</label>
+            <input type="date" value={fechaDespacho} onChange={(e) => setFechaDespacho(e.target.value)} style={{ ...inputStyle, colorScheme: dark ? "dark" : "light" as const }} />
+          </div>
+
+          {/* Archivo */}
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Adjuntar documento (opcional)</label>
+            <input ref={fileRef} type="file" accept=".pdf,.jpg,.jpeg,.png" onChange={(e) => setFile(e.target.files?.[0] || null)} style={{ display: "none" }} />
+            <div
+              onClick={() => fileRef.current?.click()}
+              style={{ border: `2px dashed ${file ? "#10B981" : (dark ? "#1e2a4a" : "#CBD5E1")}`, borderRadius: 8, padding: "12px", textAlign: "center", cursor: "pointer", fontSize: 12, color: file ? "#10B981" : sub, background: dark ? "#0d1321" : "#F8FAFC" }}
+            >
+              {file ? `✓ ${file.name}` : "Haz clic para seleccionar PDF, JPG o PNG"}
+            </div>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding: "12px 20px", borderTop: `1px solid ${bd}`, display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          <button onClick={onClose} style={{ padding: "8px 18px", border: `1px solid ${bd}`, borderRadius: 8, background: "transparent", color: sub, cursor: "pointer", fontSize: 13 }}>Cancelar</button>
+          <button onClick={handleSubmit} disabled={saving} style={{ padding: "8px 20px", background: "#10B981", border: "none", borderRadius: 8, color: "white", cursor: saving ? "wait" : "pointer", fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
+            <Truck size={14} /> {saving ? "Despachando..." : "Confirmar Despacho"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function KpiCard({ label, value, sub, accent = "var(--monza-accent)" }: { label: string; value: string | number; sub?: string; accent?: string }) {
+  const { dark } = useMonzaTheme();
+  return (
+    <div style={{ background: dark ? "#131b3e" : "white", borderRadius: 12, border: `1px solid ${dark ? "#1e2a4a" : "#E2E8F0"}`, padding: "18px 20px", flex: 1 }}>
+      <div style={{ width: 28, height: 4, borderRadius: 2, background: accent, marginBottom: 12 }} />
+      <div style={{ fontSize: 28, fontWeight: 800, color: dark ? "white" : "#1E293B", lineHeight: 1 }}>{value}</div>
+      <div style={{ fontSize: 12, color: dark ? "#8899cc" : "#64748B", marginTop: 5 }}>{label}</div>
+      {sub && <div style={{ fontSize: 11, color: dark ? "#475569" : "#94A3B8", marginTop: 3 }}>{sub}</div>}
+    </div>
+  );
+}
+
+export default function MonzaVentasPage() {
+  const { dark } = useMonzaTheme();
+  const [items, setItems] = useState<Venta[]>([]);
+  const [total, setTotal] = useState(0);
+  const [kpis, setKpis] = useState<KPIs | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [q, setQ] = useState("");
+  const [estado, setEstado] = useState("todas");
+  const [desde, setDesde] = useState("");
+  const [hasta, setHasta] = useState("");
+  const [updatingOC, setUpdatingOC] = useState<{ id: number; val: string } | null>(null);
+  const [expanded, setExpanded] = useState<number | null>(null);
+  const [details, setDetails] = useState<Record<number, { items: CotItem[]; condiciones_servicio?: string; forma_pago?: string; vehiculo?: string }>>({});
+  const [loadingDetail, setLoadingDetail] = useState<number | null>(null);
+  const [despachando, setDespachando] = useState<Venta | null>(null);
+
+  const fetchAll = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [ventasRes, kpisRes] = await Promise.all([
+        monzaVentasAPI.list({ q: q || undefined, estado: estado !== "todas" ? estado : undefined, desde: desde || undefined, hasta: hasta || undefined }),
+        monzaVentasAPI.kpis(),
+      ]);
+      setItems(ventasRes.data.items);
+      setTotal(ventasRes.data.total);
+      setKpis(kpisRes.data);
+    } catch { toast.error("Error al cargar ventas"); }
+    finally { setLoading(false); }
+  }, [q, estado, desde, hasta]);
+
+  useEffect(() => { fetchAll(); }, [fetchAll]);
+
+  const handleSaveOC = async (id: number, oc: string) => {
+    try {
+      await monzaCotizacionesAPI.update(id, { oc_cliente: oc });
+      toast.success("OC actualizada");
+      fetchAll();
+    } catch { toast.error("Error"); }
+    setUpdatingOC(null);
+  };
+
+  const toggleExpand = async (id: number) => {
+    if (expanded === id) { setExpanded(null); return; }
+    setExpanded(id);
+    if (details[id]) return;
+    setLoadingDetail(id);
+    try {
+      const res = await monzaCotizacionesAPI.get(id);
+      const d = res.data as { items: CotItem[]; condiciones_servicio?: string; forma_pago?: string; vehiculo?: string };
+      setDetails((prev) => ({ ...prev, [id]: d }));
+    } catch { toast.error("Error al cargar detalle"); }
+    finally { setLoadingDetail(null); }
+  };
+
+  const sub = dark ? "#8899cc" : "#64748B";
+  const bg = dark ? "#131b3e" : "white";
+  const bd = dark ? "#1e2a4a" : "#E2E8F0";
+  const txt = dark ? "white" : "#1E293B";
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+          <TrendingUp size={22} className="monza-ic" />
+          <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: txt }}>Ventas</h1>
+        </div>
+        <p style={{ margin: 0, fontSize: 13, color: sub }}>
+          Cotizaciones cerradas. Haz clic en "Ver" para expandir el detalle de cada cotización.
+        </p>
+      </div>
+
+      {/* KPIs */}
+      {kpis && (
+        <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
+          <KpiCard label="Vendidas este mes" accent="#10B981" value={kpis.vendidas_mes} />
+          <KpiCard label="Total vendido mes" accent="#F59E0B" value={fmt(kpis.total_mes)} />
+          <KpiCard label="Pendientes entrega" accent="#6366F1" value={kpis.pendientes_entrega} />
+        </div>
+      )}
+
+      {/* Filters */}
+      <div style={{ background: bg, border: `1px solid ${bd}`, borderRadius: 10, padding: "14px 16px", marginBottom: 16 }}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <div style={{ position: "relative", flex: 1, minWidth: 280 }}>
+            <Search size={14} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "#94A3B8" }} />
+            <input value={q} onChange={(e) => setQ(e.target.value)}
+              placeholder="Cliente, RUT, OC, N° cotización..."
+              style={{ width: "100%", padding: "8px 10px 8px 32px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: dark ? "#0d1321" : "white", color: txt }} />
+          </div>
+          <select value={estado} onChange={(e) => setEstado(e.target.value)}
+            style={{ padding: "8px 12px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, background: dark ? "#0d1321" : "white", color: txt }}>
+            <option value="todas">Todas</option>
+            <option value="vendida">Vendida</option>
+            <option value="enviada">Enviada</option>
+            <option value="propuesta">Propuesta</option>
+          </select>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: sub }}>
+            Desde: <input type="date" value={desde} onChange={(e) => setDesde(e.target.value)}
+              style={{ padding: "6px 8px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 12, background: dark ? "#0d1321" : "white", color: txt, colorScheme: dark ? "dark" : "light" as const }} />
+            Hasta: <input type="date" value={hasta} onChange={(e) => setHasta(e.target.value)}
+              style={{ padding: "6px 8px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 12, background: dark ? "#0d1321" : "white", color: txt, colorScheme: dark ? "dark" : "light" as const }} />
+          </div>
+        </div>
+      </div>
+
+      {/* Table */}
+      <div style={{ background: bg, border: `1px solid ${bd}`, borderRadius: 10, overflow: "hidden" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+          <thead>
+            <tr style={{ background: dark ? "#0d1321" : "#F8FAFC", borderBottom: `1px solid ${bd}` }}>
+              <th style={{ width: 32 }}></th>
+              {["Cotización", "Cliente", "Línea", "OC Cliente", "Vendida", "Monto", "Entrega Est.", "Plazo", "Ítems", ""].map((h, i) => (
+                <th key={i} style={{ padding: "10px 12px", textAlign: ["Monto"].includes(h) ? "right" : ["Ítems"].includes(h) ? "center" : "left", fontWeight: 600, fontSize: 11, color: sub, textTransform: "uppercase" as const, letterSpacing: 0.5 }}>
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {loading
+              ? <tr><td colSpan={11} style={{ padding: 40, textAlign: "center", color: "#94A3B8" }}>Cargando...</td></tr>
+              : items.length === 0
+                ? <tr><td colSpan={11} style={{ padding: 40, textAlign: "center", color: "#94A3B8" }}>No hay ventas con los filtros actuales.</td></tr>
+                : items.flatMap((v) => {
+                  const lc = v.linea ? LINEA_CONFIG[v.linea] : null;
+                  const ec = ESTADO_COLORS[v.estado] || ESTADO_COLORS.propuesta;
+                  const sla = slaLabel(v.fecha_entrega_est);
+                  const isExpanded = expanded === v.id;
+                  const rowBg = isExpanded ? (dark ? "#0d1321" : "#F8FAFF") : bg;
+
+                  return [
+                    <tr key={v.id}
+                      style={{ borderBottom: isExpanded ? "none" : `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}`, background: rowBg }}
+                      onMouseEnter={(e) => { if (!isExpanded) (e.currentTarget as HTMLTableRowElement).style.background = dark ? "#1a2340" : "#FAFAFA"; }}
+                      onMouseLeave={(e) => { (e.currentTarget as HTMLTableRowElement).style.background = rowBg; }}>
+                      <td style={{ paddingLeft: 12, color: "#94A3B8", cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>
+                        {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      </td>
+                      <td style={{ padding: "10px 12px", cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>
+                        <div style={{ fontWeight: 600, fontSize: 12, color: txt }}>{v.numero}</div>
+                        {v.lead_numero && <div style={{ fontSize: 10, color: "#94A3B8" }}>Lead {v.lead_numero}</div>}
+                      </td>
+                      <td style={{ padding: "10px 12px", cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>
+                        <div style={{ fontWeight: 500, color: txt }}>{v.cliente?.nombre || "—"}</div>
+                        {v.cliente?.rut && <div style={{ fontSize: 11, color: "#94A3B8" }}>{v.cliente.rut}</div>}
+                      </td>
+                      <td style={{ padding: "10px 12px", cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>
+                        {lc ? <span style={{ fontSize: 11, background: lc.bg, color: lc.color, padding: "3px 10px", borderRadius: 10, fontWeight: 600 }}>{lc.label}</span>
+                          : <span style={{ color: "#94A3B8" }}>—</span>}
+                      </td>
+                      <td style={{ padding: "10px 12px", color: sub }}>
+                        {updatingOC?.id === v.id ? (
+                          <input autoFocus value={updatingOC.val}
+                            onChange={(e) => setUpdatingOC({ id: v.id, val: e.target.value })}
+                            onBlur={() => handleSaveOC(v.id, updatingOC.val)}
+                            onKeyDown={(e) => { if (e.key === "Enter") handleSaveOC(v.id, updatingOC.val); if (e.key === "Escape") setUpdatingOC(null); }}
+                            style={{ padding: "4px 8px", border: "1px solid var(--monza-accent)", borderRadius: 4, fontSize: 12, width: 100 }} />
+                        ) : (
+                          <span onClick={(e) => { e.stopPropagation(); setUpdatingOC({ id: v.id, val: v.oc_cliente || "" }); }}
+                            title="Click para editar OC"
+                            style={{ cursor: "pointer", borderBottom: v.oc_cliente ? "none" : `1px dashed ${dark ? "#334155" : "#CBD5E1"}`, color: v.oc_cliente ? txt : (dark ? "#334155" : "#CBD5E1") }}>
+                            {v.oc_cliente || "—"}
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ padding: "10px 12px", fontSize: 12, cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>
+                        <div style={{ color: txt }}>{v.fecha_venta ? fmtDate(v.fecha_venta) : "—"}</div>
+                        <span style={{ fontSize: 10, background: ec.bg, color: ec.color, padding: "1px 6px", borderRadius: 6 }}>
+                          {v.estado.charAt(0).toUpperCase() + v.estado.slice(1)}
+                        </span>
+                      </td>
+                      <td style={{ padding: "10px 12px", textAlign: "right", fontWeight: 600, color: txt, cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>{fmt(v.total_bruto)}</td>
+                      <td style={{ padding: "10px 12px", color: sub, fontSize: 12, cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>{fmtDate(v.fecha_entrega_est)}</td>
+                      <td style={{ padding: "10px 12px", cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>
+                        <span style={{ fontSize: 10, background: sla.bg, color: sla.color, padding: "2px 8px", borderRadius: 8, fontWeight: 600 }}>{sla.label}</span>
+                      </td>
+                      <td style={{ padding: "10px 12px", textAlign: "center", cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>
+                        <span style={{ background: dark ? "#1e2a4a" : "#F1F5F9", borderRadius: 10, padding: "2px 10px", fontSize: 12, fontWeight: 600, color: sub }}>{v.items_count}</span>
+                      </td>
+                      <td style={{ padding: "10px 12px" }}>
+                        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <button onClick={() => toggleExpand(v.id)}
+                            style={{ background: isExpanded ? "var(--monza-accent)" : "transparent", border: "1px solid var(--monza-accent)", borderRadius: 6, cursor: "pointer", color: isExpanded ? "white" : "var(--monza-accent)", padding: "4px 12px", fontSize: 12, fontWeight: 600 }}>
+                            {loadingDetail === v.id ? "..." : isExpanded ? "Cerrar" : "Ver"}
+                          </button>
+                          {v.estado !== "despachado" && (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); setDespachando(v); }}
+                              title="Marcar como despachado"
+                              style={{ background: "transparent", border: "1px solid #10B981", borderRadius: 6, cursor: "pointer", color: "#10B981", padding: "4px 8px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}
+                            >
+                              <Truck size={12} /> Despachar
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>,
+
+                    /* Fila expandida */
+                    ...(isExpanded ? [
+                      <tr key={`detail-${v.id}`} style={{ borderBottom: `1px solid ${bd}` }}>
+                        <td colSpan={11} style={{ padding: "0 16px 16px 48px", background: dark ? "#0a0e1f" : "#F8FAFF" }}>
+                          {loadingDetail === v.id ? (
+                            <div style={{ padding: "16px 0", color: "#94A3B8", fontSize: 12 }}>Cargando detalle...</div>
+                          ) : details[v.id] ? (
+                            <div>
+                              {(details[v.id].vehiculo || details[v.id].forma_pago) && (
+                                <div style={{ display: "flex", gap: 16, padding: "10px 0 8px", fontSize: 12, color: sub }}>
+                                  {details[v.id].vehiculo && <span>🚗 <strong style={{ color: txt }}>{details[v.id].vehiculo}</strong></span>}
+                                  {details[v.id].forma_pago && <span>💳 {details[v.id].forma_pago}</span>}
+                                </div>
+                              )}
+                              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                                <thead>
+                                  <tr style={{ background: dark ? "#131b3e" : "#F1F5F9" }}>
+                                    {["Repuesto", "N° parte", "Marca", "Qty", "Precio Unit.", "Total", "Plazo entrega"].map((h, i) => (
+                                      <th key={i} style={{ padding: "6px 10px", textAlign: i >= 3 && i <= 5 ? "right" : "left", fontWeight: 600, fontSize: 10, color: sub, textTransform: "uppercase" as const, letterSpacing: 0.4 }}>{h}</th>
+                                    ))}
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {details[v.id].items.map((it) => (
+                                    <tr key={it.id} style={{ borderBottom: `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}` }}>
+                                      <td style={{ padding: "6px 10px", color: txt, fontWeight: 500 }}>{it.descripcion}</td>
+                                      <td style={{ padding: "6px 10px", color: sub }}>{it.numero_parte || "—"}</td>
+                                      <td style={{ padding: "6px 10px", color: sub }}>{it.marca || "—"}</td>
+                                      <td style={{ padding: "6px 10px", textAlign: "right", color: txt }}>{it.cantidad}</td>
+                                      <td style={{ padding: "6px 10px", textAlign: "right", color: sub }}>{it.precio_unitario_clp ? fmt(it.precio_unitario_clp) : "—"}</td>
+                                      <td style={{ padding: "6px 10px", textAlign: "right", fontWeight: 600, color: txt }}>{it.subtotal_clp ? fmt(it.subtotal_clp) : "—"}</td>
+                                      <td style={{ padding: "6px 10px", color: sub }}>{it.plazo_entrega || "—"}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                              {details[v.id].condiciones_servicio && (
+                                <div style={{ marginTop: 8, padding: "8px 12px", background: dark ? "#131b3e" : "#FFFBEB", border: `1px solid ${dark ? "#2a3a5e" : "#FDE68A"}`, borderRadius: 6, fontSize: 11, color: dark ? "#d4b896" : "#78350F" }}>
+                                  <strong>Nota:</strong> {details[v.id].condiciones_servicio}
+                                </div>
+                              )}
+                            </div>
+                          ) : null}
+                        </td>
+                      </tr>
+                    ] : []),
+                  ];
+                })
+            }
+          </tbody>
+        </table>
+        {total > 0 && (
+          <div style={{ padding: "10px 16px", borderTop: `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}`, fontSize: 12, color: "#94A3B8" }}>
+            Mostrando {items.length} de {total}
+          </div>
+        )}
+      </div>
+
+      {despachando && (
+        <DespacharModal
+          venta={despachando}
+          onClose={() => setDespachando(null)}
+          onDone={() => { setDespachando(null); fetchAll(); }}
+        />
+      )}
+    </div>
+  );
+}
