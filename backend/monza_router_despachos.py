@@ -6,7 +6,10 @@ from datetime import datetime
 
 from database import get_db
 from auth import get_current_user
-from monza_models import MonzaCotizacion, MonzaCliente
+from monza_models import MonzaCotizacion, MonzaCliente, MonzaCotizacionItem, MonzaDespacho, MonzaDespachoItem
+from pydantic import BaseModel
+from typing import List
+from monza_notif import crear_notif
 
 router = APIRouter(prefix="/api/monza/despachos", tags=["monza-despachos"])
 
@@ -131,3 +134,94 @@ def despachos_kpis(db: Session = Depends(get_db), _=Depends(get_current_user)):
         "monto_mes": float(total_monto),
         "sin_documento": sin_doc,
     }
+
+
+# ── Despacho como entidad (alineacion MachParts) ──────────────────────────────
+
+def _gen_num_desp(db):
+    anio = datetime.utcnow().year
+    last = db.query(MonzaDespacho).filter(MonzaDespacho.numero.like(f"DSP-{anio}-%")).order_by(MonzaDespacho.id.desc()).first()
+    n = int(last.numero.split("-")[-1]) + 1 if last and last.numero else 1
+    return f"DSP-{anio}-{n:04d}"
+
+
+@router.get("/listos")
+def listos_despacho(db: Session = Depends(get_db), _=Depends(get_current_user)):
+    """Cotizaciones con >=1 item en_bodega (listas para despachar)."""
+    cots = (
+        db.query(MonzaCotizacion)
+        .options(joinedload(MonzaCotizacion.cliente), joinedload(MonzaCotizacion.items))
+        .filter(MonzaCotizacion.estado == "vendida")
+        .all()
+    )
+    out = []
+    for c in cots:
+        en_bod = [i for i in c.items if i.estado_linea == "en_bodega"]
+        if not en_bod:
+            continue
+        total = len(c.items)
+        out.append({
+            "id": c.id, "numero": c.numero,
+            "cliente": c.cliente.nombre if c.cliente else None,
+            "vehiculo": c.vehiculo, "total_items": total, "en_bodega": len(en_bod),
+            "listo_completo": len(en_bod) == total, "total_bruto": c.total_bruto,
+            "items": [{"id": i.id, "descripcion": i.descripcion, "numero_parte": i.numero_parte, "cantidad": i.cantidad} for i in en_bod],
+        })
+    return out
+
+
+class CrearDespachoBody(BaseModel):
+    cotizacion_id: int
+    item_ids: List[int]
+    numero_guia: str = ""
+    transportista: str = ""
+    destinatario: str = ""
+    direccion_entrega: str = ""
+    observaciones: str = ""
+
+
+@router.post("/crear")
+def crear_despacho(body: CrearDespachoBody, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    cot = db.query(MonzaCotizacion).options(joinedload(MonzaCotizacion.cliente), joinedload(MonzaCotizacion.items)).filter(MonzaCotizacion.id == body.cotizacion_id).first()
+    if not cot:
+        raise HTTPException(404, "Cotización no encontrada")
+    items = [i for i in cot.items if i.id in body.item_ids and i.estado_linea == "en_bodega"]
+    if not items:
+        raise HTTPException(400, "Sin ítems en bodega para despachar")
+    dsp = MonzaDespacho(
+        numero=_gen_num_desp(db), cotizacion_id=cot.id,
+        cliente_nombre=cot.cliente.nombre if cot.cliente else None,
+        numero_guia=body.numero_guia or None, transportista=body.transportista or None,
+        destinatario=body.destinatario or None, direccion_entrega=body.direccion_entrega or None,
+        observaciones=body.observaciones or None, estado="despachado", asesor_email=current_user.email,
+    )
+    db.add(dsp); db.flush()
+    for it in items:
+        it.estado_linea = "despachado"
+        db.add(MonzaDespachoItem(despacho_id=dsp.id, item_id=it.id, qty_despachada=it.cantidad or 1))
+    # Si todos los items quedaron despachados, marcar cotizacion despachada
+    db.flush()
+    if all((i.estado_linea == "despachado") for i in cot.items):
+        cot.estado = "despachado"
+        if not cot.fecha_despacho:
+            cot.fecha_despacho = datetime.utcnow().date()
+    db.commit(); db.refresh(dsp)
+    from monza_models import MonzaLog
+    db.add(MonzaLog(user_email=current_user.email, accion="DESPACHADO", entidad="despacho", entidad_id=dsp.id, entidad_ref=dsp.numero, detalle=f"Despacho {dsp.numero} · {len(items)} ítem(s) · {cot.numero}"))
+    db.commit()
+    crear_notif(db, f"Despacho realizado · {dsp.numero}", f"{cot.numero} — {len(items)} ítem(s) despachado(s)", "success", "/monzaparts/despachos", "despacho", dsp.id)
+    return {"ok": True, "id": dsp.id, "numero": dsp.numero, "items": len(items)}
+
+
+@router.get("/entidades")
+def list_despachos(db: Session = Depends(get_db), _=Depends(get_current_user)):
+    out = []
+    for d in db.query(MonzaDespacho).order_by(MonzaDespacho.id.desc()).limit(100).all():
+        n = db.query(func.count(MonzaDespachoItem.id)).filter(MonzaDespachoItem.despacho_id == d.id).scalar() or 0
+        out.append({
+            "id": d.id, "numero": d.numero, "cotizacion_id": d.cotizacion_id,
+            "cliente_nombre": d.cliente_nombre, "numero_guia": d.numero_guia,
+            "transportista": d.transportista, "destinatario": d.destinatario,
+            "items_count": n, "fecha": d.fecha.isoformat() if d.fecha else None,
+        })
+    return out

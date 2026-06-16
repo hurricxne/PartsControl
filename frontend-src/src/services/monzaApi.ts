@@ -86,6 +86,10 @@ export const monzaDespachosAPI = {
   },
   downloadDocumento: (cotId: number) =>
     api.get(`/cotizaciones/${cotId}/documento`, { responseType: "arraybuffer" }),
+  // Despacho como entidad (alineación MachParts)
+  listos: () => api.get("/despachos/listos"),
+  crear: (data: Record<string, unknown>) => api.post("/despachos/crear", data),
+  entidades: () => api.get("/despachos/entidades"),
 };
 
 // ── Clientes ──────────────────────────────────────────────────────────────────
@@ -96,6 +100,22 @@ export const monzaClientesAPI = {
   create: (data: Record<string, unknown>) => api.post("/clientes", data),
   update: (id: number, data: Record<string, unknown>) => api.patch(`/clientes/${id}`, data),
   remove: (id: number) => api.delete(`/clientes/${id}`),
+};
+
+// ── Documentos adjuntos (genérico) ────────────────────────────────────────────
+export const monzaDocumentosAPI = {
+  list: (entidad: string, entidad_id: number) =>
+    api.get("/documentos", { params: { entidad, entidad_id } }),
+  upload: (entidad: string, entidad_id: number, file: File, categoria = "otro") => {
+    const form = new FormData();
+    form.append("entidad", entidad);
+    form.append("entidad_id", String(entidad_id));
+    form.append("categoria", categoria);
+    form.append("file", file);
+    return api.post("/documentos/upload", form, { headers: { "Content-Type": "multipart/form-data" } });
+  },
+  download: (id: number) => api.get(`/documentos/${id}/download`, { responseType: "arraybuffer" }),
+  remove: (id: number) => api.delete(`/documentos/${id}`),
 };
 
 // ── Notificaciones in-app ─────────────────────────────────────────────────────
@@ -119,22 +139,38 @@ export const monzaAbastecimientoAPI = {
   seguimiento: (params?: Record<string, unknown>) => api.get("/abastecimiento/seguimiento", { params }),
   comprar: (data: Record<string, unknown>) => api.post("/abastecimiento/comprar", data),
   listOcs: (params?: Record<string, unknown>) => api.get("/abastecimiento/ocs", { params }),
+  ocItems: (id: number) => api.get(`/abastecimiento/ocs/${id}/items`),
   updateOc: (id: number, data: Record<string, unknown>) => api.patch(`/abastecimiento/ocs/${id}`, data),
   listProveedores: () => api.get("/abastecimiento/proveedores"),
   createProveedor: (data: Record<string, unknown>) => api.post("/abastecimiento/proveedores", data),
   updateProveedor: (id: number, data: Record<string, unknown>) => api.patch(`/abastecimiento/proveedores/${id}`, data),
   deleteProveedor: (id: number) => api.delete(`/abastecimiento/proveedores/${id}`),
+  comprados: (params?: Record<string, unknown>) => api.get("/abastecimiento/comprados", { params }),
+  preparar: (item_ids: number[]) => api.post("/abastecimiento/preparar", { item_ids }),
 };
 
-// ── Bodega (recepción física + reclamos) ──────────────────────────────────────
+// ── Logística (Embarques, alineación MachParts) ───────────────────────────────
+export const monzaLogisticaAPI = {
+  kpis: () => api.get("/logistica/kpis"),
+  preparados: (params?: Record<string, unknown>) => api.get("/logistica/preparados", { params }),
+  crearEmbarque: (data: Record<string, unknown>) => api.post("/logistica/embarques", data),
+  listEmbarques: (params?: Record<string, unknown>) => api.get("/logistica/embarques", { params }),
+  getEmbarque: (id: number) => api.get(`/logistica/embarques/${id}`),
+  updateEmbarque: (id: number, data: Record<string, unknown>) => api.patch(`/logistica/embarques/${id}`, data),
+  quitarItem: (embId: number, itemId: number) => api.delete(`/logistica/embarques/${embId}/items/${itemId}`),
+};
+
+// ── Bodega (recepción física por embarque, alineación MachParts) ──────────────
 export const monzaBodegaAPI = {
   kpis: () => api.get("/bodega/kpis"),
-  porRecibir: (params?: Record<string, unknown>) => api.get("/bodega/por-recibir", { params }),
+  embarques: () => api.get("/bodega/embarques"),
+  recibir: (embId: number) => api.post(`/bodega/embarques/${embId}/recibir`),
+  getRecepcion: (id: number) => api.get(`/bodega/recepciones/${id}`),
+  marcarItem: (recId: number, itemId: number, data: Record<string, unknown>) => api.patch(`/bodega/recepciones/${recId}/items/${itemId}`, data),
+  cerrarRecepcion: (recId: number) => api.post(`/bodega/recepciones/${recId}/cerrar`),
   enBodega: (params?: Record<string, unknown>) => api.get("/bodega/en-bodega", { params }),
-  confirmar: (data: Record<string, unknown>) => api.post("/bodega/confirmar", data),
   listReclamos: (params?: Record<string, unknown>) => api.get("/bodega/reclamos", { params }),
   updateReclamo: (id: number, data: Record<string, unknown>) => api.patch(`/bodega/reclamos/${id}`, data),
-  listoDespacho: () => api.get("/bodega/listo-despacho"),
 };
 
 // ── Catálogo de partes ────────────────────────────────────────────────────────

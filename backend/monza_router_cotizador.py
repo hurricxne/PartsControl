@@ -41,6 +41,7 @@ class CalcularBody(BaseModel):
 class AplicarPrecioItem(BaseModel):
     item_id: int
     calidad: str
+    numero_parte: Optional[str] = None
     marca: Optional[str] = None
     procedencia: Optional[str] = None
     precio_clp: float  # precio neto por unidad (sin IVA)
@@ -195,6 +196,8 @@ def aplicar_precios(body: AplicarBody, db: Session = Depends(get_db), current_us
                 item.procedencia = ap.procedencia
             if ap.plazo_entrega:
                 item.plazo_entrega = ap.plazo_entrega
+            if ap.numero_parte:
+                item.numero_parte = ap.numero_parte
 
     asesor_nombre = current_user.email.split("@")[0].title()
     db.add(MonzaLeadActividad(

@@ -16,7 +16,9 @@ from monza_router_despachos import router as monza_despachos_router
 from monza_router_logs import router as monza_logs_router
 from monza_router_abastecimiento import router as monza_abastecimiento_router
 from monza_router_bodega import router as monza_bodega_router
+from monza_router_logistica import router as monza_logistica_router
 from monza_router_notificaciones import router as monza_notif_router
+from monza_router_documentos import router as monza_docs_router
 from monza_router_catalog import router as monza_catalog_router
 from monza_router_clientes import router as monza_clientes_router
 from routers.worker import worker_router, scraping_router
@@ -65,7 +67,9 @@ app.include_router(monza_despachos_router)
 app.include_router(monza_logs_router)
 app.include_router(monza_abastecimiento_router)
 app.include_router(monza_bodega_router)
+app.include_router(monza_logistica_router)
 app.include_router(monza_notif_router)
+app.include_router(monza_docs_router)
 app.include_router(monza_catalog_router)
 app.include_router(monza_clientes_router)
 

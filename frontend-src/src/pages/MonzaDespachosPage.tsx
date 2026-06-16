@@ -1,8 +1,84 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Search, Truck, RefreshCw, ChevronDown, ChevronRight, Upload, Download, FileText, CheckCircle } from "lucide-react";
+import { Search, Truck, RefreshCw, ChevronDown, ChevronRight, Upload, Download, FileText, CheckCircle, X, Package } from "lucide-react";
 import { monzaDespachosAPI, monzaCotizacionesAPI } from "../services/monzaApi";
 import { useMonzaTheme } from "./MonzaLayout";
 import toast from "react-hot-toast";
+
+// ── Panel "Listos para despachar" (ítems en bodega) ───────────────────────────
+interface ListoItem { id: number; descripcion: string; numero_parte?: string; cantidad: number; }
+interface ListoCot { id: number; numero: string; cliente?: string; vehiculo?: string; total_items: number; en_bodega: number; listo_completo: boolean; total_bruto: number; items: ListoItem[]; }
+
+function DespacharModal({ cot, onClose, onDone }: { cot: ListoCot; onClose: () => void; onDone: () => void }) {
+  const { dark } = useMonzaTheme();
+  const [guia, setGuia] = useState(""); const [transp, setTransp] = useState(""); const [dest, setDest] = useState(""); const [dir, setDir] = useState(""); const [obs, setObs] = useState(""); const [saving, setSaving] = useState(false);
+  const bg = dark ? "#131b3e" : "white"; const bd = dark ? "#1e2a4a" : "#E2E8F0"; const txt = dark ? "white" : "#1E293B"; const sub = dark ? "#8899cc" : "#64748B";
+  const IS = { width: "100%", padding: "8px 10px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: dark ? "#0d1321" : "#F8FAFC", color: txt };
+  const submit = async () => {
+    setSaving(true);
+    try {
+      await monzaDespachosAPI.crear({ cotizacion_id: cot.id, item_ids: cot.items.map((i) => i.id), numero_guia: guia, transportista: transp, destinatario: dest, direccion_entrega: dir, observaciones: obs });
+      toast.success(`Despacho creado · ${cot.numero}`); onDone();
+    } catch { toast.error("Error al crear despacho"); } finally { setSaving(false); }
+  };
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div style={{ background: bg, border: `1px solid ${bd}`, borderRadius: 14, width: "100%", maxWidth: 500 }}>
+        <div style={{ background: dark ? "#0a0e1f" : "#F8FAFC", borderBottom: `1px solid ${bd}`, padding: "14px 20px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontWeight: 700, fontSize: 15, color: txt, display: "flex", alignItems: "center", gap: 8 }}><Truck size={18} color="#10B981" /> Despachar {cot.numero}</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: sub }}><X size={18} /></button>
+        </div>
+        <div style={{ padding: "16px 20px" }}>
+          <div style={{ background: dark ? "#0d1321" : "#F0FDF4", border: `1px solid ${dark ? "#1e2a4a" : "#BBF7D0"}`, borderRadius: 8, padding: "10px 14px", marginBottom: 14, fontSize: 12 }}>
+            <div style={{ fontWeight: 700, color: txt }}>{cot.cliente} · {cot.vehiculo || "—"}</div>
+            <div style={{ color: sub }}>{cot.en_bodega} ítem(s) en bodega a despachar</div>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div><label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>N° Guía despacho</label><input value={guia} onChange={(e) => setGuia(e.target.value)} style={IS} /></div>
+            <div><label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Transportista</label><input value={transp} onChange={(e) => setTransp(e.target.value)} style={IS} /></div>
+            <div><label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Destinatario</label><input value={dest} onChange={(e) => setDest(e.target.value)} style={IS} /></div>
+            <div><label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Dirección</label><input value={dir} onChange={(e) => setDir(e.target.value)} style={IS} /></div>
+            <div style={{ gridColumn: "1 / -1" }}><label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Observaciones</label><textarea value={obs} onChange={(e) => setObs(e.target.value)} rows={2} style={{ ...IS, resize: "vertical" as const }} /></div>
+          </div>
+        </div>
+        <div style={{ padding: "12px 20px", borderTop: `1px solid ${bd}`, display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          <button onClick={onClose} style={{ padding: "8px 18px", border: `1px solid ${bd}`, borderRadius: 8, background: "transparent", color: sub, cursor: "pointer", fontSize: 13 }}>Cancelar</button>
+          <button onClick={submit} disabled={saving} style={{ padding: "8px 20px", background: "#10B981", border: "none", borderRadius: 8, color: "white", cursor: "pointer", fontWeight: 700, fontSize: 13 }}>{saving ? "Despachando..." : "Confirmar despacho"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ListosPanel() {
+  const { dark } = useMonzaTheme();
+  const [listos, setListos] = useState<ListoCot[]>([]);
+  const [desp, setDesp] = useState<ListoCot | null>(null);
+  const bd = dark ? "#1e2a4a" : "#E2E8F0"; const txt = dark ? "white" : "#1E293B"; const sub = dark ? "#8899cc" : "#64748B"; const bg = dark ? "#131b3e" : "white";
+  const load = useCallback(async () => { try { const r = await monzaDespachosAPI.listos(); setListos(r.data); } catch {} }, []);
+  useEffect(() => { load(); }, [load]);
+  if (listos.length === 0) return null;
+  return (
+    <div style={{ background: dark ? "#0f1f17" : "#F0FDF4", border: `1px solid ${dark ? "#1e3a2e" : "#BBF7D0"}`, borderRadius: 12, padding: "14px 18px", marginBottom: 20 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <Package size={16} color="#15803D" />
+        <span style={{ fontWeight: 700, fontSize: 14, color: dark ? "#86efac" : "#15803D" }}>Listos para despachar ({listos.length})</span>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 10 }}>
+        {listos.map((c) => (
+          <div key={c.id} style={{ background: bg, border: `1px solid ${bd}`, borderRadius: 10, padding: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+              <div><div style={{ fontWeight: 700, color: "var(--monza-accent)", fontSize: 13 }}>{c.numero}</div>
+                <div style={{ fontSize: 12, color: txt }}>{c.cliente}</div>
+                <div style={{ fontSize: 11, color: sub }}>{c.en_bodega}/{c.total_items} en bodega{!c.listo_completo ? " (parcial)" : ""}</div></div>
+              <button onClick={() => setDesp(c)} style={{ padding: "5px 12px", background: "#10B981", border: "none", borderRadius: 7, color: "white", cursor: "pointer", fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", gap: 4 }}><Truck size={12} /> Despachar</button>
+            </div>
+          </div>
+        ))}
+      </div>
+      {desp && <DespacharModal cot={desp} onClose={() => setDesp(null)} onDone={() => { setDesp(null); load(); window.location.reload(); }} />}
+    </div>
+  );
+}
 
 interface Despacho {
   id: number; numero: string; estado: string;
@@ -193,6 +269,9 @@ export default function MonzaDespachosPage() {
           Ventas finalizadas y despachadas al cliente. Aquí puedes cargar facturas, boletas y tickets de despacho.
         </p>
       </div>
+
+      {/* Listos para despachar (ítems en bodega) */}
+      <ListosPanel />
 
       {/* KPIs */}
       {kpis && (

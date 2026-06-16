@@ -116,7 +116,7 @@ def seguimiento(
     db: Session = Depends(get_db),
     _=Depends(get_current_user),
 ):
-    estados = [estado] if estado else ["comprado", "en_transito", "en_bodega"]
+    estados = [estado] if estado else ["comprado", "preparado", "embarcado", "en_bodega"]
     query = (
         db.query(MonzaCotizacionItem)
         .join(MonzaCotizacion, MonzaCotizacionItem.cotizacion_id == MonzaCotizacion.id)
@@ -145,6 +145,8 @@ def seguimiento(
                 d["ocp_proveedor"] = ocp.proveedor_nombre
                 d["ocp_estado"] = ocp.estado
                 d["ocp_awb"] = ocp.awb
+                d["ocp_tracking"] = ocp.tracking
+                d["ocp_numero_oc"] = ocp.numero_oc
                 d["ocp_plazo_dias"] = ocp.plazo_dias
         out.append(d)
     return out
@@ -158,7 +160,9 @@ class ComprarBody(BaseModel):
     pais: Optional[str] = None
     moneda: Optional[str] = "EUR"
     plazo_dias: Optional[int] = None
+    numero_oc: Optional[str] = None
     awb: Optional[str] = None
+    tracking: Optional[str] = None
     notas: Optional[str] = None
 
 
@@ -185,7 +189,9 @@ def comprar(body: ComprarBody, db: Session = Depends(get_db), current_user=Depen
         moneda=moneda,
         estado="emitida",
         plazo_dias=body.plazo_dias,
+        numero_oc=body.numero_oc,
         awb=body.awb,
+        tracking=body.tracking,
         notas=body.notas,
         asesor_email=current_user.email,
     )
@@ -202,6 +208,49 @@ def comprar(body: ComprarBody, db: Session = Depends(get_db), current_user=Depen
     _log(db, current_user.email, "CREATE", "oc_proveedor", ocp.id, ocp.numero,
          f"OC {ocp.numero} a {nombre or 'proveedor'} - {len(items)} item(s)")
     return {"ok": True, "ocp_id": ocp.id, "numero": ocp.numero, "items": len(items)}
+
+
+# Items comprados (OC emitida, esperando preparar)
+@router.get("/comprados")
+def comprados(q: Optional[str] = Query(None), db: Session = Depends(get_db), _=Depends(get_current_user)):
+    query = (
+        db.query(MonzaCotizacionItem)
+        .join(MonzaCotizacion, MonzaCotizacionItem.cotizacion_id == MonzaCotizacion.id)
+        .options(joinedload(MonzaCotizacionItem.cotizacion).joinedload(MonzaCotizacion.cliente))
+        .filter(MonzaCotizacionItem.estado_linea == "comprado")
+    )
+    if q:
+        query = query.filter((MonzaCotizacionItem.descripcion.ilike(f"%{q}%")) | (MonzaCotizacion.numero.ilike(f"%{q}%")))
+    items = query.order_by(MonzaCotizacionItem.id).all()
+    cache = {}
+    out = []
+    for it in items:
+        d = _item_dict(it, it.cotizacion)
+        if it.oc_proveedor_id:
+            if it.oc_proveedor_id not in cache:
+                cache[it.oc_proveedor_id] = db.query(MonzaOcProveedor).filter(MonzaOcProveedor.id == it.oc_proveedor_id).first()
+            ocp = cache[it.oc_proveedor_id]
+            if ocp:
+                d["ocp_numero"] = ocp.numero_oc or ocp.numero
+                d["ocp_proveedor"] = ocp.proveedor_nombre
+                d["ocp_plazo_dias"] = ocp.plazo_dias
+        out.append(d)
+    return out
+
+
+# Preparar items: comprado -> preparado (handoff a Logistica)
+class PrepararBody(BaseModel):
+    item_ids: List[int]
+
+
+@router.post("/preparar")
+def preparar(body: PrepararBody, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    items = db.query(MonzaCotizacionItem).filter(MonzaCotizacionItem.id.in_(body.item_ids), MonzaCotizacionItem.estado_linea == "comprado").all()
+    for it in items:
+        it.estado_linea = "preparado"
+    db.commit()
+    _log(db, current_user.email, "UPDATE", "item", None, None, f"{len(items)} ítem(s) preparado(s) para Logística")
+    return {"ok": True, "preparados": len(items)}
 
 
 # Listar OCs de proveedor
@@ -228,7 +277,9 @@ def list_ocs(
             "moneda": ocp.moneda,
             "estado": ocp.estado,
             "plazo_dias": ocp.plazo_dias,
+            "numero_oc": ocp.numero_oc,
             "awb": ocp.awb,
+            "tracking": ocp.tracking,
             "notas": ocp.notas,
             "asesor_email": ocp.asesor_email,
             "items_count": n_items,
@@ -239,7 +290,9 @@ def list_ocs(
 
 class OcUpdateBody(BaseModel):
     estado: Optional[str] = None
+    numero_oc: Optional[str] = None
     awb: Optional[str] = None
+    tracking: Optional[str] = None
     plazo_dias: Optional[int] = None
     notas: Optional[str] = None
 
@@ -253,20 +306,8 @@ def update_oc(ocp_id: int, body: OcUpdateBody, db: Session = Depends(get_db), cu
         setattr(ocp, field, value)
     ocp.updated_at = datetime.utcnow()
 
-    # Cambiar estado de las lineas segun estado de la OC
-    if body.estado:
-        items = db.query(MonzaCotizacionItem).filter(MonzaCotizacionItem.oc_proveedor_id == ocp_id).all()
-        nuevo = None
-        if body.estado == "en_transito":
-            nuevo = "en_transito"
-        elif body.estado == "llegada":
-            nuevo = "por_recibir"   # llego a Chile; Bodega debe confirmar
-        elif body.estado == "recibida":
-            nuevo = "en_bodega"     # confirmacion directa (sin paso por bodega)
-        if nuevo:
-            for it in items:
-                if it.estado_linea in ("comprado", "en_transito", "por_recibir"):
-                    it.estado_linea = nuevo
+    # El estado de la OC es informativo; el pipeline de items lo manejan
+    # Abastecimiento (preparar), Logistica (embarque) y Bodega (recepcion).
     db.commit()
     db.refresh(ocp)
     _log(db, current_user.email, "UPDATE", "oc_proveedor", ocp.id, ocp.numero,
@@ -274,6 +315,19 @@ def update_oc(ocp_id: int, body: OcUpdateBody, db: Session = Depends(get_db), cu
     if body.estado == "llegada":
         crear_notif(db, f"Mercadería en recepción · {ocp.numero}", f"{ocp.proveedor_nombre or 'Proveedor'} — lista para recibir en bodega", "info", "/monzaparts/bodega", "oc_proveedor", ocp.id)
     return {"ok": True}
+
+
+# Items de una OC (detalle completo para Logistica)
+@router.get("/ocs/{ocp_id}/items")
+def oc_items(ocp_id: int, db: Session = Depends(get_db), _=Depends(get_current_user)):
+    items = (
+        db.query(MonzaCotizacionItem)
+        .join(MonzaCotizacion, MonzaCotizacionItem.cotizacion_id == MonzaCotizacion.id)
+        .options(joinedload(MonzaCotizacionItem.cotizacion).joinedload(MonzaCotizacion.cliente))
+        .filter(MonzaCotizacionItem.oc_proveedor_id == ocp_id)
+        .all()
+    )
+    return [_item_dict(it, it.cotizacion) for it in items]
 
 
 # Proveedores de abastecimiento CRUD

@@ -47,6 +47,9 @@ class LeadCreate(BaseModel):
     cliente_id: Optional[int] = None
     cliente: Optional[ClienteQuick] = None  # crear cliente al vuelo
     vehiculo: Optional[str] = None
+    marca: Optional[str] = None
+    modelo: Optional[str] = None
+    anio: Optional[str] = None
     vin: Optional[str] = None
     linea: Optional[str] = None
     comentario: Optional[str] = None
@@ -148,6 +151,9 @@ def _lead_dict(lead: MonzaLead) -> dict:
         "estado": lead.estado,
         "canal_origen": lead.canal_origen,
         "vehiculo": lead.vehiculo,
+        "marca": lead.marca,
+        "modelo": lead.modelo,
+        "anio": lead.anio,
         "vin": lead.vin,
         "linea": lead.linea,
         "comentario": lead.comentario,
@@ -222,9 +228,9 @@ def get_kpis(db: Session = Depends(get_db), _=Depends(get_current_user)):
         MonzaLead.estado.in_(["pendiente", "en_proceso"])
     ).scalar() or 0
 
-    vendidos_mes = db.query(func.count(MonzaLead.id)).filter(
-        MonzaLead.estado == "vendido",
-        MonzaLead.fecha_actualizacion >= inicio_mes,
+    vendidos_mes = db.query(func.count(MonzaCotizacion.id)).filter(
+        MonzaCotizacion.estado == "vendida",
+        MonzaCotizacion.fecha_venta >= inicio_mes,
     ).scalar() or 0
 
     total_mes = nuevos_mes if nuevos_mes else 1
@@ -361,7 +367,10 @@ def create_lead(body: LeadCreate, db: Session = Depends(get_db), current_user=De
     lead = MonzaLead(
         numero=_gen_numero_lead(db),
         cliente_id=cliente_id,
-        vehiculo=body.vehiculo,
+        vehiculo=(f"{body.marca} {body.modelo}".strip() if (body.marca or body.modelo) else body.vehiculo),
+        marca=body.marca,
+        modelo=body.modelo,
+        anio=body.anio,
         vin=body.vin,
         canal_origen=body.canal_origen,
         asesor_id=_get_asesor_id(db, current_user.id),

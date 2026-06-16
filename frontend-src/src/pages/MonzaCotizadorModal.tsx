@@ -31,6 +31,7 @@ interface CalidadRow {
 
 interface ItemCalculo {
   item: LeadItem;
+  numero_parte: string;
   peso_kg: string;
   calidades: CalidadRow[];
   selected: boolean;
@@ -44,13 +45,15 @@ interface Config {
   iva_pct: number;
 }
 
-const CALIDAD_OPTS = ["sin_calificar", "Genuine", "OEM", "Aftermarket"];
+const CALIDAD_OPTS = ["sin_calificar", "Genuine", "OEM", "Aftermarket", "Remanufacturado", "Usado"];
 
 const CALIDAD_STYLE: Record<string, { bg: string; color: string; dot: string }> = {
-  Genuine:       { bg: "#EFF6FF", color: "#1D4ED8", dot: "#3B82F6" },
-  OEM:           { bg: "#FFFBEB", color: "#B45309", dot: "#F59E0B" },
-  Aftermarket:   { bg: "#F0FDF4", color: "#15803D", dot: "#22C55E" },
-  sin_calificar: { bg: "#F8FAFC", color: "#64748B", dot: "#94A3B8" },
+  Genuine:        { bg: "#EFF6FF", color: "#1D4ED8", dot: "#3B82F6" },
+  OEM:            { bg: "#FFFBEB", color: "#B45309", dot: "#F59E0B" },
+  Aftermarket:    { bg: "#F0FDF4", color: "#15803D", dot: "#22C55E" },
+  Remanufacturado:{ bg: "#F5F3FF", color: "#6D28D9", dot: "#8B5CF6" },
+  Usado:          { bg: "#FEF2F2", color: "#B91C1C", dot: "#EF4444" },
+  sin_calificar:  { bg: "#F8FAFC", color: "#64748B", dot: "#94A3B8" },
 };
 
 function getCalStyle(calidad: string) {
@@ -110,6 +113,7 @@ export default function MonzaCotizadorModal({ leadId, leadNumero, clienteNombre,
           // Item ya tiene precio → pre-cargarlo directamente en CLP
           return {
             item: it,
+            numero_parte: it.numero_parte || "",
             peso_kg: "0",
             selected: true,
             calidades: [{
@@ -130,6 +134,7 @@ export default function MonzaCotizadorModal({ leadId, leadNumero, clienteNombre,
         // Sin precio previo → defaults
         return {
           item: it,
+          numero_parte: it.numero_parte || "",
           peso_kg: "0",
           selected: true,
           calidades: [{
@@ -161,6 +166,14 @@ export default function MonzaCotizadorModal({ leadId, leadNumero, clienteNombre,
         next[itemIdx].calidades[calIdx].precio_neto  = precio_neto;
         next[itemIdx].calidades[calIdx].precio_bruto = precio_bruto;
       }
+      return next;
+    });
+  };
+
+  const updateNumeroParte = (itemIdx: number, val: string) => {
+    setItemsCalculo((prev) => {
+      const next = [...prev];
+      next[itemIdx] = { ...next[itemIdx], numero_parte: val };
       return next;
     });
   };
@@ -231,6 +244,7 @@ export default function MonzaCotizadorModal({ leadId, leadNumero, clienteNombre,
         procedencia: primera.procedencia,
         precio_clp: primera.precio_neto || 0,
         plazo_entrega: primera.plazo_entrega || undefined,
+        numero_parte: ic.numero_parte || undefined,
       };
     });
 
@@ -250,7 +264,7 @@ export default function MonzaCotizadorModal({ leadId, leadNumero, clienteNombre,
       for (const { ic, cal } of extras) {
         await monzaLeadsAPI.addItem(leadId, {
           descripcion: ic.item.descripcion,
-          numero_parte: ic.item.numero_parte || undefined,
+          numero_parte: ic.numero_parte || ic.item.numero_parte || undefined,
           marca: cal.marca || ic.item.marca || undefined,
           procedencia: cal.procedencia || ic.item.procedencia || undefined,
           calidad: cal.calidad.toLowerCase(),
@@ -323,9 +337,12 @@ export default function MonzaCotizadorModal({ leadId, leadNumero, clienteNombre,
 
                   <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                     <span style={{ fontWeight: 700, fontSize: 13, color: "#1E293B" }}>{ic.item.descripcion.toUpperCase()}</span>
-                    {ic.item.numero_parte && (
-                      <span style={{ fontSize: 11, color: "#94A3B8", background: "#F1F5F9", padding: "1px 7px", borderRadius: 5 }}>{ic.item.numero_parte}</span>
-                    )}
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                      <label style={{ fontSize: 10, color: "#94A3B8", fontWeight: 600 }}>N° parte</label>
+                      <input value={ic.numero_parte} onChange={(e) => updateNumeroParte(itemIdx, e.target.value)}
+                        placeholder="—"
+                        style={{ width: 130, padding: "3px 7px", border: "1px solid #E2E8F0", borderRadius: 5, fontSize: 11, fontFamily: "monospace", background: "white", color: "#1E293B" }} />
+                    </span>
                     <span style={{ fontSize: 11, color: "#94A3B8" }}>× {ic.item.cantidad}</span>
 
                     {hasExisting ? (
@@ -344,10 +361,24 @@ export default function MonzaCotizadorModal({ leadId, leadNumero, clienteNombre,
                     <input
                       type="number" value={ic.peso_kg}
                       onChange={(e) => updatePeso(itemIdx, e.target.value)}
-                      style={{ width: 60, padding: "4px 6px", border: "1px solid #E2E8F0", borderRadius: 5, fontSize: 12, textAlign: "right", background: "white" }}
+                      style={{ width: 60, padding: "4px 6px", border: "1px solid #E2E8F0", borderRadius: 5, fontSize: 12, textAlign: "right", background: "white", color: "#1E293B" }}
                     />
                   </div>
                 </div>
+
+                {/* Detalle flete aéreo Europa */}
+                {ic.selected && Number(ic.peso_kg) > 0 && (() => {
+                  const tcTarifa = cfg.moneda_tarifa === "EUR" ? cfg.tc_eur_clp : cfg.tc_usd_clp;
+                  const fleteMon = Number(ic.peso_kg) * cfg.tarifa_aerea_por_kg;
+                  const fleteClp = Math.round(fleteMon * tcTarifa);
+                  return (
+                    <div style={{ padding: "6px 16px", background: "#EFF6FF", borderBottom: "1px solid #DBEAFE", fontSize: 11, color: "#1D4ED8", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                      <span style={{ fontWeight: 700 }}>✈ Flete aéreo:</span>
+                      <span>{ic.peso_kg} kg vol × {cfg.tarifa_aerea_por_kg} {cfg.moneda_tarifa}/kg = <strong>{fleteMon.toLocaleString("es-CL")} {cfg.moneda_tarifa}</strong></span>
+                      <span style={{ color: "#64748B" }}>→ ${fleteClp.toLocaleString("es-CL")} CLP (incluido en cada precio)</span>
+                    </div>
+                  );
+                })()}
 
                 {/* Calidad rows */}
                 {ic.selected && (

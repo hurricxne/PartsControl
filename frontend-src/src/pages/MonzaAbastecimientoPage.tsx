@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
-import { ShoppingCart, Search, RefreshCw, Package, X, Truck, FileText } from "lucide-react";
+import { ShoppingCart, Search, RefreshCw, Package, X, Truck, FileText, ChevronDown, ChevronRight, Plus } from "lucide-react";
 import { monzaAbastecimientoAPI } from "../services/monzaApi";
 import { useMonzaTheme } from "./MonzaLayout";
+import MonzaDocs from "./MonzaDocs";
 import toast from "react-hot-toast";
 
 interface ItemCompra {
@@ -28,12 +29,14 @@ interface ItemCompra {
 interface OcCompra {
   id: number;
   numero: string;
+  numero_oc?: string;
   proveedor_nombre?: string;
   pais?: string;
   moneda?: string;
   estado: string;
   plazo_dias?: number;
   awb?: string;
+  tracking?: string;
   notas?: string;
   asesor_email?: string;
   items_count: number;
@@ -70,47 +73,95 @@ function KpiCard({ label, value, accent }: { label: string; value: number; accen
   );
 }
 
+// Países base (se combinan con los de proveedores existentes + agregados localmente)
+const PAISES_BASE = ["Alemania", "USA", "Japón", "China", "España", "Italia", "Francia", "Reino Unido", "Corea del Sur", "Brasil", "México", "Chile"];
+function loadPaises(extra: string[]): string[] {
+  let custom: string[] = [];
+  try { custom = JSON.parse(localStorage.getItem("monza-paises") || "[]"); } catch { /* noop */ }
+  return Array.from(new Set([...PAISES_BASE, ...extra.filter(Boolean), ...custom])).sort();
+}
+
 // ── Modal Crear OC de compra ──────────────────────────────────────────────────
 function CrearOcModal({ items, proveedores, onClose, onDone }: {
   items: ItemCompra[]; proveedores: Proveedor[]; onClose: () => void; onDone: () => void;
 }) {
   const { dark } = useMonzaTheme();
+  const [provList, setProvList] = useState<Proveedor[]>(proveedores);
   const [provId, setProvId] = useState<string>("");
-  const [provNombre, setProvNombre] = useState("");
   const [pais, setPais] = useState("");
   const [moneda, setMoneda] = useState("EUR");
+  const [numeroOc, setNumeroOc] = useState("");
   const [plazo, setPlazo] = useState("");
-  const [awb, setAwb] = useState("");
   const [notas, setNotas] = useState("");
   const [saving, setSaving] = useState(false);
+
+  // Alta inline de proveedor
+  const [addProv, setAddProv] = useState(false);
+  const [npNombre, setNpNombre] = useState(""); const [npPais, setNpPais] = useState(""); const [npMoneda, setNpMoneda] = useState("EUR");
+  const [savingProv, setSavingProv] = useState(false);
+
+  // País como lista + alta
+  const [paises, setPaises] = useState<string[]>(() => loadPaises(proveedores.map((p) => p.pais || "")));
+  const [addPais, setAddPais] = useState(false); const [nuevoPais, setNuevoPais] = useState("");
+
+  // Paso 2: documentos (AWB, tracking) sobre la OC creada
+  const [ocpId, setOcpId] = useState<number | null>(null);
+  const [ocpNumero, setOcpNumero] = useState("");
 
   const bg = dark ? "#131b3e" : "white";
   const bd = dark ? "#1e2a4a" : "#E2E8F0";
   const txt = dark ? "white" : "#1E293B";
   const sub = dark ? "#8899cc" : "#64748B";
   const IS = { width: "100%", padding: "8px 10px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: dark ? "#0d1321" : "#F8FAFC", color: txt };
+  const lbl = { fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 } as const;
 
   const onProvChange = (v: string) => {
     setProvId(v);
-    const p = proveedores.find((x) => String(x.id) === v);
-    if (p) { setProvNombre(p.nombre); setPais(p.pais || ""); setMoneda(p.moneda || "EUR"); }
+    const p = provList.find((x) => String(x.id) === v);
+    if (p) { if (p.pais) setPais(p.pais); setMoneda(p.moneda || "EUR"); }
+  };
+
+  const guardarProveedor = async () => {
+    if (!npNombre.trim()) { toast.error("Nombre requerido"); return; }
+    setSavingProv(true);
+    try {
+      const r = await monzaAbastecimientoAPI.createProveedor({ nombre: npNombre, pais: npPais || undefined, moneda: npMoneda });
+      const nuevo: Proveedor = { id: r.data.id, nombre: npNombre, pais: npPais, moneda: npMoneda };
+      setProvList((l) => [...l, nuevo]);
+      setProvId(String(nuevo.id)); if (npPais) setPais(npPais); setMoneda(npMoneda);
+      setAddProv(false); setNpNombre(""); setNpPais("");
+      toast.success(`Proveedor "${nuevo.nombre}" creado`);
+    } catch { toast.error("Error al crear proveedor"); }
+    finally { setSavingProv(false); }
+  };
+
+  const guardarPais = () => {
+    const v = nuevoPais.trim();
+    if (!v) return;
+    try {
+      const cur = JSON.parse(localStorage.getItem("monza-paises") || "[]");
+      localStorage.setItem("monza-paises", JSON.stringify(Array.from(new Set([...cur, v]))));
+    } catch { /* noop */ }
+    setPaises((p) => Array.from(new Set([...p, v])).sort());
+    setPais(v); setNuevoPais(""); setAddPais(false);
   };
 
   const submit = async () => {
+    const prov = provList.find((x) => String(x.id) === provId);
     setSaving(true);
     try {
-      await monzaAbastecimientoAPI.comprar({
+      const r = await monzaAbastecimientoAPI.comprar({
         item_ids: items.map((i) => i.id),
         proveedor_id: provId ? Number(provId) : undefined,
-        proveedor_nombre: provNombre || undefined,
+        proveedor_nombre: prov?.nombre || undefined,
         pais: pais || undefined,
         moneda,
+        numero_oc: numeroOc || undefined,
         plazo_dias: plazo ? Number(plazo) : undefined,
-        awb: awb || undefined,
         notas: notas || undefined,
       });
-      toast.success(`OC de compra creada · ${items.length} ítem(s)`);
-      onDone();
+      toast.success(`OC creada · ${items.length} ítem(s)`);
+      setOcpId(r.data.ocp_id); setOcpNumero(r.data.numero);  // pasar a paso 2 (documentos)
     } catch { toast.error("Error al crear OC"); }
     finally { setSaving(false); }
   };
@@ -121,12 +172,20 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
         <div style={{ background: dark ? "#0a0e1f" : "#F8FAFC", borderBottom: `1px solid ${bd}`, padding: "14px 20px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <ShoppingCart size={18} className="monza-ic" />
-            <span style={{ fontWeight: 700, fontSize: 15, color: txt }}>Crear OC de compra</span>
+            <span style={{ fontWeight: 700, fontSize: 15, color: txt }}>{ocpId ? `OC ${ocpNumero} · Documentos` : "Crear OC de compra"}</span>
           </div>
           <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: sub, display: "flex" }}><X size={18} /></button>
         </div>
 
         <div style={{ padding: "16px 20px", overflowY: "auto" }}>
+          {ocpId ? (
+            /* ── Paso 2: documentos AWB / tracking ── */
+            <div>
+              <div style={{ fontSize: 12, color: sub, marginBottom: 12 }}>OC <strong style={{ color: txt }}>{ocpNumero}</strong> creada. Adjunta los documentos (AWB / guía aérea, tracking) cuando los tengas — también puedes hacerlo después desde la pestaña OCs.</div>
+              <MonzaDocs entidad="oc_proveedor" entidadId={ocpId} categorias={["AWB (guía aérea)", "tracking", "factura proveedor", "packing list", "otro"]} titulo="Documentos de la OC" />
+            </div>
+          ) : (
+          <>
           {/* Ítems seleccionados */}
           <div style={{ background: dark ? "#0d1321" : "#F1F5F9", borderRadius: 8, padding: "10px 14px", marginBottom: 16 }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: sub, marginBottom: 6, textTransform: "uppercase" }}>{items.length} ítem(s) a comprar</div>
@@ -139,44 +198,80 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
           </div>
 
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            {/* Proveedor (lista + agregar) */}
             <div style={{ gridColumn: "1 / -1" }}>
-              <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Proveedor</label>
-              <select value={provId} onChange={(e) => onProvChange(e.target.value)} style={{ ...IS, marginBottom: 8 }}>
-                <option value="">— Escribir manualmente —</option>
-                {proveedores.map((p) => <option key={p.id} value={p.id}>{p.nombre}{p.pais ? ` (${p.pais})` : ""}</option>)}
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <label style={lbl}>Proveedor</label>
+                <button onClick={() => setAddProv((v) => !v)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--monza-accent)", fontSize: 11, fontWeight: 600, display: "flex", alignItems: "center", gap: 3 }}>
+                  <Plus size={12} /> Agregar proveedor
+                </button>
+              </div>
+              <select value={provId} onChange={(e) => onProvChange(e.target.value)} style={IS}>
+                <option value="">— Seleccionar proveedor —</option>
+                {provList.map((p) => <option key={p.id} value={p.id}>{p.nombre}{p.pais ? ` (${p.pais})` : ""}</option>)}
               </select>
-              <input value={provNombre} onChange={(e) => setProvNombre(e.target.value)} placeholder="Nombre del proveedor" style={IS} />
+              {addProv && (
+                <div style={{ marginTop: 8, padding: "10px 12px", border: `1px dashed ${bd}`, borderRadius: 8, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <input value={npNombre} onChange={(e) => setNpNombre(e.target.value)} placeholder="Nombre proveedor *" style={{ ...IS, gridColumn: "1 / -1" }} />
+                  <input value={npPais} onChange={(e) => setNpPais(e.target.value)} placeholder="País" style={IS} list="paises-list" />
+                  <select value={npMoneda} onChange={(e) => setNpMoneda(e.target.value)} style={IS}><option>EUR</option><option>USD</option><option>CLP</option></select>
+                  <button onClick={guardarProveedor} disabled={savingProv} style={{ gridColumn: "1 / -1", padding: "7px", background: "var(--monza-accent)", border: "none", borderRadius: 6, color: "white", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>{savingProv ? "Guardando..." : "Guardar proveedor"}</button>
+                </div>
+              )}
+            </div>
+
+            {/* País (lista + agregar) */}
+            <div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <label style={lbl}>País</label>
+                <button onClick={() => setAddPais((v) => !v)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--monza-accent)", fontSize: 11, fontWeight: 600, display: "flex", alignItems: "center", gap: 3 }}><Plus size={11} /> Otro</button>
+              </div>
+              {addPais ? (
+                <div style={{ display: "flex", gap: 6 }}>
+                  <input value={nuevoPais} onChange={(e) => setNuevoPais(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") guardarPais(); }} placeholder="Nuevo país" style={IS} autoFocus />
+                  <button onClick={guardarPais} style={{ padding: "0 12px", background: "var(--monza-accent)", border: "none", borderRadius: 6, color: "white", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>OK</button>
+                </div>
+              ) : (
+                <select value={pais} onChange={(e) => setPais(e.target.value)} style={IS}>
+                  <option value="">— Seleccionar —</option>
+                  {paises.map((p) => <option key={p} value={p}>{p}</option>)}
+                </select>
+              )}
             </div>
             <div>
-              <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>País</label>
-              <input value={pais} onChange={(e) => setPais(e.target.value)} placeholder="Alemania, USA..." style={IS} />
+              <label style={lbl}>Moneda</label>
+              <select value={moneda} onChange={(e) => setMoneda(e.target.value)} style={IS}><option>EUR</option><option>USD</option><option>CLP</option></select>
             </div>
             <div>
-              <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Moneda</label>
-              <select value={moneda} onChange={(e) => setMoneda(e.target.value)} style={IS}>
-                <option>EUR</option><option>USD</option><option>CLP</option>
-              </select>
+              <label style={lbl}>N° OC proveedor</label>
+              <input value={numeroOc} onChange={(e) => setNumeroOc(e.target.value)} placeholder="PO-2026-… (opcional)" style={IS} />
             </div>
             <div>
-              <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Plazo (días)</label>
+              <label style={lbl}>Plazo entrega proveedor (días)</label>
               <input type="number" value={plazo} onChange={(e) => setPlazo(e.target.value)} placeholder="30" style={IS} />
             </div>
-            <div>
-              <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>AWB / Tracking</label>
-              <input value={awb} onChange={(e) => setAwb(e.target.value)} placeholder="opcional" style={IS} />
-            </div>
             <div style={{ gridColumn: "1 / -1" }}>
-              <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Notas</label>
+              <label style={lbl}>Notas</label>
               <textarea value={notas} onChange={(e) => setNotas(e.target.value)} rows={2} style={{ ...IS, resize: "vertical" as const }} />
             </div>
           </div>
+          <div style={{ fontSize: 11, color: sub, marginTop: 8 }}>📎 La AWB (guía aérea) y el tracking se adjuntan como documentos en el siguiente paso.</div>
+          <datalist id="paises-list">{paises.map((p) => <option key={p} value={p} />)}</datalist>
+          </>
+          )}
         </div>
 
         <div style={{ padding: "12px 20px", borderTop: `1px solid ${bd}`, display: "flex", justifyContent: "flex-end", gap: 8 }}>
-          <button onClick={onClose} style={{ padding: "8px 18px", border: `1px solid ${bd}`, borderRadius: 8, background: "transparent", color: sub, cursor: "pointer", fontSize: 13 }}>Cancelar</button>
-          <button onClick={submit} disabled={saving} style={{ padding: "8px 20px", background: "var(--monza-accent)", border: "none", borderRadius: 8, color: "white", cursor: saving ? "wait" : "pointer", fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
-            <ShoppingCart size={14} /> {saving ? "Creando..." : "Crear OC"}
-          </button>
+          {ocpId ? (
+            <button onClick={onDone} style={{ padding: "8px 22px", background: "#10B981", border: "none", borderRadius: 8, color: "white", cursor: "pointer", fontWeight: 700, fontSize: 13 }}>Finalizar</button>
+          ) : (
+            <>
+              <button onClick={onClose} style={{ padding: "8px 18px", border: `1px solid ${bd}`, borderRadius: 8, background: "transparent", color: sub, cursor: "pointer", fontSize: 13 }}>Cancelar</button>
+              <button onClick={submit} disabled={saving} style={{ padding: "8px 20px", background: "var(--monza-accent)", border: "none", borderRadius: 8, color: "white", cursor: saving ? "wait" : "pointer", fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
+                <ShoppingCart size={14} /> {saving ? "Creando..." : "Crear OC"}
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -185,8 +280,10 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
 
 export default function MonzaAbastecimientoPage() {
   const { dark } = useMonzaTheme();
-  const [tab, setTab] = useState<"por_comprar" | "ocs">("por_comprar");
+  const [tab, setTab] = useState<"por_comprar" | "comprados" | "ocs">("por_comprar");
   const [items, setItems] = useState<ItemCompra[]>([]);
+  const [comprados, setComprados] = useState<ItemCompra[]>([]);
+  const [selPrep, setSelPrep] = useState<Set<number>>(new Set());
   const [ocs, setOcs] = useState<OcCompra[]>([]);
   const [proveedores, setProveedores] = useState<Proveedor[]>([]);
   const [kpis, setKpis] = useState<KPIs | null>(null);
@@ -194,6 +291,10 @@ export default function MonzaAbastecimientoPage() {
   const [q, setQ] = useState("");
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [showModal, setShowModal] = useState(false);
+  const [expandedOc, setExpandedOc] = useState<Set<number>>(new Set());
+  const toggleOc = (id: number) => setExpandedOc((prev) => {
+    const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n;
+  });
 
   const bg = dark ? "#131b3e" : "white";
   const bd = dark ? "#1e2a4a" : "#E2E8F0";
@@ -203,14 +304,16 @@ export default function MonzaAbastecimientoPage() {
   const fetchAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [kpisRes, itemsRes, ocsRes, provRes] = await Promise.all([
+      const [kpisRes, itemsRes, compRes, ocsRes, provRes] = await Promise.all([
         monzaAbastecimientoAPI.kpis(),
         monzaAbastecimientoAPI.porComprar({ q: q || undefined }),
+        monzaAbastecimientoAPI.comprados({ q: q || undefined }),
         monzaAbastecimientoAPI.listOcs(),
         monzaAbastecimientoAPI.listProveedores(),
       ]);
       setKpis(kpisRes.data);
       setItems(itemsRes.data);
+      setComprados(compRes.data);
       setOcs(ocsRes.data);
       setProveedores(provRes.data);
     } catch { toast.error("Error al cargar abastecimiento"); }
@@ -228,6 +331,12 @@ export default function MonzaAbastecimientoPage() {
   };
   const toggleAll = () => {
     setSelected((prev) => prev.size === items.length ? new Set() : new Set(items.map((i) => i.id)));
+  };
+
+  const togglePrep = (id: number) => setSelPrep((p) => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const preparar = async () => {
+    try { const r = await monzaAbastecimientoAPI.preparar(Array.from(selPrep)); toast.success(`${r.data.preparados} ítem(s) preparado(s) → Logística`); setSelPrep(new Set()); fetchAll(); }
+    catch { toast.error("Error al preparar"); }
   };
 
   const advanceOc = async (oc: OcCompra, nuevoEstado: string) => {
@@ -266,7 +375,7 @@ export default function MonzaAbastecimientoPage() {
 
       {/* Tabs */}
       <div style={{ display: "flex", gap: 4, marginBottom: 14, borderBottom: `1px solid ${bd}` }}>
-        {([["por_comprar", "Por comprar", items.length], ["ocs", "OCs de compra", ocs.length]] as const).map(([key, label, count]) => (
+        {([["por_comprar", "Por comprar", items.length], ["comprados", "Comprados", comprados.length], ["ocs", "OCs de compra", ocs.length]] as const).map(([key, label, count]) => (
           <button key={key} onClick={() => setTab(key)}
             style={{ padding: "9px 16px", border: "none", background: "transparent", cursor: "pointer", fontSize: 13, fontWeight: 600,
               color: tab === key ? "var(--monza-accent)" : sub, borderBottom: `2px solid ${tab === key ? "var(--monza-accent)" : "transparent"}`, marginBottom: -1 }}>
@@ -288,6 +397,12 @@ export default function MonzaAbastecimientoPage() {
             <ShoppingCart size={14} /> Comprar {selected.size} ítem(s)
           </button>
         )}
+        {tab === "comprados" && selPrep.size > 0 && (
+          <button onClick={preparar}
+            style={{ padding: "8px 16px", background: "#10B981", border: "none", borderRadius: 8, color: "white", cursor: "pointer", fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
+            <Package size={14} /> Preparar {selPrep.size} → Logística
+          </button>
+        )}
         <button onClick={fetchAll} style={{ padding: "8px 10px", border: `1px solid ${bd}`, borderRadius: 6, background: bg, cursor: "pointer", color: sub }}>
           <RefreshCw size={14} />
         </button>
@@ -297,6 +412,41 @@ export default function MonzaAbastecimientoPage() {
       <div style={{ background: bg, border: `1px solid ${bd}`, borderRadius: 10, overflow: "hidden" }}>
         {loading ? (
           <div style={{ padding: 40, textAlign: "center", color: "#94A3B8" }}>Cargando...</div>
+        ) : tab === "comprados" ? (
+          comprados.length === 0 ? (
+            <div style={{ padding: 48, textAlign: "center", color: "#94A3B8" }}>
+              <Package size={32} color="#E2E8F0" style={{ display: "block", margin: "0 auto 8px" }} />
+              No hay ítems comprados pendientes de preparar.
+            </div>
+          ) : (
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead>
+                <tr style={{ background: dark ? "#0d1321" : "#F8FAFC", borderBottom: `1px solid ${bd}` }}>
+                  <th style={{ width: 36, padding: "10px 8px", textAlign: "center" }}>
+                    <input type="checkbox" checked={selPrep.size === comprados.length && comprados.length > 0} onChange={() => setSelPrep(selPrep.size === comprados.length ? new Set() : new Set(comprados.map((i) => i.id)))} style={{ accentColor: "var(--monza-accent)" }} />
+                  </th>
+                  {["N° COT", "Cliente", "Repuesto", "OC Proveedor", "Cant."].map((h) => (
+                    <th key={h} style={{ padding: "10px 12px", textAlign: h === "Cant." ? "right" : "left", fontWeight: 600, fontSize: 11, color: sub, textTransform: "uppercase" as const }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {comprados.map((it) => {
+                  const isSel = selPrep.has(it.id);
+                  return (
+                    <tr key={it.id} onClick={() => togglePrep(it.id)} style={{ borderBottom: `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}`, background: isSel ? (dark ? "#1a2340" : "#F0FDF4") : "transparent", cursor: "pointer" }}>
+                      <td style={{ textAlign: "center", padding: 8 }}><input type="checkbox" checked={isSel} onChange={() => togglePrep(it.id)} onClick={(e) => e.stopPropagation()} style={{ accentColor: "var(--monza-accent)" }} /></td>
+                      <td style={{ padding: "9px 12px", fontWeight: 600, color: "var(--monza-accent)", fontSize: 12 }}>{it.cot_numero}</td>
+                      <td style={{ padding: "9px 12px", color: txt }}>{it.cliente || "—"}</td>
+                      <td style={{ padding: "9px 12px" }}><div style={{ color: txt, fontWeight: 500 }}>{it.descripcion}</div>{it.numero_parte && <div style={{ fontSize: 10, color: sub }}>{it.numero_parte}</div>}</td>
+                      <td style={{ padding: "9px 12px", color: sub, fontSize: 12 }}>{(it as ItemCompra & { ocp_numero?: string; ocp_proveedor?: string }).ocp_numero || "—"}{(it as ItemCompra & { ocp_proveedor?: string }).ocp_proveedor ? ` · ${(it as ItemCompra & { ocp_proveedor?: string }).ocp_proveedor}` : ""}</td>
+                      <td style={{ padding: "9px 12px", textAlign: "right", color: txt }}>{it.cantidad}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )
         ) : tab === "por_comprar" ? (
           items.length === 0 ? (
             <div style={{ padding: 48, textAlign: "center", color: "#94A3B8" }}>
@@ -357,43 +507,58 @@ export default function MonzaAbastecimientoPage() {
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
               <thead>
                 <tr style={{ background: dark ? "#0d1321" : "#F8FAFC", borderBottom: `1px solid ${bd}` }}>
-                  {["N° OC", "Proveedor", "País", "Ítems", "Plazo", "AWB", "Estado", "Acciones"].map((h) => (
+                  <th style={{ width: 32 }}></th>
+                  {["N° OC", "Proveedor", "País", "Ítems", "Plazo entrega", "AWB / Tracking", "Estado", "Acciones"].map((h) => (
                     <th key={h} style={{ padding: "10px 12px", textAlign: "left", fontWeight: 600, fontSize: 11, color: sub, textTransform: "uppercase" as const, letterSpacing: 0.5 }}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {ocs.map((oc) => {
+                {ocs.flatMap((oc) => {
                   const es = OC_ESTADO[oc.estado] || OC_ESTADO.emitida;
-                  return (
-                    <tr key={oc.id} style={{ borderBottom: `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}` }}>
-                      <td style={{ padding: "10px 12px", fontWeight: 700, color: "var(--monza-accent)" }}>{oc.numero}</td>
+                  const isExp = expandedOc.has(oc.id);
+                  const rows = [
+                    <tr key={oc.id} style={{ borderBottom: isExp ? "none" : `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}` }}>
+                      <td style={{ textAlign: "center", color: "#94A3B8", cursor: "pointer" }} onClick={() => toggleOc(oc.id)}>
+                        {isExp ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      </td>
+                      <td style={{ padding: "10px 12px" }}>
+                        <div style={{ fontWeight: 700, color: "var(--monza-accent)" }}>{oc.numero_oc || oc.numero}</div>
+                        {oc.numero_oc && <div style={{ fontSize: 10, color: "#94A3B8" }}>{oc.numero}</div>}
+                      </td>
                       <td style={{ padding: "10px 12px", color: txt }}>{oc.proveedor_nombre || "—"}</td>
                       <td style={{ padding: "10px 12px", color: sub }}>{oc.pais || "—"}</td>
                       <td style={{ padding: "10px 12px", color: sub }}>{oc.items_count}</td>
                       <td style={{ padding: "10px 12px", color: sub }}>{oc.plazo_dias ? `${oc.plazo_dias} días` : "—"}</td>
-                      <td style={{ padding: "10px 12px", color: sub, fontSize: 12 }}>{oc.awb || "—"}</td>
+                      <td style={{ padding: "10px 12px", color: sub, fontSize: 12 }}>
+                        {oc.awb ? <div>AWB: {oc.awb}</div> : null}
+                        {oc.tracking ? <div>Trk: {oc.tracking}</div> : null}
+                        {!oc.awb && !oc.tracking ? "—" : null}
+                      </td>
                       <td style={{ padding: "10px 12px" }}>
                         <span style={{ fontSize: 11, background: es.bg, color: es.color, padding: "3px 10px", borderRadius: 10, fontWeight: 600 }}>{es.label}</span>
                       </td>
                       <td style={{ padding: "10px 12px" }}>
-                        <div style={{ display: "flex", gap: 6 }}>
-                          {oc.estado === "emitida" && (
-                            <button onClick={() => advanceOc(oc, "en_transito")} title="Marcar en tránsito"
-                              style={{ padding: "4px 10px", border: "1px solid #3B82F6", borderRadius: 6, background: "transparent", color: "#3B82F6", cursor: "pointer", fontSize: 11, fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
-                              <Truck size={11} /> En tránsito
-                            </button>
-                          )}
-                          {(oc.estado === "emitida" || oc.estado === "en_transito") && (
-                            <button onClick={() => advanceOc(oc, "recibida")} title="Marcar recibida (a bodega)"
-                              style={{ padding: "4px 10px", border: "1px solid #10B981", borderRadius: 6, background: "transparent", color: "#10B981", cursor: "pointer", fontSize: 11, fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
-                              <Package size={11} /> Recibida
-                            </button>
-                          )}
-                        </div>
+                        {oc.estado === "emitida" && (
+                          <button onClick={() => advanceOc(oc, "en_transito")} title="Enviar a Logística (en tránsito)"
+                            style={{ padding: "4px 10px", border: "1px solid #6366F1", borderRadius: 6, background: "transparent", color: "#6366F1", cursor: "pointer", fontSize: 11, fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
+                            <Truck size={11} /> A Logística
+                          </button>
+                        )}
                       </td>
-                    </tr>
-                  );
+                    </tr>,
+                  ];
+                  if (isExp) {
+                    rows.push(
+                      <tr key={`doc-${oc.id}`} style={{ borderBottom: `1px solid ${bd}` }}>
+                        <td colSpan={9} style={{ padding: "8px 16px 14px 44px", background: dark ? "#0a0e1f" : "#F8FAFF" }}>
+                          {oc.notas && <div style={{ fontSize: 12, color: sub, marginBottom: 8 }}><strong>Notas:</strong> {oc.notas}</div>}
+                          <MonzaDocs entidad="oc_proveedor" entidadId={oc.id} categorias={["factura proveedor", "OC", "tracking", "packing list", "otro"]} titulo="Documentos de la OC" />
+                        </td>
+                      </tr>
+                    );
+                  }
+                  return rows;
                 })}
               </tbody>
             </table>

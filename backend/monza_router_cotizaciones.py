@@ -138,6 +138,7 @@ def _cot_detail(c: MonzaCotizacion) -> dict:
             "precio_unitario_clp": it.precio_unitario_clp,
             "subtotal_clp": it.subtotal_clp,
             "plazo_entrega": it.plazo_entrega,
+            "estado_linea": it.estado_linea or "cotizado",
         }
         for it in c.items
     ]
@@ -331,7 +332,7 @@ def update_cotizacion(cot_id: int, body: CotUpdate, db: Session = Depends(get_db
         if cot.lead_id:
             lead = db.query(MonzaLead).filter(MonzaLead.id == cot.lead_id).first()
             if lead:
-                lead.estado = "vendido"
+                lead.estado = "cerrado"
                 lead.fecha_actualizacion = datetime.utcnow()
                 # ltv cliente
                 if lead.cliente_id:

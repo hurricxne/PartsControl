@@ -68,6 +68,12 @@ def list_ventas(
     }
 
 
+ORDER_LINEA = ["cotizado","por_comprar","comprado","en_transito","por_recibir","en_bodega","despachado"]
+def _pipeline_estado(items):
+    if not items: return None
+    idxs=[ORDER_LINEA.index(i.estado_linea) if (i.estado_linea in ORDER_LINEA) else 0 for i in items]
+    return ORDER_LINEA[min(idxs)]
+
 def _venta_dict(c: MonzaCotizacion) -> dict:
     asesor_nombre = c.asesor.email.split("@")[0].title() if c.asesor else None
     return {
@@ -81,6 +87,7 @@ def _venta_dict(c: MonzaCotizacion) -> dict:
         "fecha_entrega_est": c.fecha_entrega_est.isoformat() if c.fecha_entrega_est else None,
         "total_bruto": c.total_bruto,
         "items_count": len(c.items),
+        "pipeline": _pipeline_estado(c.items),
         "asesor": asesor_nombre,
         "fecha_creacion": c.fecha_creacion.isoformat(),
         "cliente": {

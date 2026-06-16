@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback, useRef } from "react";
-import { Search, TrendingUp, ChevronDown, ChevronRight, Truck, X } from "lucide-react";
+import { useState, useEffect, useCallback } from "react";
+import { Search, TrendingUp, ChevronDown, ChevronRight } from "lucide-react";
 import { useMonzaTheme } from "./MonzaLayout";
-import { monzaVentasAPI, monzaCotizacionesAPI, monzaDespachosAPI } from "../services/monzaApi";
+import { monzaVentasAPI, monzaCotizacionesAPI } from "../services/monzaApi";
+import MonzaDocs from "./MonzaDocs";
 import toast from "react-hot-toast";
 
 interface Venta {
@@ -9,8 +10,19 @@ interface Venta {
   oc_cliente?: string; fecha_venta?: string; fecha_entrega_est?: string;
   total_bruto: number; items_count: number; asesor?: string; fecha_creacion: string;
   cliente?: { nombre: string; rut?: string };
-  lead_numero?: string;
+  lead_numero?: string; pipeline?: string;
 }
+
+// Estado del pipeline post-venta (comprada → embarcada → bodega → despachada)
+const PIPELINE_CFG: Record<string, { bg: string; color: string; label: string }> = {
+  cotizado:    { bg: "#F1F5F9", color: "#64748B", label: "Sin abastecer" },
+  por_comprar: { bg: "#FEF3C7", color: "#B45309", label: "Por comprar" },
+  comprado:    { bg: "#DBEAFE", color: "#1D4ED8", label: "Comprada" },
+  en_transito: { bg: "#EDE9FE", color: "#6D28D9", label: "Embarcada" },
+  por_recibir: { bg: "#E0F2FE", color: "#0369A1", label: "En recepción" },
+  en_bodega:   { bg: "#DCFCE7", color: "#15803D", label: "En bodega" },
+  despachado:  { bg: "#D1FAE5", color: "#047857", label: "Despachada" },
+};
 interface KPIs { vendidas_mes: number; total_mes: number; pendientes_entrega: number; }
 interface CotItem { id: number; descripcion: string; numero_parte?: string; marca?: string; cantidad: number; precio_unitario_clp?: number; subtotal_clp?: number; plazo_entrega?: string; calidad?: string; }
 
@@ -34,117 +46,6 @@ function slaLabel(fecha?: string): { label: string; bg: string; color: string } 
   if (days === 0) return { label: "Hoy", bg: "#FEF3C7", color: "#D97706" };
   if (days <= 3) return { label: `${days} día${days !== 1 ? "s" : ""}`, bg: "#FEF3C7", color: "#D97706" };
   return { label: `${days} días`, bg: "#DCFCE7", color: "#15803D" };
-}
-
-// ── DespacharModal ────────────────────────────────────────────────────────────
-interface DespacharModalProps {
-  venta: Venta;
-  onClose: () => void;
-  onDone: () => void;
-}
-function DespacharModal({ venta, onClose, onDone }: DespacharModalProps) {
-  const { dark } = useMonzaTheme();
-  const [numDoc, setNumDoc] = useState("");
-  const [tipoDoc, setTipoDoc] = useState("factura");
-  const [fechaDespacho, setFechaDespacho] = useState(() => new Date().toISOString().split("T")[0]);
-  const [file, setFile] = useState<File | null>(null);
-  const [saving, setSaving] = useState(false);
-  const fileRef = useRef<HTMLInputElement>(null);
-
-  const bg    = dark ? "#131b3e" : "white";
-  const bd    = dark ? "#1e2a4a" : "#E2E8F0";
-  const txt   = dark ? "white"   : "#1E293B";
-  const sub   = dark ? "#8899cc" : "#64748B";
-  const inputStyle = { width: "100%", padding: "8px 10px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: dark ? "#0d1321" : "#F8FAFC", color: txt };
-
-  const handleSubmit = async () => {
-    setSaving(true);
-    try {
-      await monzaCotizacionesAPI.update(venta.id, {
-        estado: "despachado",
-        numero_factura: numDoc || undefined,
-        tipo_documento: tipoDoc,
-        fecha_despacho: fechaDespacho,
-      });
-      if (file) {
-        await monzaDespachosAPI.uploadDocumento(venta.id, file, tipoDoc);
-      }
-      toast.success(`${venta.numero} marcado como despachado`);
-      onDone();
-    } catch {
-      toast.error("Error al despachar");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
-      <div style={{ background: bg, border: `1px solid ${bd}`, borderRadius: 14, width: 460, boxShadow: "0 20px 60px rgba(0,0,0,0.4)", overflow: "hidden" }}>
-        {/* Header */}
-        <div style={{ background: dark ? "#0a0e1f" : "#F8FAFC", borderBottom: `1px solid ${bd}`, padding: "14px 20px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <Truck size={18} color="#10B981" />
-            <span style={{ fontWeight: 700, fontSize: 15, color: txt }}>Marcar como Despachado</span>
-          </div>
-          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: sub, display: "flex" }}><X size={18} /></button>
-        </div>
-
-        {/* Body */}
-        <div style={{ padding: "18px 20px", display: "flex", flexDirection: "column", gap: 14 }}>
-          {/* Info venta */}
-          <div style={{ background: dark ? "#0d1321" : "#F0FDF4", border: `1px solid ${dark ? "#1e2a4a" : "#BBF7D0"}`, borderRadius: 8, padding: "10px 14px", fontSize: 12 }}>
-            <div style={{ fontWeight: 700, color: txt, marginBottom: 2 }}>{venta.numero} — {venta.cliente?.nombre || "Sin cliente"}</div>
-            <div style={{ color: sub }}>{venta.vehiculo || "Sin vehículo"} · Monto: {fmt(venta.total_bruto)}</div>
-          </div>
-
-          {/* Tipo documento */}
-          <div>
-            <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Tipo de documento</label>
-            <select value={tipoDoc} onChange={(e) => setTipoDoc(e.target.value)} style={{ ...inputStyle }}>
-              <option value="factura">Factura</option>
-              <option value="boleta">Boleta</option>
-              <option value="ticket">Ticket de despacho</option>
-              <option value="guia">Guía de despacho</option>
-              <option value="otro">Otro</option>
-            </select>
-          </div>
-
-          {/* Número documento */}
-          <div>
-            <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>N° de documento (opcional)</label>
-            <input value={numDoc} onChange={(e) => setNumDoc(e.target.value)} placeholder="Ej: 001-12345" style={{ ...inputStyle }} />
-          </div>
-
-          {/* Fecha despacho */}
-          <div>
-            <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Fecha de despacho</label>
-            <input type="date" value={fechaDespacho} onChange={(e) => setFechaDespacho(e.target.value)} style={{ ...inputStyle, colorScheme: dark ? "dark" : "light" as const }} />
-          </div>
-
-          {/* Archivo */}
-          <div>
-            <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Adjuntar documento (opcional)</label>
-            <input ref={fileRef} type="file" accept=".pdf,.jpg,.jpeg,.png" onChange={(e) => setFile(e.target.files?.[0] || null)} style={{ display: "none" }} />
-            <div
-              onClick={() => fileRef.current?.click()}
-              style={{ border: `2px dashed ${file ? "#10B981" : (dark ? "#1e2a4a" : "#CBD5E1")}`, borderRadius: 8, padding: "12px", textAlign: "center", cursor: "pointer", fontSize: 12, color: file ? "#10B981" : sub, background: dark ? "#0d1321" : "#F8FAFC" }}
-            >
-              {file ? `✓ ${file.name}` : "Haz clic para seleccionar PDF, JPG o PNG"}
-            </div>
-          </div>
-        </div>
-
-        {/* Footer */}
-        <div style={{ padding: "12px 20px", borderTop: `1px solid ${bd}`, display: "flex", justifyContent: "flex-end", gap: 8 }}>
-          <button onClick={onClose} style={{ padding: "8px 18px", border: `1px solid ${bd}`, borderRadius: 8, background: "transparent", color: sub, cursor: "pointer", fontSize: 13 }}>Cancelar</button>
-          <button onClick={handleSubmit} disabled={saving} style={{ padding: "8px 20px", background: "#10B981", border: "none", borderRadius: 8, color: "white", cursor: saving ? "wait" : "pointer", fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
-            <Truck size={14} /> {saving ? "Despachando..." : "Confirmar Despacho"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
 }
 
 function KpiCard({ label, value, sub, accent = "var(--monza-accent)" }: { label: string; value: string | number; sub?: string; accent?: string }) {
@@ -173,7 +74,6 @@ export default function MonzaVentasPage() {
   const [expanded, setExpanded] = useState<number | null>(null);
   const [details, setDetails] = useState<Record<number, { items: CotItem[]; condiciones_servicio?: string; forma_pago?: string; vehiculo?: string }>>({});
   const [loadingDetail, setLoadingDetail] = useState<number | null>(null);
-  const [despachando, setDespachando] = useState<Venta | null>(null);
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -327,9 +227,16 @@ export default function MonzaVentasPage() {
                       </td>
                       <td style={{ padding: "10px 12px", fontSize: 12, cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>
                         <div style={{ color: txt }}>{v.fecha_venta ? fmtDate(v.fecha_venta) : "—"}</div>
-                        <span style={{ fontSize: 10, background: ec.bg, color: ec.color, padding: "1px 6px", borderRadius: 6 }}>
-                          {v.estado.charAt(0).toUpperCase() + v.estado.slice(1)}
-                        </span>
+                        <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 2 }}>
+                          <span style={{ fontSize: 10, background: ec.bg, color: ec.color, padding: "1px 6px", borderRadius: 6 }}>
+                            {v.estado.charAt(0).toUpperCase() + v.estado.slice(1)}
+                          </span>
+                          {v.pipeline && PIPELINE_CFG[v.pipeline] && (
+                            <span style={{ fontSize: 10, background: PIPELINE_CFG[v.pipeline].bg, color: PIPELINE_CFG[v.pipeline].color, padding: "1px 6px", borderRadius: 6, fontWeight: 600 }}>
+                              {PIPELINE_CFG[v.pipeline].label}
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td style={{ padding: "10px 12px", textAlign: "right", fontWeight: 600, color: txt, cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>{fmt(v.total_bruto)}</td>
                       <td style={{ padding: "10px 12px", color: sub, fontSize: 12, cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>{fmtDate(v.fecha_entrega_est)}</td>
@@ -345,15 +252,6 @@ export default function MonzaVentasPage() {
                             style={{ background: isExpanded ? "var(--monza-accent)" : "transparent", border: "1px solid var(--monza-accent)", borderRadius: 6, cursor: "pointer", color: isExpanded ? "white" : "var(--monza-accent)", padding: "4px 12px", fontSize: 12, fontWeight: 600 }}>
                             {loadingDetail === v.id ? "..." : isExpanded ? "Cerrar" : "Ver"}
                           </button>
-                          {v.estado !== "despachado" && (
-                            <button
-                              onClick={(e) => { e.stopPropagation(); setDespachando(v); }}
-                              title="Marcar como despachado"
-                              style={{ background: "transparent", border: "1px solid #10B981", borderRadius: 6, cursor: "pointer", color: "#10B981", padding: "4px 8px", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}
-                            >
-                              <Truck size={12} /> Despachar
-                            </button>
-                          )}
                         </div>
                       </td>
                     </tr>,
@@ -399,6 +297,9 @@ export default function MonzaVentasPage() {
                                   <strong>Nota:</strong> {details[v.id].condiciones_servicio}
                                 </div>
                               )}
+                              <div style={{ marginTop: 10 }}>
+                                <MonzaDocs entidad="cotizacion" entidadId={v.id} categorias={["factura", "boleta", "guía de despacho", "orden de compra", "otro"]} titulo="Documentos de venta" />
+                              </div>
                             </div>
                           ) : null}
                         </td>
@@ -416,13 +317,6 @@ export default function MonzaVentasPage() {
         )}
       </div>
 
-      {despachando && (
-        <DespacharModal
-          venta={despachando}
-          onClose={() => setDespachando(null)}
-          onDone={() => { setDespachando(null); fetchAll(); }}
-        />
-      )}
     </div>
   );
 }

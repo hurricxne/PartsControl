@@ -8,7 +8,7 @@ import toast from "react-hot-toast";
 // ── Types ──────────────────────────────────────────────────────────────────
 interface Lead {
   id: number; numero: string; estado: string; canal_origen: string;
-  vehiculo?: string; vin?: string; linea?: string; comentario?: string;
+  vehiculo?: string; marca?: string; modelo?: string; anio?: string; vin?: string; linea?: string; comentario?: string;
   total_estimado: number; items_count: number; asesor_id?: number; asesor?: string;
   proximo_paso?: { tipo: string; cuando?: string } | null;
   sin_contactar_dias: number; fecha_creacion: string; fecha_actualizacion: string;
@@ -24,7 +24,8 @@ interface KPIs { nuevos_mes: number; en_proceso: number; vendidos_mes: number; t
 const ESTADO_COLORS: Record<string, { bg: string; color: string; label: string }> = {
   pendiente: { bg: "#FEF9C3", color: "#854D0E", label: "Pendiente" },
   en_proceso: { bg: "#DBEAFE", color: "#1E40AF", label: "En proceso" },
-  vendido: { bg: "#DCFCE7", color: "#166534", label: "Vendido" },
+  cerrado: { bg: "#DCFCE7", color: "#166534", label: "Cerrado / Ganado" },
+  vendido: { bg: "#DCFCE7", color: "#166534", label: "Cerrado / Ganado" },
   rechazado: { bg: "#FEE2E2", color: "#991B1B", label: "Rechazado" },
 };
 const CALIDAD_LABEL: Record<string, string> = { sin_calificar: "Sin calificar", genuine: "Genuine", oem: "OEM", aftermarket: "Aftermarket" };
@@ -62,7 +63,7 @@ function KpiCard({ label, value, sub, accent = "var(--monza-accent)" }: { label:
 interface ClienteSug { id: number; nombre: string; rut?: string; telefono?: string; email?: string }
 
 function NuevoLeadModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
-  const [form, setForm] = useState({ canal_origen: "WhatsApp", telefono: "", nombre: "", email: "", rut: "", vehiculo: "", vin: "", comentario: "" });
+  const [form, setForm] = useState({ canal_origen: "WhatsApp", telefono: "", nombre: "", email: "", rut: "", marca: "", modelo: "", anio: "", vin: "", comentario: "" });
   const [items, setItems] = useState([{ descripcion: "", numero_parte: "", marca: "", cantidad: 1 }]);
   const [saving, setSaving] = useState(false);
   // Búsqueda cliente existente
@@ -130,11 +131,17 @@ function NuevoLeadModal({ onClose, onCreated }: { onClose: () => void; onCreated
 
   const submit = async () => {
     if (!form.telefono && !form.nombre && !clienteSeleccionado) { toast.error("Ingresa al menos teléfono o nombre"); return; }
+    if (!form.marca.trim() || !form.modelo.trim() || !form.anio.trim() || !form.vin.trim()) {
+      toast.error("Marca, modelo, año y VIN son obligatorios"); return;
+    }
     setSaving(true);
     try {
       const payload: Record<string, unknown> = {
         canal_origen: form.canal_origen,
-        vehiculo: form.vehiculo,
+        vehiculo: `${form.marca} ${form.modelo}`.trim(),
+        marca: form.marca,
+        modelo: form.modelo,
+        anio: form.anio,
         vin: form.vin,
         comentario: form.comentario,
         items: items.filter((it) => it.descripcion.trim()),
@@ -263,12 +270,14 @@ function NuevoLeadModal({ onClose, onCreated }: { onClose: () => void; onCreated
               <div><label style={labelSt}>RUT</label><input style={inputSt} value={form.rut} onChange={(e) => set("rut", e.target.value)} placeholder="12.345.678-9" /></div>
             </div>
           </div>
-          {/* Vehículo */}
+          {/* Vehículo (obligatorio) */}
           <div style={{ marginBottom: 16 }}>
-            <label style={labelSt}>Vehículo</label>
+            <label style={labelSt}>Vehículo <span style={{ color: "#EF4444" }}>* obligatorio</span></label>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              <div><label style={labelSt}>Vehículo</label><input style={inputSt} value={form.vehiculo} onChange={(e) => set("vehiculo", e.target.value)} placeholder="AUDI A4 2018" /></div>
-              <div><label style={labelSt}>VIN (opcional)</label><input style={inputSt} value={form.vin} onChange={(e) => set("vin", e.target.value)} /></div>
+              <div><label style={labelSt}>Marca *</label><input style={inputSt} value={form.marca} onChange={(e) => set("marca", e.target.value)} placeholder="AUDI" /></div>
+              <div><label style={labelSt}>Modelo *</label><input style={inputSt} value={form.modelo} onChange={(e) => set("modelo", e.target.value)} placeholder="A4 2.0 TFSI" /></div>
+              <div><label style={labelSt}>Año *</label><input style={inputSt} value={form.anio} onChange={(e) => set("anio", e.target.value)} placeholder="2018" /></div>
+              <div><label style={labelSt}>VIN *</label><input style={inputSt} value={form.vin} onChange={(e) => set("vin", e.target.value)} placeholder="WAUZZZ..." /></div>
             </div>
           </div>
           {/* Items */}
@@ -445,10 +454,11 @@ function EmitirCotizacionModal({ lead, detail, onClose, onEmitted }: { lead: Lea
   const [ocCliente, setOcCliente] = useState("");
   const [loading, setLoading] = useState(false);
   const [condicionesServicio, setCondicionesServicio] = useState("");
-  const [marcaV, setMarcaV] = useState(() => { const v = detail.vehiculo || ""; const i = v.indexOf(" "); return i >= 0 ? v.slice(0, i) : v; });
-  const [modeloV, setModeloV] = useState(() => { const v = detail.vehiculo || ""; const i = v.indexOf(" "); return i >= 0 ? v.slice(i + 1) : ""; });
+  // Auto-fill desde los datos del lead (marca/modelo/año/VIN ya capturados)
+  const [marcaV, setMarcaV] = useState(() => detail.marca || (detail.vehiculo || "").split(" ")[0] || "");
+  const [modeloV, setModeloV] = useState(() => detail.modelo || (detail.vehiculo || "").split(" ").slice(1).join(" ") || "");
   const [vinV, setVinV] = useState(detail.vin || "");
-  const [anioV, setAnioV] = useState("");
+  const [anioV, setAnioV] = useState(detail.anio || "");
 
   const toggleItem = (id: number) =>
     setSelectedIds((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -907,7 +917,7 @@ function LeadDetail({ lead, onRefresh }: { lead: Lead; onRefresh: () => void }) 
                 {savingNota ? "Guardando..." : "Guardar nota"}
               </button>
               <div style={{ display: "flex", gap: 6 }}>
-                <button onClick={() => handleEstado("vendido")} style={{ fontSize: 11, padding: "5px 12px", border: "1px solid #DCFCE7", borderRadius: 6, background: "#F0FFF4", color: "#166534", cursor: "pointer", fontWeight: 600 }}>✓ Vendido</button>
+                <button onClick={() => handleEstado("en_proceso")} style={{ fontSize: 11, padding: "5px 12px", border: "1px solid #DBEAFE", borderRadius: 6, background: "#EFF6FF", color: "#1D4ED8", cursor: "pointer", fontWeight: 600 }}>● En proceso</button>
                 <button onClick={() => handleEstado("rechazado")} style={{ fontSize: 11, padding: "5px 12px", border: "1px solid #FEE2E2", borderRadius: 6, background: "#FFF5F5", color: "#991B1B", cursor: "pointer", fontWeight: 600 }}>✗ Rechazar</button>
                 <button
                   onClick={async () => {

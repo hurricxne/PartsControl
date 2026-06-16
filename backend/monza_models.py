@@ -158,6 +158,9 @@ class MonzaLead(Base):
     numero = Column(String(20), unique=True, nullable=False)  # L-2026-0001
     cliente_id = Column(Integer, ForeignKey("monza_clientes.id"), nullable=True)
     vehiculo = Column(String(200), nullable=True)
+    marca = Column(String(100), nullable=True)
+    modelo = Column(String(100), nullable=True)
+    anio = Column(String(10), nullable=True)
     vin = Column(String(50), nullable=True)
     canal_origen = Column(String(50), default="WhatsApp")
     asesor_id = Column(Integer, ForeignKey("monza_asesores.id"), nullable=True)
@@ -371,7 +374,9 @@ class MonzaOcProveedor(Base):
     moneda           = Column(String(10), default="EUR")
     estado           = Column(String(30), default="emitida")  # emitida en_transito recibida cancelada
     plazo_dias       = Column(Integer, nullable=True)
-    awb              = Column(String(100), nullable=True)
+    numero_oc        = Column(String(100), nullable=True)   # N OC manual del proveedor
+    awb              = Column(String(100), nullable=True)   # guia aerea
+    tracking         = Column(String(150), nullable=True)   # tracking courier/forwarder
     notas            = Column(Text, nullable=True)
     asesor_email     = Column(String(150), nullable=True)
     created_at       = Column(DateTime, default=datetime.utcnow)
@@ -411,4 +416,93 @@ class MonzaNotificacion(Base):
     link       = Column(String(200), nullable=True)
     leida      = Column(Integer, default=0)
     fecha      = Column(DateTime, default=datetime.utcnow)
+
+
+# -- Documentos adjuntos (generico para cualquier entidad) ------------------
+
+class MonzaDocumento(Base):
+    __tablename__ = "monza_documentos"
+
+    id            = Column(Integer, primary_key=True)
+    entidad       = Column(String(30), nullable=False)   # cotizacion oc_proveedor item lead
+    entidad_id    = Column(Integer, nullable=False)
+    categoria     = Column(String(40), default="otro")   # factura guia tracking foto otro
+    filename      = Column(String(255), nullable=False)
+    original_name = Column(String(255), nullable=True)
+    content_type  = Column(String(100), nullable=True)
+    uploaded_by   = Column(String(150), nullable=True)
+    fecha         = Column(DateTime, default=datetime.utcnow)
+
+
+# -- Alineacion core MachParts: Embarque, Recepcion, Despacho --------------------
+
+class MonzaEmbarque(Base):
+    __tablename__ = "monza_embarques"
+    id                = Column(Integer, primary_key=True)
+    numero            = Column(String(50), nullable=True)
+    estado            = Column(String(30), default="en_bodega_proveedor")  # en_bodega_proveedor en_transito en_aduana en_bodega
+    awb               = Column(String(100), nullable=True)
+    forwarder         = Column(String(150), nullable=True)
+    tracking          = Column(String(150), nullable=True)
+    fecha_despacho    = Column(String(30), nullable=True)
+    fecha_llegada_est = Column(String(30), nullable=True)
+    notas             = Column(Text, nullable=True)
+    asesor_email      = Column(String(150), nullable=True)
+    created_at        = Column(DateTime, default=datetime.utcnow)
+    updated_at        = Column(DateTime, nullable=True)
+
+
+class MonzaEmbarqueItem(Base):
+    __tablename__ = "monza_embarque_items"
+    id          = Column(Integer, primary_key=True)
+    embarque_id = Column(Integer, nullable=False)
+    item_id     = Column(Integer, nullable=False)
+    created_at  = Column(DateTime, default=datetime.utcnow)
+
+
+class MonzaRecepcion(Base):
+    __tablename__ = "monza_recepciones"
+    id            = Column(Integer, primary_key=True)
+    embarque_id   = Column(Integer, nullable=False)
+    estado        = Column(String(20), default="abierta")  # abierta cerrada
+    fecha_inicio  = Column(DateTime, default=datetime.utcnow)
+    fecha_cierre  = Column(DateTime, nullable=True)
+    usuario_email = Column(String(150), nullable=True)
+    observacion   = Column(Text, nullable=True)
+
+
+class MonzaRecepcionItem(Base):
+    __tablename__ = "monza_recepcion_items"
+    id               = Column(Integer, primary_key=True)
+    recepcion_id     = Column(Integer, nullable=False)
+    item_id          = Column(Integer, nullable=False)
+    estado_recepcion = Column(String(30), nullable=True)  # completo faltante sobrante danado_utilizable danado_no_utilizable no_llego
+    qty_recibida     = Column(Integer, default=0)
+    qty_danada       = Column(Integer, default=0)
+    observacion      = Column(Text, nullable=True)
+    fecha            = Column(DateTime, nullable=True)
+
+
+class MonzaDespacho(Base):
+    __tablename__ = "monza_despachos"
+    id               = Column(Integer, primary_key=True)
+    numero           = Column(String(50), nullable=True)
+    cotizacion_id    = Column(Integer, nullable=True)
+    cliente_nombre   = Column(String(200), nullable=True)
+    numero_guia      = Column(String(100), nullable=True)
+    transportista    = Column(String(150), nullable=True)
+    destinatario     = Column(String(200), nullable=True)
+    direccion_entrega= Column(String(400), nullable=True)
+    observaciones    = Column(Text, nullable=True)
+    estado           = Column(String(20), default="despachado")
+    asesor_email     = Column(String(150), nullable=True)
+    fecha            = Column(DateTime, default=datetime.utcnow)
+
+
+class MonzaDespachoItem(Base):
+    __tablename__ = "monza_despacho_items"
+    id             = Column(Integer, primary_key=True)
+    despacho_id    = Column(Integer, nullable=False)
+    item_id        = Column(Integer, nullable=False)
+    qty_despachada = Column(Integer, default=0)
 
