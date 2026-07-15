@@ -80,6 +80,32 @@ export function calcularCotizacion(
     }
   }
 
+  // Rama venta_clp: el precio unitario YA es venta (margen incluido); sin USD/CIF/IVA.
+  if ((config as any).origen === 'venta_clp') {
+    const resItems = items.map(item => {
+      const qty = item.cantidad || 0
+      const costo = item.precio_unit_cotizacion || 0
+      const margen = item.margen_pct || 0
+      const pv = costo * (1 + margen)
+      const tv = pv * qty
+      return {
+        ...item,
+        peso_total_lbs: 0, peso_total_kg: 0, shipping_item_clp: 0, adic_shipping_clp: 0,
+        cif_clp: 0, gastos_locales_clp: 0, costo_total_clp: tv, costo_unitario_clp: costo,
+        margen_efectivo: margen, precio_venta_clp: pv, total_venta_clp: tv,
+        total_exwork_usd: 0,
+      } as any
+    })
+    const sub = resItems.reduce((a: number, r: any) => a + r.total_venta_clp, 0)
+    return {
+      items: resItems as any,
+      totales: {
+        total_peso_kg: 0, total_cif_clp: 0, gastos_locales_total_clp: 0,
+        subtotal_neto_clp: sub, iva_clp: sub * 0.19, total_con_iva_clp: sub * 1.19, total_exwork_usd: 0,
+      },
+    }
+  }
+
   // Pasada 1: calcular shipping por ítem
   const pass1 = items.map(item => {
     const qty = item.cantidad || 0

@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 480
     CORS_ORIGINS: List[str] = ["http://localhost:5173", "https://machparts.bigcode.cl"]
+    NEXOR_WEBHOOK_KEY: str = ""
 
     class Config:
         env_file = ".env"

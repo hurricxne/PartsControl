@@ -88,6 +88,7 @@ class DespachoCreate(BaseModel):
     oc_cliente_id: int
     numero_guia: Optional[str] = None
     transportista: Optional[str] = None
+    numero_expedicion: Optional[str] = None   # N° de expedición de la guía (todos sus ítems lo comparten)
     contacto_destinatario: Optional[str] = None
     direccion_entrega: Optional[str] = None
     observaciones: Optional[str] = None
@@ -97,9 +98,16 @@ class DespachoCreate(BaseModel):
 class DespachoUpdate(BaseModel):
     numero_guia: Optional[str] = None
     transportista: Optional[str] = None
+    numero_expedicion: Optional[str] = None
     contacto_destinatario: Optional[str] = None
     direccion_entrega: Optional[str] = None
     observaciones: Optional[str] = None
+
+
+class FirmarIn(BaseModel):
+    fecha_firma: Optional[str] = None   # YYYY-MM-DD; por defecto hoy
+    numero_guia: Optional[str] = None   # opcional: setear/confirmar el N° de guía al firmar
+    archivo: Optional[str] = None       # nombre del archivo (foto/PDF) de la guía firmada, ya subido vía POST /api/compras/docs/upload
 
 
 # --- Helpers ---
@@ -399,6 +407,10 @@ def oc_cliente_detail(
                 "numero_guia": d.numero_guia,
                 "transportista": d.transportista,
                 "estado": d.estado,
+                "numero_expedicion": d.numero_expedicion,
+                "guia_firmada": bool(d.guia_firmada),
+                "fecha_firma": d.fecha_firma.isoformat() if d.fecha_firma else None,
+                "guia_firmada_archivo": d.guia_firmada_archivo,
                 "fecha_creacion": d.fecha_creacion.isoformat() if d.fecha_creacion else None,
                 "fecha_despacho": d.fecha_despacho.isoformat() if d.fecha_despacho else None,
                 "items_count": len(d.items),
@@ -432,8 +444,8 @@ def oc_cliente_detail(
                     return None
                 value = value.strip()
                 # is_file = the value corresponds to an actual file on disk
-                # (covers both upload UUIDs and any other file that may have been
-                # placed there manually)
+                # (covers both upload UUIDs and any other file que pueda haberse
+                # colocado allí manualmente)
                 is_file = _exists_in_docs(value) or (
                     _looks_like_upload(value) and _exists_in_docs(value)
                 )
@@ -520,6 +532,7 @@ def create_despacho(
         oc_cliente_id=payload.oc_cliente_id,
         numero_guia=payload.numero_guia,
         transportista=payload.transportista,
+        numero_expedicion=payload.numero_expedicion,
         contacto_destinatario=payload.contacto_destinatario,
         direccion_entrega=payload.direccion_entrega,
         observaciones=payload.observaciones,
@@ -581,6 +594,10 @@ def get_despacho(
         "direccion_entrega": d.direccion_entrega,
         "observaciones": d.observaciones,
         "estado": d.estado,
+        "numero_expedicion": d.numero_expedicion,
+        "guia_firmada": bool(d.guia_firmada),
+        "fecha_firma": d.fecha_firma.isoformat() if d.fecha_firma else None,
+        "guia_firmada_archivo": d.guia_firmada_archivo,
         "fecha_creacion": d.fecha_creacion.isoformat() if d.fecha_creacion else None,
         "fecha_despacho": d.fecha_despacho.isoformat() if d.fecha_despacho else None,
         "items": items_data,
@@ -597,8 +614,11 @@ def update_despacho(
     d = db.query(Despacho).filter(Despacho.id == despacho_id).first()
     if not d:
         raise HTTPException(404, "Despacho no encontrado")
-    if d.estado != "en_preparacion":
-        raise HTTPException(400, "Solo se pueden editar despachos en preparación")
+    if d.estado == "anulado":
+        raise HTTPException(400, "No se puede editar un despacho anulado")
+    # Los datos de cabecera (transportista, N° guía, N° de expedición, contacto, dirección,
+    # observaciones) pueden completarse/corregirse aunque el despacho ya esté cerrado o firmado:
+    # el N° de expedición suele llegar del courier DESPUÉS del despacho.
     data = payload.dict(exclude_unset=True)
     for field, value in data.items():
         setattr(d, field, value)
@@ -620,9 +640,15 @@ def cerrar_despacho(
 
     # Recolectar embarques afectados para evaluar auto-transición a "despachado"
     embarque_ids_afectados = set()
+    # Cantidad acumulada por ítem en los despachos no anulados de la OC (incluye este).
+    # La línea pasa a "despachado" solo cuando queda cubierta completa: un cierre
+    # parcial deja el remanente en bodega, despachable y facturable después.
+    qty_total = _qty_already_dispatched(db, d.oc_cliente_id)
     for di in d.items:
         it = di.item_cotizacion
         if it and it.estado_item == "en_bodega":
+            if qty_total.get(it.id, 0) + 0.001 < (it.cantidad or 0):
+                continue
             it.estado_item = "despachado"
             # Buscar el embarque que trajo este item
             ei = (
@@ -679,6 +705,45 @@ def cerrar_despacho(
     return {"ok": True, "numero_despacho": d.numero_despacho}
 
 
+@router.post("/{despacho_id}/firmar")
+def firmar_despacho(
+    despacho_id: int,
+    payload: FirmarIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Marca la guía de despacho como FIRMADA (entregada y firmada por el cliente).
+    Solo con la guía firmada Contabilidad puede emitir la factura de esos ítems."""
+    d = db.query(Despacho).filter(Despacho.id == despacho_id).first()
+    if not d:
+        raise HTTPException(404, "Despacho no encontrado")
+    if d.estado != "despachado":
+        raise HTTPException(400, "Primero confirme (cierre) el despacho; luego marque la guía como firmada")
+    if payload.numero_guia:
+        d.numero_guia = payload.numero_guia
+    fecha = None
+    if payload.fecha_firma:
+        try:
+            fecha = datetime.strptime(payload.fecha_firma[:10], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            fecha = None
+    # La guía firmada (foto/PDF) es OBLIGATORIA: es el respaldo de la entrega y
+    # la condición para que Contabilidad pueda facturar esos ítems.
+    if not payload.archivo:
+        raise HTTPException(400, "Debes adjuntar la guía de despacho firmada por el cliente")
+    if not _exists_in_docs(payload.archivo):
+        raise HTTPException(400, "El documento de la guía firmada no existe (súbalo primero)")
+    d.guia_firmada_archivo = payload.archivo
+    d.guia_firmada = 1
+    d.fecha_firma = fecha or datetime.now()
+    d.usuario_firma_id = getattr(current_user, "id", None)
+    db.commit()
+    return {
+        "ok": True, "guia_firmada": True, "numero_guia": d.numero_guia,
+        "guia_firmada_archivo": d.guia_firmada_archivo,
+    }
+
+
 @router.delete("/{despacho_id}")
 def anular_despacho(
     despacho_id: int,
@@ -691,6 +756,18 @@ def anular_despacho(
     if d.estado != "en_preparacion":
         raise HTTPException(400, "Solo se pueden anular despachos en preparación")
     d.estado = "anulado"
+    # Simetría con cerrar_despacho: si este despacho sostenía (junto a otros) la
+    # cobertura completa de una línea, al anularlo el remanente vuelve a bodega.
+    db.flush()
+    qty_total = _qty_already_dispatched(db, d.oc_cliente_id)
+    for di in d.items:
+        it = di.item_cotizacion
+        if (
+            it
+            and it.estado_item == "despachado"
+            and qty_total.get(it.id, 0) + 0.001 < (it.cantidad or 0)
+        ):
+            it.estado_item = "en_bodega"
     db.commit()
     return {"ok": True}
 

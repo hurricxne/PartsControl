@@ -434,13 +434,14 @@ def _generar_pdf(cot, cfg) -> bytes:
     from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 
     # ── Paleta exacta del template Excel ──────────────────────────────────────
-    ORANGE   = colors.HexColor("#E67E22")
-    PEACH_BG = colors.HexColor("#FDF2E9")
-    AMBER_H  = colors.HexColor("#F5CBA7")
+    ORANGE   = colors.HexColor("#C92A3D")
+    PEACH_BG = colors.HexColor("#F4CCCC")
+    AMBER_H  = colors.HexColor("#EA9999")
     DARK     = colors.HexColor("#1E293B")
     GRAY_ALT = colors.HexColor("#FAFAFA")
     LGRAY    = colors.HexColor("#E2E8F0")
     WHITE    = colors.white
+    TOTAL_BG = colors.HexColor("#C92A3D")
 
     W      = 18.0 * cm
     MARGIN = 1.5 * cm
@@ -488,11 +489,12 @@ def _generar_pdf(cot, cfg) -> bytes:
     story = []
 
     # ── HEADER: Logo izquierda + datos empresa derecha ────────────────────────
-    LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "logo_grupoam.png")
+    LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "logo_monzaparts.png")
     if os.path.exists(LOGO_PATH):
         logo = Image(LOGO_PATH, width=3.5 * cm, height=2.5 * cm, kind="proportional")
     else:
-        logo = Paragraph("", val_s)
+        logo = [Paragraph("MONZAPARTS", ps("logo_nm", 13.5, bold=True, color=ORANGE)),
+                Paragraph("REPUESTOS AUTOMOTRICES", ps("logo_sb", 6.5, color=colors.HexColor("#94A3B8")))]
 
     co_inner = Table(
         [[Paragraph(cfg.razon_social or "", co_rb)],
@@ -569,7 +571,7 @@ def _generar_pdf(cot, cfg) -> bytes:
          Paragraph("Dirección:", lbl_b),    Paragraph(cfg.direccion or "", val_b)],
         [Paragraph("Servicio:", lbl_b),   Paragraph(cot.tipo_cotizacion or "Importación de Repuestos", val_b),
          Paragraph("Giro:", lbl_b),         Paragraph(cfg.giro or "", val_b)],
-        [Paragraph("Referencia:", lbl_b), Paragraph(cot.oc_cliente or "", val_b),
+        [Paragraph("Comentario:", lbl_b), Paragraph(cot.oc_cliente or "", val_b),
          Paragraph("Correo:", lbl_b),       Paragraph(cfg.email_empresa or "", val_b)],
     ]
     cli_tbl = Table(cli_rows, colWidths=[2.5 * cm, 6.0 * cm, 2.8 * cm, 6.7 * cm])
@@ -595,16 +597,16 @@ def _generar_pdf(cot, cfg) -> bytes:
 
     # ── TABLA ÍTEMS ───────────────────────────────────────────────────────────
     # A=Repuesto | B=Marca | C=N°parte | D=Cant | E=PrecioUnit | F=TOTAL | G=Plazo
-    col_ws = [5.8*cm, 2.6*cm, 1.6*cm, 2.8*cm, 2.8*cm, 2.4*cm]
+    col_ws = [5.4*cm, 2.3*cm, 2.5*cm, 1.8*cm, 2.9*cm, 3.1*cm]
     # Total = 18.0 cm ✓
 
     thead = [
-        Paragraph("<b>Repuesto</b>",         hdr_l),
-        Paragraph("<b>Marca</b>",            hdr_c),
-        Paragraph("<b>Cantidad</b>",         hdr_c),
-        Paragraph("<b>Precio Unit.</b>",     hdr_r),
-        Paragraph("<b>TOTAL</b>",            hdr_r),
-        Paragraph("<b>Plazo de entrega</b>", hdr_c),
+        Paragraph("<b>Repuesto</b>",     hdr_l),
+        Paragraph("<b>Marca</b>",        hdr_c),
+        Paragraph("<b>Procedencia</b>",  hdr_c),
+        Paragraph("<b>Cantidad</b>",     hdr_c),
+        Paragraph("<b>Precio Unit.</b>", hdr_r),
+        Paragraph("<b>TOTAL</b>",        hdr_r),
     ]
 
     def fmt_clp(n):
@@ -617,10 +619,10 @@ def _generar_pdf(cot, cfg) -> bytes:
         irows.append([
             Paragraph(it.descripcion or "", it_l),
             Paragraph(it.marca or "", it_c),
+            Paragraph(it.procedencia or "—", it_c),
             Paragraph(str(it.cantidad), it_c),
             Paragraph(fmt_clp(it.precio_unitario_clp), it_r),
             Paragraph(fmt_clp(it.subtotal_clp), it_r),
-            Paragraph(it.plazo_entrega or "—", plazo_s),
         ])
 
     n_data = len(irows) - 1
@@ -660,7 +662,7 @@ def _generar_pdf(cot, cfg) -> bytes:
         ("BOTTOMPADDING",(0, 0), (-1, -1), 3),
         ("RIGHTPADDING", (0, 0), (-1, -1), 4),
         # Fondo naranja en la fila TOTAL (índice 2)
-        ("BACKGROUND",   (4, 2), (5, 2), ORANGE),
+        ("BACKGROUND",   (4, 2), (5, 2), TOTAL_BG),
         # Bordes en columnas E-F
         ("BOX",          (4, 0), (5, 2), 0.5, LGRAY),
         ("LINEBELOW",    (4, 0), (5, 1), 0.3, LGRAY),

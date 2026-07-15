@@ -227,6 +227,8 @@ def get_embarque_bodega(
         "estado": e.estado,
         "forwarder": e.forwarder,
         "awb": e.awb,
+        "factura_comercial": e.factura_comercial,
+        "packing_list": e.packing_list,
         "fecha_llegada_est": str(e.fecha_llegada_est) if e.fecha_llegada_est else None,
         "notas": e.notas,
         "items": items_out,

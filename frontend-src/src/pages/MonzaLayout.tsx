@@ -4,7 +4,7 @@ import { monzaNotificacionesAPI } from "../services/monzaApi";
 import {
   Users, FileText, TrendingUp, Settings, LogOut,
   ChevronDown, Bell, LayoutDashboard, Car, Sun, Moon, Truck, ScrollText,
-  ShoppingCart, PackageSearch, Ship, Boxes, UserCog,
+  ShoppingCart, PackageSearch, Ship, Boxes, UserCog, Wallet, Receipt, DollarSign, Calculator, CreditCard, Landmark,
 } from "lucide-react";
 import { useAuthStore } from "../stores/authStore";
 
@@ -60,6 +60,15 @@ const NAV_OPERACIONES = [
   { to: "/monzaparts/despachos",      label: "Despachos",     icon: Truck },
 ];
 
+// Módulos de Contabilidad agrupados en dropdown "Contabilidad" (SOLO MonzaParts)
+const NAV_CONTABILIDAD = [
+  { to: "/monzaparts/ventas-contab",     label: "Ventas",            icon: DollarSign },
+  { to: "/monzaparts/facturas",          label: "Facturas y cobranzas", icon: Receipt },
+  { to: "/monzaparts/compras-contab",    label: "Compras y pagos",   icon: CreditCard },
+  { to: "/monzaparts/tesoreria",         label: "Tesorería",         icon: Landmark },
+  { to: "/monzaparts/embarques-pricing", label: "Embarques Pricing", icon: Calculator },
+];
+
 const NAV_TAIL = [
   { to: "/monzaparts/logs",         label: "Logs",          icon: ScrollText },
   { to: "/monzaparts/configuracion",label: "Configuración", icon: Settings },
@@ -90,6 +99,11 @@ const BREADCRUMB: Record<string, string> = {
   "/monzaparts/leads":          "Leads / Pipeline",
   "/monzaparts/cotizaciones":   "Cotizaciones",
   "/monzaparts/ventas":         "Ventas",
+  "/monzaparts/ventas-contab":  "Ventas — Contabilidad",
+  "/monzaparts/facturas":       "Facturas y Cobranzas",
+  "/monzaparts/compras-contab": "Compras y Cuentas por Pagar",
+  "/monzaparts/tesoreria":      "Tesorería",
+  "/monzaparts/embarques-pricing": "Embarques — Pricing",
   "/monzaparts/abastecimiento": "Abastecimiento / Compras",
   "/monzaparts/seguimiento":    "Seguimiento",
   "/monzaparts/logistica":      "Logística / Importación",
@@ -107,6 +121,7 @@ export default function MonzaLayout() {
   const user      = useAuthStore((s) => s.user);
   const [userOpen, setUserOpen] = useState(false);
   const [opsOpen, setOpsOpen] = useState(false);
+  const [cntOpen, setCntOpen] = useState(false);
   const [dark, setDark] = useState(() => localStorage.getItem("monza-theme") === "dark");
 
   // Personalización (persistida en localStorage)
@@ -157,6 +172,7 @@ export default function MonzaLayout() {
   const setAccent = (id: string) => { setAccentState(id); localStorage.setItem("monza-accent", id); };
 
   const opsActive = NAV_OPERACIONES.some((it) => location.pathname.startsWith(it.to));
+  const cntActive = NAV_CONTABILIDAD.some((it) => location.pathname.startsWith(it.to));
 
   const toggleTheme = () => {
     const next = !dark;
@@ -227,7 +243,7 @@ export default function MonzaLayout() {
               {/* Operaciones (dropdown) */}
               <div style={{ position: "relative" }}>
                 <button
-                  onClick={() => setOpsOpen((v) => !v)}
+                  onClick={() => { setCntOpen(false); setOpsOpen((v) => !v); }}
                   style={{
                     display: "flex", alignItems: "center", gap: 6,
                     padding: "6px 14px", borderRadius: 6, border: "none", cursor: "pointer",
@@ -249,6 +265,47 @@ export default function MonzaLayout() {
                         key={to}
                         to={to}
                         onClick={() => setOpsOpen(false)}
+                        style={({ isActive }) => ({
+                          display: "flex", alignItems: "center", gap: 9,
+                          padding: "9px 12px", borderRadius: 6, textDecoration: "none", fontSize: 13,
+                          fontWeight: isActive ? 600 : 400,
+                          color: isActive ? "white" : (dark ? "#cbd5e1" : "#475569"),
+                          background: isActive ? "var(--monza-accent)" : "transparent",
+                          marginBottom: 1,
+                        })}
+                      >
+                        <Icon size={15} />{label}
+                      </NavLink>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Contabilidad (dropdown) — SOLO MonzaParts */}
+              <div style={{ position: "relative" }}>
+                <button
+                  onClick={() => { setOpsOpen(false); setCntOpen((v) => !v); }}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 6,
+                    padding: "6px 14px", borderRadius: 6, border: "none", cursor: "pointer",
+                    fontSize: 13, whiteSpace: "nowrap", fontFamily: "inherit",
+                    fontWeight: cntActive ? 600 : 400,
+                    color: cntActive || cntOpen ? "white" : "#64748B",
+                    background: cntActive ? "var(--monza-accent)" : cntOpen ? "#131b3e" : "transparent",
+                    transition: "all 0.15s",
+                  }}
+                >
+                  <Wallet size={14} />Contabilidad
+                  <ChevronDown size={12} style={{ transform: cntOpen ? "rotate(180deg)" : "none", transition: "transform 0.15s" }} />
+                </button>
+
+                {cntOpen && (
+                  <div style={{ position: "absolute", left: 0, top: "calc(100% + 6px)", background: dark ? "#131b3e" : "white", border: `1px solid ${dark ? "#1e2a4a" : "#E2E8F0"}`, borderRadius: 10, boxShadow: "0 10px 30px rgba(0,0,0,0.3)", minWidth: 210, zIndex: 200, padding: 6 }}>
+                    {NAV_CONTABILIDAD.map(({ to, label, icon: Icon }) => (
+                      <NavLink
+                        key={to}
+                        to={to}
+                        onClick={() => setCntOpen(false)}
                         style={({ isActive }) => ({
                           display: "flex", alignItems: "center", gap: 9,
                           padding: "9px 12px", borderRadius: 6, textDecoration: "none", fontSize: 13,
@@ -435,6 +492,7 @@ export default function MonzaLayout() {
 
         {userOpen && <div style={{ position: "fixed", inset: 0, zIndex: 99 }} onClick={() => setUserOpen(false)} />}
         {opsOpen && <div style={{ position: "fixed", inset: 0, zIndex: 99 }} onClick={() => setOpsOpen(false)} />}
+        {cntOpen && <div style={{ position: "fixed", inset: 0, zIndex: 99 }} onClick={() => setCntOpen(false)} />}
         {notifOpen && <div style={{ position: "fixed", inset: 0, zIndex: 99 }} onClick={() => setNotifOpen(false)} />}
       </div>
     </MonzaThemeCtx.Provider>

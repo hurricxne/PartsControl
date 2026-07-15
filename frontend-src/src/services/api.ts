@@ -48,6 +48,14 @@ export const cotizacionesAPI = {
       timeout: 300_000,
     })
   },
+  uploadVenta: (file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return api.post('/cotizaciones/upload-venta', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120_000,
+    })
+  },
   list: () => api.get('/cotizaciones/'),
   get: (id: number) => api.get(`/cotizaciones/${id}`),
   status: (id: number) => api.get(`/cotizaciones/${id}/status`),
@@ -152,6 +160,14 @@ export const comprasAPI = {
   updatePreEmbarque: (id: number, data: Record<string, any>) => api.put(`/compras/pre-embarques/${id}`, data),
   getEmbarque: (id: number) => api.get(`/compras/embarques-list/${id}`),
   desembarcarItem: (embId: number, embarqueItemId: number) => api.delete(`/compras/embarques-list/${embId}/items/${embarqueItemId}`),
+  // Documentos adicionales (N) del embarque — botón "Otros"
+  listEmbarqueDocs: (embId: number) => api.get(`/compras/embarques-list/${embId}/docs`),
+  addEmbarqueDoc: (embId: number, data: { nombre: string; archivo: string }) =>
+    api.post(`/compras/embarques-list/${embId}/docs`, data),
+  deleteEmbarqueDoc: (embId: number, docId: number) =>
+    api.delete(`/compras/embarques-list/${embId}/docs/${docId}`),
+  downloadDoc: (filename: string) =>
+    api.get(`/despachos/docs/${filename}`, { responseType: 'arraybuffer' }),
   updatePrecioUsd: (itemId: number, unit_price_usd: number) =>
     api.patch(`/compras/items/${itemId}/precio-usd`, { unit_price_usd }),
 }
@@ -215,7 +231,39 @@ export const bodegaAPI = {
   alertasPlazo: () => api.get('/bodega/ventas/alertas-plazo-critico'),
 }
 
+// --- Contabilidad (Ventas + Facturas/Cobranzas/Factoring) ---
+export const contabilidadAPI = {
+  // Ventas (agrupado por OC, expandible a ítem — solo venta)
+  listVentas: (q?: string, periodo?: string) =>
+    api.get('/contabilidad/ventas', { params: { q: q || undefined, periodo: periodo || undefined } }),
+  ventaDetalle: (ocId: number) => api.get(`/contabilidad/ventas/${ocId}`),
+  despachosFacturables: (ocId: number) => api.get(`/contabilidad/ventas/${ocId}/despachos-facturables`),
+  // Facturas / Cuentas por cobrar
+  listFacturas: (estado?: string, q?: string) =>
+    api.get('/contabilidad/facturas', { params: { estado: estado || undefined, q: q || undefined } }),
+  crearFactura: (data: Record<string, any>) => api.post('/contabilidad/facturas', data),
+  eliminarFactura: (id: number) => api.delete(`/contabilidad/facturas/${id}`),
+  // Cobranzas
+  registrarCobranza: (facturaId: number, data: Record<string, any>) =>
+    api.post(`/contabilidad/facturas/${facturaId}/cobranzas`, data),
+  eliminarCobranza: (facturaId: number, cobranzaId: number) =>
+    api.delete(`/contabilidad/facturas/${facturaId}/cobranzas/${cobranzaId}`),
+  // Factoring (por factura)
+  setFactoring: (facturaId: number, data: Record<string, any>) =>
+    api.post(`/contabilidad/facturas/${facturaId}/factoring`, data),
+  liquidarFactoring: (facturaId: number) =>
+    api.post(`/contabilidad/facturas/${facturaId}/factoring/liquidar`),
+  kpis: (periodo?: string) => api.get('/contabilidad/kpis', { params: periodo ? { periodo } : {} }),
+}
+
 // --- Despachos ---
+/** Abre un documento subido (guía firmada, etc.) en una pestaña nueva, autenticado. */
+export async function abrirDocumento(filename: string) {
+  const res = await api.get(`/despachos/docs/${filename}`, { responseType: 'blob' })
+  const url = URL.createObjectURL(res.data as Blob)
+  window.open(url, '_blank')
+}
+
 export const despachosAPI = {
   getCounts: () => api.get('/despachos/counts').then(r => r.data),
   listOcClientes: (tab: string, q?: string) =>
@@ -228,5 +276,12 @@ export const despachosAPI = {
   update: (id: number, data: Record<string, any>) =>
     api.put(`/despachos/${id}`, data).then(r => r.data),
   cerrar: (id: number) => api.post(`/despachos/${id}/cerrar`).then(r => r.data),
+  firmar: (id: number, data?: { fecha_firma?: string; numero_guia?: string; archivo?: string }) =>
+    api.post(`/despachos/${id}/firmar`, data || {}).then(r => r.data),
+  uploadDoc: (file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return api.post('/compras/docs/upload', fd, { headers: { 'Content-Type': 'multipart/form-data' } }).then(r => r.data)
+  },
   anular: (id: number) => api.delete(`/despachos/${id}`).then(r => r.data),
 }

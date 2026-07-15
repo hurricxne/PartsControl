@@ -21,7 +21,17 @@ import CierreVentaPage from './pages/CierreVentaPage'
 import CotizacionManual from './modules/CotizacionManual/CotizacionManual'
 import SeguimientoPage from './pages/SeguimientoPage'
 import VentasContabPage from './pages/VentasContabPage'
-import EmbarquesPricingPage from './pages/EmbarquesPricingPage'
+// Módulo aislado Embarques Pricing (costo landed). Para revertir: volver a
+// './pages/EmbarquesPricingPage' (mockup) y quitar la carpeta src/embarques-pricing/.
+import EmbarquesPricingPage from './embarques-pricing/EmbarquesPricingPage'
+// Módulo aislado Compras / Cuentas por Pagar. Para revertir: quitar este import,
+// la ruta 'compras-contab' y la carpeta src/compras-contab/.
+import ComprasContabPage from './compras-contab/ComprasContabPage'
+// Módulo aislado Tesorería (Grupo AM): aprobación de pagos + conciliación bancaria
+// (cargos↔egresos y abonos↔cobranzas) + flujo de caja NIC 7. Reemplaza a la antigua
+// Conciliación Bancaria. Revertir: quitar este import, las rutas 'tesoreria'/
+// 'conciliacion' y la carpeta src/tesoreria/.
+import TesoreriaPage from './tesoreria/TesoreriaPage'
 import UsuariosPage from './pages/UsuariosPage'
 import ProveedoresPage from './pages/ProveedoresPage'
 
@@ -52,6 +62,13 @@ import MonzaSeguimientoPage from './pages/MonzaSeguimientoPage'
 import MonzaLogisticaPage from './pages/MonzaLogisticaPage'
 import MonzaBodegaPage from './pages/MonzaBodegaPage'
 import MonzaPerfilPage from './pages/MonzaPerfilPage'
+// Módulo aislado Contabilidad MonzaParts (Ventas + Facturas/Cobranzas). Revertir: quitar
+// estos imports, las rutas 'ventas-contab'/'facturas' y el grupo Contabilidad en MonzaLayout.
+import MonzaVentasContabPage from './pages/MonzaVentasContabPage'
+import MonzaFacturasPage from './pages/MonzaFacturasPage'
+import MonzaEmbarquesPricingPage from './pages/MonzaEmbarquesPricingPage'
+import MonzaComprasPage from './pages/MonzaComprasPage'
+import MonzaTesoreriaPage from './pages/MonzaTesoreriaPage'
 
 export default function App() {
   return (
@@ -85,6 +102,10 @@ export default function App() {
         <Route path="seguimiento"   element={<SeguimientoPage />} />
         <Route path="ventas-contab" element={<VentasContabPage />} />
         <Route path="embarques-pricing" element={<EmbarquesPricingPage />} />
+        <Route path="compras-contab" element={<ComprasContabPage />} />
+        <Route path="tesoreria" element={<TesoreriaPage />} />
+        {/* ruta antigua del módulo (hoy Tesorería): redirige por memoria muscular */}
+        <Route path="conciliacion" element={<Navigate to="/tesoreria" replace />} />
         <Route path="usuarios"      element={<UsuariosPage />} />
         <Route path="proveedores"   element={<ProveedoresPage />} />
       </Route>
@@ -104,6 +125,11 @@ export default function App() {
         <Route path="cotizador" element={<MonzaCotizadorPage />} />
         <Route path="cotizaciones" element={<MonzaCotizacionesPage />} />
         <Route path="ventas" element={<MonzaVentasPage />} />
+        <Route path="ventas-contab" element={<MonzaVentasContabPage />} />
+        <Route path="facturas" element={<MonzaFacturasPage />} />
+        <Route path="compras-contab" element={<MonzaComprasPage />} />
+        <Route path="tesoreria" element={<MonzaTesoreriaPage />} />
+        <Route path="embarques-pricing" element={<MonzaEmbarquesPricingPage />} />
         <Route path="abastecimiento" element={<MonzaAbastecimientoPage />} />
         <Route path="seguimiento" element={<MonzaSeguimientoPage />} />
         <Route path="logistica" element={<MonzaLogisticaPage />} />

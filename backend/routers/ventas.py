@@ -43,7 +43,7 @@ def _calc_items(items_db, cfg_dict):
         }
         for i in items_db
     ]
-    result = calcular_cotizacion(item_dicts, cfg_dict)
+    result = calcular_cotizacion(item_dicts, {**cfg_dict, "origen": (items_db[0].cotizacion.origen if items_db else None) or "costo"})
     return {ci["id"]: ci for ci in result.get("items", [])}, result.get("totales", {})
 
 
@@ -208,7 +208,7 @@ def get_kpis(
             }
             for i in items_db
         ]
-        calc = calcular_cotizacion(item_dicts, cfg_dict)
+        calc = calcular_cotizacion(item_dicts, {**cfg_dict, "origen": (items_db[0].cotizacion.origen if items_db else None) or "costo"})
         total_facturado += calc.get("totales", {}).get("total_con_iva_clp", 0)
 
     return {
@@ -252,7 +252,7 @@ def get_mensual(
             }
             for i in items_db
         ]
-        calc = calcular_cotizacion(item_dicts, cfg_dict)
+        calc = calcular_cotizacion(item_dicts, {**cfg_dict, "origen": (items_db[0].cotizacion.origen if items_db else None) or "costo"})
         monthly[key]["ventas"] += 1
         monthly[key]["total_clp"] += calc.get("totales", {}).get("subtotal_neto_clp", 0)
 

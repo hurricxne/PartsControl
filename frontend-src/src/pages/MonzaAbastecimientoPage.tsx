@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { ShoppingCart, Search, RefreshCw, Package, X, Truck, FileText, ChevronDown, ChevronRight, Plus } from "lucide-react";
 import { monzaAbastecimientoAPI } from "../services/monzaApi";
+import { ADELANTO_PCT_DEFECTO } from "../constants/adelanto";
 import { useMonzaTheme } from "./MonzaLayout";
 import MonzaDocs from "./MonzaDocs";
 import toast from "react-hot-toast";
@@ -24,7 +25,15 @@ interface ItemCompra {
   plazo_entrega?: string;
   estado_linea: string;
   fecha_venta?: string;
+  // Adelanto (verificado por Contabilidad)
+  pct_adelanto?: number;
+  requiere_adelanto?: boolean;
+  pago_verificado?: boolean;
 }
+
+// Cortafuego: un ítem NO se puede comprar si su venta exige adelanto y Contabilidad aún
+// no verificó el pago. Bloquea solo ese ítem (los demás se compran normal).
+const itemBloqueado = (it: ItemCompra) => !!(it.requiere_adelanto && !it.pago_verificado);
 
 interface OcCompra {
   id: number;
@@ -162,8 +171,10 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
       });
       toast.success(`OC creada · ${items.length} ítem(s)`);
       setOcpId(r.data.ocp_id); setOcpNumero(r.data.numero);  // pasar a paso 2 (documentos)
-    } catch { toast.error("Error al crear OC"); }
-    finally { setSaving(false); }
+    } catch (e: any) {
+      // Muestra el detalle del backend (p.ej. cortafuego de adelanto no verificado).
+      toast.error(e?.response?.data?.detail || "Error al crear OC");
+    } finally { setSaving(false); }
   };
 
   return (
@@ -330,7 +341,11 @@ export default function MonzaAbastecimientoPage() {
     });
   };
   const toggleAll = () => {
-    setSelected((prev) => prev.size === items.length ? new Set() : new Set(items.map((i) => i.id)));
+    // "Seleccionar todos" omite los ítems bloqueados por adelanto no verificado.
+    setSelected((prev) => {
+      const comprables = items.filter((i) => !itemBloqueado(i));
+      return prev.size === comprables.length && comprables.length > 0 ? new Set() : new Set(comprables.map((i) => i.id));
+    });
   };
 
   const togglePrep = (id: number) => setSelPrep((p) => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -348,6 +363,9 @@ export default function MonzaAbastecimientoPage() {
   };
 
   const selItems = items.filter((i) => selected.has(i.id));
+  const comprables = items.filter((i) => !itemBloqueado(i));  // ítems sin bloqueo de adelanto
+  // Defensa: ítems seleccionados que igual estén bloqueados (no debería ocurrir: no se pueden marcar).
+  const bloqueadosSel = selItems.filter(itemBloqueado);
 
   return (
     <div>
@@ -392,10 +410,16 @@ export default function MonzaAbastecimientoPage() {
             style={{ width: "100%", padding: "8px 10px 8px 32px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: bg, color: txt }} />
         </div>
         {tab === "por_comprar" && selected.size > 0 && (
-          <button onClick={() => setShowModal(true)}
-            style={{ padding: "8px 16px", background: "var(--monza-accent)", border: "none", borderRadius: 8, color: "white", cursor: "pointer", fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
-            <ShoppingCart size={14} /> Comprar {selected.size} ítem(s)
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <button onClick={() => setShowModal(true)} disabled={bloqueadosSel.length > 0}
+              title={bloqueadosSel.length > 0 ? "Hay ítems con adelanto no verificado por Contabilidad" : "Generar OC de proveedor"}
+              style={{ padding: "8px 16px", background: "var(--monza-accent)", border: "none", borderRadius: 8, color: "white", cursor: bloqueadosSel.length > 0 ? "not-allowed" : "pointer", fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 6, opacity: bloqueadosSel.length > 0 ? 0.5 : 1 }}>
+              <ShoppingCart size={14} /> Comprar {selected.size} ítem(s)
+            </button>
+            {bloqueadosSel.length > 0 && (
+              <span style={{ fontSize: 12, color: "#B91C1C", fontWeight: 600 }}>⚠ {bloqueadosSel.length} con adelanto sin verificar</span>
+            )}
+          </div>
         )}
         {tab === "comprados" && selPrep.size > 0 && (
           <button onClick={preparar}
@@ -458,9 +482,9 @@ export default function MonzaAbastecimientoPage() {
               <thead>
                 <tr style={{ background: dark ? "#0d1321" : "#F8FAFC", borderBottom: `1px solid ${bd}` }}>
                   <th style={{ width: 36, padding: "10px 8px", textAlign: "center" }}>
-                    <input type="checkbox" checked={selected.size === items.length && items.length > 0} onChange={toggleAll} style={{ accentColor: "var(--monza-accent)", cursor: "pointer" }} />
+                    <input type="checkbox" checked={comprables.length > 0 && selected.size === comprables.length} onChange={toggleAll} style={{ accentColor: "var(--monza-accent)", cursor: "pointer" }} />
                   </th>
-                  {["N° COT", "Cliente", "Repuesto", "Marca/Calidad", "Cant.", "Costo", "Plazo", "Vendida"].map((h) => (
+                  {["N° COT", "Cliente", "Repuesto", "Marca/Calidad", "Cant.", "Costo", "Plazo", "Vendida", "Pago"].map((h) => (
                     <th key={h} style={{ padding: "10px 12px", textAlign: ["Cant.", "Costo"].includes(h) ? "right" : "left", fontWeight: 600, fontSize: 11, color: sub, textTransform: "uppercase" as const, letterSpacing: 0.5 }}>{h}</th>
                   ))}
                 </tr>
@@ -468,11 +492,17 @@ export default function MonzaAbastecimientoPage() {
               <tbody>
                 {items.map((it) => {
                   const isSel = selected.has(it.id);
+                  const bloqueado = itemBloqueado(it);  // adelanto no verificado → no se puede comprar
+                  const rowBg = isSel ? (dark ? "#1a2340" : "#FFF7F7")
+                    : bloqueado ? (dark ? "#2a1620" : "#FEF2F2") : "transparent";
                   return (
-                    <tr key={it.id} style={{ borderBottom: `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}`, background: isSel ? (dark ? "#1a2340" : "#FFF7F7") : "transparent", cursor: "pointer" }}
-                      onClick={() => toggleSel(it.id)}>
+                    <tr key={it.id} style={{ borderBottom: `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}`, background: rowBg, cursor: bloqueado ? "not-allowed" : "pointer" }}
+                      onClick={() => { if (!bloqueado) toggleSel(it.id); }}>
                       <td style={{ textAlign: "center", padding: "8px" }}>
-                        <input type="checkbox" checked={isSel} onChange={() => toggleSel(it.id)} onClick={(e) => e.stopPropagation()} style={{ accentColor: "var(--monza-accent)", cursor: "pointer" }} />
+                        <input type="checkbox" checked={isSel} disabled={bloqueado}
+                          title={bloqueado ? "Adelanto no verificado por Contabilidad: no se puede comprar hasta confirmar el pago" : ""}
+                          onChange={() => { if (!bloqueado) toggleSel(it.id); }} onClick={(e) => e.stopPropagation()}
+                          style={{ accentColor: "var(--monza-accent)", cursor: bloqueado ? "not-allowed" : "pointer" }} />
                       </td>
                       <td style={{ padding: "9px 12px" }}>
                         <div style={{ fontWeight: 600, fontSize: 12, color: "var(--monza-accent)" }}>{it.cot_numero}</div>
@@ -490,6 +520,17 @@ export default function MonzaAbastecimientoPage() {
                       <td style={{ padding: "9px 12px", textAlign: "right", color: sub }}>{it.costo ? `${it.moneda} ${it.costo}` : "—"}</td>
                       <td style={{ padding: "9px 12px", color: sub, fontSize: 12 }}>{it.plazo_entrega || "—"}</td>
                       <td style={{ padding: "9px 12px", color: sub, fontSize: 12 }}>{fmtDate(it.fecha_venta)}</td>
+                      <td style={{ padding: "9px 12px" }}>
+                        {it.requiere_adelanto ? (
+                          <span style={{ fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 999, whiteSpace: "nowrap",
+                            background: it.pago_verificado ? "#DCFCE7" : "#FEE2E2",
+                            color: it.pago_verificado ? "#15803D" : "#B91C1C" }}>
+                            {it.pago_verificado ? `Adelanto ${it.pct_adelanto || ADELANTO_PCT_DEFECTO}% verificado` : "Pago no verificado"}
+                          </span>
+                        ) : (
+                          <span style={{ fontSize: 11, color: sub }}>—</span>
+                        )}
+                      </td>
                     </tr>
                   );
                 })}

@@ -18,6 +18,16 @@ from monza_router_abastecimiento import router as monza_abastecimiento_router
 from monza_router_bodega import router as monza_bodega_router
 from monza_router_logistica import router as monza_logistica_router
 from monza_router_notificaciones import router as monza_notif_router
+from monza_router_integraciones import router as monza_integraciones_router
+from routers import contabilidad
+from routers import venta_clp
+from embarques_pricing.router import router as embarques_pricing_router
+from compras_contab.router import router as compras_contab_router
+from tesoreria.router import router as tesoreria_router
+from monza_contabilidad.router import router as monza_contabilidad_router
+from monza_embarques_pricing.router import router as monza_embarques_pricing_router
+from monza_compras_contab.router import router as monza_compras_contab_router
+from monza_tesoreria.router import router as monza_tesoreria_router
 from monza_router_documentos import router as monza_docs_router
 from monza_router_catalog import router as monza_catalog_router
 from monza_router_clientes import router as monza_clientes_router
@@ -69,6 +79,16 @@ app.include_router(monza_abastecimiento_router)
 app.include_router(monza_bodega_router)
 app.include_router(monza_logistica_router)
 app.include_router(monza_notif_router)
+app.include_router(monza_integraciones_router)
+app.include_router(contabilidad.router, prefix="/api")
+app.include_router(venta_clp.router)
+app.include_router(embarques_pricing_router, prefix="/api")
+app.include_router(compras_contab_router, prefix="/api")
+app.include_router(tesoreria_router, prefix="/api")
+app.include_router(monza_contabilidad_router)
+app.include_router(monza_embarques_pricing_router)
+app.include_router(monza_compras_contab_router)
+app.include_router(monza_tesoreria_router)
 app.include_router(monza_docs_router)
 app.include_router(monza_catalog_router)
 app.include_router(monza_clientes_router)

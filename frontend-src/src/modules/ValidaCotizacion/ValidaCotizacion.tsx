@@ -300,6 +300,38 @@ export default function ValidaCotizacion() {
     multiple: false,
   })
 
+  // Subir Excel con precios de VENTA en CLP (margen incluido, con días)
+  const uploadVentaMutation = useMutation({
+    mutationFn: (file: File) => cotizacionesAPI.uploadVenta(file),
+    onSuccess: (data: any) => {
+      toast.success(`Cotización ${data.data.numero}: ${data.data.items} ítems (precios de venta CLP)`)
+      queryClient.invalidateQueries({ queryKey: ['cotizaciones'] })
+      setSelectedCot(data.data.id)
+    },
+    onError: (err: any) => {
+      toast.error(err.response?.data?.detail || 'Error al subir el Excel de precios de venta')
+    },
+  })
+
+  const onDropVenta = useCallback((accepted: File[]) => {
+    if (!accepted.length) return
+    const file = accepted[0]
+    if (!file.name.match(/\.(xlsx|xls)$/i)) {
+      toast.error('Solo se aceptan archivos Excel (.xlsx, .xls)')
+      return
+    }
+    uploadVentaMutation.mutate(file)
+  }, [uploadVentaMutation])
+
+  const { getRootProps: getRootPropsVenta, getInputProps: getInputPropsVenta, isDragActive: isDragActiveVenta } = useDropzone({
+    onDrop: onDropVenta,
+    accept: {
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
+      'application/vnd.ms-excel': ['.xls'],
+    },
+    multiple: false,
+  })
+
   const stats = {
     total: cotizaciones.length,
     completados: cotizaciones.filter((c: any) => c.estado === 'completado').length,
@@ -386,7 +418,7 @@ export default function ValidaCotizacion() {
         <div className="space-y-5">
 
           {/* Opciones de ingreso */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
             {/* Subir Excel */}
             <div
               {...getRootProps()}
@@ -437,6 +469,52 @@ export default function ValidaCotizacion() {
                       <span className="flex items-center gap-1"><Package className="w-3 h-3" /> Lee N° PARTE</span>
                       <span className="flex items-center gap-1"><Search className="w-3 h-3" /> Busca en CAT</span>
                       <span className="flex items-center gap-1"><Download className="w-3 h-3" /> Genera Excel</span>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* Subir Excel con precios de VENTA (CLP) */}
+            <div
+              {...getRootPropsVenta()}
+              className={`relative border-2 border-dashed rounded-2xl p-8 text-center cursor-pointer transition-all duration-300 ${isDragActiveVenta ? 'border-[var(--empresa-primary)] bg-[var(--empresa-primary-sh)] scale-[1.01]' : uploadVentaMutation.isPending ? 'border-amber-500/50 bg-amber-500/5 cursor-not-allowed' : 'border-[var(--border)] hover:border-[var(--empresa-primary)] hover:bg-[var(--empresa-primary-sh)] bg-[var(--surface-100)]'}`}
+            >
+              <input {...getInputPropsVenta()} disabled={uploadVentaMutation.isPending} />
+              <div className="flex flex-col items-center gap-3">
+                {uploadVentaMutation.isPending ? (
+                  <>
+                    <div className="w-12 h-12 rounded-2xl bg-amber-500/20 flex items-center justify-center">
+                      <RefreshCw className="w-6 h-6 text-amber-400 animate-spin" />
+                    </div>
+                    <div>
+                      <p className="font-semibold text-amber-400">Procesando Excel...</p>
+                      <p className="text-sm mt-1" style={{ color: 'var(--text-faint)' }}>Por favor espera</p>
+                    </div>
+                  </>
+                ) : isDragActiveVenta ? (
+                  <>
+                    <div className="w-12 h-12 rounded-2xl flex items-center justify-center" style={{ backgroundColor: 'var(--empresa-primary-sh)' }}>
+                      <Upload className="w-6 h-6" style={{ color: 'var(--empresa-primary)' }} />
+                    </div>
+                    <p className="font-semibold" style={{ color: 'var(--empresa-primary)' }}>Suelta el archivo aquí</p>
+                  </>
+                ) : (
+                  <>
+                    <div className="w-12 h-12 rounded-2xl bg-[var(--surface-200)] flex items-center justify-center">
+                      <FileSpreadsheet className="w-6 h-6" style={{ color: 'var(--text-muted)' }} />
+                    </div>
+                    <div>
+                      <p className="font-semibold" style={{ color: 'var(--text-primary)' }}>
+                        Subir Excel con precios de venta
+                      </p>
+                      <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>
+                        Precios en CLP (margen incluido) · .xlsx / .xls
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap justify-center items-center gap-3 mt-1 text-xs" style={{ color: 'var(--text-faint)' }}>
+                      <span className="flex items-center gap-1"><Package className="w-3 h-3" /> Precio CLP</span>
+                      <span className="flex items-center gap-1"><Download className="w-3 h-3" /> Con días</span>
                     </div>
                   </>
                 )}

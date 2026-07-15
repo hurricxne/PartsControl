@@ -124,6 +124,9 @@ class ItemUpdate(BaseModel):
     peso_unit_lbs: Optional[float] = None
     margen_pct: Optional[float] = None
     plazo: Optional[str] = None
+    plazo_entrega_min: Optional[int] = None
+    plazo_entrega_max: Optional[int] = None
+    precio_venta_clp: Optional[float] = None
     precio_finning: Optional[float] = None
     descripcion: Optional[str] = None
     marca: Optional[str] = None
@@ -170,11 +173,14 @@ def get_editor(
     )
 
     items_raw = [_item_to_dict(i) for i in items]
-    resultado = calcular_cotizacion(items_raw, _config_to_dict(config))
+    _cfg = _config_to_dict(config)
+    _cfg["origen"] = (db.query(Cotizacion.origen).filter(Cotizacion.id == cotizacion_id).scalar() or "costo")
+    resultado = calcular_cotizacion(items_raw, _cfg)
 
     return {
         "id": c.id,
         "numero": c.numero,
+        "origen": getattr(c, "origen", None) or "costo",
         "cliente": c.cliente,
         "rut_cliente": c.rut_cliente,
         "contacto_cliente": c.contacto_cliente,
@@ -225,8 +231,26 @@ def update_item(
         raise HTTPException(status_code=404, detail="Ítem no encontrado")
 
     updates = body.model_dump(exclude_none=True)
+    precio_venta_edit = updates.pop("precio_venta_clp", None)
     for field, val in updates.items():
         setattr(item, field, val)
+
+    if precio_venta_edit is not None:
+        _cot = db.query(Cotizacion).filter(Cotizacion.id == cotizacion_id).first()
+        _origen = (getattr(_cot, "origen", None) or "costo")
+        # Costo unitario fijo -> mover el margen para calzar el precio de venta editado.
+        _config = _get_or_create_config(db)
+        _all = (db.query(ItemCotizacion)
+                .filter(ItemCotizacion.cotizacion_id == cotizacion_id)
+                .order_by(ItemCotizacion.item_num).all())
+        _cfg = _config_to_dict(_config); _cfg["origen"] = _origen
+        _res = calcular_cotizacion([_item_to_dict(i) for i in _all], _cfg)
+        _idx = next((k for k, i in enumerate(_all) if i.id == item.id), None)
+        _costo = 0.0
+        if _idx is not None and _idx < len(_res.get("items", [])):
+            _costo = float(_res["items"][_idx].get("costo_unitario_clp") or 0)
+        if _costo > 0:
+            item.margen_pct = float(precio_venta_edit) / _costo - 1.0
     db.commit()
     return {"ok": True}
 
@@ -274,7 +298,9 @@ def generar_formal(
     )
 
     items_raw = [_item_to_dict(i) for i in items]
-    resultado = calcular_cotizacion(items_raw, _config_to_dict(config))
+    _cfg = _config_to_dict(config)
+    _cfg["origen"] = (db.query(Cotizacion.origen).filter(Cotizacion.id == cotizacion_id).scalar() or "costo")
+    resultado = calcular_cotizacion(items_raw, _cfg)
 
     # Generar Excel formal
     filename = f"formal_{cotizacion_id}_{uuid.uuid4().hex[:8]}.xlsx"
@@ -304,7 +330,9 @@ def download_formal(
         .all()
     )
     items_raw = [_item_to_dict(i) for i in items]
-    resultado = calcular_cotizacion(items_raw, _config_to_dict(config))
+    _cfg = _config_to_dict(config)
+    _cfg["origen"] = (db.query(Cotizacion.origen).filter(Cotizacion.id == cotizacion_id).scalar() or "costo")
+    resultado = calcular_cotizacion(items_raw, _cfg)
     filename = f"formal_{cotizacion_id}_{uuid.uuid4().hex[:8]}.xlsx"
     filepath = os.path.join(RESULTS_DIR, filename)
     _generar_excel_formal(c, resultado, filepath, _config_to_dict(config))
@@ -1404,7 +1432,9 @@ def descargar_pdf(
         .all()
     )
     items_raw = [_item_to_dict(i) for i in items]
-    resultado = calcular_cotizacion(items_raw, _config_to_dict(config))
+    _cfg = _config_to_dict(config)
+    _cfg["origen"] = (db.query(Cotizacion.origen).filter(Cotizacion.id == cotizacion_id).scalar() or "costo")
+    resultado = calcular_cotizacion(items_raw, _cfg)
 
     filename = f"pdf_{cotizacion_id}_{uuid.uuid4().hex[:8]}.pdf"
     filepath = os.path.join(RESULTS_DIR, filename)

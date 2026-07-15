@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, Date, ForeignKey, Numeric, Numeric,
-    Text, Enum, Boolean
+    Text, Enum, Boolean, UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -56,6 +56,7 @@ class Cotizacion(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     fase_comercial = Column(String(50), default="ingresada")
+    origen = Column(String(20), default="costo")  # costo (proveedor USD) | venta_clp
 
     user = relationship("User", back_populates="cotizaciones")
     items = relationship(
@@ -208,6 +209,21 @@ class Embarque(Base):
     doc_adicional       = Column(String(500), nullable=True)
 
     items = relationship("EmbarqueItem", back_populates="embarque")
+
+
+class EmbarqueDocumento(Base):
+    """Documentos adicionales (N) de un embarque — botón "Otros" en Embarques.
+
+    El archivo se sube con POST /api/compras/docs/upload (deja UUID.ext en
+    uploads/docs) y se descarga con GET /api/despachos/docs/{filename}.
+    """
+    __tablename__ = "embarque_documentos"
+    id = Column(Integer, primary_key=True, index=True)
+    embarque_id = Column(Integer, ForeignKey("embarques.id"), nullable=False, index=True)
+    nombre = Column(String(255), nullable=False)    # etiqueta visible (nombre original)
+    archivo = Column(String(255), nullable=False)   # UUID.ext en uploads/docs
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    usuario_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
 
 class EmbarqueItem(Base):
@@ -438,6 +454,7 @@ class Despacho(Base):
     oc_cliente_id = Column(Integer, ForeignKey("oc_cliente.id"))
     numero_guia = Column(String(100), nullable=True)
     transportista = Column(String(255), nullable=True)
+    numero_expedicion = Column(String(120), nullable=True)   # N° de expedición de la guía (courier, ej. Samex); todos sus ítems lo comparten
     contacto_destinatario = Column(String(255), nullable=True)
     direccion_entrega = Column(String(500), nullable=True)
     observaciones = Column(Text, nullable=True)
@@ -445,6 +462,11 @@ class Despacho(Base):
     fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
     fecha_despacho = Column(DateTime(timezone=True), nullable=True)
     usuario_creacion_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # Guía firmada = entregada y firmada por el cliente. Requisito para poder facturar.
+    guia_firmada = Column(Integer, default=0)              # 0 = no firmada | 1 = firmada
+    fecha_firma = Column(DateTime(timezone=True), nullable=True)
+    usuario_firma_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    guia_firmada_archivo = Column(String(255), nullable=True)   # foto/PDF de la guía firmada (archivo en uploads/docs)
 
     oc_cliente = relationship("OcCliente")
     usuario_creacion = relationship("User", foreign_keys=[usuario_creacion_id])
@@ -462,3 +484,110 @@ class DespachoItem(Base):
 
     despacho = relationship("Despacho", back_populates="items")
     item_cotizacion = relationship("ItemCotizacion")
+
+
+# ─── Contabilidad: Facturas a cliente / Cobranzas / Factoring ─────────────────
+# Las ventas (Cotizacion + OcCliente) y los despachos (Despacho/DespachoItem) ya
+# existen y se reutilizan. Aquí se agrega lo que faltaba: la factura de venta al
+# cliente (cuentas por cobrar), los pagos del cliente y el factoring por factura.
+# Una venta (1 OC) puede generar VARIAS facturas (los ítems se despachan por
+# partes en distintas guías), cada una con su propio plazo y estado de pago.
+
+class ContFacturaCliente(Base):
+    """Factura/Boleta emitida al cliente. Unidad de cuentas por cobrar.
+
+    Se emite sobre los ítems despachados (típicamente una guía de despacho), por
+    eso `despacho_id` es opcional pero habitual. Los montos se CONGELAN al emitir.
+    """
+    __tablename__ = "cont_factura_cliente"
+    # Folio único por empresa (los NULL/borradores sin folio no colisionan en MySQL).
+    __table_args__ = (
+        UniqueConstraint("empresa", "numero_factura", name="uq_cont_factura_empresa_folio"),
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    empresa = Column(String(50), nullable=False, server_default="mineria")
+    oc_cliente_id = Column(Integer, ForeignKey("oc_cliente.id"), nullable=True, index=True)
+    cotizacion_id = Column(Integer, ForeignKey("cotizaciones.id"), nullable=True, index=True)
+    despacho_id = Column(Integer, ForeignKey("despachos.id"), nullable=True, index=True)
+    numero_factura = Column(String(100), nullable=True, index=True)   # folio SII
+    tipo_doc = Column(String(20), default="factura")       # factura | boleta
+    fecha_emision = Column(Date, nullable=True)
+    condicion_pago = Column(String(200), nullable=True)    # texto, ej "30 días contra factura"
+    plazo_dias = Column(Integer, nullable=True)
+    fecha_vencimiento = Column(Date, nullable=True)
+    monto_neto = Column(Numeric(14, 2), default=0)
+    iva = Column(Numeric(14, 2), default=0)
+    monto_bruto = Column(Numeric(14, 2), default=0)
+    estado_pago = Column(String(20), default="por_cobrar")  # por_cobrar|parcial|pagada|vencida|factorizada
+    monto_pagado = Column(Numeric(14, 2), default=0)
+    saldo = Column(Numeric(14, 2), default=0)
+    observaciones = Column(Text, nullable=True)
+    usuario_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    items = relationship("ContFacturaClienteItem", back_populates="factura",
+                         cascade="all, delete-orphan")
+    cobranzas = relationship("ContCobranza", back_populates="factura",
+                             cascade="all, delete-orphan")
+    factoring = relationship("ContFactoring", back_populates="factura",
+                             uselist=False, cascade="all, delete-orphan")
+    oc_cliente = relationship("OcCliente")
+    despacho = relationship("Despacho")
+
+
+class ContFacturaClienteItem(Base):
+    """Línea de una factura de venta (snapshot del precio al facturar)."""
+    __tablename__ = "cont_factura_cliente_item"
+    id = Column(Integer, primary_key=True, index=True)
+    factura_id = Column(Integer, ForeignKey("cont_factura_cliente.id", ondelete="CASCADE"))
+    item_cotizacion_id = Column(Integer, ForeignKey("items_cotizacion.id"), nullable=True, index=True)
+    despacho_item_id = Column(Integer, ForeignKey("despacho_items.id"), nullable=True, index=True)
+    numero_parte = Column(String(100), nullable=True)
+    descripcion = Column(String(500), nullable=True)
+    cantidad = Column(Numeric(12, 4), default=0)
+    precio_unit_neto = Column(Numeric(14, 2), default=0)
+    total_neto = Column(Numeric(14, 2), default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    factura = relationship("ContFacturaCliente", back_populates="items")
+
+
+class ContCobranza(Base):
+    """Pago del cliente aplicado a una factura."""
+    __tablename__ = "cont_cobranza"
+    id = Column(Integer, primary_key=True, index=True)
+    factura_id = Column(Integer, ForeignKey("cont_factura_cliente.id", ondelete="CASCADE"))
+    fecha = Column(Date, nullable=True)
+    monto = Column(Numeric(14, 2), default=0)
+    medio = Column(String(30), default="transferencia")  # transferencia|cheque|efectivo|factoring
+    banco = Column(String(100), nullable=True)
+    numero_operacion = Column(String(100), nullable=True)
+    observaciones = Column(Text, nullable=True)
+    usuario_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    factura = relationship("ContFacturaCliente", back_populates="cobranzas")
+
+
+class ContFactoring(Base):
+    """Operación de factoring de UNA factura (cesión al factor)."""
+    __tablename__ = "cont_factoring"
+    id = Column(Integer, primary_key=True, index=True)
+    factura_id = Column(Integer, ForeignKey("cont_factura_cliente.id", ondelete="CASCADE"),
+                        unique=True)
+    empresa_factoring = Column(String(150), nullable=True)  # ej "Penta Financiero"
+    id_operacion = Column(String(100), nullable=True)
+    fecha_operacion = Column(Date, nullable=True)
+    monto_adelantado = Column(Numeric(14, 2), default=0)
+    costo_factoring = Column(Numeric(14, 2), default=0)     # comisión / diferencial
+    retencion = Column(Numeric(14, 2), default=0)           # retención del factor (por cobrar al liquidar)
+    banco = Column(String(100), nullable=True)
+    estado = Column(String(20), default="vigente")          # vigente | liquidada
+    fecha_liquidacion = Column(Date, nullable=True)
+    observaciones = Column(Text, nullable=True)
+    usuario_id = Column(Integer, ForeignKey("users.id"), nullable=True)              # quién registró/editó
+    usuario_liquidacion_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # quién liquidó
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    factura = relationship("ContFacturaCliente", back_populates="factoring")

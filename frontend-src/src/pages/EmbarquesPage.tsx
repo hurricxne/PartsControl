@@ -179,6 +179,99 @@ function DocField({
   )
 }
 
+// ── OtrosDocs: N documentos adicionales por embarque ──────────────────────
+
+function OtrosDocs({ embId }: { embId: number }) {
+  const [docs, setDocs] = useState<{ id: number; nombre: string; archivo: string }[]>([])
+  const [uploading, setUploading] = useState(false)
+  const ref = useRef<HTMLInputElement>(null)
+
+  const load = useCallback(async () => {
+    try {
+      const { data } = await comprasAPI.listEmbarqueDocs(embId)
+      setDocs(data)
+    } catch {
+      // la card sigue usable aunque no carguen los docs
+    }
+  }, [embId])
+  useEffect(() => { load() }, [load])
+
+  const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setUploading(true)
+    try {
+      const up = await uploadDoc(file)
+      await comprasAPI.addEmbarqueDoc(embId, { nombre: up.original || file.name, archivo: up.filename })
+      toast.success('Documento adjuntado')
+      await load()
+    } catch (err: any) {
+      toast.error(err.message || 'Error al subir')
+    } finally {
+      setUploading(false)
+      if (ref.current) ref.current.value = ''
+    }
+  }
+
+  const descargar = async (d: { nombre: string; archivo: string }) => {
+    try {
+      const resp = await comprasAPI.downloadDoc(d.archivo)
+      const url = URL.createObjectURL(new Blob([resp.data]))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = d.nombre
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch {
+      toast.error('No se pudo descargar')
+    }
+  }
+
+  const quitar = async (id: number) => {
+    try {
+      await comprasAPI.deleteEmbarqueDoc(embId, id)
+      await load()
+    } catch {
+      toast.error('No se pudo quitar')
+    }
+  }
+
+  return (
+    <div>
+      <p className="text-[10px] uppercase tracking-wider mb-0.5" style={{ color: 'var(--text-faint)' }}>
+        Otros Documentos{docs.length > 0 ? ` (${docs.length})` : ''}
+      </p>
+      <input ref={ref} type="file" className="hidden"
+        accept=".pdf,.jpg,.jpeg,.png,.doc,.docx,.xls,.xlsx" onChange={handleFile} />
+      <div className="space-y-1">
+        {docs.map(d => (
+          <div key={d.id} className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg border"
+            style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-100)' }}>
+            <FileText className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+            <button onClick={() => descargar(d)} title={`Descargar ${d.nombre}`}
+              className="text-[11px] truncate flex-1 text-left hover:underline"
+              style={{ color: 'var(--text-primary)' }}>{d.nombre}</button>
+            <button onClick={() => quitar(d.id)} title="Quitar"
+              className="p-0.5 rounded hover:bg-red-500/10">
+              <X className="w-3 h-3 text-red-400" />
+            </button>
+          </div>
+        ))}
+        <button onClick={() => ref.current?.click()} disabled={uploading}
+          className="flex items-center gap-1.5 w-full px-2 py-1.5 rounded-lg border text-[11px] transition-colors hover:bg-[var(--surface-200)] disabled:opacity-50"
+          style={{ borderColor: 'var(--border)', color: 'var(--text-faint)', borderStyle: 'dashed' }}>
+          {uploading
+            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            : <Upload className="w-3.5 h-3.5" />}
+          {uploading ? 'Subiendo...' : docs.length ? 'Agregar otro' : 'Adjuntar'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 // ── InlineEdit ────────────────────────────────────────────────────────────
 
 function InlineEdit({
@@ -423,9 +516,7 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
               <DocField label="Cert. de Origen"
                 value={docs.certificado_origen}
                 onChange={v => saveDoc('certificado_origen', v)} />
-              <DocField label="Otros Documentos"
-                value={docs.doc_adicional}
-                onChange={v => saveDoc('doc_adicional', v)} />
+              <OtrosDocs embId={emb.id} />
             </div>
 
             {/* Notas */}

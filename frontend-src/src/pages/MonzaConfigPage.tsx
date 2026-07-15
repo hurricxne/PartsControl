@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { fmtClp } from "../utils/format";
 import { monzaConfigAPI, monzaClientesAPI } from "../services/monzaApi";
 import toast from "react-hot-toast";
 import { Settings, RefreshCw, Save, Users, Plus, Search, Edit2, Trash2, X, Phone, Mail } from "lucide-react";
@@ -130,8 +131,6 @@ function ClientesTab() {
     } catch { toast.error("Error al desactivar"); }
   };
 
-  const fmt = (n: number) => n > 0 ? `$${n.toLocaleString("es-CL")}` : "$0";
-
   return (
     <div>
       {/* Toolbar */}
@@ -192,7 +191,7 @@ function ClientesTab() {
                   <span style={{ background: "#DCFCE7", borderRadius: 10, padding: "2px 10px", fontSize: 12, fontWeight: 600, color: "#166534" }}>{c.vendidos_total}</span>
                 </td>
                 <td style={{ padding: "11px 14px", textAlign: "center", fontWeight: 600, color: c.ltv > 0 ? "#1E293B" : "#CBD5E1" }}>
-                  {fmt(c.ltv)}
+                  {fmtClp(c.ltv)}
                 </td>
                 <td style={{ padding: "11px 14px", textAlign: "center" }}>
                   <div style={{ display: "flex", gap: 6, justifyContent: "center" }}>

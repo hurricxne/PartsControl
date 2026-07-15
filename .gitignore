@@ -79,3 +79,6 @@ Thumbs.db
 # Documentos de despacho subidos en runtime
 backend/static/despachos/
 backend/static/docs/
+
+# Excel del dueño (Libro diario / Mayor / Clientes) - NO versionar
+Excel grupo am actual/

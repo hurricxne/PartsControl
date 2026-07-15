@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { fmtClp } from "../utils/format";
 import { Plus, Search, ChevronDown, ChevronRight, Phone, MessageCircle, FileText, Calendar, X, Tag, Clock, Edit2, Trash2, Calculator } from "lucide-react";
 import { monzaLeadsAPI, monzaCatalogAPI, monzaCotizacionesAPI, monzaClientesAPI } from "../services/monzaApi";
 import MonzaCotizadorModal from "./MonzaCotizadorModal";
@@ -29,7 +30,6 @@ const ESTADO_COLORS: Record<string, { bg: string; color: string; label: string }
   rechazado: { bg: "#FEE2E2", color: "#991B1B", label: "Rechazado" },
 };
 const CALIDAD_LABEL: Record<string, string> = { sin_calificar: "Sin calificar", genuine: "Genuine", oem: "OEM", aftermarket: "Aftermarket" };
-const fmt = (n: number) => n > 0 ? `$${n.toLocaleString("es-CL")}` : "$0";
 function timeSince(dateStr: string) {
   const diff = Date.now() - new Date(dateStr).getTime();
   const mins = Math.floor(diff / 60000);
@@ -487,6 +487,7 @@ function EmitirCotizacionModal({ lead, detail, onClose, onEmitted }: { lead: Lea
           descripcion: it.descripcion,
           numero_parte: it.numero_parte || undefined,
           marca: it.marca || undefined,
+          procedencia: it.procedencia || undefined,
           calidad: it.calidad,
           cantidad: it.cantidad,
           precio_unitario_clp: it.precio_clp,
@@ -518,7 +519,6 @@ function EmitirCotizacionModal({ lead, detail, onClose, onEmitted }: { lead: Lea
 
   const inputSt = { width: "100%", padding: "8px 10px", border: "1px solid #D1D5DB", borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: "white", color: "#1E293B" };
   const labelSt = { fontSize: 11, fontWeight: 600 as const, color: "#64748B", display: "block", marginBottom: 4 };
-  const fmt = (n: number) => `$${n.toLocaleString("es-CL")}`;
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 1010, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
@@ -576,8 +576,8 @@ function EmitirCotizacionModal({ lead, detail, onClose, onEmitted }: { lead: Lea
                       <div style={{ textAlign: "right", flexShrink: 0 }}>
                         {hasPrecio ? (
                           <>
-                            <div style={{ fontSize: 13, fontWeight: 700, color: "#0C4A6E" }}>{fmt(it.precio_clp! * it.cantidad)}</div>
-                            <div style={{ fontSize: 10, color: "#64748B" }}>{fmt(it.precio_clp!)} × {it.cantidad}</div>
+                            <div style={{ fontSize: 13, fontWeight: 700, color: "#0C4A6E" }}>{fmtClp(it.precio_clp! * it.cantidad)}</div>
+                            <div style={{ fontSize: 10, color: "#64748B" }}>{fmtClp(it.precio_clp!)} × {it.cantidad}</div>
                           </>
                         ) : (
                           <span style={{ fontSize: 10, background: "#FEF3C7", color: "#D97706", padding: "2px 7px", borderRadius: 6, fontWeight: 600 }}>Sin precio</span>
@@ -595,15 +595,15 @@ function EmitirCotizacionModal({ lead, detail, onClose, onEmitted }: { lead: Lea
             <div style={{ background: "#F0F9FF", border: "1px solid #BAE6FD", borderRadius: 8, padding: "12px 16px", marginBottom: 18 }}>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#0369A1", marginBottom: 4 }}>
                 <span>Neto ({selectedItems.length} ítem{selectedItems.length !== 1 ? "s" : ""})</span>
-                <strong>{fmt(totalNeto)}</strong>
+                <strong>{fmtClp(totalNeto)}</strong>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#0369A1", marginBottom: 6 }}>
                 <span>IVA (19%)</span>
-                <strong>{fmt(iva)}</strong>
+                <strong>{fmtClp(iva)}</strong>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 15, fontWeight: 800, color: "#0C4A6E", borderTop: "1px solid #BAE6FD", paddingTop: 6 }}>
                 <span>Total bruto</span>
-                <span>{fmt(totalBruto)}</span>
+                <span>{fmtClp(totalBruto)}</span>
               </div>
             </div>
           )}
@@ -860,7 +860,7 @@ function LeadDetail({ lead, onRefresh }: { lead: Lead; onRefresh: () => void }) 
               <div style={{ display: "flex", gap: 12, marginTop: 10, paddingTop: 10, borderTop: `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}`, fontSize: 11 }}>
                 <span style={{ color: sub }}>Leads: <strong style={{ color: txt }}>{cli.leads_total || 0}</strong></span>
                 <span style={{ color: sub }}>Vendidos: <strong style={{ color: txt }}>{cli.vendidos_total || 0}</strong></span>
-                <span style={{ color: sub }}>LTV: <strong style={{ color: txt }}>{fmt(cli.ltv || 0)}</strong></span>
+                <span style={{ color: sub }}>LTV: <strong style={{ color: txt }}>{fmtClp(cli.ltv || 0)}</strong></span>
               </div>
             </div>
           </div>
@@ -988,7 +988,7 @@ function LeadDetail({ lead, onRefresh }: { lead: Lead; onRefresh: () => void }) 
                     </span>
                   </td>
                   <td style={{ padding: "7px 10px", textAlign: "right", color: it.precio_clp ? txt : "#94A3B8", fontWeight: it.precio_clp ? 600 : 400 }}>
-                    {it.precio_clp ? fmt(it.precio_clp) : <span style={{ fontSize: 10, background: "#FEF3C7", color: "#D97706", padding: "2px 6px", borderRadius: 4 }}>Sin precio</span>}
+                    {it.precio_clp ? fmtClp(it.precio_clp) : <span style={{ fontSize: 10, background: "#FEF3C7", color: "#D97706", padding: "2px 6px", borderRadius: 4 }}>Sin precio</span>}
                   </td>
                   <td style={{ padding: "5px 8px", minWidth: 140 }}>
                     {editingPlazo === it.id ? (
@@ -1023,7 +1023,7 @@ function LeadDetail({ lead, onRefresh }: { lead: Lead; onRefresh: () => void }) 
           {(detail.items || []).length > 0 && (
             <div style={{ padding: "8px 10px", borderTop: `1px solid ${rowBd}`, textAlign: "right", fontSize: 12, color: sub }}>
               {(detail.items || []).filter((it) => it.precio_clp).length} ítem(s) con precio · Total{" "}
-              <strong style={{ color: txt }}>{fmt(detail.total_estimado)}</strong>
+              <strong style={{ color: txt }}>{fmtClp(detail.total_estimado)}</strong>
             </div>
           )}
         </div>
@@ -1127,7 +1127,7 @@ export default function MonzaLeadsPage() {
         <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
           <KpiCard label="Leads nuevos del mes" accent="#3B82F6" value={kpis.nuevos_mes} />
           <KpiCard label="En proceso" accent="#F59E0B" value={kpis.en_proceso} />
-          <KpiCard label="Vendidos" accent="#10B981" value={kpis.vendidos_mes} sub={`Total: ${fmt(kpis.total_cotizado_mes)}`} />
+          <KpiCard label="Vendidos" accent="#10B981" value={kpis.vendidos_mes} sub={`Total: ${fmtClp(kpis.total_cotizado_mes)}`} />
           <KpiCard label="Tasa de cierre" accent="#6366F1" value={`${kpis.tasa_cierre_pct}%`} />
           <KpiCard label="Sin contactar +3d" accent="#EF4444" value={kpis.sin_contactar_3d} sub={`Pendiente ${kpis.pendientes} · En trabajo ${kpis.en_trabajo}`} />
         </div>
@@ -1220,7 +1220,7 @@ export default function MonzaLeadsPage() {
                       <span style={{ fontSize: 11, color: "#64748B", marginLeft: 6 }}>{lead.asesor || "—"}</span>
                     </td>
                     <td style={{ padding: "10px 12px", textAlign: "right", fontWeight: 600, color: lead.total_estimado > 0 ? "#1E293B" : "#CBD5E1" }}>
-                      {lead.total_estimado > 0 ? fmt(lead.total_estimado) : "$0"}
+                      {lead.total_estimado > 0 ? fmtClp(lead.total_estimado) : "$0"}
                     </td>
                     <td style={{ padding: "10px 12px", textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
                       <div style={{ display: "flex", gap: 4, justifyContent: "center" }}>

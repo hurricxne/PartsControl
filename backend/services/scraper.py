@@ -3,12 +3,15 @@ Scraper para parts.cat.com/es/finningchile
 Usa Playwright con técnicas anti-detección para evadir Akamai Bot Manager.
 """
 import asyncio
+import logging
 import re
 import json
 import random
 from typing import Optional, Dict
 from playwright.async_api import async_playwright, Page, Browser
 
+
+logger = logging.getLogger("scraper")
 
 BASE_URL = "https://parts.cat.com/es/finningchile"
 SEARCH_URL = f"{BASE_URL}/search"
@@ -134,8 +137,8 @@ async def scrape_part(page: Page, numero_parte: str) -> Dict:
                         body = await response.json()
                         if isinstance(body, dict):
                             api_data.update(body)
-            except:
-                pass
+            except Exception as e:
+                logger.debug("capture_response falló para %s: %s", numero_parte, e)
 
         page.on("response", capture_response)
 
@@ -149,8 +152,8 @@ async def scrape_part(page: Page, numero_parte: str) -> Dict:
         # Esperar que cargue contenido
         try:
             await page.wait_for_selector('[data-part-number], .product-item, [class*="product"], [class*="part-detail"]', timeout=15000)
-        except:
-            pass
+        except Exception:
+            logger.warning("Timeout esperando contenido de producto para %s", numero_parte)
 
         # --- Intentar extraer desde el DOM ---
 
@@ -167,8 +170,8 @@ async def scrape_part(page: Page, numero_parte: str) -> Dict:
                     if text and len(text) > 3:
                         result["nombre_cat"] = text
                         break
-            except:
-                pass
+            except Exception:
+                pass  # selector no presente; probar el siguiente
 
         # 2. Precio
         for selector in [
@@ -190,7 +193,7 @@ async def scrape_part(page: Page, numero_parte: str) -> Dict:
                         elif "USD" in text.upper():
                             result["moneda_cat"] = "USD"
                         break
-            except:
+            except Exception:
                 pass
 
         # 3. Retiro estimado
@@ -206,7 +209,7 @@ async def scrape_part(page: Page, numero_parte: str) -> Dict:
                     if text and len(text) > 2:
                         result["retiro_estimado"] = text[:200]
                         break
-            except:
+            except Exception:
                 pass
 
         # 4. Imagen
@@ -218,7 +221,7 @@ async def scrape_part(page: Page, numero_parte: str) -> Dict:
                     if src:
                         result["imagen_url"] = src
                         break
-            except:
+            except Exception:
                 pass
 
         # 5. Verificar si se encontró algo útil
@@ -263,8 +266,8 @@ async def scrape_parts_batch(
         try:
             await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=20000)
             await asyncio.sleep(random.uniform(1.5, 2.5))
-        except:
-            pass
+        except Exception as e:
+            logger.warning("Warm-up de %s falló: %s", BASE_URL, e)
 
         total = len(part_numbers)
         for idx, np in enumerate(part_numbers):

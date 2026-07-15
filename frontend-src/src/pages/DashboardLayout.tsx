@@ -5,7 +5,7 @@ import {
   Activity, Bell, Sun, Moon, Menu, PanelLeftClose, PanelLeftOpen,
   FileText, TrendingUp, Ship, DollarSign, Users, BarChart3,
   ShoppingCart, Package, Receipt, Settings, UserCog,
-  FileSignature, PackageSearch, Banknote, Calculator, Building2, Anchor, Truck,
+  FileSignature, PackageSearch, Banknote, Calculator, Building2, Anchor, Truck, Wallet, Landmark,
 } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
 import { useTheme } from '../context/ThemeContext'
@@ -64,6 +64,8 @@ const navGroups: NavGroup[] = [
       { to: '/ventas-contab',      icon: Banknote,    label: 'Ventas',           exact: false },
       { to: '/embarques-pricing',  icon: Calculator,  label: 'Embarques Pricing',exact: false },
       { to: '/facturas',           icon: Receipt,     label: 'Facturas y Cobranzas', exact: false },
+      { to: '/compras-contab',     icon: Wallet,      label: 'Compras y Pagos', exact: false },
+      { to: '/tesoreria',          icon: Landmark,    label: 'Tesorería',       exact: false },
     ],
   },
   {
@@ -101,6 +103,8 @@ const pageLabels: Record<string, string> = {
   '/ventas-contab':       'Ventas — Contabilidad',
   '/embarques-pricing':   'Embarques Pricing',
   '/facturas':            'Facturas y Cobranzas',
+  '/compras-contab':      'Compras y Cuentas por Pagar',
+  '/tesoreria':           'Tesorería',
   '/reportes':            'Reportes',
   '/proveedores':         'Proveedores',
   '/configuracion':       'Configuración',

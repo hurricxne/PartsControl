@@ -1,0 +1,960 @@
+// Página "Tesorería" (MonzaParts): el manejo del dinero real del banco en 4 pestañas.
+//   1. APROBACIONES — los adelantos 50% informados por Comercial llegan acá; Tesorería
+//      DA LA ORDEN (aprueba con monto/fecha/banco) → Abastecimiento queda destrabado.
+//      Si la cartola ya está cargada, muestra el abono del banco que calza (sugerido).
+//   2. POR PAGAR — cola de compras con saldo (buckets de vencimiento); Tesorería aprueba
+//      el pago (selección múltiple → Comprobante de Egreso vía POST /tesoreria/pagos).
+//   3. CONCILIACIÓN — cuentas bancarias, importar cartolas (CSV/XLSX) y cruzar
+//      cargos ↔ egresos de Compras / abonos ↔ adelantos y cobranzas, con sugerencias.
+//   4. FLUJO DE CAJA — por pagar vs por cobrar por ventana de vencimiento (NIC 7).
+// Consume monzaTesoreriaAPI.
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import {
+  Landmark, Search, Loader2, RefreshCw, CheckCircle2, X, Trash2, Upload,
+  Plus, Link2, Unlink, AlertCircle, CreditCard, PiggyBank, CalendarClock, ShieldCheck,
+  Banknote, Receipt,
+} from "lucide-react";
+import toast from "react-hot-toast";
+import { useMonzaTheme } from "./MonzaLayout";
+import { hoyLocal } from "../utils/format";
+import { monzaTesoreriaAPI } from "../services/monzaApi";
+
+// ─── Tipos (espejo del JSON del backend monza_tesoreria) ──────────────────────
+interface Aprobacion {
+  cotizacion_id: number; numero_cotizacion: string | null; cliente: string | null;
+  estado_venta: string; fecha_venta: string | null; pct_adelanto: number;
+  total_venta_clp: number; estado_adelanto: string;
+  monto_sugerido_clp?: number;
+  abono_sugerido?: { movimiento_id: number; fecha: string | null; monto: number; glosa: string | null } | null;
+  adelanto?: {
+    adelanto_id: number; monto: number; monto_aplicado: number; fecha_pago: string | null;
+    banco: string | null; numero_operacion: string | null; conciliado_banco: boolean;
+  };
+}
+interface Cuenta { id: number; banco: string; nombre: string | null; numero_cuenta: string | null; moneda: string; activo: boolean; observaciones?: string | null }
+// Resumen del destino conciliado de un movimiento (egreso de Compras, adelanto 50%
+// o cobranza de Facturas). Campos opcionales según `clase` — contrato en runtime.
+interface Destino {
+  clase: "egreso" | "adelanto" | "cobranza";
+  egreso_id?: number; beneficiario?: string | null; n_compras?: number;
+  adelanto_id?: number; cotizacion_id?: number; numero_cotizacion?: string | null;
+  cobranza_id?: number; factura_id?: number; numero_factura?: string | null;
+  cliente?: string | null; monto?: number; monto_total_clp?: number;
+}
+interface Movimiento {
+  id: number; cuenta_id: number; cartola_id: number | null; fecha: string | null;
+  glosa: string | null; tipo: string; monto: number; referencia: string | null;
+  saldo: number | null; conciliado: boolean; destino: Destino | null;
+}
+interface Sugerencia {
+  clase: string; egreso_id?: number; adelanto_id?: number; fecha?: string | null;
+  fecha_pago?: string | null; monto_total_clp?: number; monto?: number;
+  beneficiario?: string | null; cliente?: string | null; numero_cotizacion?: string | null;
+  cobranza_id?: number; factura_id?: number; numero_factura?: string | null; medio?: string | null;
+  numero_operacion?: string | null; n_compras?: number; dias_diferencia?: number;
+  compras?: {
+    compra_id: number; acreedor: string | null; numero_documento: string | null;
+    monto_clp: number; categoria: string | null; tipo_gasto: string;
+  }[];
+}
+// Misma lista que expone el backend (GET /tesoreria/cuentas → bancos_sugeridos).
+const BANCOS_SUGERIDOS = [
+  "Santander", "Banco de Chile", "BCI", "BancoEstado", "Itaú", "Scotiabank",
+  "Security", "BICE", "Banco Falabella", "Banco Ripley", "Coopeuch", "Otro",
+];
+interface FlujoBucket { monto: number; n: number }
+interface FlujoCaja {
+  buckets: string[];
+  por_pagar: Record<string, FlujoBucket>; por_cobrar: Record<string, FlujoBucket>;
+  neto: Record<string, number>;
+  adelantos_por_aprobar: { n: number; monto: number };
+}
+interface Resumen {
+  aprobaciones_pendientes: number; monto_aprobaciones_clp: number;
+  movimientos_total: number; movimientos_conciliados: number;
+  cargos_pendientes: number; abonos_pendientes: number;
+  egresos_sin_conciliar: number; por_pagar_vencido_clp: number;
+  // Nuevos (opcionales: toleran un backend aún sin actualizar)
+  cobranzas_sin_conciliar?: number; pagos_por_aprobar?: number; monto_por_pagar_clp?: number;
+}
+
+// ─── Por pagar (aprobación de pagos de Compras) ───────────────────────────────
+interface CompraPorPagar {
+  compra_id: number; acreedor: string | null; proveedor_rut: string | null;
+  numero_documento: string | null; categoria: string | null; tipo_gasto: string;
+  condicion_pago: string; fecha: string | null; fecha_vencimiento: string | null;
+  bucket: string; monto_total_clp: number; monto_pagado_clp: number;
+  saldo_clp: number; estado_pago: string;
+}
+interface PorPagarResp {
+  compras: CompraPorPagar[]; total: number;
+  buckets: Record<string, { monto: number; n: number }>;
+}
+const PP_BUCKETS = ["vencido", "d0_7", "d8_30", "d31_60", "d61_mas", "sin_fecha"];
+
+// ─── Estilos (mismo sistema que el resto de MonzaParts) ───────────────────────
+function useStyles() {
+  const { dark } = useMonzaTheme();
+  return {
+    dark,
+    text: dark ? "#E2E8F0" : "#0f172a",
+    muted: dark ? "#94A3B8" : "#64748B",
+    faint: dark ? "#64748B" : "#94A3B8",
+    cardBg: dark ? "#131b3e" : "white",
+    cardBd: `1px solid ${dark ? "#1e2a4a" : "#E2E8F0"}`,
+    sub: dark ? "#0d1430" : "#F8FAFC",
+    inputBg: dark ? "#0d1430" : "white",
+  };
+}
+type Styles = ReturnType<typeof useStyles>;
+function inputBase(s: Styles): React.CSSProperties {
+  return { width: "100%", padding: "8px 12px", borderRadius: 8, border: s.cardBd, background: s.inputBg, color: s.text, fontSize: 14, fontFamily: "inherit", boxSizing: "border-box" };
+}
+function btnPrimary(): React.CSSProperties {
+  return { display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: "9px 14px", borderRadius: 8, border: "none", background: "var(--monza-accent)", color: "white", fontWeight: 600, fontSize: 13, cursor: "pointer", fontFamily: "inherit" };
+}
+function btnSecondary(s: Styles): React.CSSProperties {
+  return { display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "8px 12px", borderRadius: 8, border: s.cardBd, background: s.sub, color: s.text, fontWeight: 600, fontSize: 12, cursor: "pointer", fontFamily: "inherit" };
+}
+const fmtClp = (n: number | null | undefined) =>
+  n == null || Number.isNaN(n) ? "—" : "$" + Math.round(n).toLocaleString("es-CL");
+const fmtDate = (sd: string | null | undefined) => {
+  if (!sd) return "—";
+  const [y, m, d] = sd.slice(0, 10).split("-");
+  return y && m && d ? `${d}-${m}-${y}` : sd;
+};
+
+// ─── Modal genérico + Field ────────────────────────────────────────────────────
+function Modal({ title, wide, onClose, children }: { title: string; wide?: boolean; onClose: () => void; children: React.ReactNode }) {
+  const s = useStyles();
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.6)", padding: 16 }} onClick={onClose}>
+      <div style={{ width: "100%", maxWidth: wide ? 640 : 440, maxHeight: "90vh", overflowY: "auto", borderRadius: 14, border: s.cardBd, background: s.cardBg, boxShadow: "0 20px 50px rgba(0,0,0,0.4)" }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 18px", borderBottom: s.cardBd, position: "sticky", top: 0, background: s.cardBg, zIndex: 1 }}>
+          <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: s.text }}>{title}</h3>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: s.muted, padding: 4 }}><X size={16} /></button>
+        </div>
+        <div style={{ padding: 18, display: "flex", flexDirection: "column", gap: 12 }}>{children}</div>
+      </div>
+    </div>
+  );
+}
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  const s = useStyles();
+  return (<label style={{ display: "block" }}><span style={{ display: "block", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4, color: s.muted }}>{label}</span>{children}</label>);
+}
+
+// ═══ PESTAÑA 1: APROBACIONES ═════════════════════════════════════════════════
+function AprobarModal({ apro, onClose, onDone }: { apro: Aprobacion; onClose: () => void; onDone: () => void }) {
+  const s = useStyles();
+  const inp = inputBase(s);
+  const sugerido = Math.round(apro.monto_sugerido_clp || 0);
+  const [monto, setMonto] = useState(String(apro.abono_sugerido ? Math.round(apro.abono_sugerido.monto) : sugerido));
+  // hoyLocal(): toISOString() es UTC y de noche en Chile daría el día siguiente.
+  const [fecha, setFecha] = useState(apro.abono_sugerido?.fecha || hoyLocal());
+  const [banco, setBanco] = useState("");
+  const [op, setOp] = useState("");
+  const [obs, setObs] = useState("");
+  const [saving, setSaving] = useState(false);
+  const submit = async () => {
+    if (!monto || Number(monto) <= 0) { toast.error("Monto inválido"); return; }
+    setSaving(true);
+    try {
+      await monzaTesoreriaAPI.aprobarAdelanto(apro.cotizacion_id, {
+        monto: Number(monto), fecha_pago: fecha || undefined, banco: banco || undefined,
+        numero_operacion: op || undefined, observaciones: obs || undefined,
+      });
+      toast.success("Adelanto aprobado — Abastecimiento destrabado"); onDone(); onClose();
+    } catch (e: any) { toast.error(e?.response?.data?.detail || "No se pudo aprobar"); } finally { setSaving(false); }
+  };
+  return (
+    <Modal title={`Aprobar adelanto · COT ${apro.numero_cotizacion}`} onClose={onClose}>
+      <p style={{ margin: 0, fontSize: 12, color: s.muted }}>
+        {apro.cliente || "—"} · Adelanto {apro.pct_adelanto}% — sugerido <b style={{ color: s.text }}>{fmtClp(sugerido)}</b> sobre el total {fmtClp(apro.total_venta_clp)}.
+      </p>
+      {apro.abono_sugerido && (
+        <p style={{ margin: 0, fontSize: 12, color: "#15803D", background: "rgba(21,128,61,0.1)", padding: "8px 10px", borderRadius: 8 }}>
+          <PiggyBank size={13} style={{ verticalAlign: "-2px", marginRight: 6 }} />
+          Abono que calza en cartola: <b>{fmtClp(apro.abono_sugerido.monto)}</b> el {fmtDate(apro.abono_sugerido.fecha)}{apro.abono_sugerido.glosa ? ` · ${apro.abono_sugerido.glosa}` : ""}
+        </p>
+      )}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <Field label="Monto recibido (CLP)"><input type="number" style={inp} value={monto} onChange={e => setMonto(e.target.value)} /></Field>
+        <Field label="Fecha del pago"><input type="date" style={inp} value={fecha} onChange={e => setFecha(e.target.value)} /></Field>
+        <Field label="Banco">
+          <input style={inp} list="tes-bancos" value={banco} onChange={e => setBanco(e.target.value)} placeholder="Santander, BCI…" />
+          <datalist id="tes-bancos">{BANCOS_SUGERIDOS.map(b => <option key={b} value={b} />)}</datalist>
+        </Field>
+        <Field label="N° operación"><input style={inp} value={op} onChange={e => setOp(e.target.value)} /></Field>
+      </div>
+      <Field label="Observaciones"><input style={inp} value={obs} onChange={e => setObs(e.target.value)} /></Field>
+      <p style={{ margin: 0, fontSize: 11, color: s.faint }}>Al aprobar, Abastecimiento queda autorizado a comprar los ítems de esta venta (cortafuego del 50%).</p>
+      <button onClick={submit} disabled={saving} style={{ ...btnPrimary(), width: "100%", opacity: saving ? 0.6 : 1 }}>
+        {saving ? <Loader2 size={15} className="animate-spin" /> : <ShieldCheck size={15} />} Aprobar y dar la orden
+      </button>
+    </Modal>
+  );
+}
+
+function AprobacionesTab({ onChanged }: { onChanged: () => void }) {
+  const s = useStyles();
+  const [porAprobar, setPorAprobar] = useState<Aprobacion[]>([]);
+  const [aprobadas, setAprobadas] = useState<Aprobacion[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [modal, setModal] = useState<Aprobacion | null>(null);
+  const load = useCallback(() => {
+    setLoading(true);
+    monzaTesoreriaAPI.aprobaciones()
+      .then(({ data }) => { setPorAprobar(data.por_aprobar); setAprobadas(data.aprobadas); })
+      .catch((e: any) => toast.error(e?.response?.data?.detail || "No se pudieron cargar las aprobaciones"))
+      .finally(() => setLoading(false));
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const th: React.CSSProperties = { padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: s.faint, whiteSpace: "nowrap" };
+  const td: React.CSSProperties = { padding: "10px 14px", whiteSpace: "nowrap", fontSize: 13 };
+  if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: 60 }}><Loader2 size={26} className="animate-spin" color="var(--monza-accent)" /></div>;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ borderRadius: 12, border: s.cardBd, background: s.cardBg, padding: "12px 16px", fontSize: 13, color: s.muted }}>
+        <ShieldCheck size={15} style={{ verticalAlign: "-3px", marginRight: 6, color: "var(--monza-accent)" }} />
+        Los adelantos que Comercial informa al cerrar una venta llegan acá. <b style={{ color: s.text }}>Tesorería da la orden</b>: al aprobar, Abastecimiento queda autorizado a comprar. Ventas lo ve solo lectura.
+      </div>
+
+      {/* Por aprobar */}
+      <div style={{ borderRadius: 14, border: s.cardBd, background: s.cardBg, overflow: "hidden" }}>
+        <div style={{ padding: "12px 16px", borderBottom: s.cardBd, display: "flex", alignItems: "center", gap: 8 }}>
+          <AlertCircle size={15} color="#B45309" />
+          <b style={{ fontSize: 13, color: s.text }}>Por aprobar ({porAprobar.length})</b>
+        </div>
+        {porAprobar.length === 0 ? (
+          <p style={{ padding: 20, margin: 0, fontSize: 13, color: s.muted, textAlign: "center" }}>No hay adelantos pendientes de aprobación.</p>
+        ) : (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead><tr style={{ background: s.sub, borderBottom: s.cardBd }}>
+                {["Venta", "Cliente", "Fecha venta", "Total venta", "% Adel.", "Monto sugerido", "Abono en cartola", ""].map(h => <th key={h} style={th}>{h}</th>)}
+              </tr></thead>
+              <tbody>
+                {porAprobar.map(a => (
+                  <tr key={a.cotizacion_id} style={{ borderBottom: s.cardBd }}>
+                    <td style={{ ...td, fontFamily: "ui-monospace, monospace", fontWeight: 600, color: "var(--monza-accent)" }}>COT {a.numero_cotizacion}</td>
+                    <td style={{ ...td, color: s.text, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>{a.cliente || "—"}</td>
+                    <td style={{ ...td, color: s.muted }}>{fmtDate(a.fecha_venta)}</td>
+                    <td style={{ ...td, color: s.text, fontWeight: 600 }}>{fmtClp(a.total_venta_clp)}</td>
+                    <td style={{ ...td, color: s.muted }}>{a.pct_adelanto}%</td>
+                    <td style={{ ...td, fontWeight: 700, color: "#B45309" }}>{fmtClp(a.monto_sugerido_clp)}</td>
+                    <td style={td}>
+                      {a.abono_sugerido ? (
+                        <span style={{ background: "rgba(21,128,61,0.14)", color: "#15803D", fontSize: 11, fontWeight: 600, padding: "3px 9px", borderRadius: 999 }}>
+                          ✓ {fmtClp(a.abono_sugerido.monto)} · {fmtDate(a.abono_sugerido.fecha)}
+                        </span>
+                      ) : (
+                        <span style={{ fontSize: 11, color: s.faint }}>sin cruce aún</span>
+                      )}
+                    </td>
+                    <td style={td}>
+                      <button onClick={() => setModal(a)} style={{ ...btnPrimary(), padding: "6px 12px", fontSize: 12 }}>
+                        <ShieldCheck size={13} /> Aprobar
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Aprobadas */}
+      <div style={{ borderRadius: 14, border: s.cardBd, background: s.cardBg, overflow: "hidden" }}>
+        <div style={{ padding: "12px 16px", borderBottom: s.cardBd, display: "flex", alignItems: "center", gap: 8 }}>
+          <CheckCircle2 size={15} color="#15803D" />
+          <b style={{ fontSize: 13, color: s.text }}>Aprobadas ({aprobadas.length})</b>
+        </div>
+        {aprobadas.length === 0 ? (
+          <p style={{ padding: 20, margin: 0, fontSize: 13, color: s.muted, textAlign: "center" }}>Aún no hay adelantos aprobados.</p>
+        ) : (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead><tr style={{ background: s.sub, borderBottom: s.cardBd }}>
+                {["Venta", "Cliente", "Monto aprobado", "Fecha pago", "Banco", "N° operación", "Aplicado a facturas", "Cartola"].map(h => <th key={h} style={th}>{h}</th>)}
+              </tr></thead>
+              <tbody>
+                {aprobadas.map(a => (
+                  <tr key={a.cotizacion_id} style={{ borderBottom: s.cardBd }}>
+                    <td style={{ ...td, fontFamily: "ui-monospace, monospace", fontWeight: 600, color: "var(--monza-accent)" }}>COT {a.numero_cotizacion}</td>
+                    <td style={{ ...td, color: s.text, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>{a.cliente || "—"}</td>
+                    <td style={{ ...td, fontWeight: 700, color: "#15803D" }}>{fmtClp(a.adelanto?.monto)}</td>
+                    <td style={{ ...td, color: s.muted }}>{fmtDate(a.adelanto?.fecha_pago)}</td>
+                    <td style={{ ...td, color: s.muted }}>{a.adelanto?.banco || "—"}</td>
+                    <td style={{ ...td, color: s.muted }}>{a.adelanto?.numero_operacion || "—"}</td>
+                    <td style={{ ...td, color: s.muted }}>{fmtClp(a.adelanto?.monto_aplicado)}</td>
+                    <td style={td}>
+                      {a.adelanto?.conciliado_banco
+                        ? <span style={{ background: "rgba(21,128,61,0.14)", color: "#15803D", fontSize: 11, fontWeight: 600, padding: "3px 9px", borderRadius: 999 }}>Conciliado ✓</span>
+                        : <span style={{ fontSize: 11, color: s.faint }}>sin conciliar</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {modal && <AprobarModal apro={modal} onClose={() => setModal(null)} onDone={() => { load(); onChanged(); }} />}
+    </div>
+  );
+}
+
+// ═══ PESTAÑA 2: CONCILIACIÓN ═════════════════════════════════════════════════
+function SugerenciasModal({ mov, onClose, onDone }: { mov: Movimiento; onClose: () => void; onDone: () => void }) {
+  const s = useStyles();
+  const [sugs, setSugs] = useState<Sugerencia[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [q, setQ] = useState("");
+  const [manual, setManual] = useState<Sugerencia[] | null>(null);
+  const seqRef = useRef(0);  // descarta respuestas fuera de orden del typeahead
+  const esCargo = mov.tipo === "cargo";
+  useEffect(() => {
+    monzaTesoreriaAPI.sugerencias(mov.id)
+      .then(({ data }) => setSugs(data.sugerencias))
+      // p.ej. 400 del backend — sin el detail se vería como "sin coincidencias"
+      .catch((e: any) => toast.error(e?.response?.data?.detail || "No se pudieron cargar sugerencias"))
+      .finally(() => setLoading(false));
+  }, [mov.id]);
+  const conciliarCon = async (sug: Sugerencia) => {
+    setSaving(true);
+    try {
+      await monzaTesoreriaAPI.conciliar(mov.id,
+        sug.clase === "egreso" ? { egreso_id: sug.egreso_id }
+          : sug.clase === "cobranza" ? { cobranza_id: sug.cobranza_id }
+            : { adelanto_id: sug.adelanto_id });
+      toast.success("Conciliado"); onDone(); onClose();
+    } catch (e: any) { toast.error(e?.response?.data?.detail || "No se pudo conciliar"); } finally { setSaving(false); }
+  };
+  // Búsqueda manual: cargos → egresos de Compras (?q=); abonos → cobranzas de
+  // Facturas (?q=) + adelantos aprobados (el endpoint no recibe q: se filtran acá).
+  const buscar = async (v: string) => {
+    setQ(v);
+    const my = ++seqRef.current;
+    if (v.length < 2) { setManual(null); return; }
+    try {
+      if (esCargo) {
+        const { data } = await monzaTesoreriaAPI.egresosPendientes(v);
+        if (my === seqRef.current) setManual(data.egresos || []);
+      } else {
+        const [cobs, adels] = await Promise.all([
+          monzaTesoreriaAPI.cobranzasPendientes(v),
+          monzaTesoreriaAPI.adelantosPendientes(),
+        ]);
+        if (my === seqRef.current) {
+          const needle = v.toLowerCase();
+          const adelantos = ((adels.data.adelantos || []) as Sugerencia[]).filter(a =>
+            `${a.numero_cotizacion || ""} ${a.cliente || ""} ${a.numero_operacion || ""}`.toLowerCase().includes(needle));
+          setManual([...(cobs.data.cobranzas || []), ...adelantos]);
+        }
+      }
+    } catch { if (my === seqRef.current) setManual([]); }
+  };
+  const card = (g: Sugerencia, key: string) => (
+    <div key={key} style={{ border: s.cardBd, borderRadius: 10, padding: 12, display: "flex", alignItems: "center", gap: 12 }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        {g.clase === "egreso" ? (
+          <>
+            <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: s.text }}>
+              Egreso #{g.egreso_id} · {fmtClp(g.monto_total_clp)} · {fmtDate(g.fecha)}
+              {g.dias_diferencia != null && <span style={{ fontWeight: 400, color: s.faint }}> · {g.dias_diferencia}d de diferencia</span>}
+            </p>
+            <p style={{ margin: "2px 0 0", fontSize: 12, color: s.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {g.beneficiario || "—"}{g.numero_operacion ? ` · ${g.numero_operacion}` : ""} · paga {g.n_compras} compra(s): {(g.compras || []).map(c => c.acreedor || c.numero_documento).filter(Boolean).slice(0, 3).join(", ")}
+            </p>
+          </>
+        ) : g.clase === "cobranza" ? (
+          <>
+            <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: s.text }}>
+              Factura {g.numero_factura || g.factura_id} · <span style={{ color: "#15803D" }}>{fmtClp(g.monto)}</span> · {fmtDate(g.fecha)}
+              {g.dias_diferencia != null && <span style={{ fontWeight: 400, color: s.faint }}> · {g.dias_diferencia}d de diferencia</span>}
+            </p>
+            <p style={{ margin: "2px 0 0", fontSize: 12, color: s.muted }}>Cobranza{g.medio ? ` · ${g.medio}` : ""}{g.numero_operacion ? ` · op ${g.numero_operacion}` : ""}</p>
+          </>
+        ) : (
+          <>
+            <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: s.text }}>
+              Adelanto COT {g.numero_cotizacion} · {fmtClp(g.monto)} · {fmtDate(g.fecha_pago)}
+              {g.dias_diferencia != null && <span style={{ fontWeight: 400, color: s.faint }}> · {g.dias_diferencia}d de diferencia</span>}
+            </p>
+            <p style={{ margin: "2px 0 0", fontSize: 12, color: s.muted }}>{g.cliente || "—"}{g.numero_operacion ? ` · ${g.numero_operacion}` : ""}</p>
+          </>
+        )}
+      </div>
+      <button onClick={() => conciliarCon(g)} disabled={saving} style={{ ...btnPrimary(), padding: "7px 12px", fontSize: 12, opacity: saving ? 0.6 : 1 }}>
+        <Link2 size={13} /> Conciliar
+      </button>
+    </div>
+  );
+  return (
+    <Modal title={`Conciliar ${mov.tipo} · ${fmtClp(mov.monto)} · ${fmtDate(mov.fecha)}`} wide onClose={onClose}>
+      <p style={{ margin: 0, fontSize: 12, color: s.muted }}>
+        {mov.glosa || "(sin glosa)"} — candidatos con el mismo monto (±$1), ordenados por cercanía de fecha:
+        {esCargo ? " Comprobantes de Egreso de Compras." : " Adelantos 50% aprobados y cobranzas de Facturas."}
+      </p>
+      {loading ? (
+        <div style={{ display: "flex", justifyContent: "center", padding: 30 }}><Loader2 size={22} className="animate-spin" color="var(--monza-accent)" /></div>
+      ) : sugs.length === 0 ? (
+        <p style={{ margin: 0, padding: 16, fontSize: 13, color: s.muted, textAlign: "center", background: s.sub, borderRadius: 10 }}>
+          No hay candidatos con ese monto. {esCargo ? "Busca el egreso abajo o registra el pago en Compras primero." : "Busca abajo la cobranza o el adelanto, o regístralos primero."}
+        </p>
+      ) : sugs.map((g, i) => card(g, "s" + i))}
+      {!loading && (
+        <>
+          <div style={{ position: "relative" }}>
+            <Search size={14} color={s.faint} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)" }} />
+            <input value={q} onChange={e => buscar(e.target.value)}
+              placeholder={esCargo ? "Buscar egreso por beneficiario u operación…" : "Buscar cobranza (N° factura, operación, banco) o adelanto (COT, cliente)…"}
+              style={{ ...inputBase(s), padding: "8px 12px 8px 32px", fontSize: 13 }} />
+          </div>
+          {manual && manual.map((g, i) => card(g, "m" + i))}
+          {manual && manual.length === 0 && <p style={{ margin: 0, fontSize: 12, color: s.faint }}>Sin resultados.</p>}
+        </>
+      )}
+    </Modal>
+  );
+}
+
+function CuentaModal({ cuenta, onClose, onDone }: { cuenta: Cuenta | null; onClose: () => void; onDone: () => void }) {
+  const s = useStyles();
+  const inp = inputBase(s);
+  const [banco, setBanco] = useState(cuenta?.banco || "");
+  const [nombre, setNombre] = useState(cuenta?.nombre || "");
+  const [numero, setNumero] = useState(cuenta?.numero_cuenta || "");
+  const [saving, setSaving] = useState(false);
+  const submit = async () => {
+    if (!banco.trim()) { toast.error("Indica el banco"); return; }
+    setSaving(true);
+    try {
+      // El PUT del backend es de reemplazo total: al editar se conservan moneda,
+      // estado activo y observaciones de la cuenta (si no, se perderían).
+      const data = {
+        banco, nombre: nombre || undefined, numero_cuenta: numero || undefined,
+        moneda: cuenta?.moneda || "CLP", activo: cuenta?.activo ?? true,
+        observaciones: cuenta?.observaciones ?? undefined,
+      };
+      if (cuenta) await monzaTesoreriaAPI.actualizarCuenta(cuenta.id, data);
+      else await monzaTesoreriaAPI.crearCuenta(data);
+      toast.success(cuenta ? "Cuenta actualizada" : "Cuenta creada"); onDone(); onClose();
+    } catch (e: any) { toast.error(e?.response?.data?.detail || "Error"); } finally { setSaving(false); }
+  };
+  return (
+    <Modal title={cuenta ? "Editar cuenta bancaria" : "Nueva cuenta bancaria"} onClose={onClose}>
+      <Field label="Banco"><input style={inp} value={banco} onChange={e => setBanco(e.target.value)} placeholder="Santander, BCI…" /></Field>
+      <Field label="Alias (opcional)"><input style={inp} value={nombre} onChange={e => setNombre(e.target.value)} placeholder="Cta corriente principal" /></Field>
+      <Field label="N° de cuenta (opcional)"><input style={inp} value={numero} onChange={e => setNumero(e.target.value)} /></Field>
+      <button onClick={submit} disabled={saving} style={{ ...btnPrimary(), width: "100%", opacity: saving ? 0.6 : 1 }}>
+        {saving ? <Loader2 size={15} className="animate-spin" /> : <CheckCircle2 size={15} />} Guardar
+      </button>
+    </Modal>
+  );
+}
+
+function ConciliacionTab({ onChanged }: { onChanged: () => void }) {
+  const s = useStyles();
+  const [cuentas, setCuentas] = useState<Cuenta[]>([]);
+  const [cuentaSel, setCuentaSel] = useState<number | "">("");
+  const [movs, setMovs] = useState<Movimiento[]>([]);
+  const [total, setTotal] = useState(0);
+  const [estado, setEstado] = useState("");
+  const [q, setQ] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [importing, setImporting] = useState(false);
+  const [modal, setModal] = useState<{ type: "sugerencias"; mov: Movimiento } | { type: "cuenta"; cuenta: Cuenta | null } | null>(null);
+
+  const loadCuentas = useCallback(() => {
+    monzaTesoreriaAPI.cuentas().then(({ data }) => {
+      setCuentas(data.cuentas);
+      setCuentaSel(prev => prev || (data.cuentas[0]?.id ?? ""));
+    }).catch((e: any) => {
+      // sin esto, un backend caído se vería como "no tienes cuentas" (engañoso)
+      toast.error(e?.response?.data?.detail || "No se pudieron cargar las cuentas bancarias");
+    });
+  }, []);
+  const loadMovs = useCallback((cId: number | "", est: string, search: string) => {
+    setLoading(true);
+    monzaTesoreriaAPI.movimientos({
+      cuenta_id: cId || undefined, estado: est || undefined, q: search || undefined, page_size: 200,
+    }).then(({ data }) => { setMovs(data.movimientos); setTotal(data.total); })
+      .catch((e: any) => toast.error(e?.response?.data?.detail || "No se pudieron cargar los movimientos"))
+      .finally(() => setLoading(false));
+  }, []);
+  useEffect(() => { loadCuentas(); }, [loadCuentas]);
+  useEffect(() => { loadMovs(cuentaSel, estado, q); }, [cuentaSel, estado]);  // eslint-disable-line react-hooks/exhaustive-deps
+  const reload = () => { loadMovs(cuentaSel, estado, q); onChanged(); };
+
+  const onImportFile = async (file: File | null) => {
+    if (!file) return;
+    if (!cuentaSel) { toast.error("Crea/selecciona una cuenta bancaria primero"); return; }
+    setImporting(true);
+    try {
+      const { data } = await monzaTesoreriaAPI.importarCartola(Number(cuentaSel), file);
+      toast.success(`Cartola importada: ${data.n_importados} movimiento(s)`);
+      // Anti-duplicados del backend: avisa cuántas filas ya existían y por qué
+      if (data.warnings?.length) toast(data.warnings.join("; "));
+      reload();
+    } catch (e: any) { toast.error(e?.response?.data?.detail || "No se pudo importar la cartola"); }
+    finally { setImporting(false); }
+  };
+  const desconciliar = async (m: Movimiento) => {
+    if (!confirm("¿Deshacer esta conciliación?")) return;
+    try { await monzaTesoreriaAPI.desconciliar(m.id); toast.success("Desconciliado"); reload(); }
+    catch (e: any) { toast.error(e?.response?.data?.detail || "Error"); }
+  };
+  const borrarMov = async (m: Movimiento) => {
+    if (!confirm("¿Borrar este movimiento?")) return;
+    try { await monzaTesoreriaAPI.eliminarMovimiento(m.id); toast.success("Movimiento borrado"); reload(); }
+    catch (e: any) { toast.error(e?.response?.data?.detail || "Error"); }
+  };
+
+  const chip = (active: boolean): React.CSSProperties => ({
+    padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+    border: active ? "1px solid var(--monza-accent)" : s.cardBd,
+    background: active ? "var(--monza-accent)" : s.cardBg,
+    color: active ? "white" : s.muted,
+  });
+  const th: React.CSSProperties = { padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: s.faint, whiteSpace: "nowrap" };
+  const td: React.CSSProperties = { padding: "8px 14px", whiteSpace: "nowrap", fontSize: 13 };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      {/* Cuenta + acciones */}
+      <div style={{ display: "flex", alignItems: "flex-end", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ minWidth: 220 }}>
+          <Field label="Cuenta bancaria">
+            <select style={inputBase(s)} value={cuentaSel} onChange={e => setCuentaSel(e.target.value ? Number(e.target.value) : "")}>
+              {cuentas.length === 0 && <option value="">— crea una cuenta —</option>}
+              {cuentas.map(c => <option key={c.id} value={c.id}>{c.banco}{c.nombre ? ` · ${c.nombre}` : ""}</option>)}
+            </select>
+          </Field>
+        </div>
+        <button onClick={() => setModal({ type: "cuenta", cuenta: null })} style={btnSecondary(s)}><Plus size={14} /> Cuenta</button>
+        <label style={{ ...btnPrimary(), cursor: importing ? "wait" : "pointer", opacity: importing ? 0.6 : 1 }}>
+          {importing ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />} Importar cartola (CSV/XLSX)
+          <input type="file" accept=".csv,.xlsx" style={{ display: "none" }} disabled={importing}
+            onChange={e => { onImportFile(e.target.files?.[0] || null); e.target.value = ""; }} />
+        </label>
+        <button onClick={reload} style={btnSecondary(s)}><RefreshCw size={14} /></button>
+      </div>
+
+      {/* Filtros */}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        {[["", "Todos"], ["pendiente", "Pendientes"], ["conciliado", "Conciliados"]].map(([v, l]) => (
+          <button key={v} onClick={() => setEstado(v)} style={chip(estado === v)}>{l}</button>
+        ))}
+        <div style={{ position: "relative", flex: 1, minWidth: 200 }}>
+          <Search size={14} color={s.faint} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)" }} />
+          <input placeholder="Buscar glosa/referencia…" value={q}
+            onChange={e => { setQ(e.target.value); if (e.target.value.length === 0 || e.target.value.length >= 2) loadMovs(cuentaSel, estado, e.target.value); }}
+            style={{ ...inputBase(s), padding: "8px 12px 8px 32px", fontSize: 13 }} />
+        </div>
+        <span style={{ fontSize: 12, color: s.faint }}>{total} movimiento(s)</span>
+      </div>
+
+      {/* Movimientos */}
+      {loading ? (
+        <div style={{ display: "flex", justifyContent: "center", padding: 50 }}><Loader2 size={26} className="animate-spin" color="var(--monza-accent)" /></div>
+      ) : movs.length === 0 ? (
+        <div style={{ borderRadius: 14, border: s.cardBd, background: s.cardBg, padding: 48, textAlign: "center" }}>
+          <Landmark size={40} style={{ margin: "0 auto 12px", opacity: 0.2, color: s.muted }} />
+          <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: s.muted }}>No hay movimientos</p>
+          <p style={{ margin: "4px 0 0", fontSize: 12, color: s.faint }}>Importa una cartola del banco para empezar a conciliar.</p>
+        </div>
+      ) : (
+        <div style={{ borderRadius: 14, border: s.cardBd, background: s.cardBg, overflow: "hidden" }}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead><tr style={{ background: s.sub, borderBottom: s.cardBd }}>
+                {["Fecha", "Glosa", "Tipo", "Monto", "Referencia", "Estado / destino", ""].map(h => <th key={h} style={th}>{h}</th>)}
+              </tr></thead>
+              <tbody>
+                {movs.map(m => (
+                  <tr key={m.id} style={{ borderBottom: s.cardBd }}>
+                    <td style={{ ...td, color: s.muted }}>{fmtDate(m.fecha)}</td>
+                    <td style={{ ...td, color: s.text, maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis" }} title={m.glosa || ""}>{m.glosa || "—"}</td>
+                    <td style={td}>
+                      <span style={{
+                        background: m.tipo === "cargo" ? "rgba(185,28,28,0.1)" : "rgba(21,128,61,0.12)",
+                        color: m.tipo === "cargo" ? "#B91C1C" : "#15803D",
+                        fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 999,
+                      }}>{m.tipo === "cargo" ? "Cargo" : "Abono"}</span>
+                    </td>
+                    <td style={{ ...td, fontWeight: 700, color: m.tipo === "cargo" ? "#B91C1C" : "#15803D" }}>
+                      {m.tipo === "cargo" ? "−" : "+"}{fmtClp(m.monto)}
+                    </td>
+                    <td style={{ ...td, color: s.muted }}>{m.referencia || "—"}</td>
+                    <td style={{ ...td, maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis" }}>
+                      {m.conciliado ? (
+                        <span style={{ fontSize: 12, color: "#15803D" }}>
+                          ✓ {m.destino?.clase === "adelanto"
+                            ? `Adelanto COT ${m.destino.numero_cotizacion || ""}`
+                            : m.destino?.clase === "cobranza"
+                              ? `Cobranza Fact. ${m.destino.numero_factura || m.destino.factura_id || ""}`
+                              : m.destino?.clase === "egreso"
+                                ? `Egreso #${m.destino.egreso_id} · ${m.destino.beneficiario || ""}`
+                                : "Conciliado"}
+                        </span>
+                      ) : (
+                        <span style={{ fontSize: 12, color: s.faint }}>Pendiente</span>
+                      )}
+                    </td>
+                    <td style={{ ...td, textAlign: "right" }}>
+                      {m.conciliado ? (
+                        <button onClick={() => desconciliar(m)} style={{ ...btnSecondary(s), padding: "5px 10px", fontSize: 11 }} title="Deshacer conciliación">
+                          <Unlink size={12} /> Desconciliar
+                        </button>
+                      ) : (
+                        <span style={{ display: "inline-flex", gap: 6 }}>
+                          <button onClick={() => setModal({ type: "sugerencias", mov: m })} style={{ ...btnPrimary(), padding: "5px 10px", fontSize: 11 }}>
+                            <Link2 size={12} /> Conciliar
+                          </button>
+                          <button onClick={() => borrarMov(m)} style={{ background: "none", border: "none", color: "#B91C1C", cursor: "pointer", padding: 4 }} title="Borrar movimiento">
+                            <Trash2 size={13} />
+                          </button>
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {modal?.type === "sugerencias" && <SugerenciasModal mov={modal.mov} onClose={() => setModal(null)} onDone={reload} />}
+      {modal?.type === "cuenta" && <CuentaModal cuenta={modal.cuenta} onClose={() => setModal(null)} onDone={loadCuentas} />}
+    </div>
+  );
+}
+
+// ═══ PESTAÑA: POR PAGAR (Tesorería aprueba el pago → Comprobante de Egreso) ═══
+const BUCKET_LABEL: Record<string, string> = {
+  vencido: "Vencido", d0_7: "0–7 días", d8_30: "8–30 días",
+  d31_60: "31–60 días", d61_mas: "61+ días", sin_fecha: "Sin fecha",
+};
+
+function PagoModal({ compras, onClose, onDone }: { compras: CompraPorPagar[]; onClose: () => void; onDone: () => void }) {
+  const s = useStyles();
+  const inp = inputBase(s);
+  const [fecha, setFecha] = useState(hoyLocal());
+  const [medio, setMedio] = useState("transferencia");
+  const [banco, setBanco] = useState("");
+  const [op, setOp] = useState("");
+  // Beneficiario auto si todas las compras son del mismo acreedor
+  const acreedores = useMemo(() => [...new Set(compras.map(c => c.acreedor).filter(Boolean))], [compras]);
+  const [beneficiario, setBeneficiario] = useState(acreedores.length === 1 ? (acreedores[0] as string) : "");
+  const [glosa, setGlosa] = useState("");
+  // Monto editable por compra, con default = saldo
+  const [montos, setMontos] = useState<Record<number, string>>(
+    () => Object.fromEntries(compras.map(c => [c.compra_id, String(Math.round(c.saldo_clp))])));
+  const [saving, setSaving] = useState(false);
+  const total = compras.reduce((sum, c) => sum + (Number(montos[c.compra_id]) || 0), 0);
+
+  const submit = async () => {
+    for (const c of compras) {
+      const m = Number(montos[c.compra_id]);
+      if (!m || m <= 0) { toast.error(`Monto inválido para ${c.acreedor || "compra " + c.compra_id}`); return; }
+      if (m > c.saldo_clp + 1) { toast.error(`El pago a ${c.acreedor || "compra " + c.compra_id} excede su saldo (${fmtClp(c.saldo_clp)})`); return; }
+    }
+    setSaving(true);
+    try {
+      await monzaTesoreriaAPI.aprobarPago({
+        fecha, medio, banco: banco || undefined, numero_operacion: op || undefined,
+        beneficiario: beneficiario || undefined, glosa: glosa || undefined,
+        detalles: compras.map(c => ({ compra_id: c.compra_id, monto_clp: Number(montos[c.compra_id]) })),
+      });
+      toast.success("Pago aprobado y registrado (Comprobante de Egreso)");
+      onDone(); onClose();
+    } catch (e: any) { toast.error(e?.response?.data?.detail || "No se pudo registrar el pago"); } finally { setSaving(false); }
+  };
+  return (
+    <Modal title={`Aprobar pago · ${compras.length} compra${compras.length !== 1 ? "s" : ""}`} wide onClose={onClose}>
+      <div style={{ borderRadius: 10, border: s.cardBd }}>
+        {compras.map((c, i) => (
+          <div key={c.compra_id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "8px 12px", borderBottom: i < compras.length - 1 ? s.cardBd : "none", fontSize: 12 }}>
+            <div style={{ minWidth: 0 }}>
+              <p style={{ margin: 0, fontWeight: 600, color: s.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {c.acreedor || "—"}{c.numero_documento ? ` · doc ${c.numero_documento}` : ""}
+              </p>
+              <p style={{ margin: "1px 0 0", color: s.faint }}>
+                vence {c.fecha_vencimiento ? fmtDate(c.fecha_vencimiento) : "sin fecha"} · saldo {fmtClp(c.saldo_clp)}
+              </p>
+            </div>
+            <input type="number" style={{ ...inp, width: 120, textAlign: "right", flexShrink: 0 }}
+              value={montos[c.compra_id] ?? ""} onChange={e => setMontos(prev => ({ ...prev, [c.compra_id]: e.target.value }))} />
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <Field label="Fecha del pago"><input type="date" style={inp} value={fecha} onChange={e => setFecha(e.target.value)} /></Field>
+        <Field label="Medio">
+          <select style={inp} value={medio} onChange={e => setMedio(e.target.value)}>
+            <option value="transferencia">Transferencia</option><option value="cheque">Cheque</option>
+            <option value="efectivo">Efectivo</option><option value="tarjeta">Tarjeta</option>
+          </select>
+        </Field>
+        <Field label="Banco">
+          <input style={inp} list="tes-pago-bancos" value={banco} onChange={e => setBanco(e.target.value)} />
+          <datalist id="tes-pago-bancos">{BANCOS_SUGERIDOS.map(b => <option key={b} value={b} />)}</datalist>
+        </Field>
+        <Field label="N° operación"><input style={inp} value={op} onChange={e => setOp(e.target.value)} /></Field>
+      </div>
+      <Field label="Beneficiario">
+        <input style={inp} value={beneficiario} onChange={e => setBeneficiario(e.target.value)}
+          placeholder={acreedores.length > 1 ? "Varios acreedores (opcional)" : ""} />
+      </Field>
+      <Field label="Glosa"><input style={inp} value={glosa} onChange={e => setGlosa(e.target.value)} /></Field>
+      <button onClick={submit} disabled={saving} style={{ ...btnPrimary(), width: "100%", opacity: saving ? 0.6 : 1 }}>
+        {saving ? <Loader2 size={15} className="animate-spin" /> : <Banknote size={15} />} Aprobar y registrar pago · {fmtClp(total)}
+      </button>
+    </Modal>
+  );
+}
+
+function PorPagarTab({ onChanged }: { onChanged: () => void }) {
+  const s = useStyles();
+  const [data, setData] = useState<PorPagarResp | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [q, setQ] = useState("");
+  // Map id→compra (no Set): lo seleccionado sobrevive aunque el buscador lo saque
+  // de la vista, y el modal de pago recibe SIEMPRE todo lo marcado.
+  const [seleccion, setSeleccion] = useState<Map<number, CompraPorPagar>>(new Map());
+  const [showPago, setShowPago] = useState(false);
+  const load = useCallback((search: string) => {
+    setLoading(true);
+    monzaTesoreriaAPI.porPagar({ q: search || undefined, page_size: 300 })
+      .then(({ data }) => setData(data))
+      .catch((e: any) => { setData(null); toast.error(e?.response?.data?.detail || "No se pudo cargar Por pagar"); })
+      .finally(() => setLoading(false));
+  }, []);
+  useEffect(() => { load(""); }, [load]);
+  const toggleSel = (c: CompraPorPagar) => setSeleccion(prev => {
+    const next = new Map(prev);
+    if (next.has(c.compra_id)) next.delete(c.compra_id); else next.set(c.compra_id, c);
+    return next;
+  });
+  const seleccionadas = [...seleccion.values()];
+  const totalSel = seleccionadas.reduce((a, c) => a + c.saldo_clp, 0);
+
+  const th: React.CSSProperties = { padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: s.faint, whiteSpace: "nowrap" };
+  const td: React.CSSProperties = { padding: "10px 14px", whiteSpace: "nowrap", fontSize: 13 };
+  const pillEstado = (estado: string): React.CSSProperties => ({
+    fontSize: 11, fontWeight: 600, padding: "3px 9px", borderRadius: 999,
+    background: estado === "vencido" ? "rgba(185,28,28,0.12)" : estado === "parcial" ? "rgba(217,119,6,0.14)" : "rgba(148,163,184,0.15)",
+    color: estado === "vencido" ? "#B91C1C" : estado === "parcial" ? "#B45309" : s.muted,
+  });
+
+  if (loading && !data) return <div style={{ display: "flex", justifyContent: "center", padding: 60 }}><Loader2 size={26} className="animate-spin" color="var(--monza-accent)" /></div>;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      {/* Buscador + chips por bucket de vencimiento */}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <div style={{ position: "relative", flex: 1, minWidth: 220 }}>
+          <Search size={14} color={s.faint} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)" }} />
+          <input placeholder="Buscar por acreedor, documento, RUT o categoría…" value={q}
+            onChange={e => { setQ(e.target.value); if (e.target.value.length === 0 || e.target.value.length >= 2) load(e.target.value); }}
+            style={{ ...inputBase(s), padding: "8px 12px 8px 32px", fontSize: 13 }} />
+        </div>
+        {data && PP_BUCKETS.map(b => (data.buckets[b]?.n || 0) > 0 && (
+          <span key={b} style={{
+            padding: "5px 10px", borderRadius: 999, fontSize: 11, fontWeight: 600,
+            border: b === "vencido" ? "1px solid rgba(185,28,28,0.3)" : s.cardBd,
+            background: b === "vencido" ? "rgba(185,28,28,0.1)" : s.cardBg,
+            color: b === "vencido" ? "#B91C1C" : s.muted,
+          }}>
+            {BUCKET_LABEL[b] || b}: {fmtClp(data.buckets[b].monto)} ({data.buckets[b].n})
+          </span>
+        ))}
+        <button onClick={() => load(q)} style={btnSecondary(s)}><RefreshCw size={14} /></button>
+      </div>
+
+      {!data || data.compras.length === 0 ? (
+        <div style={{ borderRadius: 14, border: s.cardBd, background: s.cardBg, padding: 48, textAlign: "center" }}>
+          <CheckCircle2 size={36} style={{ margin: "0 auto 10px", color: "rgba(21,128,61,0.4)" }} />
+          <p style={{ margin: 0, fontSize: 13, color: s.muted }}>No hay compras con saldo pendiente. Todo pagado.</p>
+        </div>
+      ) : (
+        <div style={{ borderRadius: 14, border: s.cardBd, background: s.cardBg, overflow: "hidden" }}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead><tr style={{ background: s.sub, borderBottom: s.cardBd }}>
+                {["", "Acreedor", "Documento", "Vence", "Total", "Pagado", "Saldo", "Estado"].map((h, i) => <th key={i} style={th}>{h}</th>)}
+              </tr></thead>
+              <tbody>
+                {data.compras.map(c => (
+                  <tr key={c.compra_id} style={{ borderBottom: s.cardBd, cursor: "pointer" }} onClick={() => toggleSel(c)}>
+                    <td style={td}><input type="checkbox" checked={seleccion.has(c.compra_id)} onChange={() => toggleSel(c)} onClick={e => e.stopPropagation()} style={{ accentColor: "var(--monza-accent)" }} /></td>
+                    <td style={{ ...td, maxWidth: 220 }}>
+                      <span style={{ display: "block", fontWeight: 600, color: s.text, overflow: "hidden", textOverflow: "ellipsis" }}>{c.acreedor || "—"}</span>
+                      <span style={{ display: "block", fontSize: 11, color: s.faint, overflow: "hidden", textOverflow: "ellipsis" }}>{c.categoria || c.tipo_gasto}</span>
+                    </td>
+                    <td style={{ ...td, fontFamily: "ui-monospace, monospace", fontSize: 12, color: s.muted }}>{c.numero_documento || "—"}</td>
+                    <td style={{ ...td, color: c.bucket === "vencido" ? "#B91C1C" : s.muted, fontWeight: c.bucket === "vencido" ? 600 : 400 }}>
+                      {c.fecha_vencimiento ? fmtDate(c.fecha_vencimiento) : "—"}
+                    </td>
+                    <td style={{ ...td, color: s.muted }}>{fmtClp(c.monto_total_clp)}</td>
+                    <td style={{ ...td, color: s.muted }}>{fmtClp(c.monto_pagado_clp)}</td>
+                    <td style={{ ...td, fontWeight: 700, color: s.text }}>{fmtClp(c.saldo_clp)}</td>
+                    <td style={td}><span style={pillEstado(c.estado_pago)}>{c.estado_pago}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Barra flotante de selección */}
+      {seleccion.size > 0 && (
+        <div style={{ position: "sticky", bottom: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, borderRadius: 14, border: s.cardBd, background: s.cardBg, padding: "12px 16px", boxShadow: "0 10px 30px rgba(0,0,0,0.25)" }}>
+          <p style={{ margin: 0, fontSize: 13, color: s.text }}>
+            <b>{seleccion.size}</b> compra{seleccion.size !== 1 ? "s" : ""} seleccionada{seleccion.size !== 1 ? "s" : ""} · saldo {fmtClp(totalSel)}
+          </p>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button onClick={() => setSeleccion(new Map())} style={{ ...btnSecondary(s), padding: "6px 12px", fontSize: 12 }}>Limpiar</button>
+            <button onClick={() => setShowPago(true)} style={{ ...btnPrimary(), padding: "7px 14px", fontSize: 12 }}><Banknote size={14} /> Aprobar pago</button>
+          </div>
+        </div>
+      )}
+
+      {showPago && seleccionadas.length > 0 && (
+        <PagoModal compras={seleccionadas} onClose={() => setShowPago(false)}
+          onDone={() => { setSeleccion(new Map()); load(q); onChanged(); }} />
+      )}
+    </div>
+  );
+}
+
+// ═══ PESTAÑA 4: FLUJO DE CAJA ════════════════════════════════════════════════
+
+function FlujoCajaTab() {
+  const s = useStyles();
+  const [fc, setFc] = useState<FlujoCaja | null>(null);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    monzaTesoreriaAPI.flujoCaja().then(({ data }) => setFc(data))
+      .catch((e: any) => toast.error(e?.response?.data?.detail || "No se pudo cargar el flujo de caja"))
+      .finally(() => setLoading(false));
+  }, []);
+  if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: 60 }}><Loader2 size={26} className="animate-spin" color="var(--monza-accent)" /></div>;
+  if (!fc) return null;
+  const th: React.CSSProperties = { padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: s.faint, whiteSpace: "nowrap" };
+  const td: React.CSSProperties = { padding: "10px 14px", whiteSpace: "nowrap", fontSize: 13, textAlign: "right" };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ borderRadius: 12, border: s.cardBd, background: s.cardBg, padding: "12px 16px", fontSize: 13, color: s.muted }}>
+        <CalendarClock size={15} style={{ verticalAlign: "-3px", marginRight: 6, color: "var(--monza-accent)" }} />
+        Proyección de caja por ventana de vencimiento: lo que hay que <b style={{ color: "#B91C1C" }}>pagar</b> (Compras) vs lo que va a <b style={{ color: "#15803D" }}>entrar</b> (facturas por cobrar).
+        {fc.adelantos_por_aprobar.n > 0 && (
+          <span> Además hay <b style={{ color: "#B45309" }}>{fc.adelantos_por_aprobar.n} adelanto(s) por aprobar por {fmtClp(fc.adelantos_por_aprobar.monto)}</b> (aún no son caja segura).</span>
+        )}
+      </div>
+      <div style={{ borderRadius: 14, border: s.cardBd, background: s.cardBg, overflow: "hidden" }}>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead><tr style={{ background: s.sub, borderBottom: s.cardBd }}>
+              <th style={th}>Ventana</th>
+              <th style={{ ...th, textAlign: "right" }}>Por pagar (Compras)</th>
+              <th style={{ ...th, textAlign: "right" }}>Por cobrar (Facturas)</th>
+              <th style={{ ...th, textAlign: "right" }}>Neto</th>
+            </tr></thead>
+            <tbody>
+              {fc.buckets.map(b => (
+                <tr key={b} style={{ borderBottom: s.cardBd, background: b === "vencido" ? "rgba(185,28,28,0.05)" : "transparent" }}>
+                  <td style={{ padding: "10px 14px", fontSize: 13, fontWeight: 600, color: b === "vencido" ? "#B91C1C" : s.text }}>{BUCKET_LABEL[b] || b}</td>
+                  <td style={{ ...td, color: "#B91C1C" }}>{fmtClp(fc.por_pagar[b]?.monto)} <span style={{ color: s.faint, fontSize: 11 }}>({fc.por_pagar[b]?.n})</span></td>
+                  <td style={{ ...td, color: "#15803D" }}>{fmtClp(fc.por_cobrar[b]?.monto)} <span style={{ color: s.faint, fontSize: 11 }}>({fc.por_cobrar[b]?.n})</span></td>
+                  <td style={{ ...td, fontWeight: 700, color: (fc.neto[b] || 0) >= 0 ? "#15803D" : "#B91C1C" }}>{fmtClp(fc.neto[b])}</td>
+                </tr>
+              ))}
+              <tr style={{ background: s.sub, fontWeight: 700 }}>
+                <td style={{ padding: "10px 14px", fontSize: 13, color: s.text }}>TOTAL</td>
+                <td style={{ ...td, color: "#B91C1C" }}>{fmtClp(fc.buckets.reduce((a, b) => a + (fc.por_pagar[b]?.monto || 0), 0))}</td>
+                <td style={{ ...td, color: "#15803D" }}>{fmtClp(fc.buckets.reduce((a, b) => a + (fc.por_cobrar[b]?.monto || 0), 0))}</td>
+                <td style={{ ...td, color: s.text }}>{fmtClp(fc.buckets.reduce((a, b) => a + (fc.neto[b] || 0), 0))}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <p style={{ margin: 0, fontSize: 11, color: s.faint }}>Solo lectura: se calcula en vivo desde Compras y Facturas (NIC 7 · actividades de operación).</p>
+    </div>
+  );
+}
+
+// ═══ PÁGINA ══════════════════════════════════════════════════════════════════
+export default function MonzaTesoreriaPage() {
+  const s = useStyles();
+  const [tab, setTab] = useState<"aprobaciones" | "porpagar" | "conciliacion" | "flujo">("aprobaciones");
+  const [resumen, setResumen] = useState<Resumen | null>(null);
+  const loadResumen = useCallback(() => {
+    monzaTesoreriaAPI.resumen().then(({ data }) => setResumen(data)).catch(() => {});
+  }, []);
+  useEffect(() => { loadResumen(); }, [loadResumen]);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
+        <div style={{ minWidth: 0 }}>
+          <h1 style={{ margin: 0, fontSize: 24, fontWeight: 700, display: "flex", alignItems: "center", gap: 8, color: s.text }}>
+            <Landmark size={24} color="var(--monza-accent)" /> Tesorería
+          </h1>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: s.muted }}>Aprobación de adelantos y pagos · conciliación bancaria · flujo de caja</p>
+        </div>
+      </div>
+
+      {/* KPIs */}
+      {resumen && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12 }}>
+          {[
+            { icon: ShieldCheck, label: "Adelantos por aprobar", value: `${resumen.aprobaciones_pendientes} · ${fmtClp(resumen.monto_aprobaciones_clp)}`, color: "#B45309" },
+            // Nuevos KPIs (solo si el backend ya los entrega)
+            ...(resumen.monto_por_pagar_clp != null
+              ? [{ icon: Banknote, label: "Por pagar (saldo)", value: fmtClp(resumen.monto_por_pagar_clp), color: "var(--monza-accent)" }] : []),
+            { icon: Landmark, label: "Cargos sin conciliar", value: String(resumen.cargos_pendientes), color: "#B91C1C" },
+            { icon: PiggyBank, label: "Abonos sin conciliar", value: String(resumen.abonos_pendientes), color: "#15803D" },
+            { icon: CreditCard, label: "Egresos sin conciliar", value: String(resumen.egresos_sin_conciliar), color: "var(--monza-accent)" },
+            ...(resumen.cobranzas_sin_conciliar != null
+              ? [{ icon: Receipt, label: "Cobranzas sin conciliar", value: String(resumen.cobranzas_sin_conciliar), color: "#15803D" }] : []),
+            { icon: AlertCircle, label: "Por pagar vencido", value: fmtClp(resumen.por_pagar_vencido_clp), color: "#B91C1C" },
+          ].map(k => (
+            <div key={k.label} style={{ background: s.cardBg, border: s.cardBd, borderRadius: 14, padding: 14 }}>
+              <div style={{ width: 32, height: 32, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 8, background: s.dark ? "#0d1430" : "#F1F5F9", color: k.color }}><k.icon size={16} /></div>
+              <p style={{ margin: 0, fontSize: 10, textTransform: "uppercase", letterSpacing: 0.8, color: s.faint }}>{k.label}</p>
+              <p style={{ margin: "2px 0 0", fontSize: 17, fontWeight: 700, color: k.color }}>{k.value}</p>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Tabs */}
+      <div style={{ display: "flex", alignItems: "center", gap: 4, borderBottom: s.cardBd }}>
+        {([["aprobaciones", "Aprobaciones"], ["porpagar", "Por pagar"], ["conciliacion", "Conciliación bancaria"], ["flujo", "Flujo de caja"]] as const).map(([k, lbl]) => (
+          <button key={k} onClick={() => setTab(k)}
+            style={{
+              padding: "9px 16px", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+              background: "none", border: "none", marginBottom: -1,
+              borderBottom: tab === k ? "2px solid var(--monza-accent)" : "2px solid transparent",
+              color: tab === k ? "var(--monza-accent)" : s.muted,
+            }}>{lbl}</button>
+        ))}
+      </div>
+
+      {tab === "aprobaciones" && <AprobacionesTab onChanged={loadResumen} />}
+      {tab === "porpagar" && <PorPagarTab onChanged={loadResumen} />}
+      {tab === "conciliacion" && <ConciliacionTab onChanged={loadResumen} />}
+      {tab === "flujo" && <FlujoCajaTab />}
+    </div>
+  );
+}

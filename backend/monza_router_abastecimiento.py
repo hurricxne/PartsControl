@@ -61,6 +61,10 @@ def _item_dict(it: MonzaCotizacionItem, cot: MonzaCotizacion) -> dict:
         "estado_linea": it.estado_linea or "cotizado",
         "oc_proveedor_id": it.oc_proveedor_id,
         "fecha_venta": cot.fecha_venta.isoformat() if cot.fecha_venta else None,
+        # Adelanto (lo verifica Contabilidad): Abastecimiento ve si el pago está confirmado.
+        "pct_adelanto": int(getattr(cot, "pct_adelanto", 0) or 0),
+        "requiere_adelanto": int(getattr(cot, "pct_adelanto", 0) or 0) > 0,
+        "pago_verificado": bool(getattr(cot, "adelanto_verificado", 0)),
     }
 
 
@@ -171,6 +175,45 @@ def comprar(body: ComprarBody, db: Session = Depends(get_db), current_user=Depen
     if not body.item_ids:
         raise HTTPException(status_code=400, detail="Sin items")
 
+    # Solo ítems realmente disponibles para comprar (estado 'por_comprar'); eager-load de
+    # la cotización para el cortafuego (evita N+1 y permite detectar ítems sin venta).
+    items = (
+        db.query(MonzaCotizacionItem)
+        .options(joinedload(MonzaCotizacionItem.cotizacion))
+        .filter(
+            MonzaCotizacionItem.id.in_(body.item_ids),
+            MonzaCotizacionItem.estado_linea == "por_comprar",
+        )
+        .all()
+    )
+    # Cualquier id que no exista o no esté 'por_comprar' (ya comprado, etc.) → 400, en vez
+    # de crear la OC con menos ítems silenciosamente.
+    if len(items) != len(set(body.item_ids)):
+        raise HTTPException(status_code=400, detail="Algunos ítems no están disponibles para comprar (no existen o ya fueron comprados)")
+
+    # ── Cortafuego de ADELANTO ──────────────────────────────────────────────────
+    # Si una venta exige adelanto (pct_adelanto > 0) NO se puede generar la OC de
+    # proveedor hasta que Contabilidad verifique el pago (adelanto_verificado == 1).
+    # Protege a Abastecimiento de comprar contra ventas cuyo 50% aún no se cobró.
+    sin_verificar = [
+        it.cotizacion for it in items
+        if it.cotizacion is not None
+        and int(it.cotizacion.pct_adelanto or 0) > 0
+        and not int(it.cotizacion.adelanto_verificado or 0)
+    ]
+    if sin_verificar:
+        # dedup por id manteniendo el orden
+        vistos, unicas = set(), []
+        for c in sin_verificar:
+            if c.id not in vistos:
+                vistos.add(c.id); unicas.append(c)
+        nums = ", ".join(f"{c.numero} (adelanto {int(c.pct_adelanto or 0)}%)" for c in unicas)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Adelanto no verificado por Contabilidad en: {nums}. "
+                   f"No se puede generar la OC de proveedor hasta confirmar el pago del adelanto.",
+        )
+
     nombre = body.proveedor_nombre
     pais = body.pais
     moneda = body.moneda or "EUR"
@@ -198,7 +241,6 @@ def comprar(body: ComprarBody, db: Session = Depends(get_db), current_user=Depen
     db.add(ocp)
     db.flush()
 
-    items = db.query(MonzaCotizacionItem).filter(MonzaCotizacionItem.id.in_(body.item_ids)).all()
     for it in items:
         it.estado_linea = "comprado"
         it.oc_proveedor_id = ocp.id

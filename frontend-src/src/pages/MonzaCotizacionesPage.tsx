@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { Search, Download, RefreshCw, FileText, ChevronDown, ChevronRight, CheckCircle } from "lucide-react";
 import { monzaCotizacionesAPI } from "../services/monzaApi";
+import { PAGO_OPCIONES } from "../constants/adelanto";
 import toast from "react-hot-toast";
 
 interface Cotizacion {
@@ -37,6 +38,47 @@ const LINEA_CONFIG: Record<string, { bg: string; color: string }> = {
 function fmt(n: number) { return n > 0 ? `$${n.toLocaleString("es-CL")}` : "$0"; }
 function fmtDate(d?: string) { return d ? new Date(d).toLocaleDateString("es-CL") : "—"; }
 
+// Condiciones de pago ofrecidas al cerrar una venta (PAGO_OPCIONES, en constants/adelanto).
+// El '% adelanto' dispara la verificación de pago en Contabilidad y "pago no verificado"
+// en Abastecimiento.
+function CerrarVentaModal({ cot, loading, onClose, onConfirm }: {
+  cot: { id: number; numero: string };
+  loading: boolean;
+  onClose: () => void;
+  onConfirm: (pct: number, forma: string) => void;
+}) {
+  const [sel, setSel] = useState("contado");
+  const opt = PAGO_OPCIONES.find((o) => o.id === sel) || PAGO_OPCIONES[0];
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.5)", padding: 16 }} onClick={onClose}>
+      <div style={{ width: "100%", maxWidth: 440, background: "white", borderRadius: 14, border: "1px solid #E2E8F0", boxShadow: "0 20px 50px rgba(0,0,0,0.25)" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ padding: "14px 18px", borderBottom: "1px solid #E2E8F0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600, color: "#0f172a" }}>Cerrar venta · {cot.numero}</h3>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "#64748B", fontSize: 20, lineHeight: 1 }}>×</button>
+        </div>
+        <div style={{ padding: 18 }}>
+          <p style={{ margin: "0 0 10px", fontSize: 13, color: "#64748B" }}>Condición de pago acordada con el cliente:</p>
+          {PAGO_OPCIONES.map((o) => (
+            <label key={o.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 10, border: `1px solid ${sel === o.id ? "var(--monza-accent)" : "#E2E8F0"}`, marginBottom: 8, cursor: "pointer" }}>
+              <input type="radio" name="pago" checked={sel === o.id} onChange={() => setSel(o.id)} />
+              <span style={{ fontSize: 14, color: "#0f172a", fontWeight: sel === o.id ? 600 : 400 }}>{o.label}</span>
+            </label>
+          ))}
+          {opt.pct > 0 && (
+            <p style={{ margin: "4px 0 12px", fontSize: 12, color: "#B45309", background: "#FEF3C7", padding: "8px 10px", borderRadius: 8 }}>
+              El cliente paga {opt.pct}% por adelantado. Contabilidad deberá <b>verificar el pago</b>; en Abastecimiento aparecerá <b>"pago no verificado"</b> hasta entonces.
+            </p>
+          )}
+          <button onClick={() => onConfirm(opt.pct, opt.forma)} disabled={loading}
+            style={{ width: "100%", padding: 10, borderRadius: 8, border: "none", background: "var(--monza-accent)", color: "white", fontWeight: 600, fontSize: 14, cursor: "pointer", opacity: loading ? 0.6 : 1 }}>
+            {loading ? "Guardando…" : "Confirmar venta"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function MonzaCotizacionesPage() {
   const [items, setItems] = useState<Cotizacion[]>([]);
   const [total, setTotal] = useState(0);
@@ -51,6 +93,7 @@ export default function MonzaCotizacionesPage() {
   const [details, setDetails] = useState<Record<number, CotDetail>>({});
   const [loadingDetail, setLoadingDetail] = useState<number | null>(null);
   const [markingVendida, setMarkingVendida] = useState<number | null>(null);
+  const [cerrarVenta, setCerrarVenta] = useState<Cotizacion | null>(null);
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -115,12 +158,14 @@ export default function MonzaCotizacionesPage() {
     }
   };
 
-  const handleMarcarVendida = async (cot: Cotizacion) => {
-    if (!window.confirm(`¿Marcar la cotización ${cot.numero} como Vendida?`)) return;
+  // Cierra la venta con la condición de pago elegida (pct_adelanto dispara la
+  // verificación en Contabilidad y el estado en Abastecimiento).
+  const confirmarVenta = async (cot: Cotizacion, pctAdelanto: number, formaPago: string) => {
     setMarkingVendida(cot.id);
     try {
-      await monzaCotizacionesAPI.update(cot.id, { estado: "vendida" });
+      await monzaCotizacionesAPI.update(cot.id, { estado: "vendida", pct_adelanto: pctAdelanto, forma_pago: formaPago });
       toast.success(`Cotización ${cot.numero} marcada como Vendida`);
+      setCerrarVenta(null);
       fetchAll();
     } catch { toast.error("Error al marcar como vendida"); }
     finally { setMarkingVendida(null); }
@@ -242,7 +287,7 @@ export default function MonzaCotizacionesPage() {
                         <div style={{ display: "flex", gap: 6, justifyContent: "center", alignItems: "center" }}>
                           {cot.estado !== "vendida" && (
                             <button
-                              onClick={() => handleMarcarVendida(cot)}
+                              onClick={() => setCerrarVenta(cot)}
                               disabled={markingVendida === cot.id}
                               title="Marcar como vendida"
                               style={{ background: "transparent", border: "1px solid #16A34A40", borderRadius: 6, cursor: "pointer", color: "#16A34A", padding: "5px 8px", fontSize: 11, fontWeight: 600, display: "flex", alignItems: "center", gap: 4, opacity: markingVendida === cot.id ? 0.5 : 1 }}>
@@ -331,6 +376,14 @@ export default function MonzaCotizacionesPage() {
           </div>
         )}
       </div>
+      {cerrarVenta && (
+        <CerrarVentaModal
+          cot={cerrarVenta}
+          loading={markingVendida === cerrarVenta.id}
+          onClose={() => setCerrarVenta(null)}
+          onConfirm={(pct, forma) => confirmarVenta(cerrarVenta, pct, forma)}
+        />
+      )}
     </div>
   );
 }

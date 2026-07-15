@@ -279,8 +279,8 @@ def generate_result_excel(filepath_original: str, items_data: List[dict], output
             if i == 1 and val:
                 try:
                     cell.number_format = '#,##0.00'
-                except:
-                    pass
+                except Exception:
+                    pass  # formato numérico es cosmético; no abortar el export
 
     wb.save(output_path)
     return output_path

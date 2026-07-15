@@ -1,4 +1,7 @@
 import axios from "axios";
+import type {
+  EmbarquePricingRow, PricingDetail, PricingSavePayload,
+} from "../monza-embarques-pricing/types";
 
 const api = axios.create({ baseURL: "/api/monza" });
 
@@ -15,6 +18,119 @@ api.interceptors.request.use((cfg) => {
 export const monzaConfigAPI = {
   get: () => api.get("/config"),
   update: (data: Record<string, unknown>) => api.put("/config", data),
+};
+
+// ── Contabilidad (Ventas + Facturas/Cobranzas/Factoring) — SOLO MonzaParts ────
+export const monzaContabilidadAPI = {
+  // Ventas (agrupado por cotización vendida/despachada)
+  listVentas: (q?: string, periodo?: string) =>
+    api.get("/contabilidad/ventas", { params: { q: q || undefined, periodo: periodo || undefined } }),
+  ventaDetalle: (cotId: number) => api.get(`/contabilidad/ventas/${cotId}`),
+  despachosFacturables: (cotId: number) => api.get(`/contabilidad/ventas/${cotId}/despachos-facturables`),
+  marcarGuiaFirmada: (despId: number, data: Record<string, unknown>) =>
+    api.patch(`/contabilidad/ventas/despachos/${despId}/guia-firmada`, data),
+  // Adelanto (50%): Contabilidad verifica el pago informado por Comercial
+  verificarAdelanto: (cotId: number, data: Record<string, unknown>) =>
+    api.post(`/contabilidad/ventas/${cotId}/adelanto/verificar`, data),
+  // Facturas / cuentas por cobrar
+  listFacturas: (estado?: string, q?: string) =>
+    api.get("/contabilidad/facturas", { params: { estado: estado || undefined, q: q || undefined } }),
+  crearFactura: (data: Record<string, unknown>) => api.post("/contabilidad/facturas", data),
+  eliminarFactura: (id: number) => api.delete(`/contabilidad/facturas/${id}`),
+  // Cobranzas
+  registrarCobranza: (facturaId: number, data: Record<string, unknown>) =>
+    api.post(`/contabilidad/facturas/${facturaId}/cobranzas`, data),
+  eliminarCobranza: (facturaId: number, cobranzaId: number) =>
+    api.delete(`/contabilidad/facturas/${facturaId}/cobranzas/${cobranzaId}`),
+  // Factoring (por factura)
+  setFactoring: (facturaId: number, data: Record<string, unknown>) =>
+    api.post(`/contabilidad/facturas/${facturaId}/factoring`, data),
+  liquidarFactoring: (facturaId: number) =>
+    api.post(`/contabilidad/facturas/${facturaId}/factoring/liquidar`),
+  kpis: (periodo?: string) => api.get("/contabilidad/kpis", { params: periodo ? { periodo } : {} }),
+};
+
+// ── Embarques Pricing (costo landed) — SOLO MonzaParts ────────────────────────
+export const monzaEmbarquesPricingAPI = {
+  list: (q?: string) =>
+    api.get<EmbarquePricingRow[]>("/embarques-pricing", { params: q ? { q } : {} }),
+  get: (embarqueId: number) =>
+    api.get<PricingDetail>(`/embarques-pricing/${embarqueId}`),
+  save: (embarqueId: number, data: PricingSavePayload) =>
+    api.put<PricingDetail>(`/embarques-pricing/${embarqueId}`, data),
+  cerrar: (embarqueId: number) =>
+    api.post<PricingDetail>(`/embarques-pricing/${embarqueId}/cerrar`),
+  reabrir: (embarqueId: number) =>
+    api.post<PricingDetail>(`/embarques-pricing/${embarqueId}/reabrir`),
+};
+
+// ── Compras / Cuentas por Pagar (AP, NIIF/NIC 7) — SOLO MonzaParts ────────────
+export const monzaComprasAPI = {
+  list: (params?: Record<string, unknown>) => api.get("/compras-contab", { params }),
+  detalle: (id: number) => api.get(`/compras-contab/${id}`),
+  crear: (data: Record<string, unknown>) => api.post("/compras-contab", data),
+  kpis: (params?: Record<string, unknown>) => api.get("/compras-contab/kpis", { params }),
+  catalogos: () => api.get("/compras-contab/catalogos"),
+  // Overlay en vivo: gastos anotados en Embarques Pricing (reflejados automáticamente)
+  costosEmbarque: () => api.get("/compras-contab/costos-embarque"),
+  // Pago de UNA compra (crea un egreso de 1 detalle)
+  registrarPago: (id: number, data: Record<string, unknown>) =>
+    api.post(`/compras-contab/${id}/pagos`, data),
+  actualizarPago: (id: number, pagoId: number, data: Record<string, unknown>) =>
+    api.patch(`/compras-contab/${id}/pagos/${pagoId}`, data),
+  eliminarPago: (id: number, pagoId: number) =>
+    api.delete(`/compras-contab/${id}/pagos/${pagoId}`),
+  // Egreso consolidado: una salida de dinero paga varias compras
+  crearEgresoConsolidado: (data: Record<string, unknown>) => api.post("/compras-contab/egresos", data),
+  listarEgresos: (params?: Record<string, unknown>) => api.get("/compras-contab/egresos", { params }),
+  actualizarEgreso: (egresoId: number, data: Record<string, unknown>) =>
+    api.patch(`/compras-contab/egresos/${egresoId}`, data),
+  eliminarEgreso: (egresoId: number) => api.delete(`/compras-contab/egresos/${egresoId}`),
+  anular: (id: number, motivo?: string) => api.post(`/compras-contab/${id}/anular`, { motivo }),
+  eliminar: (id: number) => api.delete(`/compras-contab/${id}`),
+};
+
+// ── Tesorería (aprobaciones 50% + conciliación bancaria + flujo de caja) — SOLO MonzaParts ──
+export const monzaTesoreriaAPI = {
+  // Aprobaciones: la ORDEN de los adelantos 50% (destraba Abastecimiento)
+  aprobaciones: () => api.get("/tesoreria/aprobaciones"),
+  aprobarAdelanto: (cotId: number, data: Record<string, unknown>) =>
+    api.post(`/tesoreria/aprobaciones/${cotId}/aprobar`, data),
+  // Conciliación bancaria
+  cuentas: (incluirInactivas?: boolean) =>
+    api.get("/tesoreria/cuentas", { params: incluirInactivas ? { incluir_inactivas: true } : {} }),
+  crearCuenta: (data: Record<string, unknown>) => api.post("/tesoreria/cuentas", data),
+  actualizarCuenta: (id: number, data: Record<string, unknown>) => api.put(`/tesoreria/cuentas/${id}`, data),
+  eliminarCuenta: (id: number) => api.delete(`/tesoreria/cuentas/${id}`),
+  importarCartola: (cuentaId: number, file: File, nombre?: string) => {
+    const fd = new FormData();
+    fd.append("cuenta_id", String(cuentaId));
+    if (nombre) fd.append("nombre", nombre);
+    fd.append("file", file);
+    return api.post("/tesoreria/cartolas/importar", fd);
+  },
+  cartolas: (cuentaId?: number) =>
+    api.get("/tesoreria/cartolas", { params: cuentaId ? { cuenta_id: cuentaId } : {} }),
+  eliminarCartola: (id: number) => api.delete(`/tesoreria/cartolas/${id}`),
+  movimientos: (params?: Record<string, unknown>) => api.get("/tesoreria/movimientos", { params }),
+  crearMovimiento: (data: Record<string, unknown>) => api.post("/tesoreria/movimientos", data),
+  eliminarMovimiento: (id: number) => api.delete(`/tesoreria/movimientos/${id}`),
+  sugerencias: (movId: number) => api.get(`/tesoreria/movimientos/${movId}/sugerencias`),
+  conciliar: (movId: number, data: Record<string, unknown>) =>
+    api.post(`/tesoreria/movimientos/${movId}/conciliar`, data),
+  desconciliar: (movId: number) => api.post(`/tesoreria/movimientos/${movId}/desconciliar`),
+  egresosPendientes: (q?: string) =>
+    api.get("/tesoreria/egresos-pendientes", { params: q ? { q } : {} }),
+  adelantosPendientes: () => api.get("/tesoreria/adelantos-pendientes"),
+  cobranzasPendientes: (q?: string, page = 1) =>
+    api.get("/tesoreria/cobranzas-pendientes", { params: { q: q || undefined, page } }),
+  // Por pagar / aprobar pagos (Tesorería da la orden → crea el Comprobante de Egreso)
+  porPagar: (params?: { q?: string; page?: number; page_size?: number }) =>
+    api.get("/tesoreria/por-pagar", { params }),
+  aprobarPago: (data: Record<string, unknown>) => api.post("/tesoreria/pagos", data),
+  // Flujo de caja + KPIs
+  flujoCaja: () => api.get("/tesoreria/flujo-caja"),
+  resumen: () => api.get("/tesoreria/resumen"),
 };
 
 // ── Leads ───────────────────────────────────────────────────────────────────

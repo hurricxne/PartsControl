@@ -242,6 +242,11 @@ class MonzaCotizacion(Base):
     lead_id = Column(Integer, ForeignKey("monza_leads.id"), nullable=True)
     cliente_id = Column(Integer, ForeignKey("monza_clientes.id"), nullable=False)
     estado = Column(String(20), default="propuesta")  # propuesta/enviada/vendida/rechazada
+    # Adelanto (verificado por Contabilidad) — aditivo para modulo monza_contabilidad
+    pct_adelanto = Column(Integer, default=0)
+    adelanto_verificado = Column(Integer, default=0)
+    guia_firmada = Column(Integer, default=0)
+    guia_firmada_archivo = Column(String(255), nullable=True)
     forma_pago = Column(String(100), nullable=True)
     tipo_cotizacion = Column(String(100), nullable=True)
     linea = Column(String(20), nullable=True)  # autos/maquinaria
@@ -506,3 +511,16 @@ class MonzaDespachoItem(Base):
     item_id        = Column(Integer, nullable=False)
     qty_despachada = Column(Integer, default=0)
 
+
+class MonzaWebhookLog(Base):
+    __tablename__ = "monza_webhook_log"
+    id = Column(Integer, primary_key=True)
+    fuente = Column(String(40), default="nexor")
+    headers = Column(Text, nullable=True)
+    payload = Column(Text, nullable=True)
+    procesado = Column(Integer, default=0)
+    lead_id = Column(Integer, nullable=True)
+    lead_numero = Column(String(20), nullable=True)
+    error = Column(String(400), nullable=True)
+    external_id = Column(String(120), nullable=True)
+    fecha = Column(DateTime, default=datetime.utcnow)

@@ -29,6 +29,24 @@ def calcular_cotizacion(items: List[Dict], config: Dict) -> Dict:
     if not items:
         return {"items": [], "totales": _totales_vacios()}
 
+    # RAMA_VENTA_CLP: precios de venta en CLP (margen ya incluido); sin USD/CIF/IVA.
+    if str(config.get("origen") or "") == "venta_clp":
+        _res = []
+        for _it in items:
+            _qty = float(_it.get("cantidad") or 0)
+            _costo = float(_it.get("precio_unit_cotizacion") or 0)
+            _margen = float(_it.get("margen_pct") or 0)
+            _pv = _costo * (1 + _margen)
+            _tv = _pv * _qty
+            _res.append({**_it, "peso_total_kg": 0.0, "cif_clp": 0.0, "gastos_locales_clp": 0.0,
+                         "costo_total_clp": _tv, "costo_unitario_clp": _costo,
+                         "margen_efectivo": _margen,
+                         "precio_venta_clp": _pv, "total_venta_clp": _tv, "total_exwork_usd": 0.0})
+        _sub = sum(_r["total_venta_clp"] for _r in _res)
+        return {"items": _res, "totales": {"total_peso_kg": 0.0, "total_cif_clp": 0.0,
+                "gastos_locales_total_clp": 0.0, "subtotal_neto_clp": _sub, "iva_clp": _sub * 0.19,
+                "total_con_iva_clp": _sub * 1.19, "total_exwork_usd": 0.0}}
+
     # --- Pasada 1: cálculos por ítem independientes ---
     pass1 = []
     for item in items:

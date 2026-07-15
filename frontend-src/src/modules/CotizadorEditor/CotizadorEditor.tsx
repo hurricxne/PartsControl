@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -19,6 +19,8 @@ interface EditableFields {
   plazo: string
   plazo_entrega_min?: number | null
   plazo_entrega_max?: number | null
+  cantidad?: number | null
+  precio_unit_cotizacion?: number | null
 }
 
 // ── Celda editable inline ─────────────────────────────────────────────────
@@ -189,7 +191,7 @@ export default function CotizadorEditor() {
 
   useEffect(() => {
     if (!data?.config || items.length === 0) return
-    const config: PricingConfig = data.config
+    const config: PricingConfig = { ...data.config, origen: (data as any).origen } as PricingConfig
     const merged = items.map(it => ({ ...it, ...(localEdits[it.id] || {}) }))
     const res = calcularCotizacion(merged, config)
     setResultado(res)
@@ -339,6 +341,49 @@ export default function CotizadorEditor() {
   const updateField = (itemId: number, field: keyof EditableFields, value: unknown) => {
     handleLocalEdit(itemId, field, value as any)
   }
+
+  // ── Aplicar por columna a TODOS + Guardar todo (usabilidad en listados) ──
+  const bulkMargenRef = useRef<HTMLInputElement>(null)
+  const bulkMinRef = useRef<HTMLInputElement>(null)
+  const bulkMaxRef = useRef<HTMLInputElement>(null)
+
+  const applyBulk = (ref: { current: HTMLInputElement | null }, field: keyof EditableFields, transform: (n: number) => number = (n) => n) => {
+    const s = String(ref.current?.value ?? '').replace(',', '.').trim()
+    const n = parseFloat(s)
+    if (isNaN(n)) { toast.error('Ingresa un número'); return }
+    // Validación de plazos (independiente del margen): máx no puede ser menor que mín.
+    if (field === 'plazo_entrega_max') {
+      const minN = parseFloat(String(bulkMinRef.current?.value ?? '').replace(',', '.').trim())
+      if (!isNaN(minN) && n < minN) { toast.error('El plazo máximo no puede ser menor que el mínimo'); return }
+    }
+    if (field === 'plazo_entrega_min') {
+      const maxN = parseFloat(String(bulkMaxRef.current?.value ?? '').replace(',', '.').trim())
+      if (!isNaN(maxN) && n > maxN) { toast.error('El plazo mínimo no puede ser mayor que el máximo'); return }
+    }
+    items.forEach((it: any) => updateField(it.id, field, transform(n)))
+    toast.success('Aplicado a todos los ítems')
+  }
+
+  const handleSaveAll = async () => {
+    const ids = Object.keys(localEdits).map(Number)
+    if (!ids.length) { toast('No hay cambios por guardar'); return }
+    for (const id of ids) { await handleSaveItem(id) }
+    toast.success(`Guardados ${ids.length} ítem(s)`)
+  }
+
+  // ── Scroll horizontal duplicado (arriba + abajo), sincronizado ──
+  const topScrollRef = useRef<HTMLDivElement>(null)
+  const bodyScrollRef = useRef<HTMLDivElement>(null)
+  const [tableScrollW, setTableScrollW] = useState(2200)
+  useEffect(() => {
+    const measure = () => { if (bodyScrollRef.current) setTableScrollW(bodyScrollRef.current.scrollWidth) }
+    measure()
+    const t = setTimeout(measure, 150)
+    window.addEventListener('resize', measure)
+    return () => { clearTimeout(t); window.removeEventListener('resize', measure) }
+  }, [items, resultado])
+  const syncFromTop = () => { if (bodyScrollRef.current && topScrollRef.current) bodyScrollRef.current.scrollLeft = topScrollRef.current.scrollLeft }
+  const syncFromBody = () => { if (bodyScrollRef.current && topScrollRef.current) topScrollRef.current.scrollLeft = bodyScrollRef.current.scrollLeft }
 
   const saveItemMutation = {
     isPending: updateItemMutation.isPending,
@@ -737,9 +782,52 @@ export default function CotizadorEditor() {
         </div>
       )}
 
+      {/* ── Aplicar a todos + Guardar todo ── */}
+      {!faseCerrada && (
+        <div className="card mb-3 p-3 flex flex-wrap items-end gap-3">
+          <span className="text-xs font-semibold uppercase tracking-wide self-center" style={{ color: 'var(--text-faint)' }}>Aplicar a todos:</span>
+          <div className="flex flex-col gap-1">
+            <label className="text-[10px] uppercase" style={{ color: 'var(--text-faint)' }}>Margen %</label>
+            <div className="flex gap-1">
+              <input ref={bulkMargenRef} type="number" defaultValue="" placeholder="19"
+                className="w-20 px-2 py-1 rounded text-xs" style={{ background: 'var(--surface-100)', border: '1px solid var(--border)', color: 'var(--text-primary)' }} />
+              <button onClick={() => applyBulk(bulkMargenRef, 'margen_pct', n => n / 100)} className="btn-secondary text-xs px-2">Aplicar</button>
+            </div>
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="text-[10px] uppercase" style={{ color: 'var(--text-faint)' }}>Pzo mín (d)</label>
+            <div className="flex gap-1">
+              <input ref={bulkMinRef} type="number" defaultValue="" placeholder="10"
+                className="w-20 px-2 py-1 rounded text-xs" style={{ background: 'var(--surface-100)', border: '1px solid var(--border)', color: 'var(--text-primary)' }} />
+              <button onClick={() => applyBulk(bulkMinRef, 'plazo_entrega_min')} className="btn-secondary text-xs px-2">Aplicar</button>
+            </div>
+          </div>
+          <div className="flex flex-col gap-1">
+            <label className="text-[10px] uppercase" style={{ color: 'var(--text-faint)' }}>Pzo máx (d)</label>
+            <div className="flex gap-1">
+              <input ref={bulkMaxRef} type="number" defaultValue="" placeholder="20"
+                className="w-20 px-2 py-1 rounded text-xs" style={{ background: 'var(--surface-100)', border: '1px solid var(--border)', color: 'var(--text-primary)' }} />
+              <button onClick={() => applyBulk(bulkMaxRef, 'plazo_entrega_max')} className="btn-secondary text-xs px-2">Aplicar</button>
+            </div>
+          </div>
+          <div className="ml-auto self-end">
+            <button onClick={handleSaveAll} disabled={saveItemMutation.isPending}
+              className="btn-primary text-sm flex items-center gap-1.5 px-4 py-2">
+              <Save className="w-4 h-4" /> Guardar todo
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ── Tabla ── */}
       <div className="card overflow-hidden">
+        {/* Scroll horizontal superior (sincronizado con el de abajo) */}
+        <div ref={topScrollRef} onScroll={syncFromTop} className="overflow-x-auto" style={{ overflowY: 'hidden' }}>
+          <div style={{ width: tableScrollW, height: 1 }} />
+        </div>
         <div
+          ref={bodyScrollRef}
+          onScroll={syncFromBody}
           className="overflow-x-auto overflow-y-auto"
           style={{ maxHeight: 'calc(100vh - 310px)' }}
         >
@@ -831,9 +919,16 @@ export default function CotizadorEditor() {
                       {item.marca || '—'}
                     </td>
 
-                    {/* QTY */}
-                    <td className="px-2 py-2 text-right" style={{ color: 'var(--text-primary)' }}>
-                      {item.cantidad}
+                    {/* QTY — EDITABLE */}
+                    <td className="px-1 py-1 text-right" style={{ color: 'var(--text-primary)', minWidth: 70 }}>
+                      {!faseCerrada ? (
+                        <CeldaEdit
+                          value={String(item.cantidad ?? '')}
+                          onSave={v => { const n = parseFloat(v); updateField(item.id, 'cantidad', isNaN(n) ? null : n) }}
+                        />
+                      ) : (
+                        item.cantidad
+                      )}
                     </td>
 
                     {/* Ex Work */}
@@ -900,9 +995,21 @@ export default function CotizadorEditor() {
                       />
                     </td>
 
-                    {/* Precio Venta */}
-                    <td className="px-2 py-2 text-right font-semibold text-brand-400">
-                      {clp(item.precio_venta_clp)}
+                    {/* Precio Venta — EDITABLE (venta_clp fija precio; costo mueve margen) */}
+                    <td className="px-1 py-1 text-right font-semibold text-brand-400" style={{ minWidth: 110 }}>
+                      {!faseCerrada ? (
+                        <CeldaEdit
+                          value={String(Math.round(item.precio_venta_clp || 0))}
+                          onSave={v => {
+                            const n = parseFloat(v.replace(/[^0-9.-]/g, ''))
+                            if (isNaN(n)) return
+                            const costo = item.costo_unitario_clp || 0
+                            updateField(item.id, 'margen_pct', costo > 0 ? (n / costo - 1) : (item.margen_pct ?? null))
+                          }}
+                        />
+                      ) : (
+                        clp(item.precio_venta_clp)
+                      )}
                     </td>
 
                     {/* Total Venta */}

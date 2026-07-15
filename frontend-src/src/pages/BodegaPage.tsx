@@ -3,10 +3,10 @@ import { createPortal } from 'react-dom'
 import {
   Package, CheckCircle2, AlertTriangle, Clock, ChevronDown, ChevronRight,
   Loader2, Camera, Trash2, X, Check, History, Inbox, RefreshCw,
-  AlertOctagon, Archive, ImagePlus,
+  AlertOctagon, Archive, ImagePlus, FileText, Download,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
-import { bodegaAPI } from '../services/api'
+import api, { bodegaAPI } from '../services/api'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -419,6 +419,33 @@ function EmbarqueCard({ emb, onRefresh, onOpenRec }: {
   onOpenRec: (recId: number) => void
 }) {
   const [starting, setStarting] = useState(false)
+  const [expanded, setExpanded] = useState(false)
+  const [detail, setDetail] = useState<any>(null)
+  const [loadingDet, setLoadingDet] = useState(false)
+
+  const toggleDetail = async () => {
+    const next = !expanded
+    setExpanded(next)
+    if (next && !detail) {
+      setLoadingDet(true)
+      try { const { data } = await bodegaAPI.getEmbarque(emb.id); setDetail(data) }
+      catch { toast.error('No se pudo cargar el detalle') }
+      finally { setLoadingDet(false) }
+    }
+  }
+
+  const esDoc = (v?: string | null) => !!v && /^[A-Za-z0-9]{16,}\.\w+$/.test(v)
+  const descargarDoc = async (filename: string) => {
+    try {
+      const resp = await api.get(`/despachos/docs/${filename}`, { responseType: 'arraybuffer' })
+      const blob = new Blob([resp.data])
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = filename
+      document.body.appendChild(a); a.click(); document.body.removeChild(a)
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch { toast.error('No se pudo descargar el documento') }
+  }
 
   const handleRecibir = async () => {
     setStarting(true)
@@ -434,8 +461,9 @@ function EmbarqueCard({ emb, onRefresh, onOpenRec }: {
     }
   }
 
-  const estadoColor = emb.estado === 'en_recepcion' ? 'text-amber-400' : 'text-blue-400'
-  const estadoLabel = emb.estado === 'en_recepcion' ? 'En recepción' : 'En tránsito'
+  const EST_LABELS: Record<string, string> = { en_transito: 'En tránsito', en_aduana: 'En aduana', en_bodega: 'En bodega', en_recepcion: 'En recepción' }
+  const estadoColor = emb.estado === 'en_recepcion' ? 'text-amber-400' : emb.estado === 'en_bodega' ? 'text-emerald-400' : 'text-blue-400'
+  const estadoLabel = EST_LABELS[emb.estado] ?? 'En tránsito'
   const pct = emb.total_items > 0 ? Math.round((emb.items_marcados / emb.total_items) * 100) : 0
 
   return (
@@ -478,22 +506,102 @@ function EmbarqueCard({ emb, onRefresh, onOpenRec }: {
         )}
 
         {/* Actions */}
-        <div className="flex justify-end gap-2">
-          {emb.estado === 'en_transito' && (
-            <button onClick={handleRecibir} disabled={starting}
-              className="btn-primary text-xs px-4 py-1.5 flex items-center gap-1.5">
-              {starting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Inbox className="w-3.5 h-3.5" />}
-              Recibir embarque
-            </button>
-          )}
-          {emb.estado === 'en_recepcion' && emb.recepcion_id && (
-            <button onClick={() => onOpenRec(emb.recepcion_id!)}
-              className="btn-primary text-xs px-4 py-1.5 flex items-center gap-1.5">
-              <CheckCircle2 className="w-3.5 h-3.5" />
-              Ver recepción activa
-            </button>
-          )}
+        <div className="flex justify-between items-center gap-2">
+          <button onClick={toggleDetail} className="text-xs flex items-center gap-1 hover:underline" style={{ color: 'var(--text-muted)' }}>
+            {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+            {expanded ? 'Ocultar detalle' : 'Ver detalle'}
+          </button>
+          <div className="flex gap-2">
+            {['en_transito', 'en_aduana', 'en_bodega'].includes(emb.estado) && (
+              <button onClick={handleRecibir} disabled={starting}
+                className="btn-primary text-xs px-4 py-1.5 flex items-center gap-1.5">
+                {starting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Inbox className="w-3.5 h-3.5" />}
+                Recibir embarque
+              </button>
+            )}
+            {emb.estado === 'en_recepcion' && emb.recepcion_id && (
+              <button onClick={() => onOpenRec(emb.recepcion_id!)}
+                className="btn-primary text-xs px-4 py-1.5 flex items-center gap-1.5">
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                Ver recepción activa
+              </button>
+            )}
+          </div>
         </div>
+
+        {/* Detalle expandible: documentos, notas, ítems */}
+        {expanded && (
+          <div className="pt-3 mt-1 border-t space-y-3" style={{ borderColor: 'var(--border)' }}>
+            {loadingDet ? (
+              <div className="flex items-center gap-2 text-xs" style={{ color: 'var(--text-faint)' }}>
+                <Loader2 className="w-3.5 h-3.5 animate-spin" /> Cargando detalle…
+              </div>
+            ) : detail ? (
+              <>
+                <div>
+                  <p className="text-[10px] uppercase tracking-wider font-semibold mb-1.5" style={{ color: 'var(--text-faint)' }}>Documentos</p>
+                  <div className="flex flex-wrap gap-2">
+                    {([['AWB / BL', detail.awb], ['Factura comercial', detail.factura_comercial], ['Packing list', detail.packing_list]] as [string, string | null][]).map(([lbl, val]) =>
+                      val ? (esDoc(val) ? (
+                        <button key={lbl} onClick={() => descargarDoc(val)} className="text-[11px] flex items-center gap-1 px-2 py-1 rounded-lg border hover:border-brand-400 transition-colors" style={{ borderColor: 'var(--border)', color: 'var(--text-primary)' }}>
+                          <FileText className="w-3 h-3 text-brand-400" /> {lbl} <Download className="w-3 h-3" style={{ color: 'var(--text-faint)' }} />
+                        </button>
+                      ) : (
+                        <span key={lbl} className="text-[11px] px-2 py-1 rounded-lg border" style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>{lbl}: {val}</span>
+                      )) : null
+                    )}
+                    {!detail.awb && !detail.factura_comercial && !detail.packing_list && (
+                      <span className="text-[11px]" style={{ color: 'var(--text-faint)' }}>Sin documentos</span>
+                    )}
+                  </div>
+                </div>
+
+                {detail.notas && (
+                  <div>
+                    <p className="text-[10px] uppercase tracking-wider font-semibold mb-1" style={{ color: 'var(--text-faint)' }}>Notas</p>
+                    <p className="text-xs whitespace-pre-wrap" style={{ color: 'var(--text-muted)' }}>{detail.notas}</p>
+                  </div>
+                )}
+
+                <div>
+                  <p className="text-[10px] uppercase tracking-wider font-semibold mb-1.5" style={{ color: 'var(--text-faint)' }}>Ítems ({detail.items?.length ?? 0})</p>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                      <thead>
+                        <tr className="text-left" style={{ color: 'var(--text-faint)' }}>
+                          <th className="py-1 pr-3">N° Parte</th>
+                          <th className="py-1 pr-3">Descripción</th>
+                          <th className="py-1 pr-3">Marca</th>
+                          <th className="py-1 pr-3 text-right">Cant.</th>
+                          <th className="py-1 pr-3 text-right">Peso kg</th>
+                          <th className="py-1 pr-3 text-right">Unit USD</th>
+                          <th className="py-1 pr-3">OC Cliente</th>
+                          <th className="py-1 pr-3">Invoice</th>
+                          <th className="py-1 pr-3">OCP</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(detail.items ?? []).map((it: any, idx: number) => (
+                          <tr key={idx} style={{ borderTop: '1px solid var(--border)' }}>
+                            <td className="py-1 pr-3 font-mono" style={{ color: 'var(--text-primary)' }}>{it.numero_parte || '—'}</td>
+                            <td className="py-1 pr-3">{it.descripcion || '—'}</td>
+                            <td className="py-1 pr-3">{it.marca || '—'}</td>
+                            <td className="py-1 pr-3 text-right">{it.cantidad}</td>
+                            <td className="py-1 pr-3 text-right">{it.peso_kg ?? '—'}</td>
+                            <td className="py-1 pr-3 text-right">{it.unit_price_usd != null ? `$${it.unit_price_usd}` : '—'}</td>
+                            <td className="py-1 pr-3">{it.numero_oc_cliente || '—'}</td>
+                            <td className="py-1 pr-3">{it.invoice_no || '—'}</td>
+                            <td className="py-1 pr-3">{it.ocp_numero_oc || it.ocp_numero || '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
+            ) : null}
+          </div>
+        )}
       </div>
 
     </>
@@ -565,7 +673,7 @@ export default function BodegaPage() {
 
   useEffect(() => { load() }, [load])
 
-  const enTransito = embarques.filter(e => e.estado === 'en_transito')
+  const enTransito = embarques.filter(e => ['en_transito', 'en_aduana', 'en_bodega'].includes(e.estado))
   const enRecepcion = embarques.filter(e => e.estado === 'en_recepcion')
 
   return (
@@ -628,7 +736,7 @@ export default function BodegaPage() {
             {enTransito.length > 0 && (
               <div>
                 <p className="text-xs uppercase tracking-wider font-semibold mb-2" style={{ color: 'var(--text-faint)' }}>
-                  En tránsito ({enTransito.length})
+                  Por recibir ({enTransito.length})
                 </p>
                 <div className="space-y-3">
                   {enTransito.map(e => <EmbarqueCard key={e.id} emb={e} onRefresh={load} onOpenRec={setActiveRec} />)}

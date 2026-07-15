@@ -15,3 +15,6 @@ pydantic-settings==2.6.1
 alembic==1.14.0
 httpx==0.28.1
 aiofiles==24.1.0
+apscheduler==3.11.2
+reportlab
+pdfplumber

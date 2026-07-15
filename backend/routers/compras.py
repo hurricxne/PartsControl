@@ -15,7 +15,7 @@ from auth import get_current_user
 from database import get_db
 from models.models import (
     Cotizacion, ItemCotizacion, OcCliente, OcProveedor, OcProveedorItem,
-    User, Proveedor, Embarque, EmbarqueItem, PreEmbarque, PreEmbarqueItem,
+    User, Proveedor, Embarque, EmbarqueItem, EmbarqueDocumento, PreEmbarque, PreEmbarqueItem,
     ConfiguracionCotizador, FacturaProveedor, FacturaProveedorItem,
 )
 from services.pricing_service import calcular_cotizacion
@@ -361,7 +361,7 @@ def _calc_pricing_for_items(items: list, cfg, db: Session) -> dict:
     cfg_dict = _cfg_to_dict(cfg)
     for cot_id, group_items in groups.items():
         item_dicts = [_item_obj_to_dict(i) for i in group_items]
-        calc = calcular_cotizacion(item_dicts, cfg_dict)
+        calc = calcular_cotizacion(item_dicts, {**cfg_dict, "origen": (group_items[0].cotizacion.origen if group_items else None) or "costo"})
         for calc_item in calc.get("items", []):
             result[calc_item["id"]] = calc_item.get("total_venta_clp", 0)
     return result
@@ -1486,6 +1486,62 @@ def actualizar_embarque(
     # y cerrar la recepcion fisica (RecepcionEmbarque) -- ahi recien items
     # pasan a estado_item="en_bodega" (o reclamo_proveedor si hay danos/faltantes).
 
+    db.commit()
+    return {"ok": True}
+
+
+class EmbarqueDocIn(BaseModel):
+    nombre: str
+    archivo: str
+
+
+@router.get("/embarques-list/{emb_id}/docs")
+def list_embarque_docs(
+    emb_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Documentos adicionales del embarque (botón "Otros")."""
+    docs = (db.query(EmbarqueDocumento)
+            .filter(EmbarqueDocumento.embarque_id == emb_id)
+            .order_by(EmbarqueDocumento.id).all())
+    return [{"id": d.id, "nombre": d.nombre, "archivo": d.archivo,
+             "created_at": d.created_at.isoformat() if d.created_at else None} for d in docs]
+
+
+@router.post("/embarques-list/{emb_id}/docs", status_code=201)
+def add_embarque_doc(
+    emb_id: int,
+    body: EmbarqueDocIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Adjunta un documento ya subido via POST /compras/docs/upload."""
+    if not db.query(Embarque).filter(Embarque.id == emb_id).first():
+        raise HTTPException(404, "Embarque no encontrado")
+    nombre = (body.nombre or "").strip() or body.archivo
+    d = EmbarqueDocumento(embarque_id=emb_id, nombre=nombre[:255],
+                          archivo=body.archivo, usuario_id=current_user.id)
+    db.add(d)
+    db.commit()
+    db.refresh(d)
+    return {"id": d.id, "nombre": d.nombre, "archivo": d.archivo,
+            "created_at": d.created_at.isoformat() if d.created_at else None}
+
+
+@router.delete("/embarques-list/{emb_id}/docs/{doc_id}", status_code=200)
+def delete_embarque_doc(
+    emb_id: int,
+    doc_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    d = (db.query(EmbarqueDocumento)
+         .filter(EmbarqueDocumento.id == doc_id,
+                 EmbarqueDocumento.embarque_id == emb_id).first())
+    if not d:
+        raise HTTPException(404, "Documento no encontrado")
+    db.delete(d)
     db.commit()
     return {"ok": True}
 

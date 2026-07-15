@@ -1,11 +1,11 @@
 import { useState, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { despachosAPI, cotizacionesAPI, cotizadorAPI, comprasAPI } from '../services/api'
+import { despachosAPI, cotizacionesAPI, cotizadorAPI, comprasAPI, abrirDocumento } from '../services/api'
 import {
   Truck, Package, CheckCircle2, AlertCircle, Search, X,
   ChevronRight, ChevronDown, Plus, Trash2, Send,
   FileSpreadsheet, FileText, FileDown, Loader2,
-  Clock, AlertTriangle,
+  Clock, AlertTriangle, Upload, Pencil, Eye,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 
@@ -121,6 +121,10 @@ interface DespachoRow {
   numero_guia?: string
   transportista?: string
   estado: string
+  numero_expedicion?: string
+  guia_firmada?: boolean
+  fecha_firma?: string
+  guia_firmada_archivo?: string
   fecha_creacion?: string
   fecha_despacho?: string
   items_count: number
@@ -144,6 +148,8 @@ export default function DespachosPage() {
   const [search, setSearch] = useState('')
   const [expandedOc, setExpandedOc] = useState<number | null>(null)
   const [modalOc, setModalOc] = useState<OcDetail | null>(null)
+  const [firmarId, setFirmarId] = useState<number | null>(null)
+  const [editDespacho, setEditDespacho] = useState<DespachoRow | null>(null)
   const qc = useQueryClient()
 
   const { data: counts } = useQuery({
@@ -281,6 +287,8 @@ export default function DespachosPage() {
                   anularMut.mutate(id)
                 }
               }}
+              onFirmarDespacho={(id: number) => setFirmarId(id)}
+              onEditDespacho={(d: DespachoRow) => setEditDespacho(d)}
             />
           ))}
         </div>
@@ -293,6 +301,30 @@ export default function DespachosPage() {
           onClose={() => setModalOc(null)}
           onCreated={() => {
             setModalOc(null)
+            qc.invalidateQueries({ queryKey: ['despachos'] })
+          }}
+        />
+      )}
+
+      {/* Modal firmar guía (subir foto firmada) */}
+      {firmarId !== null && (
+        <FirmarGuiaModal
+          despachoId={firmarId}
+          onClose={() => setFirmarId(null)}
+          onDone={() => {
+            setFirmarId(null)
+            qc.invalidateQueries({ queryKey: ['despachos'] })
+          }}
+        />
+      )}
+
+      {/* Modal editar transportista / N° expedición */}
+      {editDespacho && (
+        <EditarDespachoModal
+          despacho={editDespacho}
+          onClose={() => setEditDespacho(null)}
+          onSaved={() => {
+            setEditDespacho(null)
             qc.invalidateQueries({ queryKey: ['despachos'] })
           }}
         />
@@ -347,6 +379,8 @@ function OcRow({
   onCrearDespacho,
   onCerrarDespacho,
   onAnularDespacho,
+  onFirmarDespacho,
+  onEditDespacho,
 }: any) {
   const badge = estadoLabel[oc.estado] ?? estadoLabel.pendiente
   return (
@@ -498,30 +532,65 @@ function OcRow({
                           {d.numero_despacho}
                         </span>
                         <DespachoEstadoBadge estado={d.estado} />
+                        {d.guia_firmada && (
+                          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1">
+                            <CheckCircle2 className="w-3 h-3" /> Guía firmada
+                          </span>
+                        )}
                       </div>
                       <div className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
                         {d.items_count} ítems
                         {d.transportista && ` · ${d.transportista}`}
                         {d.numero_guia && ` · Guía: ${d.numero_guia}`}
+                        {d.numero_expedicion && ` · Exp: ${d.numero_expedicion}`}
                         {d.fecha_despacho && ` · ${new Date(d.fecha_despacho).toLocaleDateString('es-CL')}`}
                       </div>
                     </div>
-                    {d.estado === 'en_preparacion' && (
-                      <div className="flex gap-2 shrink-0">
+                    <div className="flex gap-2 shrink-0 items-center">
+                      {d.estado === 'en_preparacion' && (
+                        <>
+                          <button
+                            onClick={() => onCerrarDespacho(d.id)}
+                            className="px-3 py-1.5 text-xs bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 rounded-lg hover:bg-emerald-500/25 flex items-center gap-1 font-semibold"
+                          >
+                            <Send className="w-3 h-3" /> Confirmar
+                          </button>
+                          <button
+                            onClick={() => onAnularDespacho(d.id)}
+                            className="px-3 py-1.5 text-xs bg-red-500/10 text-red-500 rounded-lg hover:bg-red-500/20"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </>
+                      )}
+                      {d.estado === 'despachado' && !d.guia_firmada && (
                         <button
-                          onClick={() => onCerrarDespacho(d.id)}
-                          className="px-3 py-1.5 text-xs bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 rounded-lg hover:bg-emerald-500/25 flex items-center gap-1 font-semibold"
+                          onClick={() => onFirmarDespacho(d.id)}
+                          className="px-3 py-1.5 text-xs bg-blue-500/15 text-blue-600 dark:text-blue-400 rounded-lg hover:bg-blue-500/25 flex items-center gap-1 font-semibold"
                         >
-                          <Send className="w-3 h-3" /> Confirmar
+                          <CheckCircle2 className="w-3 h-3" /> Marcar guía firmada
                         </button>
+                      )}
+                      {d.guia_firmada_archivo && (
                         <button
-                          onClick={() => onAnularDespacho(d.id)}
-                          className="px-3 py-1.5 text-xs bg-red-500/10 text-red-500 rounded-lg hover:bg-red-500/20"
+                          onClick={() => abrirDocumento(d.guia_firmada_archivo!)}
+                          className="px-2.5 py-1.5 text-xs bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 rounded-lg hover:bg-emerald-500/20 flex items-center gap-1"
+                          title="Ver guía firmada"
                         >
-                          <Trash2 className="w-3 h-3" />
+                          <Eye className="w-3 h-3" /> Guía
                         </button>
-                      </div>
-                    )}
+                      )}
+                      {d.estado !== 'en_preparacion' && d.estado !== 'anulado' && (
+                        <button
+                          onClick={() => onEditDespacho(d)}
+                          className="p-1.5 rounded-lg hover:bg-[var(--surface-300)]"
+                          style={{ color: 'var(--text-muted)' }}
+                          title="Editar transportista / N° expedición"
+                        >
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -1079,6 +1148,7 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
   const [contacto, setContacto] = useState(oc.contacto || '')
   const [direccion, setDireccion] = useState(oc.direccion || '')
   const [observaciones, setObservaciones] = useState('')
+  const [numeroExpedicion, setNumeroExpedicion] = useState('')
   const [selectedItems, setSelectedItems] = useState<Record<number, number>>({})
 
   const disponibles = useMemo(
@@ -1110,6 +1180,7 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
         oc_cliente_id: oc.id,
         transportista: transportista || null,
         numero_guia: numeroGuia || null,
+        numero_expedicion: numeroExpedicion || null,
         contacto_destinatario: contacto || null,
         direccion_entrega: direccion || null,
         observaciones: observaciones || null,
@@ -1171,6 +1242,12 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
               value={numeroGuia}
               onChange={setNumeroGuia}
               placeholder="Manual / SII"
+            />
+            <Input
+              label="N° Expedición (courier / Samex)"
+              value={numeroExpedicion}
+              onChange={setNumeroExpedicion}
+              placeholder="Opcional · se puede agregar después"
             />
             <Input
               label="Contacto Destinatario"
@@ -1306,6 +1383,179 @@ function Input({ label, value, onChange, placeholder }: any) {
         placeholder={placeholder}
         className="input"
       />
+    </div>
+  )
+}
+
+// ─── Modal: marcar guía firmada (subir foto/PDF de la guía firmada) ───────────
+function FirmarGuiaModal({
+  despachoId,
+  onClose,
+  onDone,
+}: {
+  despachoId: number
+  onClose: () => void
+  onDone: () => void
+}) {
+  const [file, setFile] = useState<File | null>(null)
+  const [numeroGuia, setNumeroGuia] = useState('')
+  const [fecha, setFecha] = useState(new Date().toISOString().slice(0, 10))
+  const [saving, setSaving] = useState(false)
+
+  const submit = async () => {
+    if (!file) {
+      toast.error('Sube la foto o PDF de la guía firmada')
+      return
+    }
+    setSaving(true)
+    try {
+      const up = await despachosAPI.uploadDoc(file)
+      await despachosAPI.firmar(despachoId, {
+        fecha_firma: fecha,
+        numero_guia: numeroGuia || undefined,
+        archivo: up.filename,
+      })
+      toast.success('Guía firmada — ya se puede facturar en Contabilidad')
+      onDone()
+    } catch (e: any) {
+      toast.error(e?.response?.data?.detail || 'Error al firmar la guía')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 flex items-center justify-center z-50 p-4"
+      style={{ backgroundColor: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)' }}
+      onClick={onClose}
+    >
+      <div
+        className="max-w-md w-full rounded-2xl border shadow-2xl"
+        style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div
+          className="p-4 border-b flex items-center justify-between"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+        >
+          <h2 className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>
+            Marcar guía firmada
+          </h2>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-[var(--surface-300)]" style={{ color: 'var(--text-muted)' }}>
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <div className="p-4 space-y-4">
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            Sube la <b>foto o PDF de la guía firmada</b> por el cliente. Quedará disponible en Contabilidad
+            para cobrar (OC + factura + guía firmada).
+          </p>
+          <div>
+            <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: 'var(--text-faint)' }}>
+              Foto / PDF de la guía firmada
+            </label>
+            <label className="flex items-center gap-2 px-3 py-2 rounded-lg border cursor-pointer hover:bg-[var(--surface-200)]" style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
+              <Upload className="w-4 h-4" />
+              <span className="text-sm truncate">{file ? file.name : 'Seleccionar archivo…'}</span>
+              <input
+                type="file"
+                accept="image/*,application/pdf"
+                onChange={e => setFile(e.target.files?.[0] || null)}
+                className="hidden"
+              />
+            </label>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <Input label="N° Guía (opcional)" value={numeroGuia} onChange={setNumeroGuia} placeholder="Si falta" />
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: 'var(--text-faint)' }}>
+                Fecha de firma
+              </label>
+              <input type="date" value={fecha} onChange={e => setFecha(e.target.value)} className="input" />
+            </div>
+          </div>
+        </div>
+        <div className="p-4 border-t flex justify-end gap-2" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+          <button onClick={onClose} className="btn-secondary text-sm">Cancelar</button>
+          <button onClick={submit} disabled={saving || !file} className="btn-primary text-sm flex items-center gap-1.5">
+            {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />} Confirmar firma
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Modal: editar transportista / N° de expedición / N° de guía ──────────────
+function EditarDespachoModal({
+  despacho,
+  onClose,
+  onSaved,
+}: {
+  despacho: DespachoRow
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [transportista, setTransportista] = useState(despacho.transportista || '')
+  const [numeroExpedicion, setNumeroExpedicion] = useState(despacho.numero_expedicion || '')
+  const [numeroGuia, setNumeroGuia] = useState(despacho.numero_guia || '')
+  const [saving, setSaving] = useState(false)
+
+  const submit = async () => {
+    setSaving(true)
+    try {
+      await despachosAPI.update(despacho.id, {
+        transportista: transportista || null,
+        numero_expedicion: numeroExpedicion || null,
+        numero_guia: numeroGuia || null,
+      })
+      toast.success('Datos del despacho actualizados')
+      onSaved()
+    } catch (e: any) {
+      toast.error(e?.response?.data?.detail || 'Error al guardar')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 flex items-center justify-center z-50 p-4"
+      style={{ backgroundColor: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)' }}
+      onClick={onClose}
+    >
+      <div
+        className="max-w-md w-full rounded-2xl border shadow-2xl"
+        style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div
+          className="p-4 border-b flex items-center justify-between"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+        >
+          <h2 className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>
+            Editar {despacho.numero_despacho}
+          </h2>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-[var(--surface-300)]" style={{ color: 'var(--text-muted)' }}>
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <div className="p-4 space-y-3">
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            Puedes completar el transportista o el N° de expedición aunque el despacho ya esté cerrado o firmado.
+          </p>
+          <Input label="Transportista" value={transportista} onChange={setTransportista} placeholder="Ej: Samex" />
+          <Input label="N° Expedición (courier / Samex)" value={numeroExpedicion} onChange={setNumeroExpedicion} />
+          <Input label="N° Guía" value={numeroGuia} onChange={setNumeroGuia} />
+        </div>
+        <div className="p-4 border-t flex justify-end gap-2" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+          <button onClick={onClose} className="btn-secondary text-sm">Cancelar</button>
+          <button onClick={submit} disabled={saving} className="btn-primary text-sm flex items-center gap-1.5">
+            {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />} Guardar
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
