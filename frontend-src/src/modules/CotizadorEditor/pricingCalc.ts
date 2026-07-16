@@ -86,7 +86,7 @@ export function calcularCotizacion(
       const qty = item.cantidad || 0
       const costo = item.precio_unit_cotizacion || 0
       const margen = item.margen_pct || 0
-      const pv = costo * (1 + margen)
+      const pv = Math.round(costo * (1 + margen))  // CLP: peso entero
       const tv = pv * qty
       return {
         ...item,
@@ -144,7 +144,7 @@ export function calcularCotizacion(
     const qty = r.cantidad || 1
     const costoUnit = qty ? costoTotal / qty : 0
     const margen = r.margen_pct != null ? r.margen_pct : margenDefault
-    const precioVenta = costoUnit * (1 + margen)
+    const precioVenta = Math.round(costoUnit * (1 + margen))  // CLP: peso entero
     const totalVenta = precioVenta * qty
 
     return {
