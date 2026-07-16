@@ -65,6 +65,9 @@ import MonzaPerfilPage from './pages/MonzaPerfilPage'
 // Módulo aislado Contabilidad MonzaParts (Ventas + Facturas/Cobranzas). Revertir: quitar
 // estos imports, las rutas 'ventas-contab'/'facturas' y el grupo Contabilidad en MonzaLayout.
 import MonzaVentasContabPage from './pages/MonzaVentasContabPage'
+
+// Contabilidad MonzaParts: apagable en build-time (VITE_MONZA_CONTAB=false en PROD).
+const MONZA_CONTAB = import.meta.env.VITE_MONZA_CONTAB !== 'false' 
 import MonzaFacturasPage from './pages/MonzaFacturasPage'
 import MonzaEmbarquesPricingPage from './pages/MonzaEmbarquesPricingPage'
 import MonzaComprasPage from './pages/MonzaComprasPage'
@@ -125,11 +128,11 @@ export default function App() {
         <Route path="cotizador" element={<MonzaCotizadorPage />} />
         <Route path="cotizaciones" element={<MonzaCotizacionesPage />} />
         <Route path="ventas" element={<MonzaVentasPage />} />
-        <Route path="ventas-contab" element={<MonzaVentasContabPage />} />
+        {MONZA_CONTAB && <Route path="ventas-contab" element={<MonzaVentasContabPage />} />}
         <Route path="facturas" element={<MonzaFacturasPage />} />
-        <Route path="compras-contab" element={<MonzaComprasPage />} />
-        <Route path="tesoreria" element={<MonzaTesoreriaPage />} />
-        <Route path="embarques-pricing" element={<MonzaEmbarquesPricingPage />} />
+        {MONZA_CONTAB && <Route path="compras-contab" element={<MonzaComprasPage />} />}
+        {MONZA_CONTAB && <Route path="tesoreria" element={<MonzaTesoreriaPage />} />}
+        {MONZA_CONTAB && <Route path="embarques-pricing" element={<MonzaEmbarquesPricingPage />} />}
         <Route path="abastecimiento" element={<MonzaAbastecimientoPage />} />
         <Route path="seguimiento" element={<MonzaSeguimientoPage />} />
         <Route path="logistica" element={<MonzaLogisticaPage />} />

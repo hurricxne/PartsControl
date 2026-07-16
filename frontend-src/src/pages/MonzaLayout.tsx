@@ -61,13 +61,21 @@ const NAV_OPERACIONES = [
 ];
 
 // Módulos de Contabilidad agrupados en dropdown "Contabilidad" (SOLO MonzaParts)
-const NAV_CONTABILIDAD = [
+// Contabilidad MonzaParts: apagable en build-time (VITE_MONZA_CONTAB=false en PROD).
+const MONZA_CONTAB = import.meta.env.VITE_MONZA_CONTAB !== 'false';
+const _NAV_CONTAB_TODOS = [
   { to: "/monzaparts/ventas-contab",     label: "Ventas",            icon: DollarSign },
   { to: "/monzaparts/facturas",          label: "Facturas y cobranzas", icon: Receipt },
   { to: "/monzaparts/compras-contab",    label: "Compras y pagos",   icon: CreditCard },
   { to: "/monzaparts/tesoreria",         label: "Tesorería",         icon: Landmark },
   { to: "/monzaparts/embarques-pricing", label: "Embarques Pricing", icon: Calculator },
 ];
+const NAV_CONTABILIDAD = MONZA_CONTAB
+  ? _NAV_CONTAB_TODOS
+  : _NAV_CONTAB_TODOS.filter(i => ![
+      "/monzaparts/ventas-contab", "/monzaparts/compras-contab",
+      "/monzaparts/tesoreria", "/monzaparts/embarques-pricing",
+    ].includes(i.to));
 
 const NAV_TAIL = [
   { to: "/monzaparts/logs",         label: "Logs",          icon: ScrollText },

@@ -24,10 +24,6 @@ from routers import venta_clp
 from embarques_pricing.router import router as embarques_pricing_router
 from compras_contab.router import router as compras_contab_router
 from tesoreria.router import router as tesoreria_router
-from monza_contabilidad.router import router as monza_contabilidad_router
-from monza_embarques_pricing.router import router as monza_embarques_pricing_router
-from monza_compras_contab.router import router as monza_compras_contab_router
-from monza_tesoreria.router import router as monza_tesoreria_router
 from monza_router_documentos import router as monza_docs_router
 from monza_router_catalog import router as monza_catalog_router
 from monza_router_clientes import router as monza_clientes_router
@@ -35,8 +31,10 @@ from routers.worker import worker_router, scraping_router
 from routers import notificaciones, bodega
 from routers import despachos
 
-# Create / migrate tables
-Base.metadata.create_all(bind=engine)
+# Crear tablas que falten. OJO: NO agrega columnas a tablas existentes — para eso
+# correr los scripts de backend/migrations/ (leccion jul 2026: error 1054 en cascada).
+if settings.AUTO_CREATE_TABLES:
+    Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="MachParts API",
@@ -85,10 +83,18 @@ app.include_router(venta_clp.router)
 app.include_router(embarques_pricing_router, prefix="/api")
 app.include_router(compras_contab_router, prefix="/api")
 app.include_router(tesoreria_router, prefix="/api")
-app.include_router(monza_contabilidad_router)
-app.include_router(monza_embarques_pricing_router)
-app.include_router(monza_compras_contab_router)
-app.include_router(monza_tesoreria_router)
+# Contabilidad MonzaParts, activable por flag. El import va DENTRO del if a
+# proposito: con el flag apagado los modelos no se cargan, asi create_all no crea
+# sus tablas (asi corre PROD desde 2026-07-15; ver deploy/README.md).
+if settings.MONZA_CONTAB_ENABLED:
+    from monza_contabilidad.router import router as monza_contabilidad_router
+    from monza_embarques_pricing.router import router as monza_embarques_pricing_router
+    from monza_compras_contab.router import router as monza_compras_contab_router
+    from monza_tesoreria.router import router as monza_tesoreria_router
+    app.include_router(monza_contabilidad_router)
+    app.include_router(monza_embarques_pricing_router)
+    app.include_router(monza_compras_contab_router)
+    app.include_router(monza_tesoreria_router)
 app.include_router(monza_docs_router)
 app.include_router(monza_catalog_router)
 app.include_router(monza_clientes_router)
