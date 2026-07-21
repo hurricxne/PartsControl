@@ -6,12 +6,13 @@
 import { useState, useEffect, useCallback } from 'react'
 import {
   Wallet, Plus, Search, AlertCircle, CheckCircle2, DollarSign,
-  Loader2, RefreshCw, ChevronDown, ChevronUp, CreditCard, X, Trash2, Ban, Ship,
+  Loader2, RefreshCw, ChevronDown, ChevronUp, CreditCard, X, Trash2, Ban, Ship, Truck,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { fmtClp, fmtDate, hoyLocal } from '../utils/format'
 import { comprasContabAPI } from './api'
-import type { Compra, Antiguedad, Kpis, Catalogos, CostoEmbarque, PlanCuenta } from './types'
+import type { CompraItemPayload } from './api'
+import type { Compra, Antiguedad, Kpis, Catalogos, CostoEmbarque, PlanCuenta, OcNacional } from './types'
 
 // ─── Mapas de presentación ──────────────────────────────────────────────────
 const PAGO: Record<string, { cls: string; label: string }> = {
@@ -76,11 +77,51 @@ function RegistrarCompraModal({ catalogos, onClose, onDone }: { catalogos: Catal
   const [pagoFechaBanco, setPagoFechaBanco] = useState(hoyLocal())
   const [saving, setSaving] = useState(false)
 
-  // Cuenta sugerida por tipo de gasto (origen MANUAL en este formulario).
+  // Compra NACIONAL con detalle de ítems: la factura ES el costo de esos repuestos
+  // (neto CLP por ítem; el IVA es crédito fiscal, no capitaliza). El backend valida
+  // que la cantidad costeada no supere lo recibido en bodega y que Σ ≤ neto.
+  const [origenTipo, setOrigenTipo] = useState<'gasto' | 'nacional'>('gasto')
+  const [ocNacionales, setOcNacionales] = useState<OcNacional[]>([])
+  const [ocpSel, setOcpSel] = useState<number | ''>('')
+  const [lineItems, setLineItems] = useState<Record<number, { incluir: boolean; cantidad: string; precio_unit: string }>>({})
+  const esNacional = origenTipo === 'nacional'
+  const ocSel = ocNacionales.find(o => o.oc_proveedor_id === ocpSel) || null
+
+  // Cuenta sugerida: nacional → Existencias (1.3.01) vía NACIONAL|cogs; si no, MANUAL|tipo.
   useEffect(() => {
-    const def = catalogos?.cuenta_default_por_tipo?.[`MANUAL|${tipoGasto}`]
+    const key = esNacional ? 'NACIONAL|cogs' : `MANUAL|${tipoGasto}`
+    const def = catalogos?.cuenta_default_por_tipo?.[key]
     if (def) setCuentaId(def)
-  }, [tipoGasto, catalogos])
+  }, [tipoGasto, esNacional, catalogos])
+
+  // Nacional fuerza costo de venta + CLP (el IVA no capitaliza en la compra nacional).
+  useEffect(() => {
+    if (esNacional) { setTipoGasto('cogs'); setMoneda('CLP') }
+  }, [esNacional])
+
+  // Cargar OC nacionales al entrar al modo nacional (una sola vez).
+  useEffect(() => {
+    if (esNacional && ocNacionales.length === 0) {
+      comprasContabAPI.ocNacionales()
+        .then(({ data }) => setOcNacionales(data.ocs))
+        .catch((e: any) => toast.error(e?.response?.data?.detail || 'No se pudieron cargar las OC nacionales'))
+    }
+  }, [esNacional])
+
+  // Al elegir OC nacional: precarga ítems (cantidad = disponible a costear) y el acreedor.
+  useEffect(() => {
+    if (!ocSel) { setLineItems({}); return }
+    const init: Record<number, { incluir: boolean; cantidad: string; precio_unit: string }> = {}
+    ocSel.items.forEach(it => {
+      init[it.item_cotizacion_id] = {
+        incluir: it.disponible_costear > 0,
+        cantidad: it.disponible_costear > 0 ? String(it.disponible_costear) : '',
+        precio_unit: '',
+      }
+    })
+    setLineItems(init)
+    if (ocSel.proveedor) setAcreedor(ocSel.proveedor)
+  }, [ocpSel, ocNacionales])
   const cuentasPorClase: Record<string, PlanCuenta[]> = {}
   for (const c of catalogos?.plan_cuentas || []) {
     const k = c.clase || 'Otras'
@@ -94,6 +135,14 @@ function RegistrarCompraModal({ catalogos, onClose, onDone }: { catalogos: Catal
   const tcN = moneda === 'CLP' ? 1 : (Number(tc) || 0)
   const totalClp = Math.round(totalN * tcN)
 
+  // Σ de las líneas costeadas incluidas (cantidad × costo unit neto CLP).
+  const sumaLineas = ocSel ? ocSel.items.reduce((acc, it) => {
+    const li = lineItems[it.item_cotizacion_id]
+    if (!li || !li.incluir) return acc
+    return acc + (Number(li.cantidad) || 0) * (Number(li.precio_unit) || 0)
+  }, 0) : 0
+  const sumaExcedeNeto = esNacional && netoN > 0 && Math.round(sumaLineas) > netoN + 1
+
   const onProveedor = (id: number | '') => {
     setProveedorId(id)
     const p = catalogos?.proveedores.find(x => x.id === id)
@@ -104,16 +153,43 @@ function RegistrarCompraModal({ catalogos, onClose, onDone }: { catalogos: Catal
     if (!acreedor.trim()) { toast.error('Indica el proveedor/acreedor'); return }
     if (netoN <= 0) { toast.error('El monto neto debe ser mayor a 0'); return }
     if (moneda !== 'CLP' && tcN <= 0) { toast.error('Indica el tipo de cambio'); return }
+
+    // Detalle por ítem de la compra NACIONAL.
+    let items: CompraItemPayload[] | undefined
+    if (esNacional) {
+      if (!ocpSel) { toast.error('Selecciona la OC-Proveedor nacional'); return }
+      const incluidos = (ocSel?.items || []).filter(it => {
+        const li = lineItems[it.item_cotizacion_id]
+        return li && li.incluir && Number(li.cantidad) > 0
+      })
+      if (incluidos.length === 0) { toast.error('Agrega al menos un ítem con cantidad'); return }
+      if (sumaExcedeNeto) { toast.error('La suma de líneas costeadas supera el neto de la factura'); return }
+      items = incluidos.map(it => {
+        const li = lineItems[it.item_cotizacion_id]
+        return {
+          item_cotizacion_id: it.item_cotizacion_id,
+          oc_proveedor_item_id: it.oc_proveedor_item_id ?? undefined,
+          numero_parte: it.numero_parte,
+          descripcion: it.descripcion,
+          cantidad: Number(li.cantidad),
+          precio_unit: Number(li.precio_unit) || 0,
+        }
+      })
+    }
+
     setSaving(true)
     try {
       await comprasContabAPI.crear({
         tipo_gasto: tipoGasto, categoria: categoria || undefined,
         cuenta_contable_id: cuentaId || undefined, es_anticipo: esAnticipo,
+        origen: esNacional ? 'NACIONAL' : undefined,
         proveedor_id: proveedorId || undefined, acreedor: acreedor || undefined, proveedor_rut: rut || undefined,
         fecha, referencia: referencia || undefined, descripcion: descripcion || undefined,
         numero_documento: numDoc || undefined, tipo_doc: tipoDoc,
         moneda, tc: tcN, monto_neto: netoN, afecto_iva: afectoIva,
         condicion_pago: condicion, plazo_dias: condicion === 'credito' && plazo ? Number(plazo) : undefined,
+        oc_proveedor_id: esNacional && ocpSel ? Number(ocpSel) : undefined,
+        items,
         pago: condicion === 'contado'
           ? { medio: pagoMedio, banco: pagoBanco || undefined, fecha, fecha_mov_bancario: pagoFechaBanco || fecha }
           : undefined,
@@ -124,12 +200,114 @@ function RegistrarCompraModal({ catalogos, onClose, onDone }: { catalogos: Catal
 
   return (
     <Modal title="Registrar compra / gasto" wide onClose={onClose}>
+      {/* Tipo de registro: gasto/servicio o compra nacional con detalle por ítem */}
+      <div className="flex flex-wrap items-center gap-2">
+        {([['gasto', 'Gasto / servicio', Wallet], ['nacional', 'Compra nacional (detalle de ítems)', Truck]] as const).map(([val, label, Icon]) => (
+          <button key={val} type="button" onClick={() => setOrigenTipo(val)}
+            className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-all flex items-center gap-1.5 ${origenTipo === val ? 'border-brand-500 bg-brand-500/10 text-brand-400' : 'border-transparent'}`}
+            style={origenTipo !== val ? { backgroundColor: 'var(--surface-200)', borderColor: 'var(--border)', color: 'var(--text-muted)' } : {}}>
+            <Icon className="w-3.5 h-3.5" /> {label}
+          </button>
+        ))}
+      </div>
+
+      {esNacional && (
+        <div className="rounded-xl border p-3 space-y-3" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+          <Field label="OC-Proveedor nacional">
+            <select className={inputCls} style={inputStyle} value={ocpSel} onChange={e => setOcpSel(e.target.value ? Number(e.target.value) : '')}>
+              <option value="">— Selecciona OC nacional —</option>
+              {ocNacionales.map(o => (
+                <option key={o.oc_proveedor_id} value={o.oc_proveedor_id}>
+                  {(o.numero_oc || o.numero || `OCP #${o.oc_proveedor_id}`)} — {o.proveedor || 'Sin proveedor'}
+                </option>
+              ))}
+            </select>
+          </Field>
+          {ocNacionales.length === 0 ? (
+            <p className="text-[11px]" style={{ color: 'var(--text-faint)' }}>
+              No hay OC nacionales con ítems. Crea una en el Panel de Compras (origen Nacional) y registra su entrega en Seguimiento antes de costear.
+            </p>
+          ) : ocSel && (
+            <>
+              <div className="rounded-lg border overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr style={{ backgroundColor: 'var(--surface-100)', borderBottom: '1px solid var(--border)' }}>
+                        <th className="px-2 py-2 w-8"></th>
+                        {['N° Parte', 'Descripción', 'Recibido', 'Disp. costear', 'Cantidad', 'Costo unit CLP', 'Subtotal'].map(h => (
+                          <th key={h} className="px-2 py-2 text-left font-semibold uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ocSel.items.map(it => {
+                        const li = lineItems[it.item_cotizacion_id] || { incluir: false, cantidad: '', precio_unit: '' }
+                        const sub = (Number(li.cantidad) || 0) * (Number(li.precio_unit) || 0)
+                        const sinDisp = it.disponible_costear <= 0
+                        return (
+                          <tr key={it.item_cotizacion_id} style={{ borderBottom: '1px solid var(--border)', opacity: li.incluir ? 1 : 0.5 }}>
+                            <td className="px-2 py-1.5">
+                              <input type="checkbox" checked={li.incluir} disabled={sinDisp}
+                                onChange={() => setLineItems(prev => ({ ...prev, [it.item_cotizacion_id]: { ...(prev[it.item_cotizacion_id] || { cantidad: '', precio_unit: '' }), incluir: !prev[it.item_cotizacion_id]?.incluir } }))} />
+                            </td>
+                            <td className="px-2 py-1.5 font-mono text-brand-400 font-semibold whitespace-nowrap">{it.numero_parte || '—'}</td>
+                            <td className="px-2 py-1.5 max-w-[150px] truncate" style={{ color: 'var(--text-primary)' }} title={it.descripcion || ''}>{it.descripcion || '—'}</td>
+                            <td className="px-2 py-1.5 text-center" style={{ color: 'var(--text-muted)' }}>{it.recibido}</td>
+                            <td className="px-2 py-1.5 text-center font-semibold" style={{ color: sinDisp ? 'var(--text-faint)' : 'var(--text-primary)' }} title={sinDisp ? 'Registra primero la recepción nacional en Seguimiento' : undefined}>{it.disponible_costear}</td>
+                            <td className="px-2 py-1.5">
+                              <input type="number" min="0" step="any" className="w-20 px-2 py-1 rounded border text-xs" style={inputStyle}
+                                value={li.cantidad} disabled={!li.incluir}
+                                onChange={e => setLineItems(prev => ({ ...prev, [it.item_cotizacion_id]: { ...(prev[it.item_cotizacion_id] || { incluir: true, precio_unit: '' }), cantidad: e.target.value } }))} />
+                            </td>
+                            <td className="px-2 py-1.5">
+                              <input type="number" min="0" step="any" className="w-24 px-2 py-1 rounded border text-xs" style={inputStyle}
+                                value={li.precio_unit} disabled={!li.incluir} placeholder="neto CLP"
+                                onChange={e => setLineItems(prev => ({ ...prev, [it.item_cotizacion_id]: { ...(prev[it.item_cotizacion_id] || { incluir: true, cantidad: '' }), precio_unit: e.target.value } }))} />
+                            </td>
+                            <td className="px-2 py-1.5 text-right font-mono whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{sub > 0 ? fmtClp(sub) : '—'}</td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <span style={{ color: 'var(--text-muted)' }}>
+                  Σ líneas: <b className="text-brand-400">{fmtClp(sumaLineas)}</b>
+                  <span className="mx-1.5">·</span>
+                  Neto factura: <b style={{ color: 'var(--text-primary)' }}>{fmtClp(netoN)}</b>
+                </span>
+                {sumaExcedeNeto ? (
+                  <span className="text-red-400 font-semibold flex items-center gap-1"><AlertCircle className="w-3.5 h-3.5" /> Σ supera el neto de la factura</span>
+                ) : (
+                  <button type="button" onClick={() => setNeto(String(Math.round(sumaLineas)))}
+                    className="text-[11px] px-2 py-1 rounded-lg border border-brand-400/40 text-brand-400 hover:bg-brand-500/10 transition-colors font-semibold">
+                    Usar Σ como neto
+                  </button>
+                )}
+              </div>
+              <p className="text-[11px]" style={{ color: 'var(--text-faint)' }}>
+                El costo por ítem es el <b>neto en CLP</b> (el IVA es crédito fiscal, no capitaliza). La cantidad costeada no puede superar lo recibido en bodega.
+              </p>
+            </>
+          )}
+        </div>
+      )}
+
       <div className="grid sm:grid-cols-2 gap-3">
-        <Field label="Tipo de gasto">
-          <select className={inputCls} style={inputStyle} value={tipoGasto} onChange={e => setTipoGasto(e.target.value)}>
-            {(catalogos?.tipos_gasto || []).map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
-          </select>
-        </Field>
+        {esNacional ? (
+          <Field label="Tipo de gasto">
+            <div className={inputCls} style={{ ...inputStyle, opacity: 0.7 }}>Costo de venta (nacional)</div>
+          </Field>
+        ) : (
+          <Field label="Tipo de gasto">
+            <select className={inputCls} style={inputStyle} value={tipoGasto} onChange={e => setTipoGasto(e.target.value)}>
+              {(catalogos?.tipos_gasto || []).map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+            </select>
+          </Field>
+        )}
         <Field label="Categoría">
           <input className={inputCls} style={inputStyle} list="cat-sugeridas" value={categoria} onChange={e => setCategoria(e.target.value)} placeholder="Ej. Flete internacional" />
           <datalist id="cat-sugeridas">{(catalogos?.categorias_sugeridas || []).map(c => <option key={c} value={c} />)}</datalist>
@@ -176,7 +354,7 @@ function RegistrarCompraModal({ catalogos, onClose, onDone }: { catalogos: Catal
       <div className="rounded-xl border p-3 mt-1" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
         <div className="grid sm:grid-cols-3 gap-3">
           <Field label="Moneda">
-            <select className={inputCls} style={inputStyle} value={moneda} onChange={e => setMoneda(e.target.value)}>
+            <select className={inputCls} style={inputStyle} value={moneda} disabled={esNacional} onChange={e => setMoneda(e.target.value)}>
               <option value="CLP">CLP</option><option value="USD">USD</option><option value="EUR">EUR</option>
             </select>
           </Field>
@@ -422,6 +600,33 @@ function CompraRow({ c, onChanged, onPagar }: { c: Compra; onChanged: () => void
                         </span>
                       </div>
                     ))}
+                  </div>
+                )}
+                {c.items && c.items.length > 0 && (
+                  <div className="mt-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wider mb-1 flex items-center gap-1" style={{ color: 'var(--text-faint)' }}>
+                      <Truck className="w-3 h-3" /> Detalle por ítem (compra nacional · costo = neto CLP)
+                    </p>
+                    <div className="overflow-x-auto rounded-lg border" style={{ borderColor: 'var(--border)' }}>
+                      <table className="w-full text-[11px]">
+                        <thead><tr style={{ backgroundColor: 'var(--surface-200)' }}>
+                          {['N° Parte', 'Descripción', 'Cantidad', 'Costo unit CLP', 'Subtotal CLP'].map(h => (
+                            <th key={h} className="text-left px-2 py-1.5 font-semibold uppercase tracking-wider whitespace-nowrap" style={{ color: 'var(--text-faint)' }}>{h}</th>
+                          ))}
+                        </tr></thead>
+                        <tbody>
+                          {c.items.map(it => (
+                            <tr key={it.id} style={{ borderTop: '1px solid var(--border)' }}>
+                              <td className="px-2 py-1.5 font-mono text-brand-400 whitespace-nowrap">{it.numero_parte || '—'}</td>
+                              <td className="px-2 py-1.5 max-w-[180px] truncate" style={{ color: 'var(--text-primary)' }} title={it.descripcion || ''}>{it.descripcion || '—'}</td>
+                              <td className="px-2 py-1.5" style={{ color: 'var(--text-muted)' }}>{it.cantidad}</td>
+                              <td className="px-2 py-1.5 font-mono" style={{ color: 'var(--text-muted)' }}>{fmtClp(it.costo_unit_clp)}</td>
+                              <td className="px-2 py-1.5 font-mono font-semibold" style={{ color: 'var(--text-primary)' }}>{fmtClp(it.costo_total_clp)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
                 )}
               </div>

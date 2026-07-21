@@ -1,22 +1,74 @@
-"""Crea las tablas del módulo Compras / Cuentas por Pagar (standalone).
+"""Crea/actualiza las tablas del módulo Compras / Cuentas por Pagar (standalone).
 
 Uso (desde backend/):
     python -m compras_contab.init_db
 
 Importa todos los modelos referenciados por las FK (proveedores, embarques,
-facturas_proveedor, users, emb_pricing_gasto) para que SQLAlchemy resuelva las
-referencias, y crea SOLO las tablas que falten (checkfirst=True). NO modifica
-ninguna tabla existente. No depende del create_all de main.py: sirve para probar
-el módulo en aislamiento antes de cablearlo.
+facturas_proveedor, users, emb_pricing_gasto, oc_proveedor, oc_proveedor_items,
+items_cotizacion) para que SQLAlchemy resuelva las referencias, y:
+
+1) Crea SOLO las tablas que falten (checkfirst=True), incluida la nueva
+   cont_compra_item (costo por ítem de la compra nacional). NO recrea lo existente.
+2) Migra la columna ADITIVA en la tabla existente (create_all NO altera tablas ya
+   creadas):
+     · cont_compra.oc_proveedor_id  (FK suave a la OC-Proveedor; pista de cabecera)
+
+Idempotente: re-ejecutable sin efecto.
 """
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from database import Base, engine
-import models.models            # noqa: F401  proveedores, embarques, users, facturas_proveedor...
+import models.models            # noqa: F401  proveedores, embarques, users, oc_proveedor(_items), items_cotizacion...
 import embarques_pricing.models  # noqa: F401  emb_pricing_gasto (FK destino)
-from . import models as _compras_models  # noqa: F401  cont_plan_cuenta, cont_compra, cont_egreso(_detalle)
+from . import models as _compras_models  # noqa: F401  cont_plan_cuenta, cont_compra(_item), cont_egreso(_detalle)
 
-TABLES = ("cont_plan_cuenta", "cont_compra", "cont_egreso", "cont_egreso_detalle")
+TABLES = ("cont_plan_cuenta", "cont_compra", "cont_egreso", "cont_egreso_detalle", "cont_compra_item")
+
+
+def _columna_existe(conn, tabla: str, columna: str) -> bool:
+    row = conn.execute(
+        text(
+            "SELECT COUNT(*) FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = :t AND column_name = :c"
+        ),
+        {"t": tabla, "c": columna},
+    ).scalar()
+    return bool(row)
+
+
+def _indice_en_columna(conn, tabla: str, columna: str) -> bool:
+    """¿Existe ALGÚN índice sobre esa columna? (por COLUMNA, no por nombre). En una BD
+    fresca, create_all crea el índice de `index=True` con el autoname de SQLAlchemy
+    (ix_cont_compra_oc_proveedor_id); en una BD ya poblada lo crea este init_db. Detectar
+    por columna evita un índice DUPLICADO en el bootstrap fresco (nombres distintos)."""
+    row = conn.execute(
+        text(
+            "SELECT COUNT(*) FROM information_schema.statistics "
+            "WHERE table_schema = DATABASE() AND table_name = :t AND column_name = :c"
+        ),
+        {"t": tabla, "c": columna},
+    ).scalar()
+    return bool(row)
+
+
+def _fk_en_columna(conn, tabla: str, columna: str) -> bool:
+    """¿Existe ALGUNA FK saliente sobre esa columna? (por COLUMNA, no por nombre). En una
+    BD fresca create_all crea la FK con un nombre autogenerado por MySQL (cont_compra_ibfk_N)
+    que NO es predecible; detectar por columna evita una FK DUPLICADA en el bootstrap."""
+    row = conn.execute(
+        text(
+            "SELECT COUNT(*) FROM information_schema.key_column_usage "
+            "WHERE table_schema = DATABASE() AND table_name = :t AND column_name = :c "
+            "AND referenced_table_name IS NOT NULL"
+        ),
+        {"t": tabla, "c": columna},
+    ).scalar()
+    return bool(row)
+
+
+def _alter(conn, sql: str, msg: str) -> None:
+    conn.execute(text(sql))
+    print(f"[compras_contab] + {msg}")
 
 
 def main() -> None:
@@ -25,6 +77,33 @@ def main() -> None:
     insp = inspect(engine)
     for t in TABLES:
         print(f"  - {t}: {'OK' if insp.has_table(t) else 'FALTA'}")
+
+    # ── Migración aditiva: puntero suave a la OC-Proveedor (compra nacional) ──
+    with engine.begin() as conn:
+        if not _columna_existe(conn, "cont_compra", "oc_proveedor_id"):
+            _alter(conn,
+                   "ALTER TABLE cont_compra ADD COLUMN oc_proveedor_id INT NULL",
+                   "columna cont_compra.oc_proveedor_id")
+        else:
+            print("[compras_contab] = cont_compra.oc_proveedor_id ya existe")
+        # Índice/FK detectados por COLUMNA (no por nombre): en una BD fresca create_all ya
+        # los creó con sus autonames; detectar por columna evita duplicarlos. Nombre
+        # alineado al autoname de SQLAlchemy (ix_cont_compra_oc_proveedor_id) para que
+        # los entornos frescos y migrados converjan al mismo nombre.
+        if not _indice_en_columna(conn, "cont_compra", "oc_proveedor_id"):
+            _alter(conn,
+                   "CREATE INDEX ix_cont_compra_oc_proveedor_id ON cont_compra (oc_proveedor_id)",
+                   "índice ix_cont_compra_oc_proveedor_id")
+        else:
+            print("[compras_contab] = índice sobre cont_compra.oc_proveedor_id ya existe")
+        if not _fk_en_columna(conn, "cont_compra", "oc_proveedor_id"):
+            _alter(conn,
+                   "ALTER TABLE cont_compra ADD CONSTRAINT fk_cont_compra_oc_proveedor_id "
+                   "FOREIGN KEY (oc_proveedor_id) REFERENCES oc_proveedor(id) ON DELETE SET NULL",
+                   "FK cont_compra.oc_proveedor_id")
+        else:
+            print("[compras_contab] = FK sobre cont_compra.oc_proveedor_id ya existe")
+
     print("[compras_contab] Listo.")
 
 

@@ -94,6 +94,10 @@ class EmbarquePricingItem(Base):
     cantidad = Column(Numeric(14, 4), default=0)
     peso_unit_lbs = Column(Numeric(14, 4), default=0)
     peso_total_lbs = Column(Numeric(16, 4), default=0)
+    # Origen del peso usado en el prorrateo del flete: cotizacion(auto) | manual.
+    # Espejo de fob_origen: si el peso de la cotización vino mal, Contabilidad lo
+    # corrige a mano y el flete se re-prorratea. 'auto' = se lee de la cotización.
+    peso_origen = Column(String(20), default="auto")
 
     # FOB unitario en moneda extranjera + de dónde salió (factura|cotizacion|manual)
     fob_unit = Column(Numeric(16, 4), default=0)

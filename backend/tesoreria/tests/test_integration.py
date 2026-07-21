@@ -110,6 +110,12 @@ def run():
     egreso_id = pago["egreso_id"]
     check("compra contado genera egreso 119000 no conciliado",
           pago["monto_clp"] == 119000.0 and pago["conciliado"] is False and egreso_id, pago)
+    # La fecha valor propia del egreso (autollenada = fecha del pago) debe sobrevivir
+    # a un ciclo conciliar→desconciliar: el snapshot del enlace la restaura (antes se
+    # perdía: la cartola la pisaba al conciliar y la limpieza por igualdad la borraba).
+    fecha_manual = pago["fecha_mov_bancario"]
+    check("egreso de contado nace con fecha valor propia (≠ fecha de la cartola)",
+          bool(fecha_manual) and fecha_manual != "2026-06-01", pago)
 
     # 4) Movimiento cargo 119000
     movs = client.get("/api/tesoreria/movimientos", params={"cuenta_id": cuenta_id, "tipo": "cargo"}).json()["movimientos"]
@@ -140,11 +146,14 @@ def run():
     r = client.post(f"/api/tesoreria/movimientos/{cargo['id']}/conciliar", json={"egreso_id": eg_x})
     check("conciliar mov ya conciliado 409", r.status_code == 409, r.text)
 
-    # 10) Desconciliar → libera
+    # 10) Desconciliar → libera y RESTAURA la fecha valor previa del egreso
     r = client.post(f"/api/tesoreria/movimientos/{cargo['id']}/desconciliar")
     check("desconciliar 200", r.status_code == 200 and r.json()["conciliado"] is False, r.text)
     det = client.get(f"/api/compras-contab/{compra['id']}").json()
     check("pago liberado", det["pagos"][0]["conciliado"] is False, det["pagos"][0])
+    check("fecha valor del operador RESTAURADA tras desconciliar (snapshot del enlace)",
+          det["pagos"][0]["fecha_mov_bancario"] == fecha_manual,
+          (det["pagos"][0]["fecha_mov_bancario"], fecha_manual))
 
     # 11) CASO DEL DUEÑO: 1 movimiento (8000) paga 2 gastos (egreso consolidado)
     b = _compra(numero_documento=f"{MARK}-B", acreedor=f"{MARK} ProvB", monto_neto=5000, afecto_iva=False).json()

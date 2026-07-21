@@ -4,6 +4,7 @@
 export type PricingEstado = 'sin_pricing' | 'borrador' | 'calculado' | 'cerrado'
 export type TipoEmbarque = 'normal' | 'courier' | 'baukat' | 'fastmark'
 export type FobOrigen = 'factura' | 'cotizacion' | 'manual' | 'auto'
+export type PesoOrigen = 'auto' | 'manual'
 
 export interface EmbarquePricingRow {
   embarque_id: number
@@ -12,6 +13,7 @@ export interface EmbarquePricingRow {
   estado_logistica: string | null
   forwarder: string | null
   awb: string | null
+  awb_numero: string | null
   fecha_despacho: string | null
   n_items: number
   docs_count: number
@@ -52,6 +54,8 @@ export interface PricingItem {
   moneda: string
   cantidad: number
   peso_unit_lbs: number
+  peso_default: number
+  peso_origen: PesoOrigen
   peso_total_lbs: number
   fob_unit: number
   fob_default: number
@@ -73,6 +77,7 @@ export interface PricingDetail {
     estado: string | null
     forwarder: string | null
     awb: string | null
+    awb_numero: string | null
     fecha_despacho: string | null
     fecha_llegada_est: string | null
     n_items: number
@@ -116,7 +121,9 @@ export interface PricingDetail {
 export interface ItemOverride {
   embarque_item_id: number
   fob_unit?: number
-  fob_manual: boolean
+  fob_manual?: boolean
+  peso_unit_lbs?: number
+  peso_manual?: boolean
 }
 
 export interface PricingSavePayload {

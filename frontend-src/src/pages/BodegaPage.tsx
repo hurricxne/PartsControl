@@ -16,6 +16,7 @@ interface EmbarqueResumen {
   estado: string
   forwarder: string
   awb: string
+  awb_numero: string | null
   fecha_llegada_est: string | null
   total_items: number
   recepcion_id: number | null
@@ -483,6 +484,7 @@ function EmbarqueCard({ emb, onRefresh, onOpenRec }: {
             </div>
             <div className="flex items-center gap-3 mt-0.5 flex-wrap text-xs" style={{ color: 'var(--text-muted)' }}>
               {emb.forwarder && <span>{emb.forwarder}</span>}
+              {emb.awb_numero && <span className="font-mono">N° AWB: {emb.awb_numero}</span>}
               {emb.awb && <span className="font-mono">AWB: {emb.awb}</span>}
               {emb.fecha_llegada_est && <span>ETA: {fmtDate(emb.fecha_llegada_est)}</span>}
             </div>
@@ -641,6 +643,7 @@ function HistorialTab() {
             <div className="flex-1 min-w-0">
               <span className="font-mono font-bold text-sm" style={{ color: 'var(--text-primary)' }}>{emb.numero || `EMB-${emb.id}`}</span>
               <div className="text-xs mt-0.5 flex gap-3 flex-wrap" style={{ color: 'var(--text-muted)' }}>
+                {emb.awb_numero && <span className="font-mono">N° AWB: {emb.awb_numero}</span>}
                 {emb.awb && <span className="font-mono">AWB: {emb.awb}</span>}
                 <span>{emb.total_items} ítems</span>
               </div>

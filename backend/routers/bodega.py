@@ -147,6 +147,7 @@ def list_embarques_bodega(
             "estado": e.estado,
             "forwarder": e.forwarder,
             "awb": e.awb,
+            "awb_numero": e.awb_numero,
             "fecha_llegada_est": str(e.fecha_llegada_est) if e.fecha_llegada_est else None,
             "notas": e.notas,
             "total_items": total_items,
@@ -198,6 +199,7 @@ def historial_embarques(
             "estado": e.estado,
             "forwarder": e.forwarder,
             "awb": e.awb,
+            "awb_numero": e.awb_numero,
             "fecha_llegada_est": str(e.fecha_llegada_est) if e.fecha_llegada_est else None,
         }
         for e in embarques
@@ -227,6 +229,7 @@ def get_embarque_bodega(
         "estado": e.estado,
         "forwarder": e.forwarder,
         "awb": e.awb,
+        "awb_numero": e.awb_numero,
         "factura_comercial": e.factura_comercial,
         "packing_list": e.packing_list,
         "fecha_llegada_est": str(e.fecha_llegada_est) if e.fecha_llegada_est else None,
@@ -373,6 +376,9 @@ def marcar_item(
 
     if body.estado_recepcion not in ESTADOS_VALIDOS:
         raise HTTPException(400, f"Estado inválido: {body.estado_recepcion}")
+    # qty_recibida alimenta el tope de despacho: negativa no tiene sentido físico
+    if (body.qty_recibida or 0) < 0:
+        raise HTTPException(400, "La cantidad recibida no puede ser negativa")
 
     es_danado = "danado" in body.estado_recepcion
 
@@ -430,6 +436,9 @@ def crear_recepcion_item(
 
     if body.estado_recepcion not in ESTADOS_VALIDOS:
         raise HTTPException(400, f"Estado inválido: {body.estado_recepcion}")
+    # qty_recibida alimenta el tope de despacho: negativa no tiene sentido físico
+    if (body.qty_recibida or 0) < 0:
+        raise HTTPException(400, "La cantidad recibida no puede ser negativa")
 
     es_danado = "danado" in body.estado_recepcion
 
@@ -569,31 +578,78 @@ def cerrar_recepcion(
             f"Quedan {len(pendientes)} ítems sin marcar. Use forzar=true para cerrar igual.",
         )
 
+    # Recibido utilizable ACUMULADO en recepciones cerradas ANTERIORES (otros
+    # embarques de la misma línea): el faltante a reclamar se calcula contra lo
+    # que AÚN no llega en total — no contra la venta completa en cada recepción,
+    # o una reposición / línea repartida en 2 embarques generaría reclamos
+    # fantasma por mercadería que ya está en bodega.
+    from routers.despachos import _qty_recibida_utilizable
+    recibido_previo = _qty_recibida_utilizable(
+        db, [ei.item_cotizacion_id for ei in all_emb_items if ei.item_cotizacion_id])
+
     # Process each item: update estado_item and create reclamos where needed
+    def _crear_reclamo(item, ri, motivo, qty_afectada):
+        asig = db.query(OcProveedorItem).filter(
+            OcProveedorItem.item_cotizacion_id == item.id
+        ).first()
+        db.add(ReclamoProveedor(
+            oc_proveedor_id=asig.oc_proveedor_id if asig else None,
+            item_cotizacion_id=item.id,
+            recepcion_item_id=ri.id if ri else None,
+            motivo=motivo,
+            qty_afectada=qty_afectada,
+        ))
+
     for ei in all_emb_items:
         ri = ri_map.get(ei.id)
-        if not ri or ri.estado_recepcion is None:
-            continue
-
         item = ei.item_cotizacion
         if not item:
             continue
 
+        if not ri or ri.estado_recepcion is None:
+            # Solo se llega aquí con forzar=true (ítem sin marcar). Antes quedaba
+            # atascado en 'embarcado' para siempre, invisible para Bodega y para
+            # Despachos: se trata como 'no_llego' con reclamo TRAZABLE que se
+            # gestiona cuando el ítem aparezca.
+            item.estado_item = "reclamo_proveedor"
+            _crear_reclamo(item, None, "no_llego", item.cantidad or 0)
+            continue
+
+        cant = item.cantidad or 0
+        recibida = max(ri.qty_recibida or 0, 0)
+        # Lo que sigue faltando de la línea considerando TODOS los embarques:
+        # lo vendido − (recibido en recepciones anteriores + esta recepción)
+        faltante_pendiente = max(cant - (recibido_previo.get(item.id, 0) + recibida), 0)
+
         if ri.estado_recepcion in ("completo", "danado_utilizable", "sobrante"):
             item.estado_item = "en_bodega"
-        elif ri.estado_recepcion in ("faltante", "danado_no_utilizable", "no_llego"):
+            # 'completo' con MENOS unidades que lo vendido = llegada parcial: lo
+            # recibido queda despachable (Despachos lo topea por qty_recibida) y
+            # el faltante REAL se reclama aparte para que no desaparezca sin
+            # traza (una reposición que completa la línea NO genera reclamo).
+            if ri.estado_recepcion == "completo" and recibida > 0 and faltante_pendiente > 0:
+                _crear_reclamo(item, ri, "faltante", faltante_pendiente)
+        elif ri.estado_recepcion == "faltante":
+            if recibida > 0:
+                # Llegada PARCIAL: las unidades que SÍ llegaron quedan en bodega
+                # y despachables (topeadas por qty_recibida en Despachos); solo
+                # la diferencia REAL va a reclamo. Antes la línea ENTERA caía a
+                # reclamo y lo recibido quedaba indespachable.
+                item.estado_item = "en_bodega"
+                if faltante_pendiente > 0:
+                    _crear_reclamo(item, ri, "faltante", faltante_pendiente)
+            else:
+                item.estado_item = "reclamo_proveedor"
+                _crear_reclamo(item, ri, "faltante", faltante_pendiente or cant)
+        elif ri.estado_recepcion == "no_llego":
             item.estado_item = "reclamo_proveedor"
-            asig = db.query(OcProveedorItem).filter(
-                OcProveedorItem.item_cotizacion_id == item.id
-            ).first()
-            reclamo = ReclamoProveedor(
-                oc_proveedor_id=asig.oc_proveedor_id if asig else None,
-                item_cotizacion_id=item.id,
-                recepcion_item_id=ri.id,
-                motivo=ri.estado_recepcion,
-                qty_afectada=ri.qty_recibida or 0,
-            )
-            db.add(reclamo)
+            # Lo afectado es TODO lo esperado (antes se registraba qty_recibida=0)
+            _crear_reclamo(item, ri, "no_llego", cant)
+        elif ri.estado_recepcion == "danado_no_utilizable":
+            item.estado_item = "reclamo_proveedor"
+            # Lo afectado es lo que llegó dañado (o lo esperado si no se registró)
+            _crear_reclamo(item, ri, "danado_no_utilizable",
+                           recibida if recibida > 0 else cant)
 
     rec.estado = "cerrada"
     rec.fecha_cierre = datetime.utcnow()

@@ -110,6 +110,11 @@ def _build_venta(cot, items_db, cfg_dict, db):
     if cot.user_id:
         user = db.query(User).filter(User.id == cot.user_id).first()
         asesor_nombre = user.nombre if user else None
+    # Si la OC tiene su propio asesor asignado, prevalece sobre el creador de la cotización.
+    if oc and oc.asesor_id:
+        oc_asesor = db.query(User).filter(User.id == oc.asesor_id).first()
+        if oc_asesor:
+            asesor_nombre = oc_asesor.nombre
 
     return {
         "id": cot.id,
@@ -126,6 +131,8 @@ def _build_venta(cot, items_db, cfg_dict, db):
         "iva_clp": round(iva, 0),
         "total_con_iva_clp": round(total_con_iva, 0),
         "numero_oc_cliente": oc.numero_oc if oc else None,
+        "oc_cliente_id": oc.id if oc else None,
+        "asesor_id": oc.asesor_id if oc else None,
         "fecha_oc": oc.fecha_oc if oc else None,
         "cond_pago": oc.cond_pago if oc else None,
         "fecha_entrega": oc.fecha_entrega if oc else None,

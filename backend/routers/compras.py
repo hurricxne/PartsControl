@@ -8,10 +8,12 @@ import os
 import shutil
 import uuid
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
+from empresa_guard import require_empresa
+from role_guard import require_rol
 from database import get_db
 from models.models import (
     Cotizacion, ItemCotizacion, OcCliente, OcProveedor, OcProveedorItem,
@@ -145,6 +147,7 @@ class EmbarqueUpdate(BaseModel):
     estado: Optional[str] = None
     forwarder: Optional[str] = None
     awb: Optional[str] = None
+    awb_numero: Optional[str] = None  # dead-code (esta clase la pisa la de más abajo); se agrega por consistencia
     fecha_despacho: Optional[str] = None
     fecha_llegada_est: Optional[str] = None
     notas: Optional[str] = None
@@ -162,6 +165,14 @@ class OcClienteCreate(BaseModel):
     asesor_id: Optional[int] = None
 
 
+class OcClienteUpdate(BaseModel):
+    numero_oc: Optional[str] = None
+    fecha_oc: Optional[str] = None
+    cond_pago: Optional[str] = None
+    fecha_entrega: Optional[str] = None
+    asesor_id: Optional[int] = None
+
+
 class OcProveedorCreate(BaseModel):
     proveedor: str
     numero_oc: Optional[str] = None
@@ -169,6 +180,9 @@ class OcProveedorCreate(BaseModel):
     moneda: Optional[str] = "USD"
     plazo_dias: Optional[int] = None
     notas: Optional[str] = None
+    # Origen de la compra: 'internacional' (embarque) o 'nacional' (camión + guía).
+    # Gobierna el camino físico y la UI; el default deja el flujo internacional intacto.
+    tipo_origen: Optional[str] = "internacional"
 
 
 class OcProveedorUpdate(BaseModel):
@@ -205,6 +219,10 @@ class InvoxItem(BaseModel):
 
 class CerrarPreEmbarqueBody(BaseModel):
     awb: Optional[str] = None
+    # N° AWB/BL escrito a mano (≠ awb, que es el filename del adjunto). Acotado a 100
+    # para no exceder la columna VARCHAR(100): un texto más largo debe rebotar como
+    # 422 de validación y NO como 500 (DataError 1406) al intentar insertarlo.
+    awb_numero: Optional[str] = Field(default=None, max_length=100)
     forwarder: Optional[str] = None
     fecha_despacho: Optional[str] = None
     fecha_llegada_est: Optional[str] = None
@@ -246,6 +264,10 @@ class EmbarqueUpdate(BaseModel):
     estado: Optional[str] = None
     forwarder: Optional[str] = None
     awb: Optional[str] = None
+    # N° AWB/BL escrito a mano (≠ awb, que es el filename del adjunto). Acotado a 100
+    # para no exceder la columna VARCHAR(100): un texto más largo debe rebotar como
+    # 422 de validación y NO como 500 (DataError 1406) al intentar persistirlo.
+    awb_numero: Optional[str] = Field(default=None, max_length=100)
     fecha_despacho: Optional[str] = None
     fecha_llegada_est: Optional[str] = None
     factura_comercial: Optional[str] = None
@@ -492,6 +514,18 @@ def crear_oc_cliente(
     cot = db.query(Cotizacion).filter(Cotizacion.id == body.cotizacion_id).first()
     if not cot:
         raise HTTPException(404, "Cotizacion no encontrada")
+    if not (body.numero_oc or "").strip():
+        raise HTTPException(400, "El N° OC del cliente es obligatorio")
+    # Idempotente por cotización: el cierre de venta hace 2 pasos (crear OC y luego
+    # avanzar la fase); si el 2° falló y el usuario reintenta, se devuelve la OC ya
+    # creada en vez de duplicarla (los datos se corrigen después con "Editar OC").
+    oc_existente = (
+        db.query(OcCliente)
+        .filter(OcCliente.cotizacion_id == body.cotizacion_id)
+        .first()
+    )
+    if oc_existente:
+        return {"id": oc_existente.id, "cotizacion_id": oc_existente.cotizacion_id}
     oc = OcCliente(**body.dict())
     db.add(oc)
     # Mark all items of this cotizacion as cerrado
@@ -525,6 +559,95 @@ def crear_oc_cliente(
         print(f"[warn] notificacion oc-cliente: {e}")
 
     return {"id": oc.id, "cotizacion_id": oc.cotizacion_id}
+
+
+@router.put(
+    "/oc-cliente/{oc_id}",
+    dependencies=[
+        Depends(require_empresa("mineria")),
+        Depends(require_rol("comercial", "contabilidad", "admin")),
+    ],
+)
+def actualizar_oc_cliente(
+    oc_id: int,
+    body: OcClienteUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Edita ex-post los datos de la OC del cliente (N° OC, fecha, condiciones, entrega, asesor).
+
+    Restringido a Grupo AM (empresa 'mineria') y a los roles comercial/contabilidad/admin
+    (ver role_guard.py: el candado de rol es permisivo hasta que exista User.rol). Se expone en las
+    páginas Ventas y Ventas — Contabilidad para corregir una OC que se cerró sin todos sus datos.
+    """
+    oc = db.query(OcCliente).filter(OcCliente.id == oc_id).first()
+    if not oc:
+        raise HTTPException(404, "OC-Cliente no encontrada")
+    # Valores que la guía SII referencia (tipo 801): se comparan tras aplicar el
+    # body para saber si el PUT intenta cambiarlos (ver guard más abajo).
+    numero_oc_original, fecha_oc_original = oc.numero_oc, oc.fecha_oc
+    if body.numero_oc is not None:
+        if not body.numero_oc.strip():
+            raise HTTPException(400, "El N° OC del cliente es obligatorio")
+        oc.numero_oc = body.numero_oc.strip()
+    if body.fecha_oc is not None:
+        oc.fecha_oc = body.fecha_oc or None
+    if body.cond_pago is not None:
+        oc.cond_pago = body.cond_pago or None
+    if body.fecha_entrega is not None:
+        oc.fecha_entrega = body.fecha_entrega or None
+    # asesor_id distingue "no enviado" (no tocar) de "null explícito" (desasignar):
+    # el modal manda null cuando el usuario elige "— sin asesor —", y con el patrón
+    # if-not-None a secas esa desasignación se tragaba en silencio con un 200.
+    if "asesor_id" in body.model_fields_set:
+        if body.asesor_id is None:
+            oc.asesor_id = None
+        else:
+            # Mismo criterio que GET /auth/users (que alimenta el selector): el asesor
+            # debe existir, estar activo y ser de la misma empresa — un id de otra
+            # empresa se colaría al nombre del asesor que muestran Ventas/Contabilidad.
+            asesor = (
+                db.query(User)
+                .filter(
+                    User.id == body.asesor_id,
+                    User.is_active == 1,
+                    User.empresa == (current_user.empresa or "mineria"),
+                )
+                .first()
+            )
+            if not asesor:
+                raise HTTPException(400, "Asesor inválido: debe ser un usuario activo de tu empresa")
+            oc.asesor_id = body.asesor_id
+    # La guía de despacho electrónica (SII 52) referencia esta OC (tipo 801, N° +
+    # fecha): con una guía viva emitida (o en emisión), cambiar el N°/fecha de la
+    # OC dejaría el documento legal desincronizado del sistema. Se bloquea igual
+    # que el folio en despachos (la anulación del DTE se gestiona en Wasabil).
+    if (oc.numero_oc, oc.fecha_oc) != (numero_oc_original, fecha_oc_original):
+        from wasabil_dte.models import WasabilDte, STATUS_EMITIDO, STATUS_PROCESANDO, STATUS_PENDIENTE
+        from wasabil_dte.service import claim_vigente
+        from models.models import Despacho
+        dtes = (
+            db.query(WasabilDte)
+            .join(Despacho, Despacho.id == WasabilDte.despacho_id)
+            .filter(Despacho.oc_cliente_id == oc.id)
+            .all()
+        )
+        for dte in dtes:
+            viva = (
+                dte.status_id == STATUS_EMITIDO
+                or claim_vigente(dte)
+                or (dte.uuid and dte.status_id in (STATUS_PROCESANDO, STATUS_PENDIENTE))
+            )
+            if viva:
+                raise HTTPException(
+                    409,
+                    "Esta OC ya tiene guía de despacho electrónica emitida"
+                    + (f" (folio {dte.folio})" if dte.folio else " (en emisión)")
+                    + ": el N° y la fecha de la OC quedaron referenciados ante el SII y no se editan. "
+                    "Los demás campos (condiciones, entrega, asesor) sí se pueden corregir.",
+                )
+    db.commit()
+    return {"ok": True}
 
 
 @router.get("/oc-cliente")
@@ -816,10 +939,37 @@ def get_items_comprados(
             "oc_proveedor_nombre": ocp.proveedor if ocp else "Sin asignar",
             "pais": ocp.pais if ocp else "",
             "moneda": ocp.moneda if ocp else "USD",
+            # Origen de la OC: los nacionales muestran "Registrar entrega nacional" en
+            # Seguimiento (saltan preparado/embarque). Sin ocp → internacional histórico.
+            "tipo_origen": ocp.tipo_origen if ocp else "internacional",
             "items": item_list,
         })
 
     return result
+
+
+def _rechazar_items_nacionales(db: Session, item_ids: list) -> None:
+    """Los ítems asignados a una OC-Proveedor NACIONAL no pasan por
+    preparado/pre-embarque/embarque: su camino físico es 'Registrar entrega
+    nacional' en Seguimiento. El backend es la autoridad — la UI oculta los
+    botones, pero una selección mixta (o una llamada directa al API) no debe
+    poder colarlos al pipeline de embarque (hallazgo del dueño probando en vivo)."""
+    if not item_ids:
+        return
+    nacionales = (db.query(ItemCotizacion.numero_parte)
+                  .join(OcProveedorItem,
+                        OcProveedorItem.item_cotizacion_id == ItemCotizacion.id)
+                  .join(OcProveedor,
+                        OcProveedor.id == OcProveedorItem.oc_proveedor_id)
+                  .filter(ItemCotizacion.id.in_(item_ids),
+                          OcProveedor.tipo_origen == "nacional")
+                  .all())
+    if nacionales:
+        partes = ", ".join(sorted({p or "?" for (p,) in nacionales}))
+        raise HTTPException(
+            400,
+            f"Ítem(s) de compra NACIONAL no pasan por embarque: {partes}. "
+            "Regístrelos con 'Registrar entrega nacional' en Seguimiento.")
 
 
 @router.post("/items/preparar")
@@ -828,6 +978,7 @@ def preparar_items(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    _rechazar_items_nacionales(db, list(body.item_ids or []))
     updated = (
         db.query(ItemCotizacion)
         .filter(ItemCotizacion.id.in_(body.item_ids))
@@ -849,6 +1000,7 @@ def preparar_items_parcial(
     - Original: cantidad reducida → estado 'preparado'
     - Clone: qty restante → estado 'comprado' (queda pendiente)
     """
+    _rechazar_items_nacionales(db, [i.item_id for i in body.items])
     processed = 0
     for item_data in body.items:
         item = db.query(ItemCotizacion).filter(
@@ -959,6 +1111,8 @@ def crear_pre_embarque(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # Cuarto camino de entrada al pipeline: mismo guard que preparar/agregar.
+    _rechazar_items_nacionales(db, list(body.item_ids or []))
     numero = _next_pre_numero(db)
     pre = PreEmbarque(numero=numero, notas=body.notas)
     db.add(pre)
@@ -1042,6 +1196,7 @@ def cerrar_pre_embarque(
         estado="en_bodega_proveedor",  # estado inicial; el usuario lo cambia manualmente
         forwarder=body.forwarder,
         awb=body.awb,
+        awb_numero=body.awb_numero,  # N° escribible; independiente del archivo awb
         fecha_despacho=body.fecha_despacho,
         fecha_llegada_est=body.fecha_llegada_est,
         factura_comercial=factura_str,
@@ -1132,6 +1287,7 @@ def add_item_to_pre_embarque(
     item = db.query(ItemCotizacion).filter(ItemCotizacion.id == body.item_id).first()
     if not item:
         raise HTTPException(404, "Item no encontrado")
+    _rechazar_items_nacionales(db, [item.id])
     if item.estado_item != "preparado":
         raise HTTPException(400, f"El item debe estar en estado 'preparado' (actual: {item.estado_item})")
 
@@ -1319,6 +1475,7 @@ def listar_embarques(
             "estado": emb.estado,
             "forwarder": emb.forwarder or "",
             "awb": emb.awb or "",
+            "awb_numero": emb.awb_numero or "",
             "fecha_despacho": emb.fecha_despacho or "",
             "fecha_llegada_est": emb.fecha_llegada_est or "",
             "factura_comercial": emb.factura_comercial or "",
@@ -1410,6 +1567,7 @@ def get_embarque(
         "estado": emb.estado,
         "forwarder": emb.forwarder or "",
         "awb": emb.awb or "",
+        "awb_numero": emb.awb_numero or "",
         "fecha_despacho": emb.fecha_despacho or "",
         "fecha_llegada_est": emb.fecha_llegada_est or "",
         "factura_comercial": emb.factura_comercial or "",
@@ -1656,7 +1814,12 @@ def crear_oc_proveedor(
     current_user: User = Depends(get_current_user),
 ):
     numero = _next_ocp_numero(db)
-    oc = OcProveedor(numero=numero, **body.dict())
+    data = body.dict()
+    # La columna es NOT NULL: un cliente que mande tipo_origen=null no debe romper el
+    # INSERT (backend autoridad). Solo 'nacional' e 'internacional' son válidos.
+    if data.get("tipo_origen") not in ("nacional", "internacional"):
+        data["tipo_origen"] = "internacional"
+    oc = OcProveedor(numero=numero, **data)
     db.add(oc)
     db.commit()
     db.refresh(oc)

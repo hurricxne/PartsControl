@@ -9,16 +9,17 @@ migración; el nombre del módulo cambió, los datos no). Se agrega UNA tabla nu
   conc_movimiento            → un movimiento del banco (cargo|abono).
   conc_conciliacion          → enlace cargo ↔ cont_egreso (Comprobante de Egreso de Compras).
   conc_conciliacion_ingreso  → NUEVA: enlace abono ↔ cont_cobranza (ingreso de caja
-                               registrado en Facturas y Cobranzas). El "conciliado" de la
-                               cobranza se DERIVA de la existencia del enlace (no se
-                               agregan columnas a cont_cobranza).
+                               registrado en Facturas y Cobranzas) O abono ↔ cont_adelanto
+                               (adelanto de cliente aprobado por Tesorería) — exactamente
+                               uno. El "conciliado" se DERIVA de la existencia del enlace
+                               (no se agregan columnas a cont_cobranza/cont_adelanto).
 
 El esquema de enlaces es N:M preparado para parciales; HOY el router concilia 1:1
 exacto (montos iguales ±TOL). Un egreso ya paga varias compras vía cont_egreso_detalle.
 Se crean con `tesoreria/init_db.py` (standalone) o con el create_all de arranque.
 """
 from sqlalchemy import (
-    Column, Integer, String, Numeric, Boolean, Text, Date, DateTime,
+    CheckConstraint, Column, Integer, String, Numeric, Boolean, Text, Date, DateTime,
     ForeignKey, Index, UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
@@ -138,32 +139,49 @@ class Conciliacion(Base):
     monto_conciliado_clp = Column(Numeric(16, 2), default=0)
     usuario_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Snapshot del egreso ANTES de que la cartola lo enriqueciera al conciliar:
+    # desconciliar RESTAURA estos valores (deshacer = volver al estado previo),
+    # conservando lo que el operador ingresó a mano incluso si coincidía con lo
+    # del banco (la igualdad de valores no distingue el origen del dato).
+    fecha_egreso_previa = Column(Date, nullable=True)
+    referencia_egreso_previa = Column(String(120), nullable=True)
 
     movimiento = relationship("MovimientoBancario", back_populates="conciliaciones")
 
 
 class ConciliacionIngreso(Base):
-    """Enlace movimiento bancario (abono) ↔ cobranza de Facturas y Cobranzas
-    (cont_cobranza: el ingreso de caja que registró el operador). El "conciliado" de la
-    cobranza se DERIVA de la existencia de este enlace (no se agregan columnas a
-    cont_cobranza, tabla de otro módulo).
+    """Enlace movimiento bancario (abono) ↔ destino conciliado. Exactamente UNO de:
+      · cobranza_id  (abono ↔ cobranza de Facturas y Cobranzas — cont_cobranza)
+      · adelanto_id  (abono ↔ adelanto de cliente APROBADO por Tesorería — cont_adelanto;
+                      la plata del adelanto se concilia por AQUÍ, y su aplicación a
+                      facturas —cobranzas medio='adelanto'— queda EXCLUIDA de esta
+                      conciliación: no es un depósito nuevo)
+    El "conciliado" de la cobranza/adelanto se DERIVA de la existencia del enlace (no se
+    agregan columnas a cont_cobranza/cont_adelanto).
 
     Invariantes a nivel de BD (defensa en profundidad; el router y el schema Pydantic
     ya las validan):
-      · UNIQUE cobranza_id: una cobranza solo puede estar conciliada con UN movimiento
-        (1:1; los NULL no aplican porque la columna es NOT NULL de facto en el uso).
+      · CHECK "exactamente uno": (cobranza_id XOR adelanto_id) no nulo.
+      · UNIQUE cobranza_id / UNIQUE adelanto_id: conciliación 1:1 (los NULL no
+        colisionan en MySQL). Si algún día se habilitan parciales (N:M), relajarlos.
     El borrado de una cobranza conciliada se BLOQUEA en Facturas y Cobranzas (409:
     desconciliar primero en Tesorería); el CASCADE es solo última defensa."""
     __tablename__ = "conc_conciliacion_ingreso"
     __table_args__ = (
+        CheckConstraint(
+            "(cobranza_id IS NOT NULL) + (adelanto_id IS NOT NULL) = 1",
+            name="ck_conc_concil_ing_un_destino",
+        ),
         UniqueConstraint("cobranza_id", name="uq_conc_concil_ing_cobranza"),
+        UniqueConstraint("adelanto_id", name="uq_conc_concil_ing_adelanto"),
         Index("ix_conc_concil_ing_mov", "movimiento_id"),
         {"mysql_engine": "InnoDB"},
     )
     id = Column(Integer, primary_key=True, index=True)
     empresa = Column(String(50), nullable=False, server_default="mineria")
     movimiento_id = Column(Integer, ForeignKey("conc_movimiento.id", ondelete="CASCADE"), index=True)
-    cobranza_id = Column(Integer, ForeignKey("cont_cobranza.id", ondelete="CASCADE"))
+    cobranza_id = Column(Integer, ForeignKey("cont_cobranza.id", ondelete="CASCADE"), nullable=True)
+    adelanto_id = Column(Integer, ForeignKey("cont_adelanto.id", ondelete="CASCADE"), nullable=True)
     monto_conciliado_clp = Column(Numeric(16, 2), default=0)
     usuario_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

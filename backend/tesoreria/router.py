@@ -3,20 +3,29 @@
 Prefijo: /tesoreria (se monta con prefix=/api → /api/tesoreria).
 SOLO MachParts (Grupo AM = 'mineria'): candado require_empresa a nivel de router.
 
-Tesorería REVISA, APRUEBA y CONCILIA lo que otros módulos registran. 4 sub-áreas:
+Tesorería REVISA, APRUEBA y CONCILIA lo que otros módulos registran. 5 sub-áreas:
 
   1. POR PAGAR / APROBAR PAGOS — cola de compras con saldo (registradas en Compras/CxP
      con pago futuro o parcial). Tesorería DA LA ORDEN del pago: crea el Comprobante
      de Egreso con la MISMA regla de negocio que Compras (reusa `_crear_egreso` de
      compras_contab: locks anti doble-pago, tope por saldo, recálculo de estados).
-  2. CONCILIACIÓN — cartolas (CSV/XLSX) y cruce 1:1 exacto (±TOL):
+  2. APROBACIÓN DE ADELANTOS — los adelantos de cliente que Comercial informa (Cierre
+     de Venta / Ventas) llegan acá; Tesorería confirma la plata recibida (monto real,
+     fecha, banco, N° operación) SIN exigir cartola, y al aprobar se APLICAN a las
+     facturas existentes como cobranza medio='adelanto' (regla en routers/contabilidad:
+     `_aplicar_adelantos_pendientes`, una sola fuente de verdad).
+  3. CONCILIACIÓN — cartolas (CSV/XLSX) y cruce 1:1 exacto (±TOL):
        · cargo  ↔ cont_egreso   (egreso de Compras; marca egreso.conciliado)
        · abono  ↔ cont_cobranza (ingreso de caja de Facturas y Cobranzas; el
          "conciliado" de la cobranza se DERIVA del enlace conc_conciliacion_ingreso)
-  3. FLUJO DE CAJA — proyección NIC 7 por buckets de vencimiento: salidas (Compras por
+       · abono  ↔ cont_adelanto (adelanto APROBADO; misma derivación). Las cobranzas
+         medio='adelanto' se EXCLUYEN del cruce: son la APLICACIÓN contable de un
+         adelanto ya recibido, no un depósito nuevo — su plata se concilia por aquí.
+  4. FLUJO DE CAJA — proyección NIC 7 por buckets de vencimiento: salidas (Compras por
      pagar) vs entradas (facturas por cobrar, excluyendo las factorizadas, cuya caja
-     pendiente es la retención del factor). Solo lectura.
-  4. CUENTAS / CARTOLAS / MOVIMIENTOS — catálogo bancario y administración de cartolas.
+     pendiente es la retención del factor). Los adelantos informados aún no aprobados
+     se muestran APARTE (todavía no son plata segura). Solo lectura.
+  5. CUENTAS / CARTOLAS / MOVIMIENTOS — catálogo bancario y administración de cartolas.
 """
 from collections import Counter
 from datetime import date, datetime, timezone
@@ -30,16 +39,25 @@ from sqlalchemy.exc import IntegrityError
 from database import get_db
 from auth import get_current_user
 from empresa_guard import require_empresa
-from models.models import User, ContFacturaCliente, ContCobranza, ContFactoring
+from models.models import (
+    User, ContFacturaCliente, ContCobranza, ContFactoring, ContAdelanto, OcCliente,
+)
 # Dependencias documentadas sobre el módulo Compras/CxP: el egreso vive allá; la orden
 # de pago de Tesorería reusa su regla de negocio (una sola fuente de verdad).
 from compras_contab.models import ContEgreso, ContEgresoDetalle, ContCompra
 from compras_contab.schemas import EgresoCreate
 from compras_contab.router import _crear_egreso
 from compras_contab.service import serialize_egreso, parse_date_estricta, _estado_pago as _estado_pago_compra
+# Regla de negocio de adelantos: vive en Contabilidad (una sola fuente de verdad).
+# Sin ciclo: routers.contabilidad solo importa tesoreria.models (no este router).
+from routers.contabilidad import (
+    MEDIO_ADELANTO, _aplicar_adelantos_pendientes, _serialize_adelanto,
+    _adelantos_conciliados_ids, _monto_comprometido_adelanto,
+    _validar_tope_adelantos, _total_bruto_venta,
+)
 
 from .models import CuentaBancaria, Cartola, MovimientoBancario, Conciliacion, ConciliacionIngreso
-from .schemas import CuentaIn, MovimientoIn, ConciliarIn
+from .schemas import CuentaIn, MovimientoIn, ConciliarIn, AprobarAdelantoIn
 from .service import (
     TOL, DIAS_SUGERENCIA, TIPOS_MOV, BANCOS_SUGERIDOS, FLUJO_BUCKETS,
     _f, _parse_date, empresa_de, bucket_de, parse_cartola,
@@ -169,6 +187,31 @@ def _cobranzas_conciliadas_ids(db, cobranza_ids) -> set:
     return {r[0] for r in rows}
 
 
+def _adelanto_summaries(db, adelantos: list) -> dict:
+    """{adelanto_id: resumen} con la info de la venta (OC/cliente) para conciliación."""
+    if not adelantos:
+        return {}
+    oc_ids = {a.oc_cliente_id for a in adelantos}
+    ocs = {o.id: o for o in db.query(OcCliente).filter(OcCliente.id.in_(oc_ids)).all()}
+    out = {}
+    for a in adelantos:
+        oc = ocs.get(a.oc_cliente_id)
+        cot = oc.cotizacion if oc else None
+        out[a.id] = {
+            "clase": "adelanto",
+            "adelanto_id": a.id,
+            "oc_cliente_id": a.oc_cliente_id,
+            "numero_oc": oc.numero_oc if oc else None,
+            "cliente": (cot.cliente if cot else None) or "",
+            "estado": a.estado,
+            "fecha": a.fecha_pago.isoformat() if a.fecha_pago else None,
+            "monto": _f(a.monto),
+            "banco": a.banco,
+            "numero_operacion": a.numero_operacion,
+        }
+    return out
+
+
 def _destinos_for_movs(db, movs, empresa: str) -> dict:
     """{mov_id: resumen del destino conciliado} — egreso o cobranza (1er enlace)."""
     mov_ids = [m.id for m in movs if m.conciliado]
@@ -188,12 +231,15 @@ def _destinos_for_movs(db, movs, empresa: str) -> dict:
         for mov_id, eg_id in first_e.items():
             if eg_id in smap:
                 out[mov_id] = smap[eg_id]
-    # abonos ↔ cobranzas
+    # abonos ↔ cobranzas / adelantos (el enlace tiene exactamente uno de los dos)
     links_i = (db.query(ConciliacionIngreso).filter(ConciliacionIngreso.movimiento_id.in_(mov_ids))
                .order_by(ConciliacionIngreso.id.asc()).all())
-    first_i = {}
+    first_i, first_a = {}, {}
     for lk in links_i:
-        first_i.setdefault(lk.movimiento_id, lk.cobranza_id)
+        if lk.cobranza_id:
+            first_i.setdefault(lk.movimiento_id, lk.cobranza_id)
+        elif lk.adelanto_id:
+            first_a.setdefault(lk.movimiento_id, lk.adelanto_id)
     if first_i:
         pares = (db.query(ContCobranza, ContFacturaCliente)
                  .join(ContFacturaCliente, ContFacturaCliente.id == ContCobranza.factura_id)
@@ -203,6 +249,14 @@ def _destinos_for_movs(db, movs, empresa: str) -> dict:
         for mov_id, cob_id in first_i.items():
             if cob_id in cmap and mov_id not in out:
                 out[mov_id] = cmap[cob_id]
+    if first_a:
+        adelantos = (db.query(ContAdelanto)
+                     .filter(ContAdelanto.id.in_(set(first_a.values())),
+                             ContAdelanto.empresa == empresa).all())
+        amap = _adelanto_summaries(db, adelantos)
+        for mov_id, adel_id in first_a.items():
+            if adel_id in amap and mov_id not in out:
+                out[mov_id] = amap[adel_id]
     return out
 
 
@@ -281,6 +335,164 @@ def aprobar_pago(payload: EgresoCreate, db: Session = Depends(get_db),
         raise
     db.refresh(egreso)
     return serialize_egreso(egreso)
+
+
+# ═══ 1b. APROBACIÓN DE ADELANTOS DE CLIENTE (la orden la da Tesorería) ═══════════
+def _venta_info_adelanto(db, adelantos: list) -> dict:
+    """{adelanto_id: info de la venta} para la cola de aprobaciones (sin N+1)."""
+    if not adelantos:
+        return {}
+    oc_ids = {a.oc_cliente_id for a in adelantos}
+    ocs = {o.id: o for o in db.query(OcCliente).filter(OcCliente.id.in_(oc_ids)).all()}
+    out = {}
+    for a in adelantos:
+        oc = ocs.get(a.oc_cliente_id)
+        cot = oc.cotizacion if oc else None
+        out[a.id] = {
+            "numero_oc": oc.numero_oc if oc else None,
+            "numero_cotizacion": cot.numero if cot else None,
+            "cliente": (cot.cliente if cot else None) or "",
+            "rut_cliente": (cot.rut_cliente if cot else None) or "",
+        }
+    return out
+
+
+@router.get("/aprobaciones")
+def aprobaciones(db: Session = Depends(get_db),
+                 current_user: User = Depends(get_current_user)):
+    """Cola de aprobación de adelantos de cliente:
+      · por_aprobar: informados por Comercial (con monto esperado y, si calza ±TOL, el
+        abono de la cartola sugerido — informativo: aprobar NO exige cartola).
+      · aprobadas: adelantos ya aprobados (con conciliado_banco y aplicado derivados)."""
+    empresa = empresa_de(current_user)
+    informados = (db.query(ContAdelanto)
+                  .filter(ContAdelanto.empresa == empresa,
+                          ContAdelanto.estado == "informado")
+                  .order_by(ContAdelanto.id.asc()).all())
+    aprobados = (db.query(ContAdelanto)
+                 .filter(ContAdelanto.empresa == empresa,
+                         ContAdelanto.estado == "aprobado")
+                 .order_by(ContAdelanto.id.desc()).limit(50).all())
+    info = _venta_info_adelanto(db, informados + aprobados)
+    conciliados = _adelantos_conciliados_ids(db, [a.id for a in aprobados])
+
+    # Abono sugerido para cada informado: abono sin conciliar con monto ≈ esperado.
+    abonos = (db.query(MovimientoBancario)
+              .filter(MovimientoBancario.empresa == empresa,
+                      MovimientoBancario.tipo == "abono",
+                      MovimientoBancario.conciliado.is_(False)).all())
+
+    def _abono_sugerido(monto_esperado: float):
+        if monto_esperado <= 0:
+            return None
+        for m in abonos:
+            if abs(_f(m.monto) - monto_esperado) <= TOL:
+                return {"movimiento_id": m.id, "fecha": m.fecha.isoformat() if m.fecha else None,
+                        "monto": _f(m.monto), "glosa": m.glosa, "referencia": m.referencia}
+        return None
+
+    return {
+        "por_aprobar": [{
+            **_serialize_adelanto(a),
+            **info.get(a.id, {}),
+            "abono_sugerido": _abono_sugerido(_f(a.monto_esperado)),
+        } for a in informados],
+        "aprobadas": [{
+            **_serialize_adelanto(a, a.id in conciliados),
+            **info.get(a.id, {}),
+        } for a in aprobados],
+    }
+
+
+@router.post("/adelantos/{adelanto_id}/aprobar")
+def aprobar_adelanto(adelanto_id: int, payload: AprobarAdelantoIn,
+                     db: Session = Depends(get_db),
+                     current_user: User = Depends(get_current_user)):
+    """TESORERÍA aprueba el adelanto: confirma la plata recibida (monto real, fecha,
+    banco, N° operación) SIN exigir cartola — la conciliación con el abono es un paso
+    posterior. Al aprobar, el adelanto se APLICA de inmediato a las facturas existentes
+    de la venta (cobranza medio='adelanto'; vía A a las del despacho real, vía B a su
+    factura de anticipo y, saldado el anticipo, su excedente al despacho real).
+    Re-aprobar (corregir) exige revertir antes la aplicación y la conciliación,
+    espejo de Monza."""
+    empresa = empresa_de(current_user)
+    # Orden GLOBAL de locks: OC → adelanto → facturas (el mismo de crear_factura en
+    # contabilidad). Tomar primero el adelanto invertía el orden y dos requests
+    # simultáneos (aprobar aquí / emitir factura allá) podían terminar en deadlock.
+    # Por eso: lectura SIN lock para ubicar la OC, lock de la OC, y recién ahí el
+    # lock del adelanto re-leyendo con datos frescos.
+    ref = (db.query(ContAdelanto)
+           .filter(ContAdelanto.id == adelanto_id, ContAdelanto.empresa == empresa)
+           .first())
+    if not ref:
+        raise HTTPException(404, "Adelanto no encontrado")
+    oc = (db.query(OcCliente).filter(OcCliente.id == ref.oc_cliente_id)
+          .with_for_update().first())
+    if not oc or not oc.cotizacion:
+        raise HTTPException(404, "Venta (OC) del adelanto no encontrada")
+    # populate_existing: sin él, el identity map devolvería la lectura previa al lock
+    adel = (db.query(ContAdelanto)
+            .filter(ContAdelanto.id == adelanto_id, ContAdelanto.empresa == empresa)
+            .populate_existing().with_for_update().first())
+    if not adel:
+        raise HTTPException(404, "Adelanto no encontrado")
+    if adel.estado == "anulado":
+        raise HTTPException(409, "El adelanto está anulado; infórmalo de nuevo desde Ventas")
+    if _f(adel.monto_aplicado) > 1.0:  # TOL_PAGO de contabilidad
+        raise HTTPException(409, "El adelanto ya fue aplicado a una factura; revierta esa cobranza antes de modificarlo")
+    if _adelantos_conciliados_ids(db, [adel.id]):
+        raise HTTPException(409, "El adelanto ya está conciliado con un abono; desconcílielo antes de modificarlo")
+    _validar_tope_adelantos(db, oc, _f(payload.monto), excluir_id=adel.id)
+
+    adel.estado = "aprobado"
+    adel.monto = round(_f(payload.monto), 2)
+    adel.fecha_pago = _fecha(payload.fecha_pago, "fecha_pago") or date.today()
+    adel.banco = payload.banco
+    adel.numero_operacion = payload.numero_operacion
+    if payload.observaciones is not None:
+        adel.observaciones = payload.observaciones
+    adel.usuario_aprueba_id = getattr(current_user, "id", None)
+    adel.fecha_aprobacion = datetime.now(timezone.utc)
+    db.flush()
+
+    # Aplicación inmediata a las facturas que ya existen (si la factura viene después,
+    # la aplica crear_factura). Lock por factura: serializa contra cobranzas concurrentes.
+    # Anticipos PRIMERO: al saldarse liberan el excedente del adelanto ligado para las
+    # facturas del despacho real en esta misma pasada (el lock de la OC ya serializa
+    # esta transacción, así que el orden de los locks por factura no arriesga deadlock).
+    facturas = (db.query(ContFacturaCliente)
+                .filter(ContFacturaCliente.oc_cliente_id == oc.id,
+                        ContFacturaCliente.empresa == empresa)
+                .order_by(ContFacturaCliente.es_anticipo.desc(),
+                          ContFacturaCliente.id.asc())
+                .with_for_update().all())
+    aplicado_total = 0.0
+    for f in facturas:
+        aplicado_total += _aplicar_adelantos_pendientes(
+            db, oc, f, usuario_id=getattr(current_user, "id", None))
+    db.commit()
+    db.refresh(adel)
+    return {
+        **_serialize_adelanto(adel),
+        **_venta_info_adelanto(db, [adel]).get(adel.id, {}),
+        "aplicado_ahora_clp": round(aplicado_total, 2),
+    }
+
+
+@router.get("/adelantos-pendientes")
+def adelantos_pendientes(db: Session = Depends(get_db),
+                         current_user: User = Depends(get_current_user)):
+    """Adelantos APROBADOS aún sin conciliar con un abono del banco (para emparejar a
+    mano en la pestaña de conciliación)."""
+    empresa = empresa_de(current_user)
+    aprobados = (db.query(ContAdelanto)
+                 .filter(ContAdelanto.empresa == empresa,
+                         ContAdelanto.estado == "aprobado")
+                 .order_by(ContAdelanto.id.desc()).all())
+    conciliados = _adelantos_conciliados_ids(db, [a.id for a in aprobados])
+    pendientes = [a for a in aprobados if a.id not in conciliados]
+    amap = _adelanto_summaries(db, pendientes)
+    return {"adelantos": [amap[a.id] for a in pendientes], "total": len(pendientes)}
 
 
 # ═══ 2. CUENTAS BANCARIAS ════════════════════════════════════════════════════════
@@ -533,7 +745,10 @@ def sugerencias(mov_id: int, db: Session = Depends(get_db),
                 current_user: User = Depends(get_current_user)):
     """Candidatos NO conciliados con monto ≈ igual, ordenados por cercanía de fecha:
       · cargo → Comprobantes de Egreso de Compras.
-      · abono → cobranzas (ingresos de caja) de Facturas y Cobranzas."""
+      · abono → cobranzas (ingresos de caja) de Facturas y Cobranzas + adelantos de
+        cliente APROBADOS. Se EXCLUYEN las cobranzas medio='adelanto': son la
+        aplicación contable de un adelanto ya recibido (no un depósito nuevo); su
+        plata se concilia por la vía abono↔adelanto."""
     empresa = empresa_de(current_user)
     mov = _mov_scoped(db, mov_id, empresa)
     _solo_cuentas_clp(mov.cuenta)
@@ -555,10 +770,11 @@ def sugerencias(mov_id: int, db: Session = Depends(get_db),
         return {"movimiento_id": mov.id, "monto": monto,
                 "sugerencias": [{**smap[e.id], "dias_diferencia": _dist_e(e)} for e in top]}
 
-    # abono → cobranzas con monto ≈ y sin enlace previo
+    # abono → cobranzas con monto ≈ y sin enlace previo (excluye medio='adelanto')
     pares = (db.query(ContCobranza, ContFacturaCliente)
              .join(ContFacturaCliente, ContFacturaCliente.id == ContCobranza.factura_id)
              .filter(ContFacturaCliente.empresa == empresa,
+                     ContCobranza.medio != MEDIO_ADELANTO,
                      ContCobranza.monto >= monto - TOL,
                      ContCobranza.monto <= monto + TOL).all())
     ya = _cobranzas_conciliadas_ids(db, [c.id for c, _f_ in pares])
@@ -571,8 +787,26 @@ def sugerencias(mov_id: int, db: Session = Depends(get_db),
     pares.sort(key=_dist_c)
     top = pares[:15]
     cmap = _cobranza_summaries(db, top)
-    return {"movimiento_id": mov.id, "monto": monto,
-            "sugerencias": [{**cmap[c.id], "dias_diferencia": _dist_c((c, f))} for c, f in top]}
+    sugs = [{**cmap[c.id], "dias_diferencia": _dist_c((c, f))} for c, f in top]
+
+    # + adelantos APROBADOS sin conciliar con monto ≈ (clase 'adelanto')
+    adelantos = (db.query(ContAdelanto)
+                 .filter(ContAdelanto.empresa == empresa,
+                         ContAdelanto.estado == "aprobado",
+                         ContAdelanto.monto >= monto - TOL,
+                         ContAdelanto.monto <= monto + TOL).all())
+    ya_a = _adelantos_conciliados_ids(db, [a.id for a in adelantos])
+    adelantos = [a for a in adelantos if a.id not in ya_a]
+
+    def _dist_a(a):
+        return abs((a.fecha_pago - ref).days) if a.fecha_pago else 9999
+
+    adelantos.sort(key=_dist_a)
+    top_a = adelantos[:15]
+    amap = _adelanto_summaries(db, top_a)
+    sugs += [{**amap[a.id], "dias_diferencia": _dist_a(a)} for a in top_a]
+    sugs.sort(key=lambda s: s.get("dias_diferencia", 9999))
+    return {"movimiento_id": mov.id, "monto": monto, "sugerencias": sugs[:15]}
 
 
 @router.post("/movimientos/{mov_id}/conciliar")
@@ -582,7 +816,9 @@ def conciliar(mov_id: int, payload: ConciliarIn, db: Session = Depends(get_db),
       · cargo + egreso_id   → marca ambos conciliados y completa en el egreso la
         fecha/ref bancaria desde la cartola.
       · abono + cobranza_id → crea el enlace (el 'conciliado' de la cobranza se deriva);
-        marca el movimiento conciliado."""
+        marca el movimiento conciliado. Rechaza cobranzas medio='adelanto' (su plata
+        se concilia por la vía abono↔adelanto; conciliarlas duplicaría el depósito).
+      · abono + adelanto_id → enlace con un adelanto de cliente APROBADO (1:1)."""
     empresa = empresa_de(current_user)
     mov = _mov_scoped(db, mov_id, empresa, lock=True)
     _solo_cuentas_clp(mov.cuenta)
@@ -603,8 +839,13 @@ def conciliar(mov_id: int, payload: ConciliarIn, db: Session = Depends(get_db),
             raise HTTPException(409, "Ese egreso ya está conciliado con otro movimiento")
         if abs(_f(mov.monto) - _f(egreso.monto_total_clp)) > TOL:
             raise HTTPException(400, f"Los montos no coinciden (movimiento {_f(mov.monto):.0f} vs egreso {_f(egreso.monto_total_clp):.0f})")
+        # Snapshot ANTES de enriquecer: mientras el egreso está conciliado la cartola
+        # es la fuente de verdad (fecha/ref del banco pisan lo del egreso), pero
+        # desconciliar debe poder RESTAURAR lo que el operador tenía ingresado.
         db.add(Conciliacion(empresa=empresa, movimiento_id=mov.id, egreso_id=egreso.id,
-                            monto_conciliado_clp=_f(mov.monto), usuario_id=uid))
+                            monto_conciliado_clp=_f(mov.monto), usuario_id=uid,
+                            fecha_egreso_previa=egreso.fecha_mov_bancario,
+                            referencia_egreso_previa=egreso.referencia_bancaria))
         egreso.conciliado = True
         egreso.conciliado_at = now
         if mov.fecha:
@@ -612,6 +853,24 @@ def conciliar(mov_id: int, payload: ConciliarIn, db: Session = Depends(get_db),
         if mov.referencia:
             egreso.referencia_bancaria = mov.referencia
         destino_fn = lambda: _egreso_summary(db, egreso)  # noqa: E731
+    elif payload.adelanto_id:
+        if mov.tipo != "abono":
+            raise HTTPException(400, "Un adelanto de cliente se concilia contra un ABONO del banco")
+        adel = (db.query(ContAdelanto)
+                .filter(ContAdelanto.id == payload.adelanto_id,
+                        ContAdelanto.empresa == empresa)
+                .with_for_update().first())
+        if not adel:
+            raise HTTPException(404, "Adelanto no encontrado")
+        if adel.estado != "aprobado":
+            raise HTTPException(409, "Solo se concilian adelantos APROBADOS por Tesorería")
+        if _adelantos_conciliados_ids(db, [adel.id]):
+            raise HTTPException(409, "Ese adelanto ya está conciliado con otro movimiento")
+        if abs(_f(mov.monto) - _f(adel.monto)) > TOL:
+            raise HTTPException(400, f"Los montos no coinciden (movimiento {_f(mov.monto):.0f} vs adelanto {_f(adel.monto):.0f})")
+        db.add(ConciliacionIngreso(empresa=empresa, movimiento_id=mov.id, adelanto_id=adel.id,
+                                   monto_conciliado_clp=_f(mov.monto), usuario_id=uid))
+        destino_fn = lambda: _adelanto_summaries(db, [adel])[adel.id]  # noqa: E731
     else:
         if mov.tipo != "abono":
             raise HTTPException(400, "Una cobranza (ingreso de caja) se concilia contra un ABONO del banco")
@@ -625,6 +884,9 @@ def conciliar(mov_id: int, payload: ConciliarIn, db: Session = Depends(get_db),
         if not par:
             raise HTTPException(404, "Cobranza no encontrada")
         cobranza, _factura = par
+        if cobranza.medio == MEDIO_ADELANTO:
+            raise HTTPException(409, "Esa cobranza es la APLICACIÓN de un adelanto (no un depósito nuevo): "
+                                     "concilie el abono contra el ADELANTO correspondiente")
         if _cobranzas_conciliadas_ids(db, [cobranza.id]):
             raise HTTPException(409, "Esa cobranza ya está conciliada con otro movimiento")
         if abs(_f(mov.monto) - _f(cobranza.monto)) > TOL:
@@ -660,16 +922,19 @@ def desconciliar(mov_id: int, db: Session = Depends(get_db),
         if eg:
             eg.conciliado = False
             eg.conciliado_at = None
-            # Se limpia SOLO lo que vino de ESTE movimiento al conciliar (fecha/ref
-            # idénticas al mov): así no queda data del cruce equivocado, pero se
-            # conserva lo que el operador ingresó a mano en Compras.
-            if mov.fecha and eg.fecha_mov_bancario == mov.fecha:
-                eg.fecha_mov_bancario = None
-            if mov.referencia and eg.referencia_bancaria == mov.referencia:
-                eg.referencia_bancaria = None
+            # Se RESTAURA lo que el egreso tenía ANTES del cruce (snapshot guardado
+            # en el enlace al conciliar): así no queda data del cruce equivocado y
+            # se conserva lo que el operador ingresó a mano en Compras, incluso si
+            # coincidía con lo del banco. Solo se toca el campo que la conciliación
+            # pisó (mov con fecha/ref); en enlaces previos a la migración el snapshot
+            # es NULL y el resultado es el mismo que la limpieza histórica.
+            if mov.fecha:
+                eg.fecha_mov_bancario = link.fecha_egreso_previa
+            if mov.referencia:
+                eg.referencia_bancaria = link.referencia_egreso_previa
         db.delete(link)
     for link in list(mov.conciliaciones_ingreso):
-        # cobranza: su 'conciliado' se deriva del enlace → basta borrar el enlace.
+        # cobranza/adelanto: su 'conciliado' se deriva del enlace → basta borrarlo.
         db.delete(link)
     mov.conciliado = False
     mov.conciliado_at = None
@@ -703,14 +968,17 @@ def egresos_pendientes(q: Optional[str] = None, page: int = 1, page_size: int = 
 def cobranzas_pendientes(q: Optional[str] = None, page: int = 1, page_size: int = PAGE_SIZE_DEFAULT,
                          db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Cobranzas (ingresos de caja de Facturas y Cobranzas) aún NO conciliadas con un
-    abono del banco. El 'conciliado' se deriva del enlace en conc_conciliacion_ingreso."""
+    abono del banco. El 'conciliado' se deriva del enlace en conc_conciliacion_ingreso.
+    Excluye medio='adelanto' (aplicación de un adelanto, no un depósito nuevo)."""
     empresa = empresa_de(current_user)
     page = max(1, int(page))
     page_size = min(max(1, int(page_size)), PAGE_SIZE_MAX)
-    ya_conciliadas = db.query(ConciliacionIngreso.cobranza_id).scalar_subquery()
+    ya_conciliadas = (db.query(ConciliacionIngreso.cobranza_id)
+                      .filter(ConciliacionIngreso.cobranza_id.isnot(None)).scalar_subquery())
     base = (db.query(ContCobranza, ContFacturaCliente)
             .join(ContFacturaCliente, ContFacturaCliente.id == ContCobranza.factura_id)
             .filter(ContFacturaCliente.empresa == empresa,
+                    ContCobranza.medio != MEDIO_ADELANTO,
                     ~ContCobranza.id.in_(ya_conciliadas)))
     if q:
         like = f"%{q}%"
@@ -768,12 +1036,29 @@ def flujo_caja(db: Session = Depends(get_db),
         for b in FLUJO_BUCKETS:
             d[b]["monto"] = round(d[b]["monto"], 0)
     neto = {b: round(por_cobrar[b]["monto"] - por_pagar[b]["monto"], 0) for b in FLUJO_BUCKETS}
+
+    # Adelantos de cliente, INFORMATIVOS y APARTE de los buckets (regla Monza):
+    #   · informados (por aprobar): aún NO son plata segura → no se proyectan.
+    #   · aprobados no aplicados: plata YA recibida (no es entrada futura); se muestra
+    #     para explicar por qué las facturas siguientes nacerán con menos saldo.
+    adel_inf_n, adel_inf_monto = (
+        db.query(func.count(ContAdelanto.id),
+                 func.coalesce(func.sum(ContAdelanto.monto_esperado), 0))
+        .filter(ContAdelanto.empresa == empresa, ContAdelanto.estado == "informado").one())
+    adel_apr = (db.query(ContAdelanto)
+                .filter(ContAdelanto.empresa == empresa,
+                        ContAdelanto.estado == "aprobado").all())
+    apr_pend = [a for a in adel_apr if _f(a.monto) - _f(a.monto_aplicado) > TOL]
+    apr_pend_monto = sum(_f(a.monto) - _f(a.monto_aplicado) for a in apr_pend)
+
     return {
         "buckets": FLUJO_BUCKETS,
         "por_pagar": por_pagar,
         "por_cobrar": por_cobrar,
         "neto": neto,
         "retenciones_factoring": {"n": int(ret_n or 0), "monto": round(_f(ret_monto), 0)},
+        "adelantos_por_aprobar": {"n": int(adel_inf_n or 0), "monto": round(_f(adel_inf_monto), 0)},
+        "adelantos_recibidos_sin_aplicar": {"n": len(apr_pend), "monto": round(apr_pend_monto, 0)},
     }
 
 
@@ -795,11 +1080,24 @@ def resumen(cuenta_id: Optional[int] = None, db: Session = Depends(get_db),
                              MovimientoBancario.tipo == "abono").count()
     egresos_pend = (db.query(func.count(ContEgreso.id))
                     .filter(ContEgreso.empresa == empresa, ContEgreso.conciliado.is_(False)).scalar())
-    ya_conciliadas = db.query(ConciliacionIngreso.cobranza_id).scalar_subquery()
+    # isnot(None): con la vía abono↔adelanto el enlace puede tener cobranza_id NULL, y
+    # un NOT IN contra una lista con NULLs no matchea NADA en SQL (vaciaría el KPI).
+    ya_conciliadas = (db.query(ConciliacionIngreso.cobranza_id)
+                      .filter(ConciliacionIngreso.cobranza_id.isnot(None)).scalar_subquery())
     cobranzas_pend = (db.query(func.count(ContCobranza.id))
                       .join(ContFacturaCliente, ContFacturaCliente.id == ContCobranza.factura_id)
                       .filter(ContFacturaCliente.empresa == empresa,
+                              ContCobranza.medio != MEDIO_ADELANTO,
                               ~ContCobranza.id.in_(ya_conciliadas)).scalar())
+    # Adelantos de cliente: informados en cola + aprobados aún sin conciliar
+    adel_inf_n, adel_inf_monto = (
+        db.query(func.count(ContAdelanto.id),
+                 func.coalesce(func.sum(ContAdelanto.monto_esperado), 0))
+        .filter(ContAdelanto.empresa == empresa, ContAdelanto.estado == "informado").one())
+    aprobados_ids = [a.id for a in db.query(ContAdelanto)
+                     .filter(ContAdelanto.empresa == empresa,
+                             ContAdelanto.estado == "aprobado").all()]
+    adel_sin_conc = len(set(aprobados_ids) - _adelantos_conciliados_ids(db, aprobados_ids))
     # Pagos por aprobar (compras con saldo) + vencido, para el semáforo del encabezado.
     pp_n, pp_monto = (db.query(func.count(ContCompra.id),
                                func.coalesce(func.sum(ContCompra.saldo_clp), 0))
@@ -814,6 +1112,9 @@ def resumen(cuenta_id: Optional[int] = None, db: Session = Depends(get_db),
         "pagos_por_aprobar": int(pp_n or 0),
         "monto_por_pagar_clp": round(_f(pp_monto), 0),
         "por_pagar_vencido_clp": round(_f(vencido), 0),
+        "adelantos_por_aprobar": int(adel_inf_n or 0),
+        "adelantos_por_aprobar_clp": round(_f(adel_inf_monto), 0),
+        "adelantos_sin_conciliar": int(adel_sin_conc),
         "movimientos_total": int(total),
         "movimientos_conciliados": int(conciliados),
         "cargos_pendientes": int(pend_cargo),

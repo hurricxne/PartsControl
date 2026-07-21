@@ -307,6 +307,87 @@ def run():
         assert _aprox(dR["totales_gastos"]["total_capitaliza"], 160_000), dR["totales_gastos"]
         print("OK 11) Robustez gastos: backend fuerza 6 líneas + reglas (iva_importacion no capitaliza, iva=0)")
 
+        # 12) Peso editable por ítem (override de peso re-prorratea el flete).
+        cotP = Cotizacion(numero=f"{MARK}-COTP", cliente="Cliente Peso"); db.add(cotP); db.flush()
+        ocpP = OcProveedor(numero=f"{MARK}-OCP-P", proveedor="PROV P", moneda="USD"); db.add(ocpP); db.flush()
+        embP = Embarque(numero=f"{MARK}-EMB-P", estado="en_bodega", forwarder="LATAM"); db.add(embP); db.flush()
+        # A: peso cotización 1.0 · B: peso cotización 3.0 · mismo FOB (100) → shipping solo por peso
+        itA = ItemCotizacion(cotizacion_id=cotP.id, numero_parte="PA-1", descripcion="A", cantidad=1, peso_unit_lbs=1.0, precio_unit_cotizacion=100); db.add(itA)
+        itB = ItemCotizacion(cotizacion_id=cotP.id, numero_parte="PB-1", descripcion="B", cantidad=1, peso_unit_lbs=3.0, precio_unit_cotizacion=100); db.add(itB); db.flush()
+        for it in (itA, itB):
+            oi = OcProveedorItem(oc_proveedor_id=ocpP.id, item_cotizacion_id=it.id); db.add(oi)
+            db.add(EmbarqueItem(embarque_id=embP.id, item_cotizacion_id=it.id, oc_proveedor_id=ocpP.id))
+        db.commit()
+
+        # Base: TC 1000, shipping 40.000 CLP, sin gastos → shipping 1:3 = 10.000 / 30.000
+        base = R.guardar_embarque_pricing(embP.id, R.PricingSaveIn(tc_valor=1000, flete_en_me=False, shipping_clp=40_000), db=db, current_user=user)
+        A = next(r for r in base["items"] if r["numero_parte"] == "PA-1")
+        B = next(r for r in base["items"] if r["numero_parte"] == "PB-1")
+        assert _aprox(A["shipping_clp"], 10_000) and _aprox(B["shipping_clp"], 30_000), (A["shipping_clp"], B["shipping_clp"])
+        assert A["peso_origen"] == "auto" and _aprox(A["peso_unit_lbs"], 1.0)
+        eiA = A["embarque_item_id"]
+
+        # 12a) Override peso A → 3.0: ahora 3:3 = 20.000 / 20.000; Σ shipping intacta (40.000)
+        d = R.guardar_embarque_pricing(embP.id, R.PricingSaveIn(items=[R.ItemOverrideIn(embarque_item_id=eiA, peso_unit_lbs=3.0, peso_manual=True)]), db=db, current_user=user)
+        A = next(r for r in d["items"] if r["embarque_item_id"] == eiA)
+        B = next(r for r in d["items"] if r["numero_parte"] == "PB-1")
+        assert _aprox(A["peso_unit_lbs"], 3.0) and A["peso_origen"] == "manual", A
+        assert _aprox(A["shipping_clp"], 20_000) and _aprox(B["shipping_clp"], 20_000), (A["shipping_clp"], B["shipping_clp"])
+        assert _aprox(A["shipping_clp"] + B["shipping_clp"], 40_000)
+        print("OK 12a) Override de peso re-prorratea el flete; Σ shipping intacta")
+
+        # 12b) Quitar override (peso_manual=False) → vuelve al peso de la cotización (1.0)
+        d = R.guardar_embarque_pricing(embP.id, R.PricingSaveIn(items=[R.ItemOverrideIn(embarque_item_id=eiA, peso_manual=False)]), db=db, current_user=user)
+        A = next(r for r in d["items"] if r["embarque_item_id"] == eiA)
+        assert _aprox(A["peso_unit_lbs"], 1.0) and A["peso_origen"] == "auto", A
+        assert _aprox(A["shipping_clp"], 10_000), A["shipping_clp"]
+        print("OK 12b) Quitar override vuelve al peso de la cotización")
+
+        # 12c) Manual <= 0 → auto (no pisa la cotización)
+        d = R.guardar_embarque_pricing(embP.id, R.PricingSaveIn(items=[R.ItemOverrideIn(embarque_item_id=eiA, peso_unit_lbs=0, peso_manual=True)]), db=db, current_user=user)
+        A = next(r for r in d["items"] if r["embarque_item_id"] == eiA)
+        assert _aprox(A["peso_unit_lbs"], 1.0) and A["peso_origen"] == "auto", A
+        print("OK 12c) Peso manual <= 0 se ignora (cae al peso de la cotización)")
+
+        # 12d) FOB manual + editar SOLO peso NO revierte el FOB (contrato tri-estado)
+        d = R.guardar_embarque_pricing(embP.id, R.PricingSaveIn(items=[R.ItemOverrideIn(embarque_item_id=eiA, fob_unit=555, fob_manual=True)]), db=db, current_user=user)
+        d = R.guardar_embarque_pricing(embP.id, R.PricingSaveIn(items=[R.ItemOverrideIn(embarque_item_id=eiA, peso_unit_lbs=2.0, peso_manual=True)]), db=db, current_user=user)
+        A = next(r for r in d["items"] if r["embarque_item_id"] == eiA)
+        assert _aprox(A["fob_unit"], 555) and A["fob_origen"] == "manual", ("FOB no debe revertirse al editar peso", A)
+        assert _aprox(A["peso_unit_lbs"], 2.0) and A["peso_origen"] == "manual", A
+        print("OK 12d) Editar solo el peso no revierte el FOB manual (overrides independientes)")
+
+        # 12e) Cerrado congela el peso manual; reabrir lo mantiene
+        R.cerrar_pricing(embP.id, db=db, current_user=user)
+        dc = R.detalle_embarque_pricing(embP.id, db=db, current_user=user)
+        A = next(r for r in dc["items"] if r["embarque_item_id"] == eiA)
+        assert A["peso_origen"] == "manual" and _aprox(A["peso_unit_lbs"], 2.0), ("snapshot debe congelar el peso", A)
+        assert A["peso_default"] == A["peso_unit_lbs"], "cerrado: default == valor congelado"
+        R.reabrir_pricing(embP.id, db=db, current_user=user)
+        print("OK 12e) Cerrado congela el peso manual (snapshot); reabrir lo mantiene")
+
+        # 12f) Todos los pesos de cotización en 0 → fallback por FOB sigue; override>0 domina
+        cotZ2 = Cotizacion(numero=f"{MARK}-COTZ2", cliente="Cli Z2"); db.add(cotZ2); db.flush()
+        ocpZ2 = OcProveedor(numero=f"{MARK}-OCP-Z2", proveedor="PROV Z2", moneda="USD"); db.add(ocpZ2); db.flush()
+        embZ2 = Embarque(numero=f"{MARK}-EMB-Z2", estado="en_bodega", forwarder="LATAM"); db.add(embZ2); db.flush()
+        izA = ItemCotizacion(cotizacion_id=cotZ2.id, numero_parte="ZA", descripcion="ZA", cantidad=1, peso_unit_lbs=0, precio_unit_cotizacion=100); db.add(izA)
+        izB = ItemCotizacion(cotizacion_id=cotZ2.id, numero_parte="ZB", descripcion="ZB", cantidad=1, peso_unit_lbs=0, precio_unit_cotizacion=100); db.add(izB); db.flush()
+        for it in (izA, izB):
+            db.add(OcProveedorItem(oc_proveedor_id=ocpZ2.id, item_cotizacion_id=it.id))
+            db.add(EmbarqueItem(embarque_id=embZ2.id, item_cotizacion_id=it.id, oc_proveedor_id=ocpZ2.id))
+        db.commit()
+        dz = R.guardar_embarque_pricing(embZ2.id, R.PricingSaveIn(tc_valor=1000, flete_en_me=False, shipping_clp=40_000), db=db, current_user=user)
+        # Sin peso en ninguno → shipping por FOB (iguales) → 20.000 / 20.000
+        assert _aprox(sum(r["shipping_clp"] for r in dz["items"]), 40_000)
+        for r in dz["items"]:
+            assert _aprox(r["shipping_clp"], 20_000), r["shipping_clp"]
+        eiZA = next(r for r in dz["items"] if r["numero_parte"] == "ZA")["embarque_item_id"]
+        # Override peso ZA=5 (único con peso) → se lleva TODO el shipping
+        dz = R.guardar_embarque_pricing(embZ2.id, R.PricingSaveIn(items=[R.ItemOverrideIn(embarque_item_id=eiZA, peso_unit_lbs=5, peso_manual=True)]), db=db, current_user=user)
+        za = next(r for r in dz["items"] if r["embarque_item_id"] == eiZA)
+        assert _aprox(za["shipping_clp"], 40_000), za["shipping_clp"]
+        print("OK 12f) Cotización con pesos 0 → fallback por FOB; un override de peso>0 domina el prorrateo")
+
         print("\n✅ Integración OK")
     finally:
         try:

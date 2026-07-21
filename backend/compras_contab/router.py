@@ -12,16 +12,19 @@ from typing import Optional, List, Tuple
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, case, and_, or_
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from database import get_db
 from auth import get_current_user
 from empresa_guard import require_empresa
-from models.models import User, Proveedor, Embarque, EmbarqueItem, OcProveedor
-from embarques_pricing.models import EmbarquePricing, EmbarquePricingGasto
+from models.models import (
+    User, Proveedor, Embarque, EmbarqueItem, OcProveedor, OcProveedorItem,
+    ItemCotizacion,
+)
+from embarques_pricing.models import EmbarquePricing, EmbarquePricingGasto, EmbarquePricingItem
 
-from .models import ContCompra, ContEgreso, ContEgresoDetalle, ContPlanCuenta
-from .schemas import CompraCreate, PagoIn, EgresoCreate, EgresoUpdate, AnularIn
+from .models import ContCompra, ContEgreso, ContEgresoDetalle, ContPlanCuenta, ContCompraItem
+from .schemas import CompraCreate, CompraItemIn, PagoIn, EgresoCreate, EgresoUpdate, AnularIn
 from .service import (
     IVA_RATE, TOL, TOL_PAGO, TIPOS_GASTO, TIPO_GASTO_LABEL,
     CATEGORIAS_SUGERIDAS, MEDIOS_PAGO, ESTADOS_PAGO, CUENTA_DEFAULT_CODIGO,
@@ -216,6 +219,9 @@ def listar_compras(
     rows = (
         base.options(
             selectinload(ContCompra.cuenta),
+            # Detalle de costeo por ítem (compra nacional): sin esta carga ansiosa era
+            # 1 query por compra al serializar sus items (N+1).
+            selectinload(ContCompra.items),
             # cadena completa hasta ContEgreso.detalles: _serialize_pago usa
             # len(e.detalles) y sin esta carga ansiosa era 1 query por egreso (N+1)
             selectinload(ContCompra.egreso_detalles)
@@ -233,6 +239,150 @@ def listar_compras(
     }
 
 
+# ─── Costeo por ítem de la compra NACIONAL (cont_compra_item) ───────────────────
+# Tolerancia en UNIDADES (no en CLP): TOL_PAGO=1 peso serviría de holgura de dinero,
+# pero como epsilon de cantidad dejaría costear 1 unidad de más que lo recibido. Las
+# cantidades son Numeric(12,4); 1e-3 absorbe el ruido de float sin abrir un hueco real.
+TOL_QTY = 0.001
+
+
+def _recibido_nacional(db: Session, item_ids, con_lock: bool = False) -> dict:
+    """{item_cotizacion_id: Σ qty_recibida utilizable} de recepciones nacionales CERRADAS.
+    Tope de la cantidad que se puede costear por ítem. Batch (import local para no
+    cablear recepcion_nacional al importar este módulo).
+
+    con_lock=True (guards del costeo): lectura BLOQUEANTE fila a fila (current
+    read) sumada en Python. Bajo REPEATABLE READ una lectura normal NO vería una
+    anulación de recepción commiteada después de nacer el snapshot — un costeo
+    concurrente a la anulación costeaba contra un recibido ya borrado (write-skew,
+    revisión G13). El lock además serializa contra anular_recepcion."""
+    if not item_ids:
+        return {}
+    from recepcion_nacional.models import (
+        RecepcionNacional, RecepcionNacionalItem, RECEPCION_UTILIZABLE,
+    )
+    q = (db.query(RecepcionNacionalItem.item_cotizacion_id,
+                  RecepcionNacionalItem.qty_recibida)
+         .join(RecepcionNacional, RecepcionNacional.id == RecepcionNacionalItem.recepcion_id)
+         .filter(RecepcionNacionalItem.item_cotizacion_id.in_(item_ids),
+                 RecepcionNacional.estado == "cerrada",
+                 RecepcionNacionalItem.estado_recepcion.in_(RECEPCION_UTILIZABLE)))
+    if con_lock:
+        q = q.with_for_update()
+    out: dict = {}
+    for iid, qty in q.all():
+        if iid is not None:
+            out[iid] = out.get(iid, 0.0) + _f(qty)
+    return out
+
+
+def _crear_items_costeo(db: Session, compra: ContCompra, payload: CompraCreate, empresa: str) -> None:
+    """Crea las líneas cont_compra_item de una compra nacional, con los guards:
+      A) doble costeo internacional (ítem con emb_pricing_item) → 409.
+      B) doble costeo nacional (Σ cantidad en otras compras ACTIVAS + esta) ≤ recibido.
+      C) Σ cantidad costeada por ítem ≤ recibido nacional utilizable → 409.
+      D) Σ líneas costeadas (CLP) ≤ neto CLP de la factura (cobertura parcial OK) → 400.
+      E) cada ítem pertenece a la OC-Proveedor referenciada → 400.
+    El costo por ítem = NETO en CLP (el IVA es crédito fiscal, NO capitaliza).
+
+    Serializa el costeo igual que despachos/pagos: bloquea las filas ItemCotizacion
+    costeadas con SELECT ... FOR UPDATE y RELEE lo ya costeado con lock. Sin esto, dos
+    costeos concurrentes del MISMO ítem leen ambos 'ya costeado = 0', pasan el tope
+    'Σ ≤ recibido' y sobre-costean (capitalizan a Existencias más unidades que las
+    recibidas)."""
+    ocp = None
+    asignados = None  # item_cotizacion_id asignados a la OC (validación de pertenencia)
+    if payload.oc_proveedor_id:
+        ocp = db.query(OcProveedor).filter(OcProveedor.id == payload.oc_proveedor_id).first()
+        if not ocp:
+            raise HTTPException(404, "OC-Proveedor no encontrada")
+        if (ocp.tipo_origen or "internacional") != "nacional":
+            raise HTTPException(400, "El detalle por ítem solo aplica a una OC nacional")
+        compra.oc_proveedor_id = ocp.id
+        # Guard E — pertenencia: los ítems costeados deben estar asignados a ESTA OC.
+        # No se puede costear un ítem de OTRA OC-Proveedor bajo esta factura (mezclaría
+        # trazabilidad y burlaría el tope, que es por ítem, no por OC). Espejo del
+        # control de recepcion_nacional.registrar_entrega ("no pertenece a esta OC").
+        asignados = {r[0] for r in db.query(OcProveedorItem.item_cotizacion_id)
+                     .filter(OcProveedorItem.oc_proveedor_id == ocp.id).all()}
+
+    tc = _f(compra.tc) or 1.0
+    neto_clp = round(_f(compra.monto_neto) * tc, 2)
+    ids = [ln.item_cotizacion_id for ln in payload.items]
+
+    # ── Serialización del costeo (patrón despachos/pagos) ──
+    # Lock de las filas ItemCotizacion costeadas, en orden por id (mismo orden que usa
+    # despachos.py, que lockea estas mismas filas → sin deadlock). Dos costeos
+    # concurrentes del MISMO ítem se serializan aquí: el segundo espera y recién
+    # entonces relee `ya_nac` viendo la fila que el primero ya commiteó.
+    # populate_existing(): sin él, el identity map devolvería el snapshot viejo aunque
+    # el lock haya esperado.
+    if ids:
+        (db.query(ItemCotizacion)
+         .filter(ItemCotizacion.id.in_(ids))
+         .order_by(ItemCotizacion.id.asc())
+         .populate_existing().with_for_update().all())
+
+    # Guard A — ítems ya con costo internacional (embarque)
+    ya_intl = {r[0] for r in db.query(EmbarquePricingItem.item_cotizacion_id)
+               .filter(EmbarquePricingItem.item_cotizacion_id.in_(ids)).all()}
+    # Guard B/C — cantidad ya costeada en OTRAS compras nacionales ACTIVAS. LECTURA CON
+    # LOCK (with_for_update): bajo REPEATABLE READ, sin el lock el snapshot NO vería las
+    # filas commiteadas por un costeo concurrente que ya cruzó el gate del ItemCotizacion
+    # → sobre-costeo. Se suma en Python (FOR UPDATE + agregado SQL no combinan; espejo de
+    # despachos._qty_already_dispatched con con_lock=True).
+    ya_nac: dict = {}
+    for iid, cant in (db.query(ContCompraItem.item_cotizacion_id, ContCompraItem.cantidad)
+                      .join(ContCompra, ContCompra.id == ContCompraItem.compra_id)
+                      .filter(ContCompraItem.item_cotizacion_id.in_(ids),
+                              ContCompra.empresa == empresa, ContCompra.anulado.is_(False))
+                      .with_for_update().all()):
+        ya_nac[iid] = ya_nac.get(iid, 0.0) + _f(cant)
+    # Guard C — recibido nacional utilizable (tope de cantidad costeable)
+    recibido = _recibido_nacional(db, ids, con_lock=True)
+
+    vistos, suma = set(), 0.0
+    for ln in payload.items:
+        iid = ln.item_cotizacion_id
+        if iid in vistos:
+            raise HTTPException(400, f"El ítem {iid} aparece dos veces en el detalle")
+        vistos.add(iid)
+        if asignados is not None and iid not in asignados:
+            raise HTTPException(
+                400,
+                f"El ítem {ln.numero_parte or iid} no pertenece a la OC-Proveedor "
+                f"{ocp.numero or ocp.id}")
+        if iid in ya_intl:
+            raise HTTPException(
+                409,
+                f"El ítem {iid} ya tiene costo internacional (embarque); no puede "
+                "costearse como nacional")
+        cu = round(_f(ln.precio_unit) * tc, 2)
+        ct = round(_f(ln.cantidad) * cu, 2)
+        suma += ct
+        acumulada = ya_nac.get(iid, 0.0) + _f(ln.cantidad)
+        recib = recibido.get(iid, 0.0)
+        if acumulada > recib + TOL_QTY:
+            raise HTTPException(
+                409,
+                f"Ítem {ln.numero_parte or iid}: cantidad costeada acumulada "
+                f"({acumulada:g}) supera lo recibido en bodega ({recib:g}). "
+                "Registre primero la recepción nacional.")
+        db.add(ContCompraItem(
+            compra_id=compra.id, item_cotizacion_id=iid,
+            oc_proveedor_id=compra.oc_proveedor_id, oc_proveedor_item_id=ln.oc_proveedor_item_id,
+            numero_parte=ln.numero_parte, descripcion=ln.descripcion,
+            cantidad=_f(ln.cantidad), precio_unit=_f(ln.precio_unit),
+            costo_unit_clp=cu, costo_total_clp=ct))
+
+    # Guard D — Σ líneas ≤ neto CLP (cobertura parcial permitida; nunca superar el neto)
+    if round(suma, 2) > neto_clp + 1.0:
+        raise HTTPException(
+            400,
+            f"La suma de líneas costeadas ({suma:.0f}) supera el neto de la factura "
+            f"({neto_clp:.0f})")
+
+
 # ─── Crear compra ──────────────────────────────────────────────────────────────
 @router.post("")
 def crear_compra(
@@ -240,6 +390,24 @@ def crear_compra(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # Los locks del costeo nacional (ItemCotizacion + rangos de cont_compra_item)
+    # pueden DEADLOCKEAR entre dos compras simultáneas incluso de ítems DISTINTOS
+    # (gap locks de InnoDB sobre el índice). MySQL mata una transacción (1213); se
+    # reintenta completa en vez de devolver un 500 al operador — mismo patrón que
+    # el retry de correlativo en create_despacho. 1205 = lock wait timeout.
+    for _ in range(3):
+        try:
+            return _crear_compra_tx(payload, db, current_user)
+        except OperationalError as e:
+            db.rollback()
+            args = getattr(getattr(e, "orig", None), "args", None) or []
+            if not args or args[0] not in (1213, 1205):
+                raise
+    raise HTTPException(
+        409, "Conflicto momentáneo al registrar la compra (registros simultáneos): reintente")
+
+
+def _crear_compra_tx(payload: CompraCreate, db: Session, current_user: User):
     empresa = empresa_de(current_user)
     if payload.tipo_gasto not in TIPOS_GASTO:
         raise HTTPException(400, f"tipo_gasto inválido: {payload.tipo_gasto}")
@@ -332,6 +500,10 @@ def crear_compra(
     try:
         db.add(compra)
         db.flush()
+        # Detalle de costeo por ítem (compra nacional): la factura ES el costo de esos
+        # repuestos. Los guards (doble costeo, Σ≤neto, Σ costeado≤recibido) validan aquí.
+        if payload.items:
+            _crear_items_costeo(db, compra, payload, empresa)
         uid = getattr(current_user, "id", None)
         pago = payload.pago
         # Para compras en moneda extranjera, el TC de la compra viaja al egreso/detalle
@@ -454,6 +626,70 @@ def costos_embarque(db: Session = Depends(get_db), current_user: User = Depends(
             "banco": g.banco, "capitaliza": bool(g.capitaliza),
         })
     return {"costos": out, "total_clp": round(sum(r["monto_total"] for r in out), 0), "n": len(out)}
+
+
+# ─── Catálogo de OC nacionales costeables (para el detalle por ítem del front) ──
+@router.get("/oc-nacionales")
+def oc_nacionales(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """OCs con `tipo_origen='nacional'` y sus ítems costeables. Para cada ítem:
+    cantidad (vendida), recibido (nacional utilizable), ya_costeado (Σ cont_compra_item
+    activas) y disponible_costear = max(min(recibido, cantidad) − ya_costeado, 0).
+    Batch, sin N+1."""
+    from collections import defaultdict
+    empresa = empresa_de(current_user)
+    ocps = (db.query(OcProveedor)
+            .filter(OcProveedor.tipo_origen == "nacional")
+            .order_by(OcProveedor.id.desc()).all())
+    if not ocps:
+        return {"ocs": []}
+    ocp_ids = [o.id for o in ocps]
+    asigns = (db.query(OcProveedorItem)
+              .filter(OcProveedorItem.oc_proveedor_id.in_(ocp_ids)).all())
+    item_ids = [a.item_cotizacion_id for a in asigns if a.item_cotizacion_id is not None]
+    items = ({it.id: it for it in db.query(ItemCotizacion)
+              .filter(ItemCotizacion.id.in_(item_ids)).all()} if item_ids else {})
+    recibido = _recibido_nacional(db, item_ids)
+    ya_cost = ({i: _f(q) for i, q in (
+        db.query(ContCompraItem.item_cotizacion_id,
+                 func.coalesce(func.sum(ContCompraItem.cantidad), 0))
+        .join(ContCompra, ContCompra.id == ContCompraItem.compra_id)
+        .filter(ContCompraItem.item_cotizacion_id.in_(item_ids),
+                ContCompra.empresa == empresa, ContCompra.anulado.is_(False))
+        .group_by(ContCompraItem.item_cotizacion_id).all())} if item_ids else {})
+
+    by_ocp = defaultdict(list)
+    for a in asigns:
+        by_ocp[a.oc_proveedor_id].append(a)
+
+    out = []
+    for o in ocps:
+        item_list = []
+        for a in by_ocp.get(o.id, []):
+            it = items.get(a.item_cotizacion_id)
+            if not it:
+                continue
+            cant = _f(it.cantidad)
+            recib = recibido.get(it.id, 0.0)
+            costeado = ya_cost.get(it.id, 0.0)
+            item_list.append({
+                "item_cotizacion_id": it.id,
+                "oc_proveedor_item_id": a.id,
+                "numero_parte": it.numero_parte,
+                "descripcion": it.descripcion,
+                "cantidad": cant,
+                "recibido": recib,
+                "ya_costeado": costeado,
+                "disponible_costear": max(min(recib, cant) - costeado, 0.0),
+            })
+        out.append({
+            "oc_proveedor_id": o.id,
+            "numero": o.numero,
+            "numero_oc": o.numero_oc,
+            "proveedor": o.proveedor,
+            "moneda": o.moneda,
+            "items": item_list,
+        })
+    return {"ocs": out}
 
 
 # ─── Egresos (pago consolidado / listado) ──────────────────────────────────────

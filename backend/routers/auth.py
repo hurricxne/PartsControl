@@ -59,3 +59,22 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
 @router.get("/me")
 def me(current_user: User = Depends(get_current_user)):
     return {"id": current_user.id, "email": current_user.email, "nombre": current_user.nombre, "empresa": current_user.empresa or "mineria"}
+
+
+@router.get("/users")
+def listar_usuarios(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Usuarios activos de la misma empresa — alimenta los selectores de 'asesor responsable'."""
+    empresa = current_user.empresa or "mineria"
+    usuarios = (
+        db.query(User)
+        .filter(User.is_active == 1, User.empresa == empresa)
+        .order_by(User.nombre)
+        .all()
+    )
+    return [
+        {"id": u.id, "nombre": u.nombre, "email": u.email, "empresa": u.empresa or "mineria"}
+        for u in usuarios
+    ]

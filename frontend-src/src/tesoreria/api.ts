@@ -3,7 +3,8 @@
 import api from '../services/api'
 import type {
   Cuenta, MovListResp, EgresosResp, CobranzasResp, Resumen, Cartola, Movimiento,
-  EgresoMatch, CobranzaMatch, PorPagarResp, FlujoCaja,
+  EgresoMatch, CobranzaMatch, AdelantoMatch, PorPagarResp, FlujoCaja,
+  AprobacionesResp,
 } from './types'
 
 // Payloads (espejo de los schemas Pydantic del backend)
@@ -25,6 +26,16 @@ export interface MovimientoPayload {
   referencia?: string
   saldo?: number
   cartola_id?: number
+}
+
+// Espejo de tesoreria.schemas.AprobarAdelantoIn (Tesorería confirma la plata del
+// adelanto SIN exigir cartola; la conciliación con el abono viene después).
+export interface AprobarAdelantoPayload {
+  monto: number
+  fecha_pago?: string
+  banco?: string
+  numero_operacion?: string
+  observaciones?: string
 }
 
 // Espejo de compras_contab.schemas.EgresoCreate (Tesorería aprueba el pago con la
@@ -70,21 +81,30 @@ export const tesoreriaAPI = {
   crearMovimiento: (data: MovimientoPayload) => api.post<Movimiento>('/tesoreria/movimientos', data),
   eliminarMovimiento: (id: number) => api.delete(`/tesoreria/movimientos/${id}`),
 
-  // Conciliación (movimiento ↔ egreso / cobranza)
+  // Conciliación (movimiento ↔ egreso / cobranza / adelanto)
   sugerencias: (movId: number) =>
-    api.get<{ movimiento_id: number; monto?: number; sugerencias: (EgresoMatch | CobranzaMatch)[]; nota?: string }>(`/tesoreria/movimientos/${movId}/sugerencias`),
+    api.get<{ movimiento_id: number; monto?: number; sugerencias: (EgresoMatch | CobranzaMatch | AdelantoMatch)[]; nota?: string }>(`/tesoreria/movimientos/${movId}/sugerencias`),
   conciliarEgreso: (movId: number, egresoId: number) =>
     api.post<Movimiento>(`/tesoreria/movimientos/${movId}/conciliar`, { egreso_id: egresoId }),
   conciliarCobranza: (movId: number, cobranzaId: number) =>
     api.post<Movimiento>(`/tesoreria/movimientos/${movId}/conciliar`, { cobranza_id: cobranzaId }),
+  conciliarAdelanto: (movId: number, adelantoId: number) =>
+    api.post<Movimiento>(`/tesoreria/movimientos/${movId}/conciliar`, { adelanto_id: adelantoId }),
   desconciliar: (movId: number) => api.post<Movimiento>(`/tesoreria/movimientos/${movId}/desconciliar`),
   egresosPendientes: (q?: string, page = 1) => api.get<EgresosResp>('/tesoreria/egresos-pendientes', { params: { q, page } }),
   cobranzasPendientes: (q?: string, page = 1) => api.get<CobranzasResp>('/tesoreria/cobranzas-pendientes', { params: { q, page } }),
+  adelantosPendientes: () =>
+    api.get<{ adelantos: AdelantoMatch[]; total: number }>('/tesoreria/adelantos-pendientes'),
 
   // Por pagar / aprobar pagos
   porPagar: (params?: { q?: string; page?: number; page_size?: number }) =>
     api.get<PorPagarResp>('/tesoreria/por-pagar', { params }),
   aprobarPago: (data: PagoPayload) => api.post('/tesoreria/pagos', data),
+
+  // Aprobación de adelantos de cliente (la ORDEN la da Tesorería; sin exigir cartola)
+  aprobaciones: () => api.get<AprobacionesResp>('/tesoreria/aprobaciones'),
+  aprobarAdelanto: (adelantoId: number, data: AprobarAdelantoPayload) =>
+    api.post(`/tesoreria/adelantos/${adelantoId}/aprobar`, data),
 
   // Flujo de caja NIC 7
   flujoCaja: () => api.get<FlujoCaja>('/tesoreria/flujo-caja'),

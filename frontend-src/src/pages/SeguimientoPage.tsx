@@ -2,10 +2,10 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Package, CheckCircle2, ChevronDown, ChevronRight,
   Loader2, Check, AlertTriangle, Receipt,
-  FileText, Upload, Plus, Trash2, X, Edit2,
+  FileText, Upload, Plus, Trash2, X, Edit2, Truck,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
-import { comprasAPI, facturasAPI } from '../services/api'
+import { comprasAPI, facturasAPI, recepcionNacionalAPI, despachosAPI } from '../services/api'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -42,8 +42,35 @@ interface OcpGroup {
   proveedor: string
   numero_oc_prov: string
   numero_oc: string
+  tipo_origen?: string   // 'nacional' → CTA "Registrar entrega nacional" (salta embarque)
   items: SeguimientoItem[]
 }
+
+// ── Recepción nacional (pendientes por recibir de una OC nacional) ─────────────
+interface PendienteNacionalItem {
+  item_cotizacion_id: number
+  oc_proveedor_item_id: number | null
+  numero_parte: string | null
+  descripcion: string | null
+  estado_item: string
+  cantidad: number
+  recibido: number
+  remanente: number
+}
+
+// Los 6 estados de recepción. Los "utilizables" (suman al tope físico en Despachos)
+// exigen cantidad > 0; no_llego / dañado_no_utilizable no cuentan (quedan 'comprado').
+const ESTADOS_RECEPCION: { value: string; label: string; utilizable: boolean }[] = [
+  { value: 'completo',              label: 'Completo',                utilizable: true },
+  { value: 'faltante',              label: 'Faltante (llegó menos)',  utilizable: true },
+  { value: 'sobrante',              label: 'Sobrante (llegó más)',    utilizable: true },
+  { value: 'danado_utilizable',     label: 'Dañado pero utilizable',  utilizable: true },
+  { value: 'danado_no_utilizable',  label: 'Dañado no utilizable',    utilizable: false },
+  { value: 'no_llego',              label: 'No llegó',                utilizable: false },
+]
+const ESTADO_UTILIZABLE = new Set(
+  ESTADOS_RECEPCION.filter(e => e.utilizable).map(e => e.value)
+)
 
 // ── Factura types ─────────────────────────────────────────────────────────────
 
@@ -565,10 +592,283 @@ function FacturasPanel({ ocpId, ocpItems }: { ocpId: number; ocpItems: Seguimien
   )
 }
 
+// ── RegistrarEntregaNacionalModal ─────────────────────────────────────────────
+// El proveedor nacional llega con su camión y su guía de despacho. Bodega registra
+// cuánto llegó de cada ítem; al cerrar (cerrar:true) los utilizables con qty>0 pasan
+// a en_bodega y quedan despachables, capados por lo recibido. Salta preparado /
+// pre-embarque / embarque. Fuente: GET /recepcion-nacional/pendientes/{ocp_id}.
+
+interface RowEntrega { incluir: boolean; qty: string; estado: string }
+
+function RegistrarEntregaNacionalModal({
+  ocpId, titulo, onClose, onSuccess,
+}: {
+  ocpId: number
+  titulo: string
+  onClose: () => void
+  onSuccess: () => void
+}) {
+  const hoy = () => {
+    const d = new Date()
+    const off = d.getTimezoneOffset()
+    return new Date(d.getTime() - off * 60_000).toISOString().slice(0, 10)
+  }
+  const [pendientes, setPendientes] = useState<PendienteNacionalItem[]>([])
+  const [rows, setRows] = useState<Record<number, RowEntrega>>({})
+  const [loading, setLoading] = useState(true)
+  const [numeroGuia, setNumeroGuia] = useState('')
+  const [fecha, setFecha] = useState(hoy())
+  const [documento, setDocumento] = useState<string | null>(null)
+  const [docNombre, setDocNombre] = useState<string | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    setLoading(true)
+    recepcionNacionalAPI.pendientes(ocpId)
+      .then(({ data }) => {
+        const items: PendienteNacionalItem[] = data.items || []
+        setPendientes(items)
+        const init: Record<number, RowEntrega> = {}
+        items.forEach(it => {
+          init[it.item_cotizacion_id] = {
+            incluir: it.remanente > 0,
+            qty: it.remanente > 0 ? String(it.remanente) : '',
+            estado: 'completo',
+          }
+        })
+        setRows(init)
+      })
+      .catch((e: any) => toast.error(e?.response?.data?.detail || 'Error al cargar ítems pendientes'))
+      .finally(() => setLoading(false))
+  }, [ocpId])
+
+  const setRow = (id: number, patch: Partial<RowEntrega>) =>
+    setRows(prev => ({ ...prev, [id]: { ...prev[id], ...patch } }))
+
+  const onEstadoChange = (id: number, estado: string) => {
+    // 'No llegó' no cuenta al tope: fuerza cantidad 0 y bloquea el input.
+    if (estado === 'no_llego') setRow(id, { estado, qty: '0' })
+    else setRow(id, { estado })
+  }
+
+  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setUploading(true)
+    try {
+      const data = await despachosAPI.uploadDoc(file)
+      setDocumento(data.filename)
+      setDocNombre(data.original || file.name)
+      toast.success('Guía adjuntada')
+    } catch (err: any) {
+      toast.error(err?.response?.data?.detail || 'Error al subir la guía')
+    } finally {
+      setUploading(false)
+      if (fileRef.current) fileRef.current.value = ''
+    }
+  }
+
+  const incluidos = pendientes.filter(it => rows[it.item_cotizacion_id]?.incluir)
+
+  const submit = async () => {
+    if (incluidos.length === 0) {
+      toast.error('Marca al menos un ítem que haya llegado en esta entrega')
+      return
+    }
+    // Validación espejo del backend: un estado utilizable exige cantidad > 0.
+    for (const it of incluidos) {
+      const r = rows[it.item_cotizacion_id]
+      const qty = Number(r.qty)
+      if (isNaN(qty) || qty < 0) {
+        toast.error(`Cantidad inválida en ${it.numero_parte || it.item_cotizacion_id}`)
+        return
+      }
+      if (ESTADO_UTILIZABLE.has(r.estado) && qty <= 0) {
+        toast.error(`${it.numero_parte || it.item_cotizacion_id}: "${ESTADOS_RECEPCION.find(e => e.value === r.estado)?.label}" exige cantidad mayor a 0`)
+        return
+      }
+    }
+    setSaving(true)
+    try {
+      await recepcionNacionalAPI.registrar({
+        oc_proveedor_id: ocpId,
+        numero_guia_proveedor: numeroGuia.trim() || undefined,
+        fecha: fecha || undefined,
+        documento: documento || undefined,
+        cerrar: true,
+        items: incluidos.map(it => ({
+          item_cotizacion_id: it.item_cotizacion_id,
+          qty_recibida: Number(rows[it.item_cotizacion_id].qty) || 0,
+          estado_recepcion: rows[it.item_cotizacion_id].estado,
+        })),
+      })
+      toast.success('Entrega nacional registrada')
+      onSuccess()
+    } catch (e: any) {
+      toast.error(e?.response?.data?.detail || 'Error al registrar la entrega')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)' }}
+      onClick={e => { if (e.target === e.currentTarget) onClose() }}
+    >
+      <div
+        className="w-full max-w-2xl rounded-2xl border shadow-2xl p-6 space-y-5 max-h-[90vh] overflow-y-auto"
+        style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}
+      >
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="w-9 h-9 rounded-xl bg-brand-500/10 flex items-center justify-center shrink-0">
+              <Truck className="w-4 h-4 text-brand-400" />
+            </div>
+            <div>
+              <h3 className="font-semibold text-base" style={{ color: 'var(--text-primary)' }}>
+                Registrar entrega nacional
+              </h3>
+              <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{titulo}</p>
+            </div>
+          </div>
+          <button onClick={onClose} className="rounded-lg p-1 hover:bg-[var(--surface-200)] transition-colors">
+            <X className="w-4 h-4" style={{ color: 'var(--text-muted)' }} />
+          </button>
+        </div>
+
+        {/* Cabecera de la guía */}
+        <div className="grid sm:grid-cols-3 gap-3">
+          <div>
+            <label className="block text-[11px] font-semibold uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>
+              N° guía del proveedor
+            </label>
+            <input className="input w-full" placeholder="Ej: 12345" value={numeroGuia} onChange={e => setNumeroGuia(e.target.value)} />
+          </div>
+          <div>
+            <label className="block text-[11px] font-semibold uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>
+              Fecha de recepción
+            </label>
+            <input type="date" className="input w-full" value={fecha} onChange={e => setFecha(e.target.value)} />
+          </div>
+          <div>
+            <label className="block text-[11px] font-semibold uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>
+              Guía escaneada (opcional)
+            </label>
+            <input ref={fileRef} type="file" className="hidden"
+              accept=".pdf,.jpg,.jpeg,.png,.webp" onChange={handleUpload} />
+            <button type="button" onClick={() => fileRef.current?.click()} disabled={uploading}
+              className="w-full flex items-center justify-center gap-1.5 text-xs px-2 py-2 rounded-lg border transition-colors hover:bg-[var(--surface-200)] disabled:opacity-50"
+              style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
+              {uploading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
+              {documento ? 'Cambiar' : 'Adjuntar'}
+            </button>
+            {docNombre && (
+              <p className="text-[10px] mt-1 flex items-center gap-1 truncate" style={{ color: 'var(--text-faint)' }} title={docNombre}>
+                <FileText className="w-2.5 h-2.5 shrink-0" /> {docNombre}
+              </p>
+            )}
+          </div>
+        </div>
+
+        {/* Ítems por recibir */}
+        {loading ? (
+          <div className="flex justify-center py-8">
+            <Loader2 className="w-6 h-6 animate-spin" style={{ color: 'var(--text-faint)' }} />
+          </div>
+        ) : pendientes.length === 0 ? (
+          <p className="text-xs text-center py-6" style={{ color: 'var(--text-faint)' }}>
+            No hay ítems pendientes de recibir en esta OC nacional.
+          </p>
+        ) : (
+          <div className="rounded-xl border overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr style={{ backgroundColor: 'var(--surface-200)', borderBottom: '1px solid var(--border)' }}>
+                    <th className="px-3 py-2 w-8">
+                      <input type="checkbox"
+                        checked={incluidos.length === pendientes.length && pendientes.length > 0}
+                        onChange={e => {
+                          const val = e.target.checked
+                          setRows(prev => {
+                            const next = { ...prev }
+                            pendientes.forEach(it => { next[it.item_cotizacion_id] = { ...next[it.item_cotizacion_id], incluir: val } })
+                            return next
+                          })
+                        }}
+                        className="rounded" />
+                    </th>
+                    {['N° Parte', 'Descripción', 'Vendido', 'Recibido', 'Remanente', 'Llegó (qty)', 'Estado'].map(h => (
+                      <th key={h} className="px-3 py-2 text-left font-semibold uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {pendientes.map((it, idx) => {
+                    const r = rows[it.item_cotizacion_id] || { incluir: false, qty: '', estado: 'completo' }
+                    const noLlego = r.estado === 'no_llego'
+                    return (
+                      <tr key={it.item_cotizacion_id}
+                        style={{ borderBottom: idx < pendientes.length - 1 ? '1px solid var(--border)' : undefined, opacity: r.incluir ? 1 : 0.5 }}>
+                        <td className="px-3 py-2">
+                          <input type="checkbox" checked={r.incluir}
+                            onChange={() => setRow(it.item_cotizacion_id, { incluir: !r.incluir })} className="rounded" />
+                        </td>
+                        <td className="px-3 py-2 font-mono text-brand-400 font-semibold whitespace-nowrap">{it.numero_parte || '—'}</td>
+                        <td className="px-3 py-2 max-w-[160px] truncate" style={{ color: 'var(--text-primary)' }} title={it.descripcion || ''}>{it.descripcion || '—'}</td>
+                        <td className="px-3 py-2 text-center" style={{ color: 'var(--text-muted)' }}>{it.cantidad}</td>
+                        <td className="px-3 py-2 text-center" style={{ color: 'var(--text-muted)' }}>{it.recibido || 0}</td>
+                        <td className="px-3 py-2 text-center font-semibold" style={{ color: 'var(--text-primary)' }}>{it.remanente}</td>
+                        <td className="px-3 py-2">
+                          <input type="number" min="0" step="any"
+                            className="input w-20 py-1 text-xs"
+                            value={r.qty}
+                            disabled={!r.incluir || noLlego}
+                            onChange={e => setRow(it.item_cotizacion_id, { qty: e.target.value })} />
+                        </td>
+                        <td className="px-3 py-2">
+                          <select className="input py-1 text-xs" value={r.estado}
+                            disabled={!r.incluir}
+                            onChange={e => onEstadoChange(it.item_cotizacion_id, e.target.value)}>
+                            {ESTADOS_RECEPCION.map(e => <option key={e.value} value={e.value}>{e.label}</option>)}
+                          </select>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        <p className="text-[11px]" style={{ color: 'var(--text-faint)' }}>
+          Al registrar, los ítems utilizables con cantidad recibida pasan a bodega y quedan
+          despachables (topeados por lo recibido). "No llegó" y "Dañado no utilizable" no cuentan
+          y siguen pendientes.
+        </p>
+
+        <div className="flex gap-3 pt-1">
+          <button onClick={onClose} className="btn-secondary flex-1">Cancelar</button>
+          <button onClick={submit} disabled={saving || loading || incluidos.length === 0}
+            className="btn-primary flex-1 flex items-center justify-center gap-2 disabled:opacity-50">
+            {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Truck className="w-4 h-4" />}
+            {saving ? 'Registrando...' : `Registrar entrega (${incluidos.length})`}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── OcpGroupCard ──────────────────────────────────────────────────────────────
 
 function OcpGroupCard({
-  group, selectedIds, onToggleItem, onToggleAll, onMarcarPreparado, saving,
+  group, selectedIds, onToggleItem, onToggleAll, onMarcarPreparado, saving, onRefresh,
 }: {
   group: OcpGroup
   selectedIds: Set<number>
@@ -576,8 +876,14 @@ function OcpGroupCard({
   onToggleAll: (group: OcpGroup) => void
   onMarcarPreparado: (items: { item_id: number; cantidad?: number }[]) => void
   saving: boolean
+  onRefresh: () => void
 }) {
   const [expanded, setExpanded] = useState(true)
+  const [showEntrega, setShowEntrega] = useState(false)
+  // Camino físico nacional: el flujo salta preparado/pre-embarque/embarque. En su lugar,
+  // Bodega registra la entrega del camión (guía del proveedor) y los ítems recibidos
+  // pasan directo a en_bodega, despachables.
+  const esNacional = group.tipo_origen === 'nacional' && group.oc_proveedor_id != null
   const [qtyEdits, setQtyEdits] = useState<Record<number, string>>({})
   const [usdEdits, setUsdEdits] = useState<Record<number, string>>({})
   const [savingUsd, setSavingUsd] = useState<Record<number, boolean>>({})
@@ -624,12 +930,22 @@ function OcpGroupCard({
           <p className="text-sm font-medium mt-0.5" style={{ color: 'var(--text-primary)' }}>
             {group.oc_proveedor_nombre || group.proveedor}
           </p>
-          <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
-            {group.items.length} ítem(s) en estado <span className="text-amber-400 font-semibold">comprado</span>
+          <p className="text-xs mt-0.5 flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
+            {esNacional && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-brand-500/15 text-brand-400">
+                <Truck className="w-2.5 h-2.5" /> Nacional
+              </span>
+            )}
+            <span>{group.items.length} ítem(s) en estado <span className="text-amber-400 font-semibold">comprado</span></span>
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          {selectedInGroup.length > 0 && (
+          {esNacional ? (
+            <button onClick={e => { e.stopPropagation(); setShowEntrega(true) }}
+              className="btn-primary text-xs px-3 py-1.5 flex items-center gap-1">
+              <Truck className="w-3 h-3" /> Registrar entrega nacional
+            </button>
+          ) : selectedInGroup.length > 0 && (
             <button onClick={e => { e.stopPropagation(); onMarcarPreparado(selectedInGroup.map(id => ({ item_id: id, cantidad: qtyEdits[id] ? parseFloat(qtyEdits[id]) : undefined }))) }}
               disabled={saving} className="btn-primary text-xs px-3 py-1.5 flex items-center gap-1">
               {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <CheckCircle2 className="w-3 h-3" />}
@@ -651,10 +967,15 @@ function OcpGroupCard({
                 <thead>
                   <tr style={{ backgroundColor: 'var(--surface-200)', borderBottom: '1px solid var(--border)' }}>
                     <th className="px-3 py-2 text-left w-8">
-                      <input type="checkbox" checked={allSelected}
-                        ref={el => { if (el) el.indeterminate = someSelected && !allSelected }}
-                        onChange={() => onToggleAll(group)} className="rounded"
-                        onClick={e => e.stopPropagation()} />
+                      {/* Nacional: sin selección — el botón GLOBAL "Preparar
+                          seleccionados" los mandaría al embarque (el backend igual
+                          los rechaza con 400, pero mejor no ofrecerlos). */}
+                      {!esNacional && (
+                        <input type="checkbox" checked={allSelected}
+                          ref={el => { if (el) el.indeterminate = someSelected && !allSelected }}
+                          onChange={() => onToggleAll(group)} className="rounded"
+                          onClick={e => e.stopPropagation()} />
+                      )}
                     </th>
                     {['N° Parte','Descripción','Marca','Qty','Qty Desp.','Peso','Unit USD','Total USD','Trans.','Delta','Pzo. Prov.','Pzo. Máx.','Días Rest.','COT','OC Cliente','Cliente'].map(h => (
                       <th key={h} className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wider"
@@ -665,12 +986,14 @@ function OcpGroupCard({
                 <tbody>
                   {group.items.map((item, idx) => (
                     <tr key={item.id}
-                      className={`cursor-pointer transition-colors ${selectedIds.has(item.id) ? 'bg-brand-500/5' : 'hover:bg-[var(--surface-200)]'}`}
+                      className={`transition-colors ${esNacional ? '' : 'cursor-pointer'} ${selectedIds.has(item.id) ? 'bg-brand-500/5' : 'hover:bg-[var(--surface-200)]'}`}
                       style={{ borderBottom: idx < group.items.length - 1 ? '1px solid var(--border)' : undefined }}
-                      onClick={() => onToggleItem(item.id)}>
+                      onClick={() => { if (!esNacional) onToggleItem(item.id) }}>
                       <td className="px-3 py-2.5" onClick={e => e.stopPropagation()}>
-                        <input type="checkbox" checked={selectedIds.has(item.id)}
-                          onChange={() => onToggleItem(item.id)} className="rounded" />
+                        {!esNacional && (
+                          <input type="checkbox" checked={selectedIds.has(item.id)}
+                            onChange={() => onToggleItem(item.id)} className="rounded" />
+                        )}
                       </td>
                       <td className="px-3 py-2.5 font-mono text-xs text-brand-400 font-semibold whitespace-nowrap">
                         {item.numero_parte || '—'}
@@ -751,11 +1074,21 @@ function OcpGroupCard({
             </div>
           </div>
 
-          {/* Facturas panel (only for OCPs with known id) */}
-          {group.oc_proveedor_id && (
+          {/* Facturas panel USD (flujo internacional). Un grupo nacional no factura
+              en USD ni se prorratea flete → se oculta. */}
+          {group.oc_proveedor_id && !esNacional && (
             <FacturasPanel ocpId={group.oc_proveedor_id} ocpItems={group.items} />
           )}
         </>
+      )}
+
+      {showEntrega && group.oc_proveedor_id != null && (
+        <RegistrarEntregaNacionalModal
+          ocpId={group.oc_proveedor_id}
+          titulo={`${group.numero_oc_prov || group.oc_proveedor_numero || group.numero} · ${group.oc_proveedor_nombre || group.proveedor}`}
+          onClose={() => setShowEntrega(false)}
+          onSuccess={() => { setShowEntrega(false); onRefresh() }}
+        />
       )}
     </div>
   )
@@ -865,6 +1198,7 @@ export default function SeguimientoPage() {
               group={group} selectedIds={selectedIds}
               onToggleItem={toggleItem} onToggleAll={toggleAll}
               onMarcarPreparado={marcarPreparado} saving={saving}
+              onRefresh={load}
             />
           ))}
         </div>

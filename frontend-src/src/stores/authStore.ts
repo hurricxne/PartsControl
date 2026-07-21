@@ -6,6 +6,9 @@ interface User {
   email: string
   nombre: string
   empresa: 'mineria' | 'automotriz'
+  // Forward-compat: hoy login/me no lo devuelven (queda undefined). Cuando el backend propague
+  // el rol, los gates de "Editar OC" y el guard require_rol del backend empiezan a candar.
+  rol?: string
 }
 
 interface AuthState {

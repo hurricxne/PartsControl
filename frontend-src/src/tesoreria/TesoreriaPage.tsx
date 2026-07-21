@@ -2,21 +2,23 @@
 // registran. Compras registra compras (pago futuro/inmediato/parcial); Facturas y
 // Cobranzas registra los ingresos de caja; Tesorería:
 //   · aprueba los pagos por vencer (da la orden → crea el Comprobante de Egreso),
-//   · concilia la cartola del banco: cargos↔egresos y abonos↔cobranzas,
+//   · aprueba los ADELANTOS de cliente que Comercial informa (confirma la plata
+//     recibida SIN exigir cartola; al aprobar se aplican solos a las facturas),
+//   · concilia la cartola del banco: cargos↔egresos y abonos↔cobranzas/adelantos,
 //   · proyecta el flujo de caja (NIC 7).
-// Pestañas: Conciliar · Por pagar · Flujo de caja · Movimientos · Cuentas.
+// Pestañas: Conciliar · Por pagar · Adelantos · Flujo de caja · Movimientos · Cuentas.
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   Landmark, Plus, Search, Loader2, RefreshCw, ChevronDown, ChevronUp, X, Trash2,
   Upload, Link2, Unlink, CheckCircle2, AlertCircle, Wallet, Building2, Receipt,
-  Banknote, CalendarClock,
+  Banknote, CalendarClock, HandCoins,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { fmtClp, fmtDate } from '../utils/format'
 import { tesoreriaAPI } from './api'
 import type {
-  Cuenta, Movimiento, EgresoMatch, CobranzaMatch, Destino, Resumen,
-  CompraPorPagar, PorPagarResp, FlujoCaja, Bucket,
+  Cuenta, Movimiento, EgresoMatch, CobranzaMatch, AdelantoMatch, Destino, Resumen,
+  CompraPorPagar, PorPagarResp, FlujoCaja, Bucket, Adelanto, AprobacionesResp,
 } from './types'
 
 // ─── Helpers UI ────────────────────────────────────────────────────────────────
@@ -261,6 +263,71 @@ function CobranzaCard({ c, onVincular }: { c: CobranzaMatch; onVincular: () => v
   )
 }
 
+function AdelantoCard({ a, onVincular }: { a: AdelantoMatch; onVincular: () => void }) {
+  return (
+    <div className="flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-xs" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+      <div className="min-w-0">
+        <p className="font-medium truncate" style={{ color: 'var(--text-primary)' }}>
+          <span className="text-emerald-500 font-semibold">{fmtClp(a.monto)}</span> · Adelanto {a.cliente || ''}{a.numero_oc ? ` · OC ${a.numero_oc}` : ''}
+        </p>
+        <p className="truncate" style={{ color: 'var(--text-faint)' }}>
+          pago {fmtDate(a.fecha)}{a.dias_diferencia != null ? ` · ${a.dias_diferencia}d de dif.` : ''}{a.banco ? ` · ${a.banco}` : ''}{a.numero_operacion ? ` · op ${a.numero_operacion}` : ''}
+        </p>
+      </div>
+      <button onClick={onVincular} className="btn-primary px-2.5 py-1 text-xs flex items-center gap-1 shrink-0"><Link2 className="w-3 h-3" /> Vincular</button>
+    </div>
+  )
+}
+
+// ─── Modal: aprobar adelanto (Tesorería confirma la plata recibida) ─────────────
+function AprobarAdelantoModal({ adelanto, onClose, onDone }: { adelanto: Adelanto; onClose: () => void; onDone: () => void }) {
+  const sugerido = adelanto.abono_sugerido
+  const [monto, setMonto] = useState(String(Math.round(sugerido?.monto || adelanto.monto_esperado || 0) || ''))
+  const [fecha, setFecha] = useState(sugerido?.fecha || hoyISO())
+  const [banco, setBanco] = useState('')
+  const [numeroOperacion, setNumeroOperacion] = useState(sugerido?.referencia || '')
+  const [obs, setObs] = useState('')
+  const [saving, setSaving] = useState(false)
+  const submit = async () => {
+    if (!monto || Number(monto) <= 0) { toast.error('Indica el monto recibido'); return }
+    setSaving(true)
+    try {
+      const { data } = await tesoreriaAPI.aprobarAdelanto(adelanto.id, {
+        monto: Number(monto), fecha_pago: fecha || undefined, banco: banco || undefined,
+        numero_operacion: numeroOperacion || undefined, observaciones: obs || undefined,
+      })
+      toast.success(data.aplicado_ahora_clp > 0
+        ? `Adelanto aprobado y aplicado a facturas (${fmtClp(data.aplicado_ahora_clp)})`
+        : 'Adelanto aprobado — se aplicará solo al emitir la factura')
+      onDone(); onClose()
+    } catch (e: any) { toast.error(e?.response?.data?.detail || 'No se pudo aprobar el adelanto') } finally { setSaving(false) }
+  }
+  return (
+    <Modal title={`Aprobar adelanto · ${adelanto.cliente || ''} ${adelanto.numero_oc ? `(OC ${adelanto.numero_oc})` : ''}`} onClose={onClose}>
+      <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+        Confirma la plata recibida del cliente (no exige cartola: la conciliación con el abono viene después).
+        {adelanto.monto_esperado > 0 && <> Comercial informó <b>{fmtClp(adelanto.monto_esperado)}</b>{adelanto.pct ? ` (${adelanto.pct}%)` : ''}.</>}
+      </p>
+      {sugerido && (
+        <div className="rounded-lg border px-3 py-2 text-xs" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+          <p className="font-medium" style={{ color: 'var(--text-primary)' }}>Abono de la cartola que calza: <span className="text-emerald-500">{fmtClp(sugerido.monto)}</span> · {fmtDate(sugerido.fecha)}</p>
+          <p className="truncate" style={{ color: 'var(--text-faint)' }}>{sugerido.glosa || ''}</p>
+        </div>
+      )}
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Monto recibido (CLP)"><input type="number" className={inputCls} style={inputStyle} value={monto} onChange={e => setMonto(e.target.value)} /></Field>
+        <Field label="Fecha del pago"><input type="date" className={inputCls} style={inputStyle} value={fecha} onChange={e => setFecha(e.target.value)} /></Field>
+        <Field label="Banco"><input className={inputCls} style={inputStyle} value={banco} onChange={e => setBanco(e.target.value)} /></Field>
+        <Field label="N° operación"><input className={inputCls} style={inputStyle} value={numeroOperacion} onChange={e => setNumeroOperacion(e.target.value)} /></Field>
+      </div>
+      <Field label="Observaciones"><input className={inputCls} style={inputStyle} value={obs} onChange={e => setObs(e.target.value)} /></Field>
+      <button onClick={submit} disabled={saving} className="btn-primary w-full flex items-center justify-center gap-2">
+        {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <HandCoins className="w-4 h-4" />} Aprobar adelanto · {fmtClp(Number(monto) || 0)}
+      </button>
+    </Modal>
+  )
+}
+
 // ─── Fila de movimiento a conciliar (pestaña Conciliar) ─────────────────────────
 function ConciliarRow({ m, onChanged }: { m: Movimiento; onChanged: () => void }) {
   const [open, setOpen] = useState(false)
@@ -286,6 +353,7 @@ function ConciliarRow({ m, onChanged }: { m: Movimiento; onChanged: () => void }
   const vincular = async (d: Destino) => {
     try {
       if (d.clase === 'egreso') await tesoreriaAPI.conciliarEgreso(m.id, d.egreso_id)
+      else if (d.clase === 'adelanto') await tesoreriaAPI.conciliarAdelanto(m.id, d.adelanto_id)
       else await tesoreriaAPI.conciliarCobranza(m.id, d.cobranza_id)
       toast.success('Movimiento conciliado'); onChanged()
     } catch (e: any) { toast.error(e?.response?.data?.detail || 'Error al conciliar') }
@@ -296,13 +364,28 @@ function ConciliarRow({ m, onChanged }: { m: Movimiento; onChanged: () => void }
     if (v.length >= 2) {
       try {
         if (esCargo) { const { data } = await tesoreriaAPI.egresosPendientes(v); if (my === seqRef.current) setManual(data.egresos) }
-        else { const { data } = await tesoreriaAPI.cobranzasPendientes(v); if (my === seqRef.current) setManual(data.cobranzas) }
+        else {
+          // abono: cobranzas (búsqueda del backend) + adelantos aprobados sin conciliar
+          // (lista corta; se filtra por cliente/OC aquí mismo)
+          const [cob, adel] = await Promise.all([
+            tesoreriaAPI.cobranzasPendientes(v),
+            tesoreriaAPI.adelantosPendientes().catch(() => ({ data: { adelantos: [], total: 0 } })),
+          ])
+          if (my === seqRef.current) {
+            const vl = v.toLowerCase()
+            const adelantos = (adel.data.adelantos || []).filter(a =>
+              `${a.cliente || ''} ${a.numero_oc || ''} ${a.numero_operacion || ''}`.toLowerCase().includes(vl))
+            setManual([...(cob.data.cobranzas || []), ...adelantos])
+          }
+        }
       } catch { if (my === seqRef.current) setManual([]) }
     } else setManual(null)
   }
   const card = (d: Destino, key: string) => d.clase === 'egreso'
     ? <EgresoCard key={key} e={d} onVincular={() => vincular(d)} />
-    : <CobranzaCard key={key} c={d} onVincular={() => vincular(d)} />
+    : d.clase === 'adelanto'
+      ? <AdelantoCard key={key} a={d} onVincular={() => vincular(d)} />
+      : <CobranzaCard key={key} c={d} onVincular={() => vincular(d)} />
   return (
     <div className="rounded-xl border" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-100)' }}>
       <button onClick={expand} className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left">
@@ -324,7 +407,7 @@ function ConciliarRow({ m, onChanged }: { m: Movimiento; onChanged: () => void }
           {!busy && sugs && sugs.length > 0 && (
             <>
               <p className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>
-                {esCargo ? 'Egresos de Compras sugeridos (mismo monto)' : 'Cobranzas de Facturas sugeridas (mismo monto)'}
+                {esCargo ? 'Egresos de Compras sugeridos (mismo monto)' : 'Cobranzas y adelantos sugeridos (mismo monto)'}
               </p>
               {sugs.map((d, i) => card(d, 's' + i))}
             </>
@@ -349,7 +432,7 @@ function ConciliarRow({ m, onChanged }: { m: Movimiento; onChanged: () => void }
 }
 
 // ─── Página ──────────────────────────────────────────────────────────────────────
-type Tab = 'conciliar' | 'porpagar' | 'flujo' | 'movimientos' | 'cuentas'
+type Tab = 'conciliar' | 'porpagar' | 'adelantos' | 'flujo' | 'movimientos' | 'cuentas'
 
 export default function TesoreriaPage() {
   const [cuentas, setCuentas] = useState<Cuenta[]>([])
@@ -358,7 +441,7 @@ export default function TesoreriaPage() {
   const [tab, setTab] = useState<Tab>('conciliar')
   const [resumen, setResumen] = useState<Resumen | null>(null)
   const [loading, setLoading] = useState(true)
-  const [modal, setModal] = useState<{ type: 'cuenta' | 'import' | 'manual' | 'pago'; cuenta?: Cuenta | null } | null>(null)
+  const [modal, setModal] = useState<{ type: 'cuenta' | 'import' | 'manual' | 'pago' | 'aprobar-adelanto'; cuenta?: Cuenta | null; adelanto?: Adelanto } | null>(null)
 
   // datos por pestaña
   const [pendientes, setPendientes] = useState<Movimiento[]>([])
@@ -371,6 +454,7 @@ export default function TesoreriaPage() {
   // de la vista, y el modal de pago recibe SIEMPRE todo lo marcado.
   const [seleccion, setSeleccion] = useState<Map<number, CompraPorPagar>>(new Map())
   const [flujo, setFlujo] = useState<FlujoCaja | null>(null)
+  const [aprobaciones, setAprobaciones] = useState<AprobacionesResp | null>(null)
 
   const loadCuentas = useCallback(async () => {
     try {
@@ -407,20 +491,27 @@ export default function TesoreriaPage() {
     catch (e: any) { setFlujo(null); toast.error(e?.response?.data?.detail || 'No se pudo cargar el flujo de caja') }
   }, [])
 
+  const loadAprobaciones = useCallback(async () => {
+    try { const { data } = await tesoreriaAPI.aprobaciones(); setAprobaciones(data) }
+    catch (e: any) { setAprobaciones(null); toast.error(e?.response?.data?.detail || 'No se pudieron cargar los adelantos') }
+  }, [])
+
   useEffect(() => { loadCuentas() }, [loadCuentas])
   useEffect(() => {
     loadResumen(cuentaId)
     if (tab === 'conciliar' && cuentaId != null) loadPendientes(cuentaId)
     if (tab === 'movimientos' && cuentaId != null) loadMovs(cuentaId, filtroEstado, filtroTipo)
     if (tab === 'porpagar') loadPorPagar(ppQ)
+    if (tab === 'adelantos') loadAprobaciones()
     if (tab === 'flujo') loadFlujo()
-  }, [cuentaId, tab, filtroEstado, filtroTipo, ppQ, loadResumen, loadPendientes, loadMovs, loadPorPagar, loadFlujo])
+  }, [cuentaId, tab, filtroEstado, filtroTipo, ppQ, loadResumen, loadPendientes, loadMovs, loadPorPagar, loadAprobaciones, loadFlujo])
 
   const refrescar = () => {
     loadResumen(cuentaId)
     if (tab === 'conciliar' && cuentaId != null) loadPendientes(cuentaId)
     if (tab === 'movimientos' && cuentaId != null) loadMovs(cuentaId, filtroEstado, filtroTipo)
     if (tab === 'porpagar') { loadPorPagar(ppQ); setSeleccion(new Map()) }
+    if (tab === 'adelantos') loadAprobaciones()
     if (tab === 'flujo') loadFlujo()
   }
 
@@ -446,7 +537,9 @@ export default function TesoreriaPage() {
 
   const destinoLinea = (d: Destino) => d.clase === 'egreso'
     ? `↔ ${d.beneficiario || 'egreso'} · ${d.n_compras} gasto${d.n_compras !== 1 ? 's' : ''} · ${fmtClp(d.monto_total_clp)}`
-    : `↔ Factura ${d.numero_factura || d.factura_id} · ${fmtClp(d.monto)}`
+    : d.clase === 'adelanto'
+      ? `↔ Adelanto ${d.cliente || ''}${d.numero_oc ? ` · OC ${d.numero_oc}` : ''} · ${fmtClp(d.monto)}`
+      : `↔ Factura ${d.numero_factura || d.factura_id} · ${fmtClp(d.monto)}`
 
   return (
     <div className="space-y-6">
@@ -472,6 +565,7 @@ export default function TesoreriaPage() {
           {[
             { icon: Banknote, label: 'Por pagar (saldo)', value: resumen.monto_por_pagar_clp, color: 'text-brand-400', money: true },
             { icon: CalendarClock, label: 'Vencido por pagar', value: resumen.por_pagar_vencido_clp, color: 'text-red-400', money: true },
+            { icon: HandCoins, label: 'Adelantos por aprobar', value: resumen.adelantos_por_aprobar, color: 'text-emerald-500', money: false },
             { icon: AlertCircle, label: 'Cargos pendientes', value: resumen.cargos_pendientes, color: 'text-amber-400', money: false },
             { icon: Wallet, label: 'Abonos pendientes', value: resumen.abonos_pendientes, color: 'text-emerald-500', money: false },
             { icon: Link2, label: 'Egresos sin conciliar', value: resumen.egresos_sin_conciliar, color: 'text-brand-400', money: false },
@@ -488,7 +582,7 @@ export default function TesoreriaPage() {
 
       {/* Tabs */}
       <div className="flex items-center gap-2 border-b overflow-x-auto" style={{ borderColor: 'var(--border)' }}>
-        {([['conciliar', 'Conciliar'], ['porpagar', 'Por pagar'], ['flujo', 'Flujo de caja'], ['movimientos', 'Movimientos'], ['cuentas', 'Cuentas']] as const).map(([k, lbl]) => (
+        {([['conciliar', 'Conciliar'], ['porpagar', 'Por pagar'], ['adelantos', 'Adelantos'], ['flujo', 'Flujo de caja'], ['movimientos', 'Movimientos'], ['cuentas', 'Cuentas']] as const).map(([k, lbl]) => (
           <button key={k} onClick={() => setTab(k)}
             className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-all whitespace-nowrap ${tab === k ? 'border-brand-500 text-brand-400' : 'border-transparent'}`}
             style={tab !== k ? { color: 'var(--text-muted)' } : {}}>{lbl}</button>
@@ -597,6 +691,88 @@ export default function TesoreriaPage() {
         </div>
       )}
 
+      {/* Pestaña Adelantos (aprobación de adelantos de cliente) */}
+      {tab === 'adelantos' && (
+        !aprobaciones ? (
+          <div className="flex items-center justify-center py-16"><Loader2 className="w-6 h-6 animate-spin text-brand-400" /></div>
+        ) : (
+          <div className="space-y-5">
+            <div>
+              <p className="text-[11px] font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--text-faint)' }}>
+                Por aprobar (informados por Comercial)
+              </p>
+              {aprobaciones.por_aprobar.length === 0 ? (
+                <div className="rounded-2xl border py-10 text-center" style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
+                  <CheckCircle2 className="w-9 h-9 mx-auto mb-2 text-emerald-500/40" />
+                  <p className="text-sm" style={{ color: 'var(--text-muted)' }}>No hay adelantos esperando aprobación.</p>
+                  <p className="text-xs mt-1" style={{ color: 'var(--text-faint)' }}>Comercial los informa en el Cierre de Venta (o desde Ventas de Contabilidad).</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {aprobaciones.por_aprobar.map(a => (
+                    <div key={a.id} className="flex items-center justify-between gap-3 rounded-xl border px-4 py-3" style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
+                      <div className="min-w-0">
+                        <p className="font-medium text-sm truncate" style={{ color: 'var(--text-primary)' }}>
+                          {a.cliente || '—'}{a.numero_oc ? ` · OC ${a.numero_oc}` : ''}{a.numero_cotizacion ? ` · COT ${a.numero_cotizacion}` : ''}
+                        </p>
+                        <p className="text-xs truncate" style={{ color: 'var(--text-faint)' }}>
+                          Esperado: <b>{fmtClp(a.monto_esperado)}</b>{a.pct ? ` (${a.pct}%)` : ''}
+                          {a.abono_sugerido ? <span className="text-emerald-500"> · hay un abono en la cartola que calza ({fmtDate(a.abono_sugerido.fecha)})</span> : ''}
+                          {a.observaciones ? ` · ${a.observaciones}` : ''}
+                        </p>
+                      </div>
+                      <button onClick={() => setModal({ type: 'aprobar-adelanto', adelanto: a })}
+                        className="btn-primary flex items-center gap-2 text-xs shrink-0"><HandCoins className="w-3.5 h-3.5" /> Aprobar</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div>
+              <p className="text-[11px] font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--text-faint)' }}>
+                Aprobadas (últimas 50)
+              </p>
+              {aprobaciones.aprobadas.length === 0 ? (
+                <p className="text-xs px-1" style={{ color: 'var(--text-faint)' }}>Todavía no hay adelantos aprobados.</p>
+              ) : (
+                <div className="rounded-2xl border overflow-hidden" style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead><tr className="border-b" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+                        {['Cliente / OC', 'Monto', 'Aplicado', 'Fecha pago', 'Banco / operación', 'Estado'].map(h => <th key={h} className="text-left px-3 py-3 text-xs font-semibold uppercase tracking-wider whitespace-nowrap" style={{ color: 'var(--text-faint)' }}>{h}</th>)}
+                      </tr></thead>
+                      <tbody>
+                        {aprobaciones.aprobadas.map(a => (
+                          <tr key={a.id} className="border-b" style={{ borderColor: 'var(--border)' }}>
+                            <td className="px-3 py-2.5 max-w-[240px]" style={{ color: 'var(--text-primary)' }}>
+                              <span className="block truncate font-medium">{a.cliente || '—'}</span>
+                              <span className="block text-[11px] truncate" style={{ color: 'var(--text-faint)' }}>{a.numero_oc ? `OC ${a.numero_oc}` : ''}{a.factura_anticipo_folio ? ` · respaldo Factura N° ${a.factura_anticipo_folio}` : ''}</span>
+                            </td>
+                            <td className="px-3 py-2.5 whitespace-nowrap font-semibold" style={{ color: 'var(--text-primary)' }}>{fmtClp(a.monto)}</td>
+                            <td className="px-3 py-2.5 whitespace-nowrap text-xs" style={{ color: 'var(--text-muted)' }}>
+                              {a.monto_aplicado >= a.monto - 1
+                                ? <span className="text-emerald-500">Aplicado a factura</span>
+                                : a.monto_aplicado > 0 ? `${fmtClp(a.monto_aplicado)} (queda ${fmtClp(a.pendiente_aplicar)})` : 'Esperando factura'}
+                            </td>
+                            <td className="px-3 py-2.5 whitespace-nowrap text-xs" style={{ color: 'var(--text-muted)' }}>{fmtDate(a.fecha_pago)}</td>
+                            <td className="px-3 py-2.5 whitespace-nowrap text-xs" style={{ color: 'var(--text-muted)' }}>{a.banco || '—'}{a.numero_operacion ? ` · ${a.numero_operacion}` : ''}</td>
+                            <td className="px-3 py-2.5 whitespace-nowrap text-xs">
+                              {a.conciliado_banco
+                                ? <span className="inline-flex items-center gap-1 text-emerald-500"><CheckCircle2 className="w-3.5 h-3.5" /> Conciliado</span>
+                                : <span style={{ color: 'var(--text-faint)' }}>Sin conciliar</span>}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )
+      )}
+
       {/* Pestaña Flujo de caja */}
       {tab === 'flujo' && (
         !flujo ? (
@@ -634,6 +810,13 @@ export default function TesoreriaPage() {
               ({flujo.retenciones_factoring.n} operación{flujo.retenciones_factoring.n !== 1 ? 'es' : ''} vigente{flujo.retenciones_factoring.n !== 1 ? 's' : ''} · {fmtClp(flujo.retenciones_factoring.monto)} por liquidar).
               Los adelantos ya aplicados y los pagos parciales ya están descontados de los saldos.
             </p>
+            {(flujo.adelantos_por_aprobar?.n > 0 || flujo.adelantos_recibidos_sin_aplicar?.n > 0) && (
+              <p className="text-xs px-1" style={{ color: 'var(--text-faint)' }}>
+                <b>Adelantos de clientes</b> (aparte de los buckets):
+                {flujo.adelantos_por_aprobar?.n > 0 && <> {flujo.adelantos_por_aprobar.n} por aprobar ({fmtClp(flujo.adelantos_por_aprobar.monto)}) — aún no son plata segura.</>}
+                {flujo.adelantos_recibidos_sin_aplicar?.n > 0 && <> {flujo.adelantos_recibidos_sin_aplicar.n} recibido{flujo.adelantos_recibidos_sin_aplicar.n !== 1 ? 's' : ''} sin aplicar ({fmtClp(flujo.adelantos_recibidos_sin_aplicar.monto)}) — plata YA en el banco; las próximas facturas nacerán con ese monto descontado.</>}
+              </p>
+            )}
           </div>
         )
       )}
@@ -720,6 +903,7 @@ export default function TesoreriaPage() {
       {modal?.type === 'import' && cuentaId != null && <ImportModal cuentaId={cuentaId} onClose={() => setModal(null)} onDone={refrescar} />}
       {modal?.type === 'manual' && cuentaId != null && <MovManualModal cuentaId={cuentaId} onClose={() => setModal(null)} onDone={refrescar} />}
       {modal?.type === 'pago' && comprasSeleccionadas.length > 0 && <PagoModal compras={comprasSeleccionadas} onClose={() => setModal(null)} onDone={refrescar} />}
+      {modal?.type === 'aprobar-adelanto' && modal.adelanto && <AprobarAdelantoModal adelanto={modal.adelanto} onClose={() => setModal(null)} onDone={refrescar} />}
     </div>
   )
 }

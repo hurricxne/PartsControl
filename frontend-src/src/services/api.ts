@@ -129,6 +129,7 @@ export const ventasAPI = {
 export const comprasAPI = {
   listOcCliente: () => api.get('/compras/oc-cliente'),
   crearOcCliente: (data: Record<string, any>) => api.post('/compras/oc-cliente', data),
+  actualizarOcCliente: (id: number, data: Record<string, any>) => api.put(`/compras/oc-cliente/${id}`, data),
   listOcProveedor: () => api.get('/compras/oc-proveedor'),
   crearOcProveedor: (data: Record<string, any>) => api.post('/compras/oc-proveedor', data),
   actualizarOcProveedor: (id: number, data: Record<string, any>) => api.put(`/compras/oc-proveedor/${id}`, data),
@@ -241,6 +242,8 @@ export const contabilidadAPI = {
   // Facturas / Cuentas por cobrar
   listFacturas: (estado?: string, q?: string) =>
     api.get('/contabilidad/facturas', { params: { estado: estado || undefined, q: q || undefined } }),
+  // Previsualiza la factura (líneas + neto/IVA/total + receptor + problemas) sin emitir
+  previewFactura: (data: Record<string, any>) => api.post('/contabilidad/facturas/preview', data),
   crearFactura: (data: Record<string, any>) => api.post('/contabilidad/facturas', data),
   eliminarFactura: (id: number) => api.delete(`/contabilidad/facturas/${id}`),
   // Cobranzas
@@ -254,6 +257,33 @@ export const contabilidadAPI = {
   liquidarFactoring: (facturaId: number) =>
     api.post(`/contabilidad/facturas/${facturaId}/factoring/liquidar`),
   kpis: (periodo?: string) => api.get('/contabilidad/kpis', { params: periodo ? { periodo } : {} }),
+  // Adelantos de cliente: Comercial INFORMA (Cierre de Venta / Ventas) y Tesorería
+  // APRUEBA (tesoreriaAPI). Acepta oc_cliente_id o cotizacion_id (recién cerrada).
+  informarAdelanto: (data: { oc_cliente_id?: number; cotizacion_id?: number; monto_esperado?: number; pct?: number; observaciones?: string }) =>
+    api.post('/contabilidad/ventas/adelantos', data),
+  adelantosDeVenta: (ocId: number) => api.get(`/contabilidad/ventas/${ocId}/adelantos`),
+  editarAdelanto: (id: number, data: Record<string, any>) =>
+    api.patch(`/contabilidad/adelantos/${id}`, data),
+  anularAdelanto: (id: number) => api.post(`/contabilidad/adelantos/${id}/anular`),
+}
+
+// --- Wasabil DTE (guías de despacho electrónicas al SII) ---
+// Flujo: preview (no toca el SII) → emitir (con OK explícito del usuario) → sondeo
+// de estado hasta Emitido (folio + PDF) o Fallido (reintento seguro).
+export const wasabilAPI = {
+  config: () => api.get('/wasabil/config'),
+  previewGuia: (despachoId: number, tipoTraslado?: number) =>
+    api.post(`/wasabil/despachos/${despachoId}/preview`, null,
+      tipoTraslado ? { params: { tipo_traslado: tipoTraslado } } : undefined),
+  emitirGuia: (despachoId: number, tipoTraslado?: number) =>
+    api.post(`/wasabil/despachos/${despachoId}/emitir`, null,
+      tipoTraslado ? { params: { tipo_traslado: tipoTraslado } } : undefined),
+  estadoGuia: (despachoId: number) => api.get(`/wasabil/despachos/${despachoId}/estado`),
+  reintentarGuia: (despachoId: number, tipoTraslado?: number) =>
+    api.post(`/wasabil/despachos/${despachoId}/reintentar`, null,
+      tipoTraslado ? { params: { tipo_traslado: tipoTraslado } } : undefined),
+  estadoBatch: (despachoIds: number[]) =>
+    api.get('/wasabil/despachos/estado-batch', { params: { ids: despachoIds.join(',') } }),
 }
 
 // --- Despachos ---
@@ -284,4 +314,36 @@ export const despachosAPI = {
     return api.post('/compras/docs/upload', fd, { headers: { 'Content-Type': 'multipart/form-data' } }).then(r => r.data)
   },
   anular: (id: number) => api.delete(`/despachos/${id}`).then(r => r.data),
+}
+
+// --- Recepción Nacional (camino físico de la compra NACIONAL: camión + guía de
+// despacho del proveedor, sin embarque). Bodega registra "cuánto llegó" por ítem;
+// al cerrar la entrega, los utilizables con qty>0 pasan a en_bodega y quedan
+// despachables, capados por lo recibido. Scope minería (Grupo AM). ---
+export interface EntregaNacionalItemPayload {
+  item_cotizacion_id: number
+  qty_recibida: number
+  estado_recepcion: string
+  observacion?: string
+}
+export interface RegistrarEntregaNacionalPayload {
+  oc_proveedor_id: number
+  numero_guia_proveedor?: string
+  fecha?: string
+  documento?: string
+  observacion?: string
+  cerrar?: boolean
+  items: EntregaNacionalItemPayload[]
+}
+export const recepcionNacionalAPI = {
+  // Registra una entrega (una recepción). cerrar:true → cierra y los utilizables
+  // pasan a en_bodega (despachables). Backend es la autoridad del tope físico.
+  registrar: (data: RegistrarEntregaNacionalPayload) =>
+    api.post('/recepcion-nacional', data),
+  cerrar: (id: number) => api.post(`/recepcion-nacional/${id}/cerrar`),
+  anular: (id: number) => api.delete(`/recepcion-nacional/${id}`),
+  // Ítems 'comprado'/'en_bodega' de una OC nacional con su remanente por recibir.
+  pendientes: (ocpId: number) => api.get(`/recepcion-nacional/pendientes/${ocpId}`),
+  listar: (ocpId?: number) =>
+    api.get('/recepcion-nacional', { params: ocpId ? { ocp_id: ocpId } : {} }),
 }

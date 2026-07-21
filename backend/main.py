@@ -23,7 +23,9 @@ from routers import contabilidad
 from routers import venta_clp
 from embarques_pricing.router import router as embarques_pricing_router
 from compras_contab.router import router as compras_contab_router
+from recepcion_nacional.router import router as recepcion_nacional_router  # camino físico de la compra nacional
 from tesoreria.router import router as tesoreria_router
+from wasabil_dte.router import router as wasabil_dte_router  # módulo aislado (Wasabil DTE: guías de despacho electrónicas al SII)
 from monza_router_documentos import router as monza_docs_router
 from monza_router_catalog import router as monza_catalog_router
 from monza_router_clientes import router as monza_clientes_router
@@ -82,7 +84,9 @@ app.include_router(contabilidad.router, prefix="/api")
 app.include_router(venta_clp.router)
 app.include_router(embarques_pricing_router, prefix="/api")
 app.include_router(compras_contab_router, prefix="/api")
+app.include_router(recepcion_nacional_router, prefix="/api")  # /api/recepcion-nacional
 app.include_router(tesoreria_router, prefix="/api")
+app.include_router(wasabil_dte_router, prefix="/api")  # /api/wasabil (guías de despacho electrónicas)
 # Contabilidad MonzaParts, activable por flag. El import va DENTRO del if a
 # proposito: con el flag apagado los modelos no se cargan, asi create_all no crea
 # sus tablas (asi corre PROD desde 2026-07-15; ver deploy/README.md).

@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     # create_all al arrancar: crea tablas que falten (NO agrega columnas a tablas
     # existentes; para eso estan backend/migrations/).
     AUTO_CREATE_TABLES: bool = True
+    # Wasabil (facturador electrónico — emisión de DTE al SII). El token se genera en
+    # https://app.wasabil.com/api-tokens y va SOLO en backend/.env (nunca en git).
+    # Sin token, el módulo wasabil_dte permite previsualizar pero NO emitir.
+    WASABIL_API_TOKEN: str = ""
+    WASABIL_API_BASE: str = "https://api.wasabil.com/api"
 
     class Config:
         env_file = ".env"

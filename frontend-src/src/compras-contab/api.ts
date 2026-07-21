@@ -3,6 +3,7 @@
 import api from '../services/api'
 import type {
   Catalogos, Compra, CompraListResponse, CostosEmbarqueResponse, Kpis,
+  OcNacionalesResponse,
 } from './types'
 
 export interface CompraListParams {
@@ -27,6 +28,16 @@ export interface PagoInlinePayload {
   fecha_mov_bancario?: string
   numero_operacion?: string
   observaciones?: string
+}
+
+// Línea de costeo por ítem de una compra NACIONAL (espejo de CompraItemIn del backend).
+export interface CompraItemPayload {
+  item_cotizacion_id: number
+  oc_proveedor_item_id?: number | null
+  numero_parte?: string | null
+  descripcion?: string | null
+  cantidad: number
+  precio_unit: number    // NETO unitario en moneda factura (CLP en nacional)
 }
 
 export interface CompraCreatePayload {
@@ -54,6 +65,9 @@ export interface CompraCreatePayload {
   embarque_id?: number
   emb_pricing_gasto_id?: number
   factura_proveedor_id?: number
+  // Compra NACIONAL con detalle de ítems (la factura ES el costo de esos repuestos).
+  oc_proveedor_id?: number
+  items?: CompraItemPayload[]
   observaciones?: string
   pago?: PagoInlinePayload
 }
@@ -116,4 +130,6 @@ export const comprasContabAPI = {
     api.get<Kpis>('/compras-contab/kpis', { params }),
   catalogos: () => api.get<Catalogos>('/compras-contab/catalogos'),
   costosEmbarque: () => api.get<CostosEmbarqueResponse>('/compras-contab/costos-embarque'),
+  // OC nacionales con sus ítems costeables (para el detalle por ítem del alta).
+  ocNacionales: () => api.get<OcNacionalesResponse>('/compras-contab/oc-nacionales'),
 }

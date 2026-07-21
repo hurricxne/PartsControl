@@ -7,7 +7,7 @@ import toast from 'react-hot-toast'
 import { embarquesPricingAPI } from './api'
 import { calcularLanded, type LandedInput } from './compute'
 import type {
-  EmbarquePricingRow, PricingDetail, GastoLinea, ItemOverride, PricingSavePayload,
+  EmbarquePricingRow, PricingDetail, GastoLinea, ItemOverride, PricingSavePayload, PesoOrigen,
 } from './types'
 
 // Etiquetas de flete según quién paga, por tipo de embarque.
@@ -50,6 +50,7 @@ function PricingEditor({ detail: initial, onSaved }: { detail: PricingDetail; on
   const [items, setItems] = useState(initial.items)
   const [overrides, setOverrides] = useState<Record<number, ItemOverride>>({})
   const [fobInputs, setFobInputs] = useState<Record<number, string>>({})
+  const [pesoInputs, setPesoInputs] = useState<Record<number, string>>({})
   const [saving, setSaving] = useState(false)
 
   const locked = pricing.estado === 'cerrado'
@@ -82,19 +83,28 @@ function PricingEditor({ detail: initial, onSaved }: { detail: PricingDetail; on
     return it.fob_unit
   }, [overrides])
 
+  // Peso efectivo por ítem (override manual / reset / actual del server). Espejo
+  // del FOB: el peso decide el prorrateo del flete (shipping por peso).
+  const pesoEfectivo = useCallback((it: typeof items[number]) => {
+    const ov = overrides[it.embarque_item_id]
+    if (ov?.peso_manual === true) return ov.peso_unit_lbs ?? 0
+    if (ov?.peso_manual === false) return it.peso_default
+    return it.peso_unit_lbs
+  }, [overrides])
+
   // ── Vista previa en vivo (espeja el backend) ──
   const preview = useMemo(() => {
     const inputs: LandedInput[] = items.map(it => ({
       embarque_item_id: it.embarque_item_id,
       cantidad: it.cantidad,
-      peso_unit_lbs: it.peso_unit_lbs,
+      peso_unit_lbs: pesoEfectivo(it),
       fob_unit: fobEfectivo(it),
       tc_valor: tc,
     }))
     const { rows, totales } = calcularLanded(inputs, shippingTotal, totalGastosCap)
     const byId = new Map(rows.map(r => [r.embarque_item_id, r]))
     return { byId, totales }
-  }, [items, fobEfectivo, tc, shippingTotal, totalGastosCap])
+  }, [items, fobEfectivo, pesoEfectivo, tc, shippingTotal, totalGastosCap])
 
   // ── Edición de gastos ──
   type GastoField = 'monto_neto' | 'iva' | 'nro_factura' | 'fecha_factura' | 'banco'
@@ -110,13 +120,25 @@ function PricingEditor({ detail: initial, onSaved }: { detail: PricingDetail; on
   }
 
   // ── Edición de FOB ──
+  // MERGEA sobre el override existente (...o[id]) para no pisar un override de
+  // peso: FOB y peso comparten overrides[embarque_item_id].
   const setFob = (id: number, val: string) => {
     setFobInputs(f => ({ ...f, [id]: val }))
-    setOverrides(o => ({ ...o, [id]: { embarque_item_id: id, fob_unit: Number(val) || 0, fob_manual: true } }))
+    setOverrides(o => ({ ...o, [id]: { ...o[id], embarque_item_id: id, fob_unit: Number(val) || 0, fob_manual: true } }))
   }
   const resetFob = (id: number) => {
     setFobInputs(f => { const n = { ...f }; delete n[id]; return n })
-    setOverrides(o => ({ ...o, [id]: { embarque_item_id: id, fob_manual: false } }))
+    setOverrides(o => ({ ...o, [id]: { ...o[id], embarque_item_id: id, fob_manual: false } }))
+  }
+
+  // ── Edición de peso (espejo del FOB; también mergea para no pisar el FOB) ──
+  const setPeso = (id: number, val: string) => {
+    setPesoInputs(f => ({ ...f, [id]: val }))
+    setOverrides(o => ({ ...o, [id]: { ...o[id], embarque_item_id: id, peso_unit_lbs: Number(val) || 0, peso_manual: true } }))
+  }
+  const resetPeso = (id: number) => {
+    setPesoInputs(f => { const n = { ...f }; delete n[id]; return n })
+    setOverrides(o => ({ ...o, [id]: { ...o[id], embarque_item_id: id, peso_manual: false } }))
   }
 
   const buildPayload = (): PricingSavePayload => ({
@@ -142,6 +164,7 @@ function PricingEditor({ detail: initial, onSaved }: { detail: PricingDetail; on
     setItems(d.items)        // refrescar FOB/origen confirmados por el server
     setOverrides({})
     setFobInputs({})
+    setPesoInputs({})
     setTcValor(String(d.pricing.tc_valor || ''))
     setTcTipo(d.pricing.tc_tipo || 'manual')
     setTipoEmb(d.pricing.tipo_embarque)
@@ -213,6 +236,7 @@ function PricingEditor({ detail: initial, onSaved }: { detail: PricingDetail; on
             {initial.embarque.numero || `EMB #${initial.embarque.id}`}
             {initial.embarque.forwarder ? ` · ${initial.embarque.forwarder}` : ''}
             {initial.embarque.estado ? ` · ${initial.embarque.estado}` : ''}
+            {initial.embarque.awb_numero ? ` · AWB ${initial.embarque.awb_numero}` : ''}
           </span>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -382,7 +406,8 @@ function PricingEditor({ detail: initial, onSaved }: { detail: PricingDetail; on
             <thead>
               <tr style={{ backgroundColor: 'var(--surface-200)', borderBottom: '1px solid var(--border)' }}>
                 {['N° Parte', 'Descripción', 'Cant', 'Peso lb', `FOB unit ${moneda}`, 'FOB CLP', 'Shipping', 'CIF CLP', 'Gastos', 'Costo Total', 'Costo Unit'].map(h => (
-                  <th key={h} className="px-3 py-2 text-left font-semibold uppercase tracking-wider whitespace-nowrap" style={{ color: 'var(--text-faint)' }}>{h}</th>
+                  <th key={h} className="px-3 py-2 text-left font-semibold uppercase tracking-wider whitespace-nowrap" style={{ color: 'var(--text-faint)' }}
+                    title={h === 'Peso lb' ? 'El peso se lee de la cotización; edítalo si vino mal y el flete se re-prorratea' : undefined}>{h}</th>
                 ))}
               </tr>
             </thead>
@@ -392,12 +417,31 @@ function PricingEditor({ detail: initial, onSaved }: { detail: PricingDetail; on
                 const ov = overrides[it.embarque_item_id]
                 const isManual = ov?.fob_manual === true || (ov?.fob_manual !== false && it.fob_origen === 'manual')
                 const origen = ov?.fob_manual === true ? 'manual' : ov?.fob_manual === false ? it.fob_origen : it.fob_origen
+                const pesoOrigen: PesoOrigen = ov?.peso_manual === true ? 'manual'
+                  : ov?.peso_manual === false ? 'auto' : it.peso_origen
+                const pesoIsManual = pesoOrigen === 'manual'
                 return (
                   <tr key={`${it.embarque_item_id ?? 's'}-${idx}`} style={{ borderBottom: '1px solid var(--border)', backgroundColor: idx % 2 ? 'var(--surface-100)' : 'transparent' }}>
                     <td className="px-3 py-1.5 font-mono font-semibold whitespace-nowrap text-brand-400">{it.numero_parte || '—'}</td>
                     <td className="px-3 py-1.5 max-w-[160px] truncate" style={{ color: 'var(--text-primary)' }} title={it.descripcion}>{it.descripcion}</td>
                     <td className="px-3 py-1.5 text-right" style={{ color: 'var(--text-muted)' }}>{fmtNum(it.cantidad, 0)}</td>
-                    <td className="px-3 py-1.5 text-right" style={{ color: 'var(--text-muted)' }}>{fmtNum(it.peso_unit_lbs)}</td>
+                    <td className="px-2 py-1.5 min-w-[110px]">
+                      <div className="flex items-center gap-1">
+                        <input
+                          value={pesoInputs[it.embarque_item_id] ?? String(pesoEfectivo(it) || '')}
+                          disabled={locked}
+                          onChange={e => setPeso(it.embarque_item_id, e.target.value)}
+                          className={inputCls} style={inputStyle} placeholder="0" />
+                        {!locked && pesoIsManual && (
+                          <button onClick={() => resetPeso(it.embarque_item_id)} title="Volver al peso de la cotización" className="shrink-0 text-brand-400 hover:text-brand-300">
+                            <RotateCcw className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                      <span className="text-[9px] uppercase tracking-wide" style={{ color: pesoOrigen === 'manual' ? 'var(--text-muted)' : 'var(--text-faint)' }}>
+                        {pesoOrigen === 'manual' ? 'manual' : 'de cotización'}
+                      </span>
+                    </td>
                     <td className="px-2 py-1.5 min-w-[120px]">
                       <div className="flex items-center gap-1">
                         <input
@@ -505,6 +549,12 @@ function EmbarqueCard({ row, onChanged }: { row: EmbarquePricingRow; onChanged: 
               </span>
             )}
             <span className="font-mono font-bold text-sm text-brand-400">{row.numero || `EMB #${row.embarque_id}`}</span>
+            {row.awb_numero && (
+              <span className="text-[11px] font-mono px-1.5 py-0.5 rounded-md"
+                style={{ backgroundColor: 'var(--surface-200)', color: 'var(--text-muted)' }} title="N° AWB / BL">
+                AWB {row.awb_numero}
+              </span>
+            )}
             <Badge map={TIPO_BADGE} k={row.tipo_embarque} />
             <Badge map={PRICING_BADGE} k={row.pricing_estado} />
           </div>

@@ -163,6 +163,13 @@ class OcProveedor(Base):
     proveedor = Column(String(255))
     pais = Column(String(100))
     moneda = Column(String(20), default="USD")
+    # Origen de la compra: 'internacional' (embarque + aduana + costo landed) o
+    # 'nacional' (camión + guía de despacho del proveedor, sin embarque). Fuente
+    # ÚNICA de verdad del camino físico y de la UI; NO se deriva de pais/moneda
+    # (pais es texto libre y un proveedor nacional podría facturar en USD). Todo lo
+    # histórico queda 'internacional'. La columna la crea recepcion_nacional/init_db
+    # (create_all NO altera tablas ya existentes).
+    tipo_origen = Column(String(20), nullable=False, server_default="internacional", index=True)
     estado = Column(String(50), default="borrador")
     plazo_dias = Column(Integer)
     awb = Column(String(100))
@@ -197,6 +204,7 @@ class Embarque(Base):
     estado = Column(String(50), default="en_transito")
     forwarder = Column(String(255))
     awb = Column(String(100))
+    awb_numero = Column(String(100), index=True)  # N° universal de AWB/BL escrito a mano; ≠ awb (que es el ARCHIVO adjunto). Buscable en todos los embarques.
     fecha_despacho = Column(String(50))
     fecha_llegada_est = Column(Date, nullable=True)
     notas = Column(Text)
@@ -511,6 +519,10 @@ class ContFacturaCliente(Base):
     despacho_id = Column(Integer, ForeignKey("despachos.id"), nullable=True, index=True)
     numero_factura = Column(String(100), nullable=True, index=True)   # folio SII
     tipo_doc = Column(String(20), default="factura")       # factura | boleta
+    # Factura de ANTICIPO: respalda un adelanto del cliente ante el SII y por eso NO
+    # exige guía de despacho firmada. Su neto se descuenta después (línea negativa)
+    # de las facturas del despacho real, para que Σ facturas de la OC == total venta.
+    es_anticipo = Column(Integer, default=0)               # 0 normal | 1 factura de anticipo
     fecha_emision = Column(Date, nullable=True)
     condicion_pago = Column(String(200), nullable=True)    # texto, ej "30 días contra factura"
     plazo_dias = Column(Integer, nullable=True)
@@ -525,7 +537,10 @@ class ContFacturaCliente(Base):
     usuario_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+    # foreign_keys explícito: la línea tiene DOS FKs a esta tabla (factura_id la dueña,
+    # anticipo_factura_id la factura de anticipo descontada) y SQLAlchemy no puede inferir.
     items = relationship("ContFacturaClienteItem", back_populates="factura",
+                         foreign_keys="ContFacturaClienteItem.factura_id",
                          cascade="all, delete-orphan")
     cobranzas = relationship("ContCobranza", back_populates="factura",
                              cascade="all, delete-orphan")
@@ -542,6 +557,13 @@ class ContFacturaClienteItem(Base):
     factura_id = Column(Integer, ForeignKey("cont_factura_cliente.id", ondelete="CASCADE"))
     item_cotizacion_id = Column(Integer, ForeignKey("items_cotizacion.id"), nullable=True, index=True)
     despacho_item_id = Column(Integer, ForeignKey("despacho_items.id"), nullable=True, index=True)
+    # Línea de DESCUENTO por anticipo facturado (total_neto NEGATIVO): referencia a la
+    # factura de anticipo que descuenta. El "anticipo pendiente de descontar" se DERIVA:
+    # neto de la factura de anticipo − Σ(−total_neto) de las líneas que la referencian.
+    # Sin ondelete: la FK bloquea borrar una factura de anticipo ya descontada (además
+    # del 409 explícito en eliminar_factura).
+    anticipo_factura_id = Column(Integer, ForeignKey("cont_factura_cliente.id"),
+                                 nullable=True, index=True)
     numero_parte = Column(String(100), nullable=True)
     descripcion = Column(String(500), nullable=True)
     cantidad = Column(Numeric(12, 4), default=0)
@@ -549,7 +571,8 @@ class ContFacturaClienteItem(Base):
     total_neto = Column(Numeric(14, 2), default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    factura = relationship("ContFacturaCliente", back_populates="items")
+    factura = relationship("ContFacturaCliente", back_populates="items",
+                           foreign_keys=[factura_id])
 
 
 class ContCobranza(Base):
@@ -559,7 +582,13 @@ class ContCobranza(Base):
     factura_id = Column(Integer, ForeignKey("cont_factura_cliente.id", ondelete="CASCADE"))
     fecha = Column(Date, nullable=True)
     monto = Column(Numeric(14, 2), default=0)
-    medio = Column(String(30), default="transferencia")  # transferencia|cheque|efectivo|factoring
+    # transferencia|cheque|efectivo|factoring_adelanto|factoring_retencion|adelanto
+    # ('adelanto' = aplicación AUTOMÁTICA de un cont_adelanto aprobado por Tesorería;
+    #  no es un depósito nuevo → se excluye de la conciliación bancaria de ingresos)
+    medio = Column(String(30), default="transferencia")
+    # Qué adelanto generó esta cobranza (solo medio='adelanto'): permite revertirla
+    # devolviendo el monto a cont_adelanto.monto_aplicado aunque la OC tenga varios.
+    adelanto_id = Column(Integer, ForeignKey("cont_adelanto.id"), nullable=True, index=True)
     banco = Column(String(100), nullable=True)
     numero_operacion = Column(String(100), nullable=True)
     observaciones = Column(Text, nullable=True)
@@ -591,3 +620,45 @@ class ContFactoring(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     factura = relationship("ContFacturaCliente", back_populates="factoring")
+
+
+class ContAdelanto(Base):
+    """Adelanto (anticipo) de un CLIENTE sobre una OC de venta — Grupo AM.
+
+    Espejo adaptado de monza_cont_adelanto, con diferencias pedidas por el dueño:
+      · UNA OC puede tener VARIOS adelantos (sin UNIQUE por oc_cliente_id).
+      · Máquina de estados explícita: 'informado' (lo declara Comercial en el Cierre de
+        Venta o desde Ventas) → 'aprobado' (Tesorería confirma la plata recibida: monto
+        real, fecha, banco, N° operación — SIN exigir cartola) → 'anulado'.
+      · Dos vías de aplicación, excluyentes por adelanto:
+          A) factura_anticipo_id NULL   → al emitir las facturas del despacho real se
+             aplica como cobranza medio='adelanto' (hasta agotar `monto − monto_aplicado`).
+          B) factura_anticipo_id seteado → la cobranza 'adelanto' cae en ESA factura de
+             anticipo; las facturas del despacho real llevan línea de DESCUENTO negativa.
+    Derivados (no columnas): conciliado_banco (existe enlace en conc_conciliacion_ingreso),
+    pendiente = monto − monto_aplicado. INVARIANTE: monto_aplicado == Σ cobranzas
+    medio='adelanto' generadas por este adelanto."""
+    __tablename__ = "cont_adelanto"
+    id = Column(Integer, primary_key=True, index=True)
+    empresa = Column(String(50), nullable=False, server_default="mineria")
+    oc_cliente_id = Column(Integer, ForeignKey("oc_cliente.id", ondelete="CASCADE"),
+                           nullable=False, index=True)
+    estado = Column(String(20), default="informado")  # informado | aprobado | anulado
+    monto_esperado = Column(Numeric(14, 2), nullable=True)  # lo que informa Comercial
+    pct = Column(Integer, nullable=True)                    # % informativo (ej. 30)
+    monto = Column(Numeric(14, 2), default=0)               # monto REAL confirmado por Tesorería
+    monto_aplicado = Column(Numeric(14, 2), default=0)      # ya convertido en cobranzas 'adelanto'
+    fecha_pago = Column(Date, nullable=True)
+    banco = Column(String(100), nullable=True)
+    numero_operacion = Column(String(100), nullable=True)
+    factura_anticipo_id = Column(Integer, ForeignKey("cont_factura_cliente.id"),
+                                 nullable=True, index=True)
+    observaciones = Column(Text, nullable=True)
+    usuario_informa_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    usuario_aprueba_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    fecha_aprobacion = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    oc_cliente = relationship("OcCliente")
+    factura_anticipo = relationship("ContFacturaCliente",
+                                    foreign_keys=[factura_anticipo_id])

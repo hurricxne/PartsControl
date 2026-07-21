@@ -48,7 +48,22 @@ export interface CobranzaMatch {
   dias_diferencia?: number
 }
 
-export type Destino = EgresoMatch | CobranzaMatch
+// Adelanto de cliente aprobado (candidato de conciliación abono↔adelanto)
+export interface AdelantoMatch {
+  clase: 'adelanto'
+  adelanto_id: number
+  oc_cliente_id: number
+  numero_oc: string | null
+  cliente: string
+  estado: string
+  fecha: string | null
+  monto: number
+  banco: string | null
+  numero_operacion: string | null
+  dias_diferencia?: number
+}
+
+export type Destino = EgresoMatch | CobranzaMatch | AdelantoMatch
 
 export interface Movimiento {
   id: number
@@ -74,6 +89,9 @@ export interface Resumen {
   pagos_por_aprobar: number
   monto_por_pagar_clp: number
   por_pagar_vencido_clp: number
+  adelantos_por_aprobar: number
+  adelantos_por_aprobar_clp: number
+  adelantos_sin_conciliar: number
   movimientos_total: number
   movimientos_conciliados: number
   cargos_pendientes: number
@@ -81,6 +99,36 @@ export interface Resumen {
   egresos_sin_conciliar: number
   cobranzas_sin_conciliar: number
   movimientos_pendientes: number
+}
+
+// ─── Aprobación de adelantos de cliente ────────────────────────────────────────
+export interface Adelanto {
+  id: number
+  oc_cliente_id: number
+  estado: 'informado' | 'aprobado' | 'anulado'
+  monto_esperado: number
+  pct: number | null
+  monto: number
+  monto_aplicado: number
+  pendiente_aplicar: number
+  fecha_pago: string | null
+  banco: string | null
+  numero_operacion: string | null
+  conciliado_banco: boolean
+  factura_anticipo_id: number | null
+  factura_anticipo_folio: string | null
+  observaciones: string | null
+  // info de la venta (cola de aprobaciones)
+  numero_oc?: string | null
+  numero_cotizacion?: string | null
+  cliente?: string
+  rut_cliente?: string
+  abono_sugerido?: { movimiento_id: number; fecha: string | null; monto: number; glosa: string | null; referencia: string | null } | null
+}
+
+export interface AprobacionesResp {
+  por_aprobar: Adelanto[]
+  aprobadas: Adelanto[]
 }
 
 export interface Cartola {
@@ -132,4 +180,6 @@ export interface FlujoCaja {
   por_cobrar: Record<Bucket, BucketInfo>
   neto: Record<Bucket, number>
   retenciones_factoring: { n: number; monto: number }
+  adelantos_por_aprobar: { n: number; monto: number }
+  adelantos_recibidos_sin_aplicar: { n: number; monto: number }
 }

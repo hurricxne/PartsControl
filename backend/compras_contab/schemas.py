@@ -21,6 +21,16 @@ class PagoInline(BaseModel):
     observaciones: Optional[str] = None
 
 
+class CompraItemIn(BaseModel):
+    """Línea de costeo por ítem de una compra NACIONAL (la factura ES el costo)."""
+    item_cotizacion_id: int
+    oc_proveedor_item_id: Optional[int] = None
+    numero_parte: Optional[str] = None
+    descripcion: Optional[str] = None
+    cantidad: float = Field(..., gt=0)
+    precio_unit: float = Field(..., ge=0)   # NETO unitario en moneda factura (CLP en nacional)
+
+
 class CompraCreate(BaseModel):
     """Alta de una compra/gasto. Si condicion_pago='contado' y no viene `pago`, se genera
     automáticamente un egreso por el total (sale del banco el mismo día)."""
@@ -48,6 +58,9 @@ class CompraCreate(BaseModel):
     embarque_id: Optional[int] = None
     emb_pricing_gasto_id: Optional[int] = None
     factura_proveedor_id: Optional[int] = None
+    # Compra NACIONAL con detalle de ítems: la factura ES el costo de esos repuestos.
+    oc_proveedor_id: Optional[int] = None
+    items: Optional[List[CompraItemIn]] = None
     observaciones: Optional[str] = None
     pago: Optional[PagoInline] = None
 

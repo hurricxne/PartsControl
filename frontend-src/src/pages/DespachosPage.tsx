@@ -1,13 +1,14 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { despachosAPI, cotizacionesAPI, cotizadorAPI, comprasAPI, abrirDocumento } from '../services/api'
+import { despachosAPI, cotizacionesAPI, cotizadorAPI, comprasAPI, wasabilAPI, abrirDocumento } from '../services/api'
 import {
   Truck, Package, CheckCircle2, AlertCircle, Search, X,
   ChevronRight, ChevronDown, Plus, Trash2, Send,
   FileSpreadsheet, FileText, FileDown, Loader2,
-  Clock, AlertTriangle, Upload, Pencil, Eye,
+  Clock, AlertTriangle, Upload, Pencil, Eye, Receipt,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
+import { hoyLocal } from '../utils/format'
 
 interface DocumentosOc {
   excel_oc: boolean
@@ -149,7 +150,10 @@ export default function DespachosPage() {
   const [expandedOc, setExpandedOc] = useState<number | null>(null)
   const [modalOc, setModalOc] = useState<OcDetail | null>(null)
   const [firmarId, setFirmarId] = useState<number | null>(null)
+  const [firmarDteFolio, setFirmarDteFolio] = useState<string | null>(null)
   const [editDespacho, setEditDespacho] = useState<DespachoRow | null>(null)
+  const [editDespachoDteFolio, setEditDespachoDteFolio] = useState<string | null>(null)
+  const [emitirGuia, setEmitirGuia] = useState<DespachoRow | null>(null)
   const qc = useQueryClient()
 
   const { data: counts } = useQuery({
@@ -287,8 +291,15 @@ export default function DespachosPage() {
                   anularMut.mutate(id)
                 }
               }}
-              onFirmarDespacho={(id: number) => setFirmarId(id)}
-              onEditDespacho={(d: DespachoRow) => setEditDespacho(d)}
+              onFirmarDespacho={(id: number, dteFolio: string | null) => {
+                setFirmarId(id)
+                setFirmarDteFolio(dteFolio)
+              }}
+              onEditDespacho={(d: DespachoRow, dteFolio: string | null) => {
+                setEditDespacho(d)
+                setEditDespachoDteFolio(dteFolio)
+              }}
+              onEmitirGuia={(d: DespachoRow) => setEmitirGuia(d)}
             />
           ))}
         </div>
@@ -310,6 +321,7 @@ export default function DespachosPage() {
       {firmarId !== null && (
         <FirmarGuiaModal
           despachoId={firmarId}
+          dteFolio={firmarDteFolio}
           onClose={() => setFirmarId(null)}
           onDone={() => {
             setFirmarId(null)
@@ -322,10 +334,29 @@ export default function DespachosPage() {
       {editDespacho && (
         <EditarDespachoModal
           despacho={editDespacho}
+          dteFolio={editDespachoDteFolio}
           onClose={() => setEditDespacho(null)}
           onSaved={() => {
             setEditDespacho(null)
             qc.invalidateQueries({ queryKey: ['despachos'] })
+          }}
+        />
+      )}
+
+      {/* Modal emitir guía de despacho electrónica (SII) vía Wasabil */}
+      {emitirGuia && (
+        <EmitirGuiaSIIModal
+          despacho={emitirGuia}
+          onClose={() => {
+            setEmitirGuia(null)
+            // Refrescar SIEMPRE al cerrar: la emisión pudo avanzar aunque el
+            // usuario cierre el modal a mitad de camino (folio/badges al día)
+            qc.invalidateQueries({ queryKey: ['despachos'] })
+            qc.invalidateQueries({ queryKey: ['wasabil'] })
+          }}
+          onDone={() => {
+            qc.invalidateQueries({ queryKey: ['despachos'] })
+            qc.invalidateQueries({ queryKey: ['wasabil'] })
           }}
         />
       )}
@@ -371,6 +402,24 @@ function TabBtn({ active, onClick, children }: any) {
   )
 }
 
+// Estados de un DTE realmente EN PROCESO (espejo del guard _guia_electronica_activa
+// del backend): claim en vuelo o documento vivo en Wasabil sin resultado final.
+// OJO: 'no_enviado' (limbo: claim expirado sin respuesta) NO está — el backend
+// permite anular/editar en ese caso y el frontend no debe sobre-bloquear.
+const DTE_EN_PROCESO = ['enviando', 'procesando', 'pendiente']
+
+// Qué pasarle a los modales que pueden tocar el N° de guía (editar / firmar):
+//   'verificando' = la consulta de DTEs no resolvió con éxito (bloquear por precaución)
+//   folio SII     = guía electrónica emitida (bloqueado: el folio no se edita a mano)
+//   'en_emision'  = guía en proceso en el SII, aún sin folio (bloqueado: llegará solo)
+//   null          = sin guía electrónica (o fallida): el N° manual se puede editar
+function folioParaModal(dtesListos: boolean, dte: any): string | null {
+  if (!dtesListos) return 'verificando'
+  if (dte?.folio) return dte.folio
+  if (dte && DTE_EN_PROCESO.includes(dte.estado)) return 'en_emision'
+  return null
+}
+
 function OcRow({
   oc,
   expanded,
@@ -381,8 +430,20 @@ function OcRow({
   onAnularDespacho,
   onFirmarDespacho,
   onEditDespacho,
+  onEmitirGuia,
 }: any) {
   const badge = estadoLabel[oc.estado] ?? estadoLabel.pendiente
+  // Estado de las guías electrónicas (Wasabil) de los despachos de esta OC —
+  // solo BD, en lote, para pintar folio/PDF/fallida sin N llamadas.
+  // `dtesListos` importa: mientras la consulta no resuelva CON ÉXITO, el folio SII
+  // se trata como DESCONOCIDO (se bloquea la edición manual por precaución, no al
+  // revés). isSuccess y no isFetched: una consulta FALLIDA también debe bloquear.
+  const despachoIds = (detail?.despachos ?? []).map((d: DespachoRow) => d.id)
+  const { data: dtes = {}, isSuccess: dtesListos } = useQuery({
+    queryKey: ['wasabil', 'estado-batch', despachoIds],
+    queryFn: () => wasabilAPI.estadoBatch(despachoIds).then(r => r.data),
+    enabled: expanded && despachoIds.length > 0,
+  })
   return (
     <div className="card overflow-hidden">
       <button
@@ -520,7 +581,9 @@ function OcRow({
                 Despachos ({detail.despachos.length})
               </div>
               <div className="space-y-2">
-                {detail.despachos.map((d: DespachoRow) => (
+                {detail.despachos.map((d: DespachoRow) => {
+                  const dte = (dtes as any)[d.id]
+                  return (
                   <div
                     key={d.id}
                     className="flex items-center justify-between p-3 border rounded-xl"
@@ -532,6 +595,17 @@ function OcRow({
                           {d.numero_despacho}
                         </span>
                         <DespachoEstadoBadge estado={d.estado} />
+                        {dte?.estado === 'emitido' && (
+                          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-blue-500/15 text-blue-600 dark:text-blue-400 inline-flex items-center gap-1">
+                            <Receipt className="w-3 h-3" /> Guía SII {dte.folio}
+                          </span>
+                        )}
+                        {dte && dte.estado !== 'emitido' && (
+                          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 inline-flex items-center gap-1">
+                            <AlertTriangle className="w-3 h-3" />
+                            {dte.puede_reintentar ? 'Emisión SII fallida' : 'Emisión SII en proceso'}
+                          </span>
+                        )}
                         {d.guia_firmada && (
                           <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1">
                             <CheckCircle2 className="w-3 h-3" /> Guía firmada
@@ -546,9 +620,29 @@ function OcRow({
                         {d.fecha_despacho && ` · ${new Date(d.fecha_despacho).toLocaleDateString('es-CL')}`}
                       </div>
                     </div>
-                    <div className="flex gap-2 shrink-0 items-center">
+                    <div className="flex flex-wrap gap-2 shrink-0 items-center justify-end">
                       {d.estado === 'en_preparacion' && (
                         <>
+                          {(!dte || dte.puede_reintentar) && (
+                            <button
+                              onClick={() => onEmitirGuia(d)}
+                              className="px-3 py-1.5 text-xs bg-blue-500/15 text-blue-600 dark:text-blue-400 rounded-lg hover:bg-blue-500/25 flex items-center gap-1 font-semibold"
+                              title="Emitir la guía de despacho electrónica al SII vía Wasabil"
+                            >
+                              <Receipt className="w-3 h-3" /> {dte ? 'Reintentar guía SII' : 'Emitir guía SII'}
+                            </button>
+                          )}
+                          {/* Paso 3 del flujo: el transportista se agrega DESPUÉS de emitir
+                              la guía (no viaja al SII). Reusa el modal de edición, que ya
+                              blinda el folio del SII para que no se pise a mano. */}
+                          <button
+                            onClick={() => onEditDespacho(d, folioParaModal(dtesListos, dte))}
+                            className="px-3 py-1.5 text-xs rounded-lg hover:bg-[var(--surface-300)] flex items-center gap-1 font-semibold border"
+                            style={{ color: 'var(--text-muted)', borderColor: 'var(--border)' }}
+                            title="Agregar o editar el transportista y el N° de expedición"
+                          >
+                            <Truck className="w-3 h-3" /> {d.transportista ? 'Transportista' : 'Agregar transportista'}
+                          </button>
                           <button
                             onClick={() => onCerrarDespacho(d.id)}
                             className="px-3 py-1.5 text-xs bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 rounded-lg hover:bg-emerald-500/25 flex items-center gap-1 font-semibold"
@@ -556,7 +650,22 @@ function OcRow({
                             <Send className="w-3 h-3" /> Confirmar
                           </button>
                           <button
-                            onClick={() => onAnularDespacho(d.id)}
+                            onClick={() => {
+                              // El backend rechaza (409) anular con guía SII viva; acá se
+                              // explica de inmediato en vez de dejar intentar algo que fallará.
+                              if (dte?.estado === 'emitido') {
+                                toast.error(
+                                  `Este despacho tiene guía SII EMITIDA (folio ${dte.folio}): ` +
+                                  'anúlala primero en Wasabil y luego anula el despacho.'
+                                )
+                                return
+                              }
+                              if (dte && DTE_EN_PROCESO.includes(dte.estado)) {
+                                toast.error('Este despacho tiene una emisión de guía SII en curso: espera el resultado antes de anular.')
+                                return
+                              }
+                              onAnularDespacho(d.id)
+                            }}
                             className="px-3 py-1.5 text-xs bg-red-500/10 text-red-500 rounded-lg hover:bg-red-500/20"
                           >
                             <Trash2 className="w-3 h-3" />
@@ -565,10 +674,28 @@ function OcRow({
                       )}
                       {d.estado === 'despachado' && !d.guia_firmada && (
                         <button
-                          onClick={() => onFirmarDespacho(d.id)}
+                          onClick={() => onFirmarDespacho(d.id, folioParaModal(dtesListos, dte))}
                           className="px-3 py-1.5 text-xs bg-blue-500/15 text-blue-600 dark:text-blue-400 rounded-lg hover:bg-blue-500/25 flex items-center gap-1 font-semibold"
                         >
                           <CheckCircle2 className="w-3 h-3" /> Marcar guía firmada
+                        </button>
+                      )}
+                      {dte && dte.estado !== 'emitido' && !dte.puede_reintentar && (
+                        <button
+                          onClick={() => onEmitirGuia(d)}
+                          className="px-3 py-1.5 text-xs bg-amber-500/15 text-amber-600 dark:text-amber-400 rounded-lg hover:bg-amber-500/25 flex items-center gap-1 font-semibold"
+                          title="La emisión sigue en proceso: consultar el estado real en el SII"
+                        >
+                          <Clock className="w-3 h-3" /> Estado guía SII
+                        </button>
+                      )}
+                      {dte?.pdf_url && (
+                        <button
+                          onClick={() => window.open(dte.pdf_url, '_blank', 'noopener,noreferrer')}
+                          className="px-2.5 py-1.5 text-xs bg-blue-500/10 text-blue-600 dark:text-blue-400 rounded-lg hover:bg-blue-500/20 flex items-center gap-1"
+                          title="Ver el PDF de la guía electrónica (SII)"
+                        >
+                          <FileText className="w-3 h-3" /> PDF SII
                         </button>
                       )}
                       {d.guia_firmada_archivo && (
@@ -582,7 +709,7 @@ function OcRow({
                       )}
                       {d.estado !== 'en_preparacion' && d.estado !== 'anulado' && (
                         <button
-                          onClick={() => onEditDespacho(d)}
+                          onClick={() => onEditDespacho(d, folioParaModal(dtesListos, dte))}
                           className="p-1.5 rounded-lg hover:bg-[var(--surface-300)]"
                           style={{ color: 'var(--text-muted)' }}
                           title="Editar transportista / N° expedición"
@@ -592,19 +719,25 @@ function OcRow({
                       )}
                     </div>
                   </div>
-                ))}
+                  )
+                })}
               </div>
             </div>
           )}
 
           {/* Action */}
           {detail.items.some((it: ItemRow) => it.qty_disponible > 0) && (
-            <button
-              onClick={onCrearDespacho}
-              className="btn-primary w-full justify-center"
-            >
-              <Plus className="w-4 h-4" /> Crear Despacho
-            </button>
+            <div className="space-y-1.5">
+              <button
+                onClick={onCrearDespacho}
+                className="btn-primary w-full justify-center"
+              >
+                <Plus className="w-4 h-4" /> Crear Despacho
+              </button>
+              <p className="text-[11px] text-center" style={{ color: 'var(--text-faint)' }}>
+                Eliges qué se despacha. La guía SII, el transportista y la confirmación van después, en la fila del despacho.
+              </p>
+            </div>
           )}
         </div>
       )}
@@ -1143,12 +1276,14 @@ function DespachoEstadoBadge({ estado }: { estado: string }) {
 }
 
 function CrearDespachoModal({ oc, onClose, onCreated }: any) {
-  const [transportista, setTransportista] = useState('')
-  const [numeroGuia, setNumeroGuia] = useState('')
+  // Este modal es el PASO 1 del despacho: definir QUÉ se despacha (ítems + a quién).
+  // Los datos de transporte (transportista, N° de expedición) y el N° de guía NO se
+  // piden aquí a propósito: la guía de despacho SII se emite en el paso 2 y su folio
+  // lo asigna el SII; el transportista se agrega en el paso 3, ya con la guía emitida.
+  // Ver EditarDespachoModal (paso 3) y EmitirGuiaSIIModal (paso 2).
   const [contacto, setContacto] = useState(oc.contacto || '')
   const [direccion, setDireccion] = useState(oc.direccion || '')
   const [observaciones, setObservaciones] = useState('')
-  const [numeroExpedicion, setNumeroExpedicion] = useState('')
   const [selectedItems, setSelectedItems] = useState<Record<number, number>>({})
 
   const disponibles = useMemo(
@@ -1169,7 +1304,9 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
   }
 
   const updateQty = (id: number, value: number) => {
-    setSelectedItems(prev => ({ ...prev, [id]: value }))
+    // Nunca menos de 1: un 0 o negativo dejaría el ítem "seleccionado" y el
+    // botón Crear habilitado, para chocar recién con el 400 del backend.
+    setSelectedItems(prev => ({ ...prev, [id]: Math.max(1, value) }))
   }
 
   const seleccionTotal = Object.keys(selectedItems).length
@@ -1178,9 +1315,8 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
     mutationFn: () =>
       despachosAPI.create({
         oc_cliente_id: oc.id,
-        transportista: transportista || null,
-        numero_guia: numeroGuia || null,
-        numero_expedicion: numeroExpedicion || null,
+        // transportista / numero_guia / numero_expedicion se omiten a propósito:
+        // el backend los acepta nulos y se completan en los pasos 2 y 3 del flujo.
         contacto_destinatario: contacto || null,
         direccion_entrega: direccion || null,
         observaciones: observaciones || null,
@@ -1190,7 +1326,7 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
         })),
       }),
     onSuccess: (data: any) => {
-      toast.success(`Despacho ${data.numero_despacho} creado`)
+      toast.success(`Despacho ${data.numero_despacho} creado. Ahora emite la guía SII, agrega el transportista y confirma el despacho.`)
       onCreated()
     },
     onError: (e: any) => toast.error(e?.response?.data?.detail || 'Error al crear'),
@@ -1213,7 +1349,7 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
         >
           <div>
             <h2 className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>
-              Nuevo Despacho
+              Crear despacho
             </h2>
             <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
               OC {oc.numero_oc} · {oc.cliente}
@@ -1229,26 +1365,23 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
         </div>
 
         <div className="p-4 space-y-4 overflow-y-auto flex-1">
-          {/* Datos despacho */}
+          {/* Guía del flujo: este modal es solo el paso 1 de 4. */}
+          <div
+            className="flex items-start gap-2 p-3 rounded-xl border text-xs"
+            style={{ backgroundColor: 'var(--surface-200)', borderColor: 'var(--border)', color: 'var(--text-muted)' }}
+          >
+            <Receipt className="w-4 h-4 shrink-0 mt-0.5 text-blue-500" />
+            <span>
+              <b style={{ color: 'var(--text-primary)' }}>Paso 1 de 4:</b> elige qué se despacha.
+              Luego, en la fila del despacho: <b style={{ color: 'var(--text-primary)' }}>emites la guía SII</b> (el
+              folio lo asigna el SII), <b style={{ color: 'var(--text-primary)' }}>agregas el transportista</b> y
+              <b style={{ color: 'var(--text-primary)' }}> confirmas el despacho</b>.
+            </span>
+          </div>
+
+          {/* Destinatario (la guía SII usa la ficha del cliente en Wasabil; estos
+              datos son de referencia interna del despacho y vienen desde la OC). */}
           <div className="grid grid-cols-2 gap-3">
-            <Input
-              label="Transportista"
-              value={transportista}
-              onChange={setTransportista}
-              placeholder="Ej: Chilexpress"
-            />
-            <Input
-              label="N° Guía"
-              value={numeroGuia}
-              onChange={setNumeroGuia}
-              placeholder="Manual / SII"
-            />
-            <Input
-              label="N° Expedición (courier / Samex)"
-              value={numeroExpedicion}
-              onChange={setNumeroExpedicion}
-              placeholder="Opcional · se puede agregar después"
-            />
             <Input
               label="Contacto Destinatario"
               value={contacto}
@@ -1367,7 +1500,7 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
   )
 }
 
-function Input({ label, value, onChange, placeholder }: any) {
+function Input({ label, value, onChange, placeholder, disabled, hint }: any) {
   return (
     <div>
       <label
@@ -1381,8 +1514,12 @@ function Input({ label, value, onChange, placeholder }: any) {
         value={value}
         onChange={e => onChange(e.target.value)}
         placeholder={placeholder}
-        className="input"
+        disabled={disabled}
+        className={`input ${disabled ? 'opacity-60 cursor-not-allowed' : ''}`}
       />
+      {hint && (
+        <p className="text-[11px] mt-1" style={{ color: 'var(--text-faint)' }}>{hint}</p>
+      )}
     </div>
   )
 }
@@ -1390,17 +1527,25 @@ function Input({ label, value, onChange, placeholder }: any) {
 // ─── Modal: marcar guía firmada (subir foto/PDF de la guía firmada) ───────────
 function FirmarGuiaModal({
   despachoId,
+  dteFolio,
   onClose,
   onDone,
 }: {
   despachoId: number
+  dteFolio?: string | null
   onClose: () => void
   onDone: () => void
 }) {
   const [file, setFile] = useState<File | null>(null)
   const [numeroGuia, setNumeroGuia] = useState('')
-  const [fecha, setFecha] = useState(new Date().toISOString().slice(0, 10))
+  // hoyLocal() y no toISOString(): en Chile (UTC-3/-4) la fecha UTC ya es
+  // "mañana" pasadas las ~21:00 y la firma quedaría con fecha futura.
+  const [fecha, setFecha] = useState(hoyLocal())
   const [saving, setSaving] = useState(false)
+
+  // Mismo candado que EditarDespachoModal (ver folioParaModal): con guía
+  // electrónica emitida/en proceso, el N° es (o será) el folio del SII.
+  const folioBloqueado = dteFolio !== null && dteFolio !== undefined
 
   const submit = async () => {
     if (!file) {
@@ -1412,7 +1557,8 @@ function FirmarGuiaModal({
       const up = await despachosAPI.uploadDoc(file)
       await despachosAPI.firmar(despachoId, {
         fecha_firma: fecha,
-        numero_guia: numeroGuia || undefined,
+        // Con folio SII, el N° de guía no viaja (el backend además lo rechaza)
+        numero_guia: folioBloqueado ? undefined : (numeroGuia || undefined),
         archivo: up.filename,
       })
       toast.success('Guía firmada — ya se puede facturar en Contabilidad')
@@ -1467,7 +1613,22 @@ function FirmarGuiaModal({
             </label>
           </div>
           <div className="grid grid-cols-2 gap-3">
-            <Input label="N° Guía (opcional)" value={numeroGuia} onChange={setNumeroGuia} placeholder="Si falta" />
+            <Input
+              label="N° Guía (opcional)"
+              value={folioBloqueado && dteFolio !== 'verificando' && dteFolio !== 'en_emision' ? dteFolio : numeroGuia}
+              onChange={setNumeroGuia}
+              placeholder="Si falta"
+              disabled={folioBloqueado}
+              hint={
+                dteFolio === 'verificando'
+                  ? 'Verificando si este despacho tiene guía electrónica…'
+                  : dteFolio === 'en_emision'
+                    ? 'Guía electrónica en emisión: el N° quedará fijado por el folio del SII.'
+                    : folioBloqueado
+                      ? `Guía electrónica emitida al SII (folio ${dteFolio}): el N° no se edita a mano.`
+                      : undefined
+              }
+            />
             <div>
               <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: 'var(--text-faint)' }}>
                 Fecha de firma
@@ -1490,10 +1651,12 @@ function FirmarGuiaModal({
 // ─── Modal: editar transportista / N° de expedición / N° de guía ──────────────
 function EditarDespachoModal({
   despacho,
+  dteFolio,
   onClose,
   onSaved,
 }: {
   despacho: DespachoRow
+  dteFolio?: string | null
   onClose: () => void
   onSaved: () => void
 }) {
@@ -1502,13 +1665,19 @@ function EditarDespachoModal({
   const [numeroGuia, setNumeroGuia] = useState(despacho.numero_guia || '')
   const [saving, setSaving] = useState(false)
 
+  // dteFolio: null = sin guía electrónica · 'verificando' = consulta en curso ·
+  // 'en_emision' = guía en proceso en el SII (ver folioParaModal) · otro valor =
+  // folio SII real. Cualquier valor no-null bloquea la edición manual del N°.
+  const folioBloqueado = dteFolio !== null && dteFolio !== undefined
+
   const submit = async () => {
     setSaving(true)
     try {
       await despachosAPI.update(despacho.id, {
         transportista: transportista || null,
         numero_expedicion: numeroExpedicion || null,
-        numero_guia: numeroGuia || null,
+        // Guía electrónica emitida (o sin verificar): el folio no se edita a mano
+        ...(folioBloqueado ? {} : { numero_guia: numeroGuia || null }),
       })
       toast.success('Datos del despacho actualizados')
       onSaved()
@@ -1543,11 +1712,25 @@ function EditarDespachoModal({
         </div>
         <div className="p-4 space-y-3">
           <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-            Puedes completar el transportista o el N° de expedición aunque el despacho ya esté cerrado o firmado.
+            Puedes completar el transportista o el N° de expedición en cualquier momento del despacho.
           </p>
           <Input label="Transportista" value={transportista} onChange={setTransportista} placeholder="Ej: Samex" />
           <Input label="N° Expedición (courier / Samex)" value={numeroExpedicion} onChange={setNumeroExpedicion} />
-          <Input label="N° Guía" value={numeroGuia} onChange={setNumeroGuia} />
+          <Input
+            label="N° Guía"
+            value={numeroGuia}
+            onChange={setNumeroGuia}
+            disabled={folioBloqueado}
+            hint={
+              dteFolio === 'verificando'
+                ? 'Verificando si este despacho tiene guía electrónica… (reabre el detalle para editar)'
+                : dteFolio === 'en_emision'
+                  ? 'Guía electrónica en emisión: el N° quedará fijado por el folio del SII al terminar.'
+                  : folioBloqueado
+                    ? `Guía electrónica emitida al SII (folio ${dteFolio}): el N° no se edita a mano.`
+                    : 'Solo para guía en papel. Si vas a emitir la guía SII, déjalo vacío: el folio lo pone el SII.'
+            }
+          />
         </div>
         <div className="p-4 border-t flex justify-end gap-2" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
           <button onClick={onClose} className="btn-secondary text-sm">Cancelar</button>
@@ -1555,6 +1738,347 @@ function EditarDespachoModal({
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />} Guardar
           </button>
         </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Modal: emitir guía de despacho electrónica (SII 52) vía Wasabil ──────────
+// Protocolo de seguridad: PASO 1 previsualización (no toca el SII) → PASO 2 con
+// el OK explícito del usuario se emite (IRREVERSIBLE) → sondeo del estado hasta
+// Emitido (folio real + PDF) o Fallido (motivo del SII + reintento seguro).
+const fmtCLP = (n: number) => '$' + Math.round(n || 0).toLocaleString('es-CL')
+
+function EmitirGuiaSIIModal({
+  despacho,
+  onClose,
+  onDone,
+}: {
+  despacho: DespachoRow
+  onClose: () => void
+  onDone: () => void
+}) {
+  type Fase = 'cargando' | 'preview' | 'error_carga' | 'emitiendo' | 'sondeo' | 'exito' | 'fallido' | 'pendiente'
+  const [fase, setFase] = useState<Fase>('cargando')
+  const [preview, setPreview] = useState<any>(null)
+  const [dte, setDte] = useState<any>(null)
+  const [error, setError] = useState('')
+  // Tipo de traslado del SII (dispatchTypeCode): 1 venta por defecto, 5 traslado
+  // interno hacia bodega propia, etc. El operador lo elige antes de emitir.
+  const [tipoTraslado, setTipoTraslado] = useState(1)
+
+  // Decide la fase según el DTE previo (única fuente: puede_reintentar del backend)
+  const faseSegunDte = (d: any): Fase => {
+    if (!d || d.estado === 'no_enviado') return 'preview'
+    if (d.estado === 'emitido') return 'exito'
+    if (d.puede_reintentar) return 'fallido'          // fallido del SII o error de envío
+    if (d.uuid) return 'sondeo'                       // procesando/pendiente en Wasabil
+    return 'pendiente'                                // claim en vuelo de otro intento
+  }
+
+  // PASO 1: cargar la previsualización (si ya había una emisión previa, retomarla).
+  // También se usa para RESINCRONIZAR tras un error al emitir.
+  const cargarPreview = () => {
+    setFase('cargando')
+    wasabilAPI.previewGuia(despacho.id)
+      .then(({ data }) => {
+        setPreview(data)
+        if (data.dte) setDte(data.dte)
+        setFase(faseSegunDte(data.dte))
+      })
+      .catch((e: any) => {
+        setError(e?.response?.data?.detail || 'No se pudo cargar la previsualización')
+        setFase('error_carga')
+      })
+  }
+  useEffect(cargarPreview, [despacho.id])
+
+  // Sondeo: el envío al SII es asíncrono (segundos a minutos)
+  useEffect(() => {
+    if (fase !== 'sondeo') return
+    let vivo = true
+    let intentos = 0
+    const tick = async () => {
+      if (!vivo) return
+      intentos += 1
+      try {
+        const { data } = await wasabilAPI.estadoGuia(despacho.id)
+        if (!vivo) return
+        setDte(data)
+        if (data.estado === 'emitido') { setFase('exito'); onDone(); return }
+        if (data.puede_reintentar) { setFase('fallido'); return }
+      } catch { /* error transitorio: se reintenta en el próximo tick */ }
+      if (intentos >= 30) { setFase('pendiente'); return }  // ~90 s: seguir después
+      window.setTimeout(tick, 3000)
+    }
+    tick()
+    return () => { vivo = false }
+  }, [fase, despacho.id])
+
+  // PASO 2: emitir (solo tras ver la previsualización) o reintentar un fallido
+  const emitir = async (reintento: boolean) => {
+    setFase('emitiendo')
+    setError('')
+    try {
+      const { data } = reintento
+        ? await wasabilAPI.reintentarGuia(despacho.id, tipoTraslado)
+        : await wasabilAPI.emitirGuia(despacho.id, tipoTraslado)
+      setDte(data)
+      if (data.estado === 'emitido') { setFase('exito'); onDone() }
+      else if (data.puede_reintentar) setFase('fallido')
+      else setFase('sondeo')
+    } catch (e: any) {
+      // 409/502/timeout: RESINCRONIZAR con el backend en vez de adivinar la fase
+      // (el estado real pudo cambiar: claim en curso, fallido, incluso emitido)
+      setError(e?.response?.data?.detail || 'No se pudo emitir la guía')
+      cargarPreview()
+    }
+  }
+
+  const receptor = preview?.receptor
+  const referencia = preview?.referencias?.[0]
+
+  return (
+    <div
+      className="fixed inset-0 flex items-center justify-center z-50 p-4"
+      style={{ backgroundColor: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)' }}
+      onClick={onClose}
+    >
+      <div
+        className="max-w-2xl w-full max-h-[90vh] overflow-hidden flex flex-col rounded-2xl border shadow-2xl"
+        style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div
+          className="p-4 border-b flex items-center justify-between"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+        >
+          <div>
+            <h2 className="text-lg font-bold flex items-center gap-2" style={{ color: 'var(--text-primary)' }}>
+              <Receipt className="w-5 h-5 text-blue-500" /> Emitir guía de despacho SII
+            </h2>
+            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+              {despacho.numero_despacho} · vía Wasabil (GRUPO AM SPA)
+            </p>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-[var(--surface-300)]" style={{ color: 'var(--text-muted)' }}>
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="p-4 space-y-4 overflow-y-auto">
+          {fase === 'cargando' && (
+            <div className="py-10 text-center" style={{ color: 'var(--text-muted)' }}>
+              <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" /> Armando la previsualización…
+            </div>
+          )}
+
+          {(fase === 'emitiendo' || fase === 'sondeo') && (
+            <div className="py-10 text-center" style={{ color: 'var(--text-muted)' }}>
+              <Loader2 className="w-8 h-8 animate-spin mx-auto mb-3 text-blue-500" />
+              <p className="font-semibold" style={{ color: 'var(--text-primary)' }}>
+                {fase === 'emitiendo' ? 'Enviando a Wasabil…' : 'Procesando en el SII…'}
+              </p>
+              <p className="text-xs mt-1">El SII puede tardar de segundos a un par de minutos. No cierres esta ventana.</p>
+            </div>
+          )}
+
+          {fase === 'exito' && dte && (
+            <div className="py-8 text-center space-y-3">
+              <CheckCircle2 className="w-10 h-10 mx-auto text-emerald-500" />
+              <p className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>
+                Guía emitida — Folio SII {dte.folio}
+              </p>
+              <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                El folio quedó registrado en el despacho. Imprime el PDF para que viaje con la carga.
+                Cierra esta ventana para agregar el transportista y confirmar el despacho.
+              </p>
+              {dte.pdf_url && (
+                <button
+                  onClick={() => window.open(dte.pdf_url, '_blank', 'noopener,noreferrer')}
+                  className="btn-primary text-sm inline-flex items-center gap-1.5"
+                >
+                  <FileText className="w-4 h-4" /> Ver PDF de la guía
+                </button>
+              )}
+            </div>
+          )}
+
+          {fase === 'pendiente' && (
+            <div className="py-8 text-center space-y-2">
+              <Clock className="w-8 h-8 mx-auto text-amber-500" />
+              <p className="font-semibold" style={{ color: 'var(--text-primary)' }}>Emisión en curso</p>
+              <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                Hay una emisión en proceso para este despacho (puede ser de otra pestaña u
+                otro usuario). Puedes cerrar esta ventana: el estado se actualizará al volver
+                a abrir el despacho y <b>no se emitirá dos veces</b>.
+              </p>
+            </div>
+          )}
+
+          {fase === 'error_carga' && (
+            <div className="py-8 text-center space-y-2">
+              <AlertTriangle className="w-8 h-8 mx-auto text-red-500" />
+              <p className="font-semibold" style={{ color: 'var(--text-primary)' }}>
+                No se pudo cargar la previsualización
+              </p>
+              <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{error}</p>
+              <button onClick={cargarPreview} className="btn-secondary text-sm">Volver a intentar</button>
+            </div>
+          )}
+
+          {fase === 'fallido' && (
+            <div className="p-3 rounded-xl border bg-red-500/10 border-red-500/30 space-y-1">
+              <p className="text-sm font-semibold text-red-500 flex items-center gap-1.5">
+                <AlertTriangle className="w-4 h-4" />
+                {dte?.estado === 'error_envio' ? 'La emisión no llegó a Wasabil' : 'El SII rechazó la guía'}
+              </p>
+              <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                {error || dte?.error || 'Sin detalle del motivo'}
+              </p>
+            </div>
+          )}
+
+          {(fase === 'preview' || fase === 'fallido') && preview && (
+            <>
+              {preview.problemas?.length > 0 && fase === 'preview' && (
+                <div className="p-3 rounded-xl border bg-red-500/10 border-red-500/30">
+                  <p className="text-xs font-semibold text-red-500 mb-1">Para emitir falta resolver:</p>
+                  <ul className="text-xs space-y-0.5 list-disc pl-4" style={{ color: 'var(--text-muted)' }}>
+                    {preview.problemas.map((p: string, i: number) => <li key={i}>{p}</li>)}
+                  </ul>
+                </div>
+              )}
+              {preview.advertencias?.length > 0 && (
+                <div className="p-3 rounded-xl border bg-amber-500/10 border-amber-500/30">
+                  <ul className="text-xs space-y-0.5 list-disc pl-4" style={{ color: 'var(--text-muted)' }}>
+                    {preview.advertencias.map((a: string, i: number) => <li key={i}>{a}</li>)}
+                  </ul>
+                </div>
+              )}
+
+              {/* Receptor (ficha real en Wasabil = lo que verá el SII) */}
+              <div className="grid grid-cols-2 gap-3 text-sm">
+                <div>
+                  <div className="text-xs uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>
+                    Receptor {receptor?.fuente === 'wasabil' ? '(ficha Wasabil)' : '(datos locales)'}
+                  </div>
+                  <div className="font-semibold" style={{ color: 'var(--text-primary)' }}>{receptor?.razon_social || '—'}</div>
+                  <div className="text-xs" style={{ color: 'var(--text-muted)' }}>RUT {receptor?.rut || '—'}</div>
+                  {receptor?.giro && <div className="text-xs" style={{ color: 'var(--text-muted)' }}>{receptor.giro}</div>}
+                  {receptor?.direccion && (
+                    <div className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                      {receptor.direccion}{receptor.comuna ? `, ${receptor.comuna}` : ''}
+                    </div>
+                  )}
+                </div>
+                <div>
+                  <div className="text-xs uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>
+                    Referencia (SII 801)
+                  </div>
+                  <div className="font-semibold" style={{ color: 'var(--text-primary)' }}>OC {referencia?.folio || '—'}</div>
+                  <div className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                    Fecha OC: {referencia?.fecha || '—'}
+                  </div>
+                  <label className="block mt-2">
+                    <span className="text-[11px] uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>
+                      Tipo de traslado (SII)
+                    </span>
+                    <select
+                      value={tipoTraslado}
+                      onChange={(e) => setTipoTraslado(Number(e.target.value))}
+                      disabled={fase !== 'preview' && fase !== 'fallido'}
+                      className="w-full mt-0.5 px-2 py-1 rounded-lg text-xs border disabled:opacity-60"
+                      style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)', color: 'var(--text-primary)' }}
+                    >
+                      {(preview.tipos_traslado ?? [{ codigo: 1, label: 'Operación constituye venta' }]).map(
+                        (t: { codigo: number; label: string }) => (
+                          <option key={t.codigo} value={t.codigo}>{t.label}</option>
+                        ),
+                      )}
+                    </select>
+                  </label>
+                </div>
+              </div>
+
+              {/* Líneas */}
+              {preview.lineas?.length > 0 && (
+                <div className="border rounded-xl overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr style={{ backgroundColor: 'var(--surface-200)', color: 'var(--text-faint)' }}>
+                        <th className="p-2 text-left font-semibold uppercase tracking-wider">Ítem</th>
+                        <th className="p-2 text-right font-semibold uppercase tracking-wider">Cant.</th>
+                        <th className="p-2 text-right font-semibold uppercase tracking-wider">P. unit. neto</th>
+                        <th className="p-2 text-right font-semibold uppercase tracking-wider">Total neto</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {preview.lineas.map((ln: any, i: number) => (
+                        <tr key={i} className="border-t" style={{ borderColor: 'var(--border)' }}>
+                          <td className="p-2">
+                            <span className="font-mono font-semibold" style={{ color: 'var(--text-primary)' }}>{ln.name}</span>
+                            {ln.description && (
+                              <span className="block text-[11px]" style={{ color: 'var(--text-faint)' }}>{ln.description}</span>
+                            )}
+                          </td>
+                          <td className="p-2 text-right" style={{ color: 'var(--text-primary)' }}>{ln.quantity}</td>
+                          <td className="p-2 text-right" style={{ color: 'var(--text-muted)' }}>{fmtCLP(ln.price)}</td>
+                          <td className="p-2 text-right font-semibold" style={{ color: 'var(--text-primary)' }}>
+                            {fmtCLP(ln.price * ln.quantity)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot style={{ backgroundColor: 'var(--surface-200)' }}>
+                      <tr className="border-t" style={{ borderColor: 'var(--border)' }}>
+                        <td colSpan={3} className="p-2 text-right text-[11px] uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>Neto</td>
+                        <td className="p-2 text-right font-semibold" style={{ color: 'var(--text-primary)' }}>{fmtCLP(preview.totales?.neto)}</td>
+                      </tr>
+                      <tr>
+                        <td colSpan={3} className="p-2 text-right text-[11px] uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>IVA 19%</td>
+                        <td className="p-2 text-right" style={{ color: 'var(--text-muted)' }}>{fmtCLP(preview.totales?.iva)}</td>
+                      </tr>
+                      <tr>
+                        <td colSpan={3} className="p-2 text-right text-[11px] uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>Total</td>
+                        <td className="p-2 text-right font-bold text-blue-500">{fmtCLP(preview.totales?.total)}</td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              )}
+
+              {error && fase === 'preview' && (
+                <div className="p-3 rounded-xl border bg-red-500/10 border-red-500/30 text-xs text-red-500">{error}</div>
+              )}
+            </>
+          )}
+        </div>
+
+        {(fase === 'preview' || fase === 'fallido') && (
+          <div className="p-4 border-t space-y-2" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+            <p className="text-[11px] flex items-center gap-1.5" style={{ color: 'var(--text-muted)' }}>
+              <AlertTriangle className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+              Al confirmar, la guía se emite al SII a través de Wasabil. Esta acción es IRREVERSIBLE.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button onClick={onClose} className="btn-secondary text-sm">Cancelar</button>
+              {fase === 'fallido' ? (
+                <button onClick={() => emitir(true)} className="btn-primary text-sm flex items-center gap-1.5">
+                  <Send className="w-4 h-4" /> Reintentar emisión
+                </button>
+              ) : (
+                <button
+                  onClick={() => emitir(false)}
+                  disabled={!preview?.puede_emitir}
+                  className="btn-primary text-sm flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Send className="w-4 h-4" /> Confirmar y emitir al SII
+                </button>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )

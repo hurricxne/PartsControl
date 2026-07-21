@@ -3,10 +3,10 @@ import { useNavigate } from 'react-router-dom'
 import {
   ShoppingBag, Zap, ArrowRight, Info, CheckCircle2,
   Package, TruckIcon, BookOpen, Loader2, AlertCircle,
-  Search, X,
+  Search, X, HandCoins,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
-import { cotizacionesAPI, cotizadorAPI, authAPI, comprasAPI } from '../services/api'
+import { cotizacionesAPI, cotizadorAPI, authAPI, comprasAPI, contabilidadAPI } from '../services/api'
 
 interface CotItem {
   id: number
@@ -190,6 +190,11 @@ export default function CierreVentaPage() {
   const [cerrando, setCerrando] = useState(false)
   const [plazoDias, setPlazoDias] = useState<number | null>(null)
   const [plazoDefault, setPlazoDefault] = useState<number>(45)  // fallback config
+  // Adelanto del cliente: Comercial lo INFORMA aquí; Tesorería lo aprueba después
+  const [conAdelanto, setConAdelanto] = useState(false)
+  const [adelPct, setAdelPct] = useState('50')
+  const [adelMonto, setAdelMonto] = useState('')
+  const [adelObs, setAdelObs] = useState('')
 
   // Load cotizaciones (fase validada o enviada)
   useEffect(() => {
@@ -210,6 +215,12 @@ export default function CierreVentaPage() {
   // Load items when cot changes
   useEffect(() => {
     if (!selectedCotId) { setItems([]); return }
+    // El adelanto es POR VENTA: al cambiar de cotización se limpia lo digitado
+    // (un % o monto de la venta anterior no debe filtrarse a la nueva).
+    setConAdelanto(false)
+    setAdelPct('50')
+    setAdelMonto('')
+    setAdelObs('')
     setLoadingItems(true)
     cotizadorAPI.get(selectedCotId as number).then(({ data }) => {
       // Plazo por ítem: preferir plazo_entrega_max, luego plazo_entrega_min,
@@ -275,17 +286,47 @@ export default function CierreVentaPage() {
   const itemsSeleccionados = items.filter(i => selectedItems.has(i.id))
   const totalVenta = itemsSeleccionados.reduce((sum, i) =>
     sum + (i.total_venta_clp || i.costo_total_clp || 0), 0)
+  // Base del % del adelanto: TODOS los ítems de la cotización (misma base que el
+  // backend valida en el tope de adelantos, que no mira la selección), en bruto c/IVA.
+  const totalBrutoCotizacion = items.reduce((sum, i) =>
+    sum + (i.total_venta_clp || i.costo_total_clp || 0), 0) * 1.19
+  const montoAdel = Number(adelMonto) || 0
+  const adelantoExcede = totalBrutoCotizacion > 0 && montoAdel > totalBrutoCotizacion
+  // Espejo inverso: % digitado → pesos. Misma fórmula que informar_adelanto en el
+  // backend (total bruto × pct / 100, redondeado a peso): lo que se ve es lo que
+  // quedará informado. Solo con % válido (1-100) y sin monto manual digitado.
+  const pctNum = Number(adelPct)
+  const montoDesdePct =
+    !adelMonto && totalBrutoCotizacion > 0 && pctNum > 0 && pctNum <= 100
+      ? Math.round(totalBrutoCotizacion * pctNum / 100)
+      : null
+
+  /** Normaliza el error del backend a texto legible (un 422 de FastAPI trae detail
+   *  como array de objetos; sin esto el toast muestra [object Object]). */
+  const msgError = (err: any, fallback: string): string => {
+    const d = err?.response?.data?.detail
+    if (Array.isArray(d)) return d.map((x: any) => x?.msg || JSON.stringify(x)).join('; ')
+    if (typeof d === 'string') return d
+    return fallback
+  }
 
   const handleCerrar = async () => {
     if (!selectedCotId) { toast.error('Selecciona una cotización'); return }
     if (itemsSeleccionados.length === 0) { toast.error('Selecciona al menos un ítem'); return }
+    if (!oc.trim()) { toast.error('El N° OC del cliente es obligatorio'); return }
+    // El adelanto se informa DESPUÉS de cerrar la venta: validarlo aquí evita
+    // cerrar y recién ahí chocar con un 422 por un monto/porcentaje inválido.
+    if (conAdelanto) {
+      if (adelMonto && !(Number(adelMonto) > 0)) { toast.error('El monto del adelanto debe ser mayor a 0'); return }
+      if (!adelMonto && !(Number(adelPct) > 0 && Number(adelPct) <= 100)) { toast.error('El % de adelanto debe estar entre 1 y 100'); return }
+    }
 
     setCerrando(true)
     try {
       // 1. Create OC Cliente (visible en panel de Compras)
       await comprasAPI.crearOcCliente({
         cotizacion_id: selectedCotId,
-        numero_oc: oc || null,
+        numero_oc: oc.trim(),
         fecha_oc: fechaOc || null,
         cond_pago: condPago || null,
         fecha_entrega: fechaEntrega || null,
@@ -293,11 +334,28 @@ export default function CierreVentaPage() {
       })
       // 2. Advance fase to validada
       await cotizacionesAPI.updateFase(selectedCotId as number, 'validada')
+      // 3. Adelanto informado por Comercial → cola de aprobación de Tesorería.
+      //    Si falla, la venta YA quedó cerrada: se avisa cómo informarlo después.
+      if (conAdelanto) {
+        try {
+          await contabilidadAPI.informarAdelanto({
+            cotizacion_id: selectedCotId as number,
+            pct: adelMonto ? undefined : (Number(adelPct) || undefined),
+            monto_esperado: adelMonto ? Number(adelMonto) : undefined,
+            observaciones: adelObs || undefined,
+          })
+          toast.success('Adelanto informado — queda esperando aprobación de Tesorería')
+        } catch (err: any) {
+          toast.error(msgError(err, 'No se pudo informar el adelanto')
+            + ' — la venta quedó cerrada; infórmalo desde Contabilidad → Ventas', { duration: 8000 })
+        }
+      }
       toast.success(`Venta cerrada — COT-${selectedCot?.numero} aparece ahora en Compras`)
+      // El botón queda deshabilitado hasta navegar: re-habilitarlo aquí abría una
+      // ventana de 1,5 s donde un segundo clic crearía una OC-Cliente duplicada.
       setTimeout(() => navigate('/compras'), 1500)
     } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Error al cerrar la venta')
-    } finally {
+      toast.error(msgError(err, 'Error al cerrar la venta'))
       setCerrando(false)
     }
   }
@@ -534,7 +592,7 @@ export default function CierreVentaPage() {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: 'var(--text-faint)' }}>
-                  N° OC del Cliente
+                  N° OC del Cliente <span className="text-red-400">*</span>
                 </label>
                 <input className="input w-full" placeholder="Ej: OC-98712"
                   value={oc} onChange={e => setOc(e.target.value)} />
@@ -587,6 +645,66 @@ export default function CierreVentaPage() {
                   </select>
                 </div>
               )}
+
+              {/* Adelanto del cliente (lo aprueba Tesorería después) */}
+              <div className="sm:col-span-2 rounded-xl border p-3 space-y-3"
+                style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+                <label className="flex items-center gap-2 text-sm font-medium cursor-pointer" style={{ color: 'var(--text-primary)' }}>
+                  <input type="checkbox" checked={conAdelanto} onChange={e => setConAdelanto(e.target.checked)} />
+                  <HandCoins className="w-4 h-4 text-emerald-500" />
+                  Esta venta tiene adelanto del cliente
+                </label>
+                {conAdelanto && (
+                  <>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: 'var(--text-faint)' }}>
+                          % del total
+                        </label>
+                        {/* Con monto CLP digitado, el % se DERIVA en vivo sobre el total de
+                            la cotización completa (misma base que el tope del backend; la
+                            proporción es idéntica medida en neto o en bruto). */}
+                        <input type="number" min={1} max={100} className="input w-full"
+                          value={adelMonto
+                            ? (totalBrutoCotizacion > 0
+                                ? ((montoAdel / totalBrutoCotizacion) * 100).toFixed(1) : '')
+                            : adelPct}
+                          onChange={e => setAdelPct(e.target.value)} disabled={!!adelMonto} />
+                        {!!adelMonto && totalBrutoCotizacion > 0 && (
+                          <p className={`text-[11px] mt-1 ${adelantoExcede ? 'text-red-400' : ''}`}
+                            style={adelantoExcede ? undefined : { color: 'var(--text-faint)' }}>
+                            {adelantoExcede
+                              ? `El monto supera el total de la venta (${fmtClp(Math.round(totalBrutoCotizacion))} c/IVA)`
+                              : `del total c/IVA ${fmtClp(Math.round(totalBrutoCotizacion))}`}
+                          </p>
+                        )}
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: 'var(--text-faint)' }}>
+                          o monto exacto (CLP, con IVA)
+                        </label>
+                        <input type="number" className="input w-full" value={adelMonto}
+                          onChange={e => setAdelMonto(e.target.value)} placeholder="opcional" />
+                        {/* Espejo del %: al digitar el porcentaje, aquí se ve cuántos pesos
+                            son — la MISMA fórmula con que el backend registra el adelanto
+                            (total bruto de la cotización × % / 100, redondeado a peso). */}
+                        {!adelMonto && montoDesdePct !== null && (
+                          <p className="text-[11px] mt-1" style={{ color: 'var(--text-faint)' }}>
+                            ≈ <b style={{ color: 'var(--text-primary)' }}>{fmtClp(montoDesdePct)}</b> c/IVA
+                            {' '}({fmtClp(Math.round(montoDesdePct / 1.19))} neto)
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                    <input className="input w-full" value={adelObs} onChange={e => setAdelObs(e.target.value)}
+                      placeholder="Observaciones (ej: cliente transfiere esta semana)" />
+                    <p className="text-xs" style={{ color: 'var(--text-faint)' }}>
+                      Queda <b>informado</b>: Tesorería confirma la plata recibida en su pestaña Adelantos, y al
+                      emitir la(s) factura(s) el sistema lo aplica solo como pago.
+                    </p>
+                  </>
+                )}
+              </div>
             </div>
           </div>
 
@@ -657,7 +775,7 @@ export default function CierreVentaPage() {
               </p>
 
               <button onClick={handleCerrar}
-                disabled={cerrando || selectedItems.size === 0}
+                disabled={cerrando || selectedItems.size === 0 || !oc.trim()}
                 className="btn-primary w-full flex items-center justify-center gap-2">
                 {cerrando
                   ? <Loader2 className="w-4 h-4 animate-spin" />

@@ -101,6 +101,10 @@ class ContCompra(Base):
     embarque_id = Column(Integer, ForeignKey("embarques.id", ondelete="SET NULL"), nullable=True, index=True)
     emb_pricing_gasto_id = Column(Integer, ForeignKey("emb_pricing_gasto.id", ondelete="SET NULL"), nullable=True, index=True)
     factura_proveedor_id = Column(Integer, ForeignKey("facturas_proveedor.id", ondelete="SET NULL"), nullable=True, index=True)
+    # FK suave a la OC-Proveedor (compra nacional): solo pista/filtro de cabecera; el
+    # costo real por ítem vive en cont_compra_item. SET NULL: borrar la OC no borra la
+    # compra. La columna la crea compras_contab/init_db (create_all no altera tablas).
+    oc_proveedor_id = Column(Integer, ForeignKey("oc_proveedor.id", ondelete="SET NULL"), nullable=True, index=True)
 
     observaciones = Column(Text, nullable=True)
     usuario_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
@@ -110,6 +114,8 @@ class ContCompra(Base):
     egreso_detalles = relationship("ContEgresoDetalle", back_populates="compra",
                                    cascade="all, delete-orphan")
     cuenta = relationship("ContPlanCuenta", foreign_keys=[cuenta_contable_id])
+    items = relationship("ContCompraItem", back_populates="compra",
+                         cascade="all, delete-orphan")
 
 
 class ContEgreso(Base):
@@ -169,6 +175,35 @@ class ContEgresoDetalle(Base):
 
     egreso = relationship("ContEgreso", back_populates="detalles")
     compra = relationship("ContCompra", back_populates="egreso_detalles")
+
+
+class ContCompraItem(Base):
+    """Costo por ítem de una compra NACIONAL (la factura ES el costo; sin flete-por-peso
+    ni gastos-por-CIF). Espejo conceptual de emb_pricing_item, SIN prorrateo. Costo =
+    NETO de la línea en CLP; el IVA es crédito fiscal recuperable → NO capitaliza
+    (distinto del iva_importacion internacional). La tabla la crea compras_contab/init_db."""
+    __tablename__ = "cont_compra_item"
+    __table_args__ = (
+        Index("ix_cont_compra_item_compra", "compra_id"),
+        Index("ix_cont_compra_item_itemcot", "item_cotizacion_id"),
+        {"mysql_engine": "InnoDB"},
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    compra_id = Column(Integer, ForeignKey("cont_compra.id", ondelete="CASCADE"), nullable=False)
+    # Clave de costeo: liga la línea de la factura al repuesto vendido.
+    item_cotizacion_id = Column(Integer, ForeignKey("items_cotizacion.id", ondelete="SET NULL"), nullable=True)
+    oc_proveedor_id = Column(Integer, nullable=True)                # trazabilidad (pista, sin FK dura)
+    oc_proveedor_item_id = Column(Integer, ForeignKey("oc_proveedor_items.id", ondelete="SET NULL"), nullable=True)
+    numero_parte = Column(String(100), nullable=True)              # snapshot
+    descripcion = Column(String(500), nullable=True)               # snapshot
+    cantidad = Column(Numeric(12, 4), default=0)
+    precio_unit = Column(Numeric(16, 4), default=0)                # neto unit en moneda factura (auditoría)
+    costo_unit_clp = Column(Numeric(16, 2), default=0)             # = precio_unit × compra.tc
+    costo_total_clp = Column(Numeric(16, 2), default=0)            # = cantidad × costo_unit_clp (BASE rentabilidad futura)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    compra = relationship("ContCompra", back_populates="items")
 
 
 class ContPlanCuenta(Base):

@@ -153,6 +153,15 @@ def _build_inputs(db: Session, embarque: Embarque, pricing: EmbarquePricing) -> 
         else:
             fob_unit, origen = default_fob, default_origen
 
+        # Peso: default de la cotización; override manual solo si trae valor > 0.
+        # Espejo del FOB: un "manual" en 0 no es un peso real (una pieza física
+        # pesa > 0) y NO debe pisar el peso de la cotización.
+        default_peso = _f(item.peso_unit_lbs) if item else 0.0
+        if s is not None and (s.peso_origen or "auto") == "manual" and _f(s.peso_unit_lbs) > 0:
+            peso_unit, peso_origen = _f(s.peso_unit_lbs), "manual"
+        else:
+            peso_unit, peso_origen = default_peso, "auto"
+
         # TC del encabezado para todos los ítems. El TC por orden (FastMark
         # multi-OC) es una mejora futura: hoy un embarque usa un TC único, que
         # es el caso de Normal/Courier/Baukat. Así un cambio de TC se propaga
@@ -166,7 +175,9 @@ def _build_inputs(db: Session, embarque: Embarque, pricing: EmbarquePricing) -> 
             "descripcion": (item.descripcion if item else None) or "",
             "moneda": pricing.moneda,
             "cantidad": _f(item.cantidad) if item else 0.0,
-            "peso_unit_lbs": _f(item.peso_unit_lbs) if item else 0.0,
+            "peso_unit_lbs": peso_unit,
+            "peso_default": default_peso,
+            "peso_origen": peso_origen,
             "fob_unit": fob_unit,
             "fob_default": default_fob,
             "fob_origen": origen,
@@ -212,6 +223,9 @@ def _snapshot_items(db: Session, pricing: EmbarquePricing) -> List[dict]:
         "moneda": s.moneda,
         "cantidad": _f(s.cantidad),
         "peso_unit_lbs": _f(s.peso_unit_lbs),
+        # Cerrado no se edita: el default mostrado es el mismo peso congelado.
+        "peso_default": _f(s.peso_unit_lbs),
+        "peso_origen": s.peso_origen or "auto",
         "peso_total_lbs": round(_f(s.peso_total_lbs), 2),
         "fob_unit": _f(s.fob_unit),
         # Cerrado no se edita: el default mostrado es el mismo valor congelado.
@@ -258,6 +272,8 @@ def _compute_detail(db: Session, embarque: Embarque, pricing: EmbarquePricing) -
                 "moneda": r["moneda"],
                 "cantidad": r["cantidad"],
                 "peso_unit_lbs": r["peso_unit_lbs"],
+                "peso_default": r.get("peso_default", 0.0),
+                "peso_origen": r.get("peso_origen", "auto"),
                 "peso_total_lbs": round(r["peso_total_lbs"], 2),
                 "fob_unit": r["fob_unit"],
                 "fob_default": r.get("fob_default", 0.0),
@@ -276,6 +292,7 @@ def _compute_detail(db: Session, embarque: Embarque, pricing: EmbarquePricing) -
         "embarque": {
             "id": embarque.id, "numero": embarque.numero, "estado": embarque.estado,
             "forwarder": embarque.forwarder, "awb": embarque.awb,
+            "awb_numero": embarque.awb_numero,
             "fecha_despacho": embarque.fecha_despacho,
             "fecha_llegada_est": embarque.fecha_llegada_est.isoformat() if embarque.fecha_llegada_est else None,
             "n_items": len(embarque.items),
@@ -338,7 +355,8 @@ def _persist_snapshot(db: Session, pricing: EmbarquePricing, detail: dict) -> No
             item_cotizacion_id=r["item_cotizacion_id"],
             numero_parte=r["numero_parte"], descripcion=r["descripcion"], moneda=r["moneda"],
             cantidad=r["cantidad"], peso_unit_lbs=r["peso_unit_lbs"],
-            peso_total_lbs=r["peso_total_lbs"], fob_unit=r["fob_unit"],
+            peso_total_lbs=r["peso_total_lbs"], peso_origen=r.get("peso_origen", "auto"),
+            fob_unit=r["fob_unit"],
             fob_origen=r["fob_origen"], tc_valor=r["tc_valor"],
             fob_total=r["fob_total"], fob_clp=r["fob_clp"], shipping_clp=r["shipping_clp"],
             cif_clp=r["cif_clp"], gastos_clp=r["gastos_clp"],
@@ -374,7 +392,7 @@ def listar_embarques_pricing(
     for e in embarques:
         if q:
             ql = q.lower()
-            hay = " ".join([e.numero or "", e.forwarder or "", e.awb or ""]).lower()
+            hay = " ".join([e.numero or "", e.forwarder or "", e.awb or "", e.awb_numero or ""]).lower()
             if ql not in hay:
                 continue
         p = pricings.get(e.id)
@@ -386,6 +404,7 @@ def listar_embarques_pricing(
             "estado_logistica": e.estado,
             "forwarder": e.forwarder,
             "awb": e.awb,
+            "awb_numero": e.awb_numero,
             "fecha_despacho": e.fecha_despacho,
             "n_items": len(e.items),
             "docs_count": sum(1 for d in docs if d),
@@ -430,8 +449,13 @@ class GastoIn(BaseModel):
 
 class ItemOverrideIn(BaseModel):
     embarque_item_id: int
+    # Tri-estado: True=fijar manual · False=volver a auto · None=no tocar este
+    # campo (el usuario no lo editó). Evita que editar SOLO el peso revierta un
+    # FOB manual guardado (y viceversa). El backend es la autoridad del override.
     fob_unit: Optional[float] = None
-    fob_manual: bool = False
+    fob_manual: Optional[bool] = None
+    peso_unit_lbs: Optional[float] = None
+    peso_manual: Optional[bool] = None
 
 
 class PricingSaveIn(BaseModel):
@@ -518,7 +542,10 @@ def guardar_embarque_pricing(
             ))
         db.flush()
 
-    # 3) Overrides por ítem (FOB manual) — guardados como input que _build_inputs lee.
+    # 3) Overrides por ítem (FOB y/o peso manual) — guardados como input que
+    #    _build_inputs lee. FOB y peso comparten la MISMA fila emb_pricing_item y
+    #    son INDEPENDIENTES: un flag en None significa "el usuario no tocó ese
+    #    campo" y no se altera (evita que editar el peso revierta un FOB manual).
     overrides = {o.embarque_item_id: o for o in (payload.items or [])}
     if overrides:
         existing = {
@@ -528,19 +555,35 @@ def guardar_embarque_pricing(
         }
         for eiid, o in overrides.items():
             row = existing.get(eiid)
-            # FOB manual válido solo si trae un valor (evita el caso "manual + vacío"
-            # que pondría el costo en 0 sin aviso). Sin valor → se ignora el override.
-            if o.fob_manual and o.fob_unit is not None:
-                # Fijar FOB manual (crea la fila si no existe).
-                if row is None:
-                    row = EmbarquePricingItem(pricing_id=pricing.id, embarque_item_id=eiid)
-                    db.add(row)
+            # FOB manual válido solo con valor (evita "manual + vacío" → costo 0).
+            quiere_fob = o.fob_manual is True and o.fob_unit is not None
+            # Peso manual válido solo con valor > 0: un peso 0/negativo no es real
+            # y debe caer al peso de la cotización.
+            quiere_peso = o.peso_manual is True and o.peso_unit_lbs is not None and _f(o.peso_unit_lbs) > 0
+
+            # Crear la fila de override una sola vez si algún campo la necesita
+            # (FOB y peso comparten fila).
+            if (quiere_fob or quiere_peso) and row is None:
+                row = EmbarquePricingItem(pricing_id=pricing.id, embarque_item_id=eiid)
+                db.add(row)
+
+            # FOB
+            if quiere_fob:
                 row.fob_unit = _f(o.fob_unit)
                 row.fob_origen = "manual"
-            elif not o.fob_manual and row is not None and row.fob_origen == "manual":
+            elif o.fob_manual is False and row is not None and row.fob_origen == "manual":
                 # Quitar override manual → volver al FOB por defecto (factura/cotización).
                 row.fob_origen = "auto"
                 row.fob_unit = 0
+
+            # Peso (espejo del FOB)
+            if quiere_peso:
+                row.peso_unit_lbs = _f(o.peso_unit_lbs)
+                row.peso_origen = "manual"
+            elif o.peso_manual is False and row is not None and (row.peso_origen or "auto") == "manual":
+                # Quitar override → volver al peso de la cotización.
+                row.peso_origen = "auto"
+                row.peso_unit_lbs = 0
         db.flush()
 
     # FLUSH antes del refresh: refresh expira el objeto y lo recarga desde la DB,

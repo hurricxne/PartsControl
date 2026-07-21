@@ -48,6 +48,7 @@ interface OcProveedor {
   pais: string
   moneda: string
   estado: string
+  tipo_origen?: string // 'internacional' (embarque+aduana) | 'nacional' (camión+guía)
 }
 
 interface ProveedorMaestro {
@@ -100,6 +101,10 @@ function AsignarModal({
   const [numeroOc, setNumeroOc] = useState('')
   const [ocError, setOcError] = useState(false)
   const [saving, setSaving] = useState(false)
+  // Camino físico de la compra: internacional (embarque+aduana+landed) o nacional
+  // (camión + guía de despacho, sin embarque). Gobierna la moneda por defecto en la
+  // UI y el flujo posterior en Seguimiento (nacional salta preparado/pre-embarque).
+  const [tipoOrigen, setTipoOrigen] = useState<'internacional' | 'nacional'>('internacional')
 
   // Per-item plazo_dias_prov
   const selectedItems = ocCliente.items.filter(i => selectedItemIds.includes(i.id))
@@ -199,11 +204,14 @@ function AsignarModal({
       }
       if (modo === 'nueva') {
         const prov = proveedoresMaestro.find(p => p.id === proveedorMaestroId)
+        const esNacional = tipoOrigen === 'nacional'
         const { data } = await comprasAPI.crearOcProveedor({
           proveedor: prov?.nombre ?? '',
           numero_oc: numeroOc.trim(),
-          pais: prov?.pais ?? undefined,
-          moneda: prov?.moneda ?? 'USD',
+          // Nacional → Chile/CLP por defecto en la UI (no cambia el default de la columna).
+          pais: esNacional ? 'Chile' : (prov?.pais ?? undefined),
+          moneda: esNacional ? 'CLP' : (prov?.moneda ?? 'USD'),
+          tipo_origen: tipoOrigen,
         })
         targetId = data.id
         toast.success(`OC-Proveedor ${data.numero} creada`)
@@ -253,11 +261,11 @@ function AsignarModal({
           Asignando <strong>{selectedItemIds.length}</strong> item(s) de <strong>COT-{ocCliente.numero_cot}</strong>
         </p>
 
-        {/* N° OC Proveedor */}
+        {/* N° del proveedor */}
         <div>
           <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5"
             style={{ color: ocError ? '#f87171' : 'var(--text-faint)' }}>
-            N° OC del Proveedor <span className="text-red-400">*</span>
+            N° del proveedor <span className="text-red-400">*</span>
           </label>
           <input
             className="input w-full"
@@ -268,6 +276,11 @@ function AsignarModal({
             autoFocus
           />
           {ocError && <p className="text-xs mt-1 text-red-400">Campo obligatorio</p>}
+          {modo === 'nueva' && (
+            <p className="text-[11px] mt-1" style={{ color: 'var(--text-faint)' }}>
+              N° interno (Grupo AM): se generará automáticamente (OCP-2026-…)
+            </p>
+          )}
         </div>
 
         {/* Modo selector */}
@@ -306,6 +319,41 @@ function AsignarModal({
           </div>
         ) : (
           <div className="space-y-3">
+            {/* Origen de la compra: internacional (embarque) o nacional (camión + guía) */}
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: 'var(--text-faint)' }}>
+                Origen de la compra
+              </label>
+              <div className="flex gap-2">
+                {([
+                  ['internacional', 'Internacional', 'Embarque + aduana'],
+                  ['nacional', 'Nacional', 'Camión + guía, sin embarque'],
+                ] as const).map(([val, label, sub]) => (
+                  <button
+                    key={val}
+                    type="button"
+                    onClick={() => setTipoOrigen(val)}
+                    className={`flex-1 py-2 px-2 rounded-xl text-xs font-semibold border transition-colors text-left ${
+                      tipoOrigen === val
+                        ? 'border-brand-500 bg-brand-500/10 text-brand-400'
+                        : 'border-[var(--border)] text-[var(--text-muted)] hover:border-brand-500/50'
+                    }`}
+                  >
+                    {label}
+                    <span className="block text-[10px] font-normal mt-0.5"
+                      style={{ color: tipoOrigen === val ? undefined : 'var(--text-faint)' }}>
+                      {sub}
+                    </span>
+                  </button>
+                ))}
+              </div>
+              {tipoOrigen === 'nacional' && (
+                <p className="text-[11px] mt-1.5" style={{ color: 'var(--text-faint)' }}>
+                  Nacional: moneda <span className="font-semibold text-brand-400">CLP</span> por defecto, sin AWB/forwarder.
+                  La entrega se registra luego en Seguimiento.
+                </p>
+              )}
+            </div>
             <div>
               <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: 'var(--text-faint)' }}>
                 Proveedor <span className="text-red-400">*</span>

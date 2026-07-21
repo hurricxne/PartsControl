@@ -30,6 +30,15 @@ El **FOB** por ítem sale, en orden: factura del proveedor (`FacturaProveedorIte
 unit_price_usd`, por par ítem+OC) → precio de la cotización → 0; y se puede
 sobrescribir a mano.
 
+El **peso** por ítem sale de la cotización (`ItemCotizacion.peso_unit_lbs`) y se
+puede **sobrescribir a mano** (mismo patrón que el FOB): si el peso vino mal,
+Contabilidad lo corrige y el flete se re-prorratea (el shipping se reparte por
+peso). El snapshot congela el peso al cerrar. La columna `emb_pricing_item.
+peso_origen` (`auto`|`manual`) guarda el origen. FOB y peso comparten la MISMA
+fila de override y son **independientes**: el payload usa flags tri-estado
+(`fob_manual`/`peso_manual` como `true`/`false`/ausente), así editar solo el peso
+no revierte un FOB manual y viceversa.
+
 ## Flete por tipo de embarque
 
 `flete_en_me` = el flete viene prepagado por el proveedor en moneda extranjera
@@ -61,6 +70,10 @@ Logística. El detalle expone los **documentos** del embarque (AWB, factura
 comercial, packing list, certificado de origen, otros) para trazabilidad, y un
 **correlativo** (= `emb_pricing.id`, parte de 1).
 
+> El buscador (`GET ?q=`) matchea contra N° de embarque, forwarder, el nombre del
+> archivo AWB adjunto (`awb`) y, desde 2026-07-17, el **N° AWB/BL escrito a mano**
+> (`awb_numero`, columna nueva independiente del adjunto).
+
 ## Archivos
 
 | Archivo | Rol |
@@ -68,9 +81,10 @@ comercial, packing list, certificado de origen, otros) para trazabilidad, y un
 | `service.py` | Cálculo landed (función pura, sin DB) |
 | `integration.py` | Creación/seed del pricing (creación diferida desde el router) |
 | `models.py` | 3 tablas nuevas: `emb_pricing`, `emb_pricing_gasto`, `emb_pricing_item` |
+| `init_db.py` | Migración idempotente: crea tablas faltantes + agrega `emb_pricing_item.peso_origen` |
 | `router.py` | API REST `/api/embarques-pricing` |
 | `tests/test_service.py` | Tests del cálculo + detect_tipo + flete defaults (8) |
-| `tests/test_integration.py` | Flujo completo contra la DB (14 chequeos; siembra y limpia) |
+| `tests/test_integration.py` | Flujo completo contra la DB (incluye paso 12: peso editable — re-prorrateo, quitar override, manual ≤ 0, FOB+peso independientes, cerrado congela, fallback por FOB; siembra y limpia) |
 
 ## Endpoints
 
@@ -87,6 +101,19 @@ cd backend
 ./venv/bin/python embarques_pricing/tests/test_service.py
 ./venv/bin/python embarques_pricing/tests/test_integration.py   # requiere MySQL local
 ```
+
+## Deploy (una vez por entorno)
+
+```bash
+cd backend && python -m embarques_pricing.init_db
+```
+
+Agrega la columna `emb_pricing_item.peso_origen` de forma **idempotente** (crea
+también las 3 tablas si faltan). Correrlo **ANTES** de reiniciar el backend con el
+código nuevo: el modelo ya declara la columna, así que un backend nuevo la
+necesita al leer/escribir el snapshot; sin la migración, un backend viejo no la
+ve pero uno nuevo falla. Es seguro correrlo varias veces (la 2ª imprime "ya
+existe").
 
 ## Cómo deshacer (revertir 100%)
 

@@ -3,13 +3,19 @@ import {
   TrendingUp, Search, DollarSign, CreditCard,
   CheckCircle2, Loader2, RefreshCw, Download,
   ChevronDown, ChevronUp, FileText, Package,
-  Truck, ShoppingCart, Clock, BarChart2,
+  Truck, ShoppingCart, Clock, BarChart2, Pencil,
 } from 'lucide-react'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Area, AreaChart,
 } from 'recharts'
 import { ventasAPI, bodegaAPI } from '../services/api'
+import { useAuthStore } from '../stores/authStore'
+import OcClienteEditModal from '../components/OcClienteEditModal'
+
+// Roles que pueden editar la OC. Hoy `user.rol` es undefined (login no lo envía) -> visible;
+// cuando el backend propague el rol, el gate se cierra solo (ver authStore/role_guard).
+const ROLES_EDITAN_OC = ['comercial', 'contabilidad', 'admin']
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -49,6 +55,8 @@ interface Venta {
   iva_clp: number
   total_con_iva_clp: number
   numero_oc_cliente: string
+  oc_cliente_id: number | null
+  asesor_id: number | null
   fecha_oc: string
   cond_pago: string
   fecha_entrega: string
@@ -159,8 +167,11 @@ function ChartTooltip({ active, payload, label }: any) {
 
 // ─── Venta Card ───────────────────────────────────────────────────────────────
 
-function VentaCard({ venta }: { venta: Venta }) {
+function VentaCard({ venta, onUpdated }: { venta: Venta; onUpdated: () => void }) {
   const [open, setOpen] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const rol = useAuthStore(s => s.user)?.rol
+  const canEdit = (!rol || ROLES_EDITAN_OC.includes(rol)) && venta.oc_cliente_id != null
 
   const itemsVendidos = venta.items.filter(i => i.estado_item !== 'ingresado')
 
@@ -248,12 +259,27 @@ function VentaCard({ venta }: { venta: Venta }) {
         </div>
       </button>
 
+      {editing && venta.oc_cliente_id != null && (
+        <OcClienteEditModal
+          ocId={venta.oc_cliente_id}
+          initial={{
+            numero_oc: venta.numero_oc_cliente || null,
+            fecha_oc: venta.fecha_oc || null,
+            cond_pago: venta.cond_pago || null,
+            fecha_entrega: venta.fecha_entrega || null,
+            asesor_id: venta.asesor_id ?? null,
+          }}
+          onSaved={onUpdated}
+          onClose={() => setEditing(false)}
+        />
+      )}
+
       {/* Expanded items */}
       {open && (
         <div className="border-t" style={{ borderColor: 'var(--border)' }}>
           {/* OC meta */}
-          {(venta.numero_oc_cliente || venta.fecha_oc || venta.cond_pago || venta.fecha_entrega) && (
-            <div className="px-5 py-3 flex flex-wrap gap-x-6 gap-y-1 text-xs"
+          {(venta.numero_oc_cliente || venta.fecha_oc || venta.cond_pago || venta.fecha_entrega || canEdit) && (
+            <div className="px-5 py-3 flex flex-wrap items-center gap-x-6 gap-y-1 text-xs"
               style={{ backgroundColor: 'var(--surface-100)', borderBottom: '1px solid var(--border)' }}>
               {venta.numero_oc_cliente && (
                 <span><span style={{ color: 'var(--text-faint)' }}>N° OC Cliente: </span>
@@ -274,6 +300,15 @@ function VentaCard({ venta }: { venta: Venta }) {
                 <span><span style={{ color: 'var(--text-faint)' }}>F. Entrega: </span>
                   <span className="font-semibold" style={{ color: 'var(--text-primary)' }}>{venta.fecha_entrega}</span>
                 </span>
+              )}
+              {!venta.numero_oc_cliente && (
+                <span className="italic" style={{ color: 'var(--text-faint)' }}>Sin N° OC registrado</span>
+              )}
+              {canEdit && (
+                <button onClick={() => setEditing(true)}
+                  className="ml-auto inline-flex items-center gap-1 text-brand-400 hover:underline">
+                  <Pencil className="w-3 h-3" /> Editar OC
+                </button>
               )}
             </div>
           )}
@@ -742,7 +777,7 @@ export default function VentasPage() {
           <p className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>
             {totalVentas} {totalVentas === 1 ? 'cotización' : 'cotizaciones'} · {PERIODO_LABELS[periodo]}
           </p>
-          {ventas.map(v => <VentaCard key={v.id} venta={v} />)}
+          {ventas.map(v => <VentaCard key={v.id} venta={v} onUpdated={() => load(q || undefined, periodo || undefined)} />)}
         </div>
       )}
     </div>

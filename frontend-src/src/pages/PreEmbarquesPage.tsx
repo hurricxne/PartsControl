@@ -197,7 +197,7 @@ function CerrarEmbarqueModal({ pre, onClose, onSuccess }: {
     } catch { /* si falla validación, permitir continuar */ }
     // ─────────────────────────────────────────────────────────────────────
       const { data } = await comprasAPI.cerrarPreEmbarque(pre.id, {
-        awb: awb || null, forwarder: forwarder || null,
+        awb: awb || null, awb_numero: awb || null, forwarder: forwarder || null,
         fecha_despacho: fechaDespacho || null, fecha_llegada_est: fechaLlegada || null,
         packing_list: packingList || null, certificado_origen: certOrigen || null,
         notas: notas || null,
@@ -267,7 +267,7 @@ function CerrarEmbarqueModal({ pre, onClose, onSuccess }: {
               </div>
               <div>
                 <label className="block text-[10px] uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>AWB / BL</label>
-                <input className="input w-full text-xs" placeholder="Número de guía aérea o BL"
+                <input className="input w-full text-xs" placeholder="Número de guía aérea o BL" maxLength={100}
                   value={awb} onChange={e => setAwb(e.target.value)} />
               </div>
               <div>
@@ -580,6 +580,7 @@ function GenEmbarqueModal({ items, onClose, onSuccess }: {
   items: PrepItem[]; onClose: () => void; onSuccess: () => void
 }) {
   const [awb, setAwb] = useState<DocFile|null>(null)
+  const [awbNumero, setAwbNumero] = useState('')  // N° AWB/BL escrito a mano (≠ adjunto obligatorio)
   const [facturaComercial, setFacturaComercial] = useState<DocFile|null>(null)
   const [packingList, setPackingList] = useState<DocFile|null>(null)
   const [certOrigen, setCertOrigen] = useState<DocFile|null>(null)
@@ -742,6 +743,7 @@ function GenEmbarqueModal({ items, onClose, onSuccess }: {
 
       await comprasAPI.cerrarPreEmbarque(pre.id, {
         awb: awb?.filename || '',
+        awb_numero: awbNumero.trim() || null,   // ← nuevo: N° escribible, opcional
         factura_comercial: facturaComercial?.filename || null,
         packing_list: packingList?.filename || null,
         certificado_origen: certOrigen?.filename || null,
@@ -929,6 +931,12 @@ function GenEmbarqueModal({ items, onClose, onSuccess }: {
             <label className="block text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--text-faint)' }}>
               Documentación de embarque
             </label>
+            {/* N° AWB / BL escribible: identificador universal, buscable. El adjunto de abajo sigue obligatorio. */}
+            <div className="mb-3">
+              <label className="block text-[10px] uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>N° AWB / BL</label>
+              <input className="input w-full text-xs" placeholder="Ej: 176-12345678" maxLength={100}
+                value={awbNumero} onChange={e => setAwbNumero(e.target.value)} />
+            </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <DocUploadField label="AWB / BL" required value={awb}
                 onChange={v => { setAwb(v); setAwbError(false) }} error={awbError} />

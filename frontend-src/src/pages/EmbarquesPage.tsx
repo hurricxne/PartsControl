@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Ship, ChevronDown, ChevronRight, Loader2,
   CheckCircle2, Clock, X, Check, FileText, AlertTriangle,
-  RefreshCw, Edit2, Upload, Trash2,
+  RefreshCw, Edit2, Upload, Trash2, Search,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { comprasAPI } from '../services/api'
@@ -38,6 +38,7 @@ interface Embarque {
   estado: string
   forwarder: string
   awb: string
+  awb_numero: string
   fecha_despacho: string
   fecha_llegada_est: string
   factura_comercial: string
@@ -275,10 +276,10 @@ function OtrosDocs({ embId }: { embId: number }) {
 // ── InlineEdit ────────────────────────────────────────────────────────────
 
 function InlineEdit({
-  label, value, onSave, type = 'text', placeholder = '—',
+  label, value, onSave, type = 'text', placeholder = '—', maxLength,
 }: {
   label: string; value: string; onSave: (v: string) => void
-  type?: string; placeholder?: string
+  type?: string; placeholder?: string; maxLength?: number  // opcional: tope de longitud (p.ej. N° AWB = 100, columna VARCHAR(100))
 }) {
   const [editing, setEditing] = useState(false)
   const [val, setVal] = useState(value)
@@ -299,7 +300,7 @@ function InlineEdit({
     <div>
       <p className="text-[10px] uppercase tracking-wider mb-0.5" style={{ color: 'var(--text-faint)' }}>{label}</p>
       <input
-        autoFocus type={type} value={val}
+        autoFocus type={type} value={val} maxLength={maxLength}
         onChange={e => setVal(e.target.value)}
         onBlur={() => { onSave(val); setEditing(false) }}
         onKeyDown={e => {
@@ -462,6 +463,13 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
                   ← {emb.pre_embarque_numero}
                 </span>
               )}
+              {emb.awb_numero && (
+                <span className="text-[10px] px-1.5 py-0.5 rounded font-mono"
+                  style={{ backgroundColor: 'var(--surface-300)', color: 'var(--text-muted)' }}
+                  title="N° AWB / BL">
+                  AWB {emb.awb_numero}
+                </span>
+              )}
               {editEstado ? (
                 <div className="flex items-center gap-1">
                   <select className="input text-xs py-0.5 px-1.5 h-6"
@@ -500,6 +508,7 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
               <InlineEdit label="Forwarder" value={emb.forwarder} onSave={v => saveField('forwarder', v)} />
               <InlineEdit label="F. Despacho" value={emb.fecha_despacho} onSave={v => saveField('fecha_despacho', v)} type="date" />
               <InlineEdit label="ETA" value={emb.fecha_llegada_est} onSave={v => saveField('fecha_llegada_est', v)} type="date" />
+              <InlineEdit label="N° AWB / BL" value={emb.awb_numero} onSave={v => saveField('awb_numero', v)} maxLength={100} />
             </div>
 
             {/* Docs */}
@@ -691,6 +700,7 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
 export default function EmbarquesPage() {
   const [embarques, setEmbarques] = useState<Embarque[]>([])
   const [loading, setLoading] = useState(true)
+  const [search, setSearch] = useState('')
 
   const load = useCallback(() => {
     setLoading(true)
@@ -706,6 +716,15 @@ export default function EmbarquesPage() {
   const enBodega    = embarques.filter(e => e.estado === 'en_bodega').length
   const despachados = embarques.filter(e => e.estado === 'despachado').length
 
+  // Buscador client-side sobre la lista ya cargada: N° de embarque, N° AWB o forwarder.
+  const q = search.trim().toLowerCase()
+  const visibles = q
+    ? embarques.filter(e =>
+        (e.numero || '').toLowerCase().includes(q) ||
+        (e.awb_numero || '').toLowerCase().includes(q) ||
+        (e.forwarder || '').toLowerCase().includes(q))
+    : embarques
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -718,6 +737,19 @@ export default function EmbarquesPage() {
         <button onClick={load} className="btn-secondary flex items-center gap-2 self-start">
           <RefreshCw className="w-4 h-4" /> Actualizar
         </button>
+      </div>
+
+      <div className="relative">
+        <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2" style={{ color: 'var(--text-faint)' }} />
+        <input type="text" value={search} onChange={e => setSearch(e.target.value)}
+          placeholder="Buscar por N° de embarque, N° AWB o forwarder…" className="input pl-10 pr-10" />
+        {search && (
+          <button onClick={() => setSearch('')}
+            className="absolute right-3 top-1/2 -translate-y-1/2 hover:opacity-100 opacity-60"
+            style={{ color: 'var(--text-muted)' }}>
+            <X className="w-4 h-4" />
+          </button>
+        )}
       </div>
 
       {!loading && (
@@ -753,9 +785,15 @@ export default function EmbarquesPage() {
       ) : (
         <div className="space-y-3">
           <p className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>
-            {embarques.length} embarque(s) · Expande cada fila para ver ítems
+            {visibles.length} embarque(s) · Expande cada fila para ver ítems
           </p>
-          {embarques.map(emb => <EmbCard key={emb.id} emb={emb} onRefresh={load} />)}
+          {q && visibles.length === 0 ? (
+            <p className="text-sm py-6 text-center" style={{ color: 'var(--text-muted)' }}>
+              Sin coincidencias para “{search.trim()}”.
+            </p>
+          ) : (
+            visibles.map(emb => <EmbCard key={emb.id} emb={emb} onRefresh={load} />)
+          )}
         </div>
       )}
     </div>
