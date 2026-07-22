@@ -120,6 +120,21 @@ app.mount("/uploads/bodega", StaticFiles(directory="uploads/bodega"), name="bode
 
 @app.on_event("startup")
 def startup_event():
+    # Alarma si un merge/deploy futuro pisa el isolation_level de database.py: los topes
+    # de plata dependen de READ COMMITTED como segunda capa (docs/regla-lecturas-de-plata.md).
+    try:
+        from database import engine as _eng
+        from sqlalchemy import text as _text
+        with _eng.connect() as _c:
+            _iso = _c.execute(_text("SELECT @@transaction_isolation")).scalar()
+        # flush=True: con el proceso en segundo plano (nohup/systemd) stdout va a un pipe
+        # con buffer completo y el aviso no aparecería en el log del servidor.
+        print(f"[startup] isolation={_iso}"
+              + ("" if str(_iso).upper().replace("_", "-") == "READ-COMMITTED"
+                 else "  <-- ESPERADO READ-COMMITTED! revisa backend/database.py"),
+              flush=True)
+    except Exception as e:
+        print(f"[startup] no se pudo verificar el isolation level: {e}", flush=True)
     try:
         from scheduler import start_scheduler
         start_scheduler()

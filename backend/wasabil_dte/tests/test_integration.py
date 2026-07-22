@@ -156,6 +156,9 @@ def _limpiar(db):
 
 def run():
     db = SessionLocal()
+    # Re-instalar NUESTRO fake al empezar: si pytest importó también el test de
+    # facturas (que instala el suyo a nivel de módulo), el último import ganó.
+    fake.install()
     _limpiar(db)  # por si un run anterior murió a medias
     try:
         CURRENT["empresa"] = "mineria"

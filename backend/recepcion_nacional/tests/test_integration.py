@@ -35,11 +35,26 @@ Base.metadata.create_all(bind=engine, checkfirst=True)
 MARK = "__TEST_RN__"
 CURRENT = {"empresa": "mineria", "id": None}
 
+from fastapi import Depends  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
+from database import get_db  # noqa: E402
+
 app = FastAPI()
 app.include_router(rn_router, prefix="/api")
 app.include_router(compras_router, prefix="/api")
-app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
-    id=CURRENT["id"], empresa=CURRENT["empresa"])
+# Auth REALISTA: además de devolver el usuario, hace una lectura en la MISMA sesión del
+# request, igual que auth.get_current_user en producción. Ese SELECT abre el read view de
+# MySQL (REPEATABLE READ) ANTES de cualquier with_for_update(), que es la condición real
+# bajo la que corren los endpoints. Con un lambda "seco", el lock terminaba siendo la
+# PRIMERA sentencia y el snapshot nacía DESPUÉS del lock: las carreras de plata quedaban
+# invisibles para los tests.
+def _cu(db: Session = Depends(get_db)):
+    db.execute(text("SELECT 1"))
+    return SimpleNamespace(id=CURRENT["id"], empresa=CURRENT["empresa"])
+
+
+app.dependency_overrides[get_current_user] = _cu
 client = TestClient(app)
 
 _fails: list = []

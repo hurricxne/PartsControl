@@ -40,10 +40,26 @@ CURRENT = {"empresa": "mineria", "id": None}
 
 Base.metadata.create_all(bind=engine, checkfirst=True)
 
+from fastapi import Depends  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
+from database import get_db  # noqa: E402
+
 app = FastAPI()
 app.include_router(cont.router, prefix="/api")
 app.include_router(tes_router, prefix="/api")
-app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=CURRENT["id"], empresa=CURRENT["empresa"])
+# Auth REALISTA: además de devolver el usuario, hace una lectura en la MISMA sesión del
+# request, igual que auth.get_current_user en producción. Ese SELECT abre el read view de
+# MySQL (REPEATABLE READ) ANTES de cualquier with_for_update(), que es la condición real
+# bajo la que corren los endpoints. Con el lambda "seco" de antes, el lock terminaba siendo
+# la PRIMERA sentencia y el snapshot nacía DESPUÉS del lock: las carreras de plata (dos
+# cobranzas simultáneas, doble aplicación de adelanto) eran INVISIBLES para los tests.
+def _current_user_realista(db: Session = Depends(get_db)):
+    db.execute(text("SELECT 1"))
+    return SimpleNamespace(id=CURRENT["id"], empresa=CURRENT["empresa"])
+
+
+app.dependency_overrides[get_current_user] = _current_user_realista
 client = TestClient(app)
 
 # Precios deterministas (el pricing engine tiene sus propios tests). El total de la

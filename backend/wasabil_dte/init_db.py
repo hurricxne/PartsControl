@@ -32,6 +32,14 @@ def init():
             if nombre not in columnas:
                 conn.execute(text(ddl))
                 print(f"columna agregada: {nombre}")
+        # Índices únicos agregados después de la primera versión (create_all no los
+        # agrega a tablas existentes). Fase B: candado anti doble emisión por factura.
+        indices = {i["name"] for i in insp.get_indexes("wasabil_dte")}
+        if "uq_wasabil_dte_factura" not in indices:
+            conn.execute(text(
+                "ALTER TABLE wasabil_dte ADD CONSTRAINT uq_wasabil_dte_factura "
+                "UNIQUE (factura_id)"))
+            print("índice único agregado: uq_wasabil_dte_factura")
     print("wasabil_dte OK")
 
 

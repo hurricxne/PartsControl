@@ -43,7 +43,11 @@ TIPOS_TRASLADO = {
     9: "Venta para exportación",
 }
 TIPO_TRASLADO_DEFAULT = TIPO_TRASLADO_VENTA
+TIPO_DOC_FACTURA = 33            # DTE 33: factura electrónica (Fase B)
 TIPO_REF_OC = "801"              # referencia SII: Orden de Compra del cliente
+TIPO_REF_GUIA = "52"             # referencia SII: guía de despacho (folio SII de la guía)
+TIPO_REF_ANTICIPO = "33"         # referencia SII: factura (aquí: la de anticipo descontada)
+MAX_REFERENCIAS = 5              # tope de referencias por documento en Wasabil
 NOMBRE_MAX = 25                  # límite del SII para el nombre de línea
 DESCRIPCION_MAX = 255            # descripción larga de línea
 REASON_MAX = 90                  # límite del campo reason de una referencia
@@ -52,6 +56,7 @@ INVOICE_REF_MAX = 200
 FOLIO_REF_MAX = 18               # límite del SII para el folio de una referencia (N° OC)
 MAX_LINEAS = 60                  # tope de líneas por documento en Wasabil
 TOL_QTY = 0.001                  # tolerancia de cantidades (unidades)
+NETO_MINIMO_DTE = 1.0            # bajo $1 el neto se emite como $0 y el SII lo rechaza
 
 # Formatos reales vistos en oc_cliente.fecha_oc (texto libre, String(50))
 _FORMATOS_FECHA = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%Y/%m/%d",
@@ -185,12 +190,16 @@ def armar_guia(*, numero_oc: str, fecha_oc: date, numero_despacho: str,
         "documentDate": (fecha_emision or hoy_chile()).isoformat(),
         "dispatchGuide": {"dispatchTypeCode": tipo_traslado},
         "details": lineas,
-        # Referencia estructurada a la OC del cliente (obligatoria en Grupo AM)
+        # Referencia estructurada a la OC del cliente (obligatoria en Grupo AM).
+        # SIN `reason`: Wasabil imprime la etiqueta del tipo ("ORDEN DE COMPRA",
+        # que deduce del código 801) junto al folio, así que un reason del estilo
+        # "Orden de compra 1788" hacía salir la etiqueta Y el número DOS VECES en
+        # el papel — hallazgo de la guía folio 137. El campo es opcional para el
+        # SII (RazonRef) y payload_a_rest lo omite si viene vacío.
         "references": [{
             "documentType": TIPO_REF_OC,
             "folio": str(numero_oc),
             "date": fecha_oc.isoformat(),
-            "reason": f"Orden de compra {numero_oc}"[:REASON_MAX],
         }],
         # Referencia libre = SOLO el N° de despacho interno (ancla anti doble
         # emisión: única por despacho, permite reencontrar el documento ante un
@@ -230,6 +239,7 @@ def payload_a_rest(doc: dict) -> dict:
         "issue": "issue",
         "details": "details",
         "references": "references",
+        "paymentMethod": "payment_method",
     }
     rest: dict = {}
     for k, v in doc.items():
@@ -292,8 +302,13 @@ def serialize_dte(dte) -> dict:
         estado = "error_envio"
     else:
         estado = "no_enviado"
+    # Sin uuid = el documento NUNCA llegó a Wasabil → reintentable en cuanto el claim
+    # deja de estar vigente, HAYA o NO error registrado. El `bool(dte.error)` que había
+    # antes dejaba clavado el caso "el server se cayó (o se hizo deploy) entre el claim
+    # y la respuesta": nadie alcanzó a escribir el error, el claim expiraba solo y la
+    # UI quedaba en "SII en proceso" para siempre, sin botón de reintento.
     puede_reintentar = (not en_vuelo) and (
-        dte.status_id == STATUS_FALLIDO or (dte.uuid is None and bool(dte.error))
+        dte.status_id == STATUS_FALLIDO or dte.uuid is None
     )
     return {
         "id": dte.id,
@@ -314,3 +329,200 @@ def serialize_dte(dte) -> dict:
         "created_at": dte.created_at.isoformat() if dte.created_at else None,
         "updated_at": dte.updated_at.isoformat() if dte.updated_at else None,
     }
+
+
+# ─── FASE B: factura electrónica (DTE 33) ─────────────────────────────────────
+# Mismo estilo que la guía 52: funciones PURAS que arman el documento en el
+# vocabulario del esquema (camelCase) — payload_a_rest lo traduce al REST real.
+# La factura se emite DESDE la factura local persistida (líneas congeladas en
+# cont_factura_cliente_item): preview == emisión == lo que quedó en la BD.
+
+def armar_referencias_factura(*, numero_oc: str, fecha_oc: Optional[date],
+                              guia_folio: Optional[str] = None,
+                              guia_fecha: Optional[date] = None,
+                              anticipos: Optional[List[dict]] = None,
+                              ) -> Tuple[List[dict], List[str]]:
+    """Referencias del DTE 33 según la matriz de negocio de Grupo AM:
+
+      · SIEMPRE la OC del cliente (801, con N° y fecha) — igual que la guía.
+      · Si la factura viene de una guía: referencia 52 con el FOLIO SII de la guía.
+      · Por cada factura de ANTICIPO descontada: referencia 33 con su folio.
+
+    `anticipos`: [{"folio": str, "fecha": date|None}]. Devuelve (referencias,
+    problemas); cualquier problema es bloqueante (documento inválido ante el SII).
+    """
+    problemas: List[str] = []
+    refs: List[dict] = []
+
+    numero_oc = (numero_oc or "").strip()
+    if not numero_oc:
+        problemas.append("La OC de cliente no tiene número: la factura debe referenciarla (801)")
+    elif len(numero_oc) > FOLIO_REF_MAX:
+        problemas.append(
+            f"El N° de OC del cliente ('{numero_oc}') tiene {len(numero_oc)} caracteres; "
+            f"el SII permite máximo {FOLIO_REF_MAX} en la referencia. Acorta el N° de OC en la venta.")
+    if not fecha_oc:
+        problemas.append("No se pudo interpretar la fecha de la OC: corrígela en la venta "
+                         "(la referencia 801 lleva la fecha real de la OC)")
+    if not problemas:
+        # SIN `reason`: ver la nota en armar_guia — el tipo ya imprime la etiqueta
+        # "ORDEN DE COMPRA" junto al folio; repetirla duplicaba el texto en el papel.
+        refs.append({
+            "documentType": TIPO_REF_OC, "folio": numero_oc,
+            "date": fecha_oc.isoformat(),
+        })
+
+    if guia_folio and str(guia_folio).strip():
+        folio_g = str(guia_folio).strip()
+        if len(folio_g) > FOLIO_REF_MAX:
+            problemas.append(
+                f"El folio de la guía ('{folio_g}') excede {FOLIO_REF_MAX} caracteres "
+                "para la referencia 52 (¿guía manual con N° largo?)")
+        else:
+            # SIN `reason`: el tipo 52 ya se imprime como "GUIA DE DESPACHO" + folio.
+            refs.append({
+                "documentType": TIPO_REF_GUIA, "folio": folio_g,
+                **({"date": guia_fecha.isoformat()} if guia_fecha else {}),
+            })
+
+    for a in (anticipos or []):
+        folio_a = str(a.get("folio") or "").strip()
+        if not folio_a or folio_a.startswith("#"):
+            # "#<id>" es el placeholder de una factura de anticipo SIN folio SII:
+            # no es referenciable ante el SII — se bloquea para no emitir chueco.
+            problemas.append(
+                "Una factura de anticipo descontada no tiene folio SII registrado: "
+                "complétalo antes de emitir esta factura (la referencia 33 lo exige)")
+            continue
+        if len(folio_a) > FOLIO_REF_MAX:
+            problemas.append(f"El folio del anticipo ('{folio_a}') excede {FOLIO_REF_MAX} caracteres")
+            continue
+        fecha_a = a.get("fecha")
+        # Este reason SÍ se conserva: explica POR QUÉ se referencia esa factura —
+        # información que el tipo (33 = "FACTURA ELECTRONICA") y el folio no dan.
+        # Pero sin repetir la palabra "Factura" ni el folio, que ya se imprimen.
+        refs.append({
+            "documentType": TIPO_REF_ANTICIPO, "folio": folio_a,
+            **({"date": fecha_a.isoformat()} if fecha_a else {}),
+            "reason": "Descuento anticipo"[:REASON_MAX],
+        })
+
+    if len(refs) > MAX_REFERENCIAS:
+        problemas.append(
+            f"La factura llevaría {len(refs)} referencias y Wasabil acepta máximo "
+            f"{MAX_REFERENCIAS} (OC + guía + anticipos): divide el descuento de "
+            "anticipos en más de una factura")
+    return refs, problemas
+
+
+def armar_lineas_factura(items: list) -> Tuple[List[dict], List[str]]:
+    """Convierte las líneas PERSISTIDAS de la factura (ContFacturaClienteItem) en
+    details del DTE 33. La fuente es la factura local ya congelada — lo emitido es
+    EXACTAMENTE lo registrado (y, por construcción de crear_factura, cuadra con la
+    guía 52 cuando la línea tomó el precio congelado).
+
+    Los DESCUENTOS de anticipo (líneas locales negativas) NO viajan como línea:
+    el API real los RECHAZA (price y quantity deben ser > 0 — verificado en
+    borrador issue:false el 2026-07-20). Van como `discount` porcentual sobre las
+    líneas positivas (aplicar_descuento_lineas), manteniendo el monto exacto.
+    """
+    lineas: List[dict] = []
+    problemas: List[str] = []
+    descuento_neto = 0.0
+    for it in items:
+        qty = _f(it.cantidad)
+        precio = round(_f(it.precio_unit_neto), 2)
+        if it.anticipo_factura_id is not None or precio < 0:
+            # Línea local de DESCUENTO por anticipo: se acumula y se aplica como %
+            descuento_neto += -_f(it.total_neto)
+            continue
+        if qty <= TOL_QTY:
+            continue  # línea vacía
+        if precio == 0:
+            problemas.append(
+                f"{it.numero_parte or 'línea ' + str(it.id)}: precio $0 en la factura "
+                "(no debería ocurrir: la emisión se bloquea)")
+            continue
+        lineas.append({
+            "name": acortar_nombre(it.numero_parte, it.descripcion),
+            "description": (it.descripcion or "").strip()[:DESCRIPCION_MAX] or None,
+            "code": (it.numero_parte or "").strip() or None,
+            # Identidad 1:1 de la línea con la factura local (auditoría/cuadratura)
+            "externalId": str(it.despacho_item_id or f"fi-{it.id}"),
+            "quantity": qty,
+            "price": precio,
+        })
+    if descuento_neto > 0:
+        problemas.extend(aplicar_descuento_lineas(lineas, round(descuento_neto, 2)))
+    if not lineas:
+        problemas.append("La factura no tiene líneas emitibles")
+    if len(lineas) > MAX_LINEAS:
+        problemas.append(f"La factura tiene {len(lineas)} líneas y Wasabil acepta máximo "
+                         f"{MAX_LINEAS} por documento")
+    return lineas, problemas
+
+
+def aplicar_descuento_lineas(lineas: List[dict], descuento_neto: float) -> List[str]:
+    """Reparte el descuento del anticipo como `discount` PORCENTUAL sobre las líneas
+    (de mayor a menor total), con la precisión completa del float: Wasabil calcula
+    con la precisión enviada (verificado en borrador: 16.6665% sobre 200.000 dio
+    166.667 exacto), así el neto del DTE == neto local por construcción.
+
+    Muta `lineas` (agrega "discount"). Devuelve problemas (bloqueantes)."""
+    problemas: List[str] = []
+    restante = descuento_neto
+    for ln in sorted(lineas, key=lambda x: x["price"] * x["quantity"], reverse=True):
+        if restante <= TOL_QTY:
+            break
+        total_linea = round(ln["price"] * ln["quantity"], 2)
+        if total_linea <= 0:
+            continue
+        d = min(restante, total_linea)
+        ln["discount"] = (d / total_linea) * 100.0
+        restante = round(restante - d, 2)
+    if restante > TOL_QTY:
+        problemas.append(
+            f"El descuento por anticipo (${descuento_neto:,.0f}) supera el total de las "
+            "líneas de esta factura: no se puede emitir electrónicamente".replace(",", "."))
+    # El SII no acepta un DTE en cero. Se evalúa SIEMPRE (no solo si alguna línea llegó
+    # a 100%): un descuento repartido entre varias líneas puede dejar el total en
+    # centavos sin que ninguna sola llegue al 100%. El umbral es UN PESO — el neto del
+    # DTE se emite redondeado, así que cualquier cosa bajo $1 llega al SII como $0.
+    # round() de la SUMA: el % de descuento arrastra error de float (un neto de $1,00
+    # exacto daba 0.9999999…) y sin redondear bloqueaba una factura legítima, además de
+    # contradecir al preview, que compara el neto ya redondeado.
+    total_doc = round(sum(round(ln["price"] * ln["quantity"], 2) *
+                          (1 - ln.get("discount", 0) / 100.0) for ln in lineas), 2)
+    if lineas and total_doc < NETO_MINIMO_DTE:
+        problemas.append(
+            "El descuento del anticipo deja la factura en $0: el SII no acepta un "
+            "DTE en cero — ajusta el descuento o registra la factura por la vía manual")
+    return problemas
+
+
+def armar_factura(*, referencia_interna: str, lineas: List[dict],
+                  referencias: List[dict], client_id: Optional[int] = None,
+                  fecha_emision: Optional[date] = None, issue: bool = False,
+                  payment_method: Optional[str] = None) -> dict:
+    """Arma el documento factura 33 en el vocabulario del esquema. NO lo envía.
+
+    `issue=False` por defecto: emitir al SII es IRREVERSIBLE y este módulo solo
+    manda issue=True tras la confirmación explícita del usuario (mismo protocolo
+    que la guía 52). `referencia_interna` = "FACT-<id local>" — el ancla anti
+    doble emisión (única por factura; Wasabil la imprime, por eso NO lleva la OC:
+    aprendizaje del formato v2 de las guías).
+    """
+    doc = {
+        "siiDocumentTypeCode": TIPO_DOC_FACTURA,
+        "issue": issue,
+        "documentDate": (fecha_emision or hoy_chile()).isoformat(),
+        "details": lineas,
+        "references": referencias,
+        "invoiceReference": str(referencia_interna)[:INVOICE_REF_MAX],
+    }
+    if client_id:
+        doc["clientId"] = client_id  # Wasabil autocompleta RUT/razón/giro/dirección/comuna
+    # paymentMethod es OBLIGATORIO en el esquema del 33 (verificado 2026-07-20);
+    # 'credito' es el default del negocio (30/60 días contra factura).
+    doc["paymentMethod"] = payment_method if payment_method in ("contado", "credito") else "credito"
+    return doc

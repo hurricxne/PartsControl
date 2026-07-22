@@ -284,6 +284,15 @@ export const wasabilAPI = {
       tipoTraslado ? { params: { tipo_traslado: tipoTraslado } } : undefined),
   estadoBatch: (despachoIds: number[]) =>
     api.get('/wasabil/despachos/estado-batch', { params: { ids: despachoIds.join(',') } }),
+  // Fase B — FACTURAS electrónicas (DTE 33). El payload es el MISMO de crearFactura
+  // pero SIN numero_factura (el folio lo asigna el SII al emitir).
+  previewFacturaSII: (payload: Record<string, any>) =>
+    api.post('/wasabil/facturas/preview', payload),
+  emitirFacturaSII: (payload: Record<string, any>) =>
+    api.post('/wasabil/facturas/emitir', payload),
+  estadoFacturaSII: (facturaId: number) => api.get(`/wasabil/facturas/${facturaId}/estado`),
+  reintentarFacturaSII: (facturaId: number) =>
+    api.post(`/wasabil/facturas/${facturaId}/reintentar`),
 }
 
 // --- Despachos ---

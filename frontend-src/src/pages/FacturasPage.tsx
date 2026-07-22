@@ -8,7 +8,7 @@ import {
   HandCoins,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
-import { contabilidadAPI, abrirDocumento } from '../services/api'
+import { contabilidadAPI, wasabilAPI, abrirDocumento } from '../services/api'
 import { fmtClp, fmtDate, hoyLocal } from '../utils/format'
 
 // ─── Tipos ────────────────────────────────────────────────────────────────────
@@ -23,6 +23,9 @@ interface Factura {
   monto_neto: number; iva: number; monto_bruto: number; monto_pagado: number; saldo: number
   estado_pago: string; semaforo: string; dias_vencimiento: number | null; observaciones: string | null
   items: FacturaItem[]; cobranzas: Cobranza[]; factoring: Factoring | null
+  // Emisión electrónica al SII vía Wasabil (solo presente si la factura tiene DTE 33)
+  dte_estado?: string | null; dte_folio?: string | null; dte_pdf_url?: string | null
+  dte_puede_reintentar?: boolean; dte_en_vuelo?: boolean; dte_error?: string | null
 }
 interface Kpis { facturado_clp: number; cobrado_clp: number; cobrado_cliente_clp?: number; por_cobrar_clp: number; vencido_clp: number; en_factoring_clp: number }
 interface Aging { '0_30': number; '31_60': number; '61_90': number; '91_mas': number }
@@ -66,6 +69,279 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   return (<label className="block"><span className="block text-[11px] font-semibold uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>{label}</span>{children}</label>)
 }
 
+// ─── Emisión de factura electrónica al SII (DTE 33 vía Wasabil) ───────────────
+// Mismo patrón 2 pasos que la guía de despacho (EmitirGuiaSIIModal): PREVIEW SII
+// (no toca el SII: receptor real de la ficha Wasabil + referencias OC/guía/anticipo
+// + descuento de anticipo) → EMITIR con OK explícito → sondeo hasta Emitido
+// (folio + PDF) o Fallido (reintento seguro: el backend nunca emite dos veces).
+// Se usa desde los dos modales de creación (payload nuevo) y desde la fila de una
+// factura ya creada (facturaId: retomar/reintentar).
+const REF_SII_LABEL: Record<string, string> = { '801': 'Orden de compra', '52': 'Guía de despacho', '33': 'Factura de anticipo' }
+
+function EmisionFacturaSII({ payload, facturaId, onDone, onVolver, onCerrar, onBusy }: {
+  payload?: Record<string, any>   // emisión NUEVA: payload de crearFactura SIN numero_factura
+  facturaId?: number              // retomar/reintentar una factura ya creada
+  onDone: () => void              // refresca la lista (la factura pudo crearse o cambiar)
+  onVolver?: () => void           // volver al formulario (solo antes de emitir)
+  onCerrar: () => void
+  onBusy?: (b: boolean) => void   // avisa al Modal padre que NO debe cerrarse (envío en vuelo)
+}) {
+  type Fase = 'cargando' | 'preview' | 'emitiendo' | 'sondeo' | 'exito' | 'fallido' | 'pendiente' | 'error'
+  const [fase, setFase] = useState<Fase>('cargando')
+  const [prev, setPrev] = useState<any>(null)
+  const [dte, setDte] = useState<any>(null)
+  const [error, setError] = useState('')
+  // Puerta de una sola dirección: apenas se dispara el POST /emitir, este modal NUNCA
+  // vuelve al formulario. El backend PUDO crear la factura (y hasta emitirla) aunque la
+  // respuesta se perdiera; re-enviar el formulario crearía un SEGUNDO documento real.
+  const [emisionIntentada, setEmisionIntentada] = useState(false)
+
+  // Única fuente de verdad del botón Reintentar: puede_reintentar del backend
+  const faseSegunDte = (d: any): Fase => {
+    if (d?.estado === 'emitido') return 'exito'
+    if (d?.puede_reintentar) return 'fallido'
+    if (d?.uuid) return 'sondeo'
+    return 'pendiente'  // claim en vuelo de otro intento (otra pestaña/usuario)
+  }
+
+  // Carga inicial: preview SII (emisión nueva) o estado real (retomar factura)
+  useEffect(() => {
+    let vivo = true
+    if (payload) {
+      wasabilAPI.previewFacturaSII(payload)
+        .then(({ data }) => { if (vivo) { setPrev(data); setFase('preview') } })
+        .catch((e: any) => { if (vivo) { setError(errMsg(e, 'No se pudo previsualizar la factura')); setFase('error') } })
+    } else if (facturaId) {
+      wasabilAPI.estadoFacturaSII(facturaId)
+        .then(({ data }) => { if (vivo) { setDte(data); setFase(faseSegunDte(data)); if (data.estado === 'emitido') onDone() } })
+        .catch((e: any) => { if (vivo) { setError(errMsg(e, 'No se pudo consultar el estado SII')); setFase('error') } })
+    }
+    return () => { vivo = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Sondeo: la emisión al SII es asíncrona (segundos a minutos)
+  useEffect(() => {
+    if (fase !== 'sondeo') return
+    const id = dte?.factura_id || facturaId
+    if (!id) { setFase('pendiente'); return }
+    let vivo = true
+    let intentos = 0
+    const tick = async () => {
+      if (!vivo) return
+      intentos += 1
+      try {
+        const { data } = await wasabilAPI.estadoFacturaSII(id)
+        if (!vivo) return
+        setDte(data)
+        if (data.estado === 'emitido') { setFase('exito'); onDone(); return }
+        if (data.puede_reintentar) { setFase('fallido'); onDone(); return }
+      } catch { /* error transitorio: se reintenta en el próximo tick */ }
+      if (intentos >= 30) { setFase('pendiente'); return }  // ~90 s: seguir después desde la lista
+      window.setTimeout(tick, 3000)
+    }
+    tick()
+    return () => { vivo = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fase])
+
+  // Mientras el envío está en vuelo el modal no debe cerrarse (ni con clic al fondo):
+  // el documento puede estar naciendo ante el SII y cerrar da falsa sensación de "no pasó nada".
+  useEffect(() => { onBusy?.(fase === 'emitiendo' || fase === 'sondeo') }, [fase])
+  // Al cerrar SIEMPRE se refresca la lista: la factura pudo quedar creada (y con folio)
+  // aunque el usuario cierre antes de que termine el sondeo.
+  const cerrar = () => { onDone(); onCerrar() }
+
+  const procesarRespuesta = (data: any) => {
+    setDte(data)
+    if (data.estado === 'emitido') { setFase('exito'); onDone() }
+    else if (data.puede_reintentar) { setFase('fallido'); onDone() }
+    else setFase('sondeo')
+  }
+  const emitir = async () => {
+    setEmisionIntentada(true)
+    setFase('emitiendo'); setError('')
+    try { procesarRespuesta((await wasabilAPI.emitirFacturaSII(payload!)).data) }
+    catch (e: any) {
+      // 409 (datos/emisión en curso) o 502 (sin confirmación de Wasabil): la factura
+      // PUDO quedar creada — el backend nunca emite dos veces; se refresca la lista
+      // para verla con su estado real (SII en proceso / SII fallida).
+      setError(errMsg(e, 'No se pudo emitir la factura'))
+      setFase('error'); onDone()
+    }
+  }
+  const reintentar = async () => {
+    const id = dte?.factura_id || facturaId
+    if (!id) return
+    setFase('emitiendo'); setError('')
+    try { procesarRespuesta((await wasabilAPI.reintentarFacturaSII(id)).data) }
+    catch (e: any) { setError(errMsg(e, 'No se pudo reintentar la emisión')); setFase('error'); onDone() }
+  }
+
+  return (
+    <div className="space-y-3">
+      {fase === 'cargando' && (
+        <div className="py-8 text-center text-sm" style={{ color: 'var(--text-muted)' }}>
+          <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" /> Verificando con Wasabil…
+        </div>
+      )}
+
+      {(fase === 'emitiendo' || fase === 'sondeo') && (
+        <div className="py-8 text-center" style={{ color: 'var(--text-muted)' }}>
+          <Loader2 className="w-8 h-8 animate-spin mx-auto mb-3 text-brand-400" />
+          <p className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>
+            {fase === 'emitiendo' ? 'Enviando a Wasabil…' : 'Procesando en el SII…'}
+          </p>
+          <p className="text-xs mt-1">El SII puede tardar de segundos a un par de minutos. No cierres esta ventana.</p>
+        </div>
+      )}
+
+      {fase === 'exito' && dte && (
+        <div className="py-6 text-center space-y-3">
+          <CheckCircle2 className="w-10 h-10 mx-auto text-emerald-500" />
+          <p className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>Factura emitida — Folio SII {dte.folio}</p>
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            El folio quedó registrado en la factura y ya aparece en la lista para cobranzas y factoring.
+          </p>
+          {dte.pdf_url && (
+            <button onClick={() => window.open(dte.pdf_url, '_blank', 'noopener,noreferrer')} className="btn-primary text-sm inline-flex items-center gap-1.5">
+              <FileText className="w-4 h-4" /> Ver PDF de la factura
+            </button>
+          )}
+          <div><button onClick={cerrar} className="btn-secondary text-sm">Cerrar</button></div>
+        </div>
+      )}
+
+      {fase === 'pendiente' && (
+        <div className="py-6 text-center space-y-2">
+          <AlertCircle className="w-8 h-8 mx-auto text-amber-500" />
+          <p className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>Emisión en curso</p>
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+            Hay una emisión en proceso para esta factura (puede ser de otra pestaña u otro usuario).
+            Puedes cerrar: en la lista se ve como <b>SII en proceso</b> y <b>no se emitirá dos veces</b>.
+          </p>
+          <button onClick={cerrar} className="btn-secondary text-sm">Cerrar</button>
+        </div>
+      )}
+
+      {fase === 'fallido' && (
+        <div className="space-y-3">
+          <div className="p-3 rounded-xl border bg-red-500/10 border-red-500/30 space-y-1">
+            <p className="text-sm font-semibold text-red-500 flex items-center gap-1.5">
+              <AlertCircle className="w-4 h-4" />
+              {dte?.estado === 'error_envio' ? 'La emisión no llegó a Wasabil' : 'El SII/Wasabil rechazó la factura'}
+            </p>
+            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{error || dte?.error || 'Sin detalle del motivo'}</p>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={reintentar} className="btn-primary flex-1 text-sm flex items-center justify-center gap-1.5">
+              <RefreshCw className="w-4 h-4" /> Reintentar emisión
+            </button>
+            <button onClick={cerrar} className="btn-secondary text-sm">Cerrar</button>
+          </div>
+        </div>
+      )}
+
+      {fase === 'error' && (
+        <div className="space-y-3">
+          <div className="p-3 rounded-xl border bg-red-500/10 border-red-500/30 space-y-1">
+            <p className="text-sm font-semibold text-red-500 flex items-center gap-1.5"><AlertCircle className="w-4 h-4" /> No se pudo completar</p>
+            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{error}</p>
+            <p className="text-[11px]" style={{ color: 'var(--text-faint)' }}>
+              Si la factura alcanzó a crearse, aparece en la lista como <b>SII en proceso</b> o <b>SII fallida</b> y puedes reintentar desde ahí (nunca se emite dos veces).
+            </p>
+          </div>
+          <div className="flex gap-2">
+            {/* Volver SOLO si nunca se disparó el emitir (p.ej. falló el preview) */}
+            {onVolver && payload && !emisionIntentada && (
+              <button onClick={onVolver} className="btn-secondary flex-1 text-sm">← Volver al formulario</button>
+            )}
+            <button onClick={cerrar} className="btn-secondary flex-1 text-sm">Cerrar</button>
+          </div>
+        </div>
+      )}
+
+      {fase === 'preview' && prev && (
+        <>
+          {prev.problemas?.length > 0 && (
+            <div className="p-3 rounded-xl border bg-red-500/10 border-red-500/30">
+              <p className="text-xs font-semibold text-red-500 mb-1">Para emitir falta resolver:</p>
+              <ul className="text-xs space-y-0.5 list-disc pl-4" style={{ color: 'var(--text-muted)' }}>
+                {prev.problemas.map((p: string, i: number) => <li key={i}>{p}</li>)}
+              </ul>
+            </div>
+          )}
+          {prev.advertencias?.length > 0 && (
+            <div className="p-3 rounded-xl border bg-amber-500/10 border-amber-500/30">
+              <ul className="text-xs space-y-0.5 list-disc pl-4" style={{ color: 'var(--text-muted)' }}>
+                {prev.advertencias.map((a: string, i: number) => <li key={i}>{a}</li>)}
+              </ul>
+            </div>
+          )}
+
+          {/* Receptor real (ficha Wasabil = lo que verá el SII) + referencias del DTE */}
+          <div className="grid sm:grid-cols-2 gap-3 text-sm">
+            <div className="rounded-xl border p-3" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+              <div className="text-[11px] uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>
+                Receptor {prev.receptor?.fuente === 'wasabil' ? '(ficha Wasabil)' : '(datos locales)'}
+              </div>
+              <div className="font-semibold" style={{ color: 'var(--text-primary)' }}>{prev.receptor?.razon_social || '—'}</div>
+              <div className="text-xs" style={{ color: 'var(--text-muted)' }}>RUT {prev.receptor?.rut || '—'}</div>
+              {prev.receptor?.giro && <div className="text-xs" style={{ color: 'var(--text-muted)' }}>{prev.receptor.giro}</div>}
+              {prev.receptor?.direccion && (
+                <div className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                  {prev.receptor.direccion}{prev.receptor.comuna ? `, ${prev.receptor.comuna}` : ''}
+                </div>
+              )}
+            </div>
+            <div className="rounded-xl border p-3" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+              <div className="text-[11px] uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>Referencias del DTE</div>
+              {(prev.referencias ?? []).map((r: any, i: number) => (
+                <div key={i} className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                  {REF_SII_LABEL[String(r.tipo)] || `Doc ${r.tipo}`}: <b style={{ color: 'var(--text-primary)' }}>{r.folio}</b>{r.fecha ? ` · ${fmtDate(r.fecha)}` : ''}
+                </div>
+              ))}
+              {(prev.referencias?.length ?? 0) === 0 && <div className="text-xs" style={{ color: 'var(--text-faint)' }}>Sin referencias</div>}
+            </div>
+          </div>
+
+          {/* Descuento de anticipo (si la factura descuenta facturas de anticipo previas) */}
+          {(prev.descuentos?.length ?? 0) > 0 && (
+            <div className="rounded-xl border p-3 text-xs space-y-0.5" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+              <p className="text-[11px] font-semibold uppercase tracking-wider text-emerald-500">Anticipo descontado en esta factura</p>
+              {prev.descuentos.map((d: any, i: number) => (
+                <p key={i} style={{ color: 'var(--text-muted)' }}>
+                  Factura de anticipo {d.folio || `#${d.anticipo_factura_id}`}: <b className="text-emerald-500">−{fmtClp(d.monto_neto)}</b> neto
+                </p>
+              ))}
+            </div>
+          )}
+
+          {/* Totales que se enviarán al SII */}
+          {prev.totales && (
+            <div className="rounded-xl border p-3 text-xs flex gap-5" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)', color: 'var(--text-muted)' }}>
+              <span>Neto: <b style={{ color: 'var(--text-primary)' }}>{fmtClp(prev.totales.neto)}</b></span>
+              <span>IVA 19%: <b style={{ color: 'var(--text-primary)' }}>{fmtClp(prev.totales.iva)}</b></span>
+              <span>Total: <b className="text-brand-400">{fmtClp(prev.totales.bruto)}</b></span>
+            </div>
+          )}
+
+          <p className="text-[11px]" style={{ color: 'var(--text-faint)' }}>
+            El folio lo asigna el SII al emitir. Esta emisión es un documento tributario <b>real</b> — revisa el receptor y los montos antes de confirmar.
+          </p>
+          <div className="flex gap-2">
+            {onVolver && <button onClick={onVolver} className="btn-secondary text-sm">← Volver</button>}
+            <button onClick={emitir} disabled={!prev.puede_emitir}
+              className="btn-primary flex-1 text-sm flex items-center justify-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed">
+              <Receipt className="w-4 h-4" /> Emitir al SII ahora
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 // ─── Modal: emitir factura (desde un despacho/guía de una OC) ─────────────────
 // Antes de emitir se PREVISUALIZA lo que se va a facturar (receptor + líneas + neto/IVA/
 // total), se exige el RUT del cliente (campo por llenar si la venta no lo trae) y el folio.
@@ -98,6 +374,11 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
   const [prevError, setPrevError] = useState('')
   const [reintento, setReintento] = useState(0)  // fuerza re-consulta del preview tras un error
   const [saving, setSaving] = useState(false)
+  // Modo de emisión: 'sii' (default: Wasabil emite y el SII asigna el folio) o
+  // 'manual' (registrar una factura ya emitida a mano, con su folio digitado).
+  const [modoSii, setModoSii] = useState(true)
+  const [siiPayload, setSiiPayload] = useState<Record<string, any> | null>(null)
+  const [siiBusy, setSiiBusy] = useState(false)   // envío en vuelo: el modal no se cierra
 
   useEffect(() => {
     contabilidadAPI.listVentas().then(({ data }) =>
@@ -162,31 +443,47 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
   }, [ocId, despachoId, rutDebounced, razonDebounced, reintento])
 
   const rutFaltante = !rut.trim()
-  const folioFaltante = tipo === 'factura' && !folio.trim()
+  const folioFaltante = tipo === 'factura' && !modoSii && !folio.trim()
   const bloqueadoDatos = (preview?.problemas?.length ?? 0) > 0
   const puedeEmitir = !!preview && preview.lineas.length > 0 && !rutFaltante && !folioFaltante && !bloqueadoDatos && !loadingPrev
 
+  // Payload común a ambos modos (el folio SOLO va en modo manual: en SII lo asigna el SII)
+  const armarPayload = () => ({
+    oc_cliente_id: Number(ocId), despacho_id: Number(despachoId),
+    tipo_doc: tipo,
+    fecha_emision: fecha, plazo_dias: plazo ? Number(plazo) : undefined,
+    // Condición real pactada en la OC; si no hay, se deriva del plazo
+    condicion_pago: condPagoOc || (plazo ? `${plazo} días` : undefined),
+    rut_cliente: rut || undefined,
+    razon_social_cliente: razonSocial.trim() || undefined,
+  })
+
   const submit = async () => {
     if (!ocId || !despachoId) { toast.error('Selecciona OC y despacho'); return }
-    if (folioFaltante) { toast.error('Ingresa el folio SII de la factura'); return }
     if (rutFaltante) { toast.error('Ingresa el RUT del cliente'); return }
+    if (modoSii) {
+      if (tipo !== 'factura') { toast.error('La emisión electrónica es solo para facturas; una boleta regístrala como ya emitida'); return }
+      setSiiPayload(armarPayload())  // pasa al flujo SII (preview Wasabil → emitir)
+      return
+    }
+    if (folioFaltante) { toast.error('Ingresa el folio SII de la factura'); return }
     setSaving(true)
     try {
-      await contabilidadAPI.crearFactura({
-        oc_cliente_id: Number(ocId), despacho_id: Number(despachoId),
-        numero_factura: folio || undefined, tipo_doc: tipo,
-        fecha_emision: fecha, plazo_dias: plazo ? Number(plazo) : undefined,
-        // Condición real pactada en la OC; si no hay, se deriva del plazo
-        condicion_pago: condPagoOc || (plazo ? `${plazo} días` : undefined),
-        rut_cliente: rut || undefined,
-        razon_social_cliente: razonSocial.trim() || undefined,
-      })
-      toast.success('Factura emitida')
+      await contabilidadAPI.crearFactura({ ...armarPayload(), numero_factura: folio || undefined })
+      toast.success('Factura registrada')
       onDone(); onClose()
     } catch (e: any) {
-      toast.error(errMsg(e, 'No se pudo emitir la factura'))
+      toast.error(errMsg(e, 'No se pudo registrar la factura'))
     } finally { setSaving(false) }
   }
+
+  // Flujo SII en curso: el formulario cede el modal al componente de emisión
+  if (siiPayload) return (
+    <Modal title="Emitir factura electrónica (SII)" onClose={siiBusy ? () => {} : onClose} wide>
+      <EmisionFacturaSII payload={siiPayload} onDone={onDone}
+        onVolver={() => setSiiPayload(null)} onCerrar={onClose} onBusy={setSiiBusy} />
+    </Modal>
+  )
 
   return (
     <Modal title="Emitir factura" onClose={onClose} wide>
@@ -323,7 +620,13 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
       )}
 
       <div className="grid grid-cols-2 gap-3">
-        <Field label={`N° Factura (folio SII)${tipo === 'factura' ? ' *' : ''}`}><input className={inputCls} style={inputStyle} value={folio} onChange={e => setFolio(e.target.value)} placeholder="Ej. 35" /></Field>
+        {modoSii ? (
+          <Field label="N° Factura (folio SII)">
+            <div className={inputCls} style={{ ...inputStyle, color: 'var(--text-faint)' }}>Lo asigna el SII al emitir</div>
+          </Field>
+        ) : (
+          <Field label={`N° Factura (folio SII)${tipo === 'factura' ? ' *' : ''}`}><input className={inputCls} style={inputStyle} value={folio} onChange={e => setFolio(e.target.value)} placeholder="Ej. 35" /></Field>
+        )}
         <Field label="Tipo">
           <select className={inputCls} style={inputStyle} value={tipo} onChange={e => setTipo(e.target.value)}><option value="factura">Factura</option><option value="boleta">Boleta</option></select>
         </Field>
@@ -331,7 +634,10 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
         <Field label="Plazo (días)"><input type="number" min={0} step={1} className={inputCls} style={inputStyle} value={plazo} onChange={e => setPlazo(e.target.value)} /></Field>
       </div>
       <button onClick={submit} disabled={saving || !puedeEmitir} className="btn-primary w-full flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
-        {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Receipt className="w-4 h-4" />} Emitir factura
+        {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Receipt className="w-4 h-4" />} {modoSii ? 'Emitir factura al SII' : 'Registrar factura emitida'}
+      </button>
+      <button type="button" onClick={() => setModoSii(m => !m)} className="w-full text-center text-[11px] underline underline-offset-2" style={{ color: 'var(--text-muted)' }}>
+        {modoSii ? '¿La factura ya fue emitida a mano en el SII? Regístrala con su folio' : '← Volver a emitir al SII (folio automático)'}
       </button>
     </Modal>
   )
@@ -361,7 +667,13 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
   const [razonSocial, setRazonSocial] = useState('')
   const [razonDebounced, setRazonDebounced] = useState('')
   const [preview, setPreview] = useState<PreviewData | null>(null)
+  const [prevError, setPrevError] = useState('')
   const [saving, setSaving] = useState(false)
+  // Modo de emisión: 'sii' (default: Wasabil emite y el SII asigna el folio) o
+  // 'manual' (registrar una factura de anticipo ya emitida a mano, con su folio).
+  const [modoSii, setModoSii] = useState(true)
+  const [siiPayload, setSiiPayload] = useState<Record<string, any> | null>(null)
+  const [siiBusy, setSiiBusy] = useState(false)   // envío en vuelo: el modal no se cierra
 
   useEffect(() => {
     contabilidadAPI.listVentas().then(({ data }) =>
@@ -386,7 +698,11 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
   useEffect(() => {
     setAdelSel(new Set()); setAdelantos([]); setPreview(null)
     if (!ocId) return
+    // `vivo`: sin este guard, la respuesta atrasada de la OC anterior poblaba los
+    // adelantos (y el monto sugerido) de la OC recién elegida.
+    let vivo = true
     contabilidadAPI.adelantosDeVenta(Number(ocId)).then(({ data }) => {
+      if (!vivo) return
       const cand = (data || []).filter((a: AdelantoVenta) =>
         a.estado !== 'anulado' && !a.factura_anticipo_id && (a.monto_aplicado || 0) <= 1)
       setAdelantos(cand)
@@ -395,7 +711,8 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
         const bruto = cand[0].estado === 'aprobado' ? cand[0].monto : cand[0].monto_esperado
         if (bruto > 0 && !montoNeto) setMontoNeto(String(Math.round(bruto / 1.19)))
       }
-    }).catch(() => setAdelantos([]))
+    }).catch(() => { if (vivo) setAdelantos([]) })
+    return () => { vivo = false }
   }, [ocId])
 
   // Previsualiza con la misma fuente de verdad que la emisión
@@ -409,35 +726,55 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
       razon_social_cliente: razonDebounced || undefined,
     }).then(({ data }) => {
       if (!vivo) return
-      setPreview(data)
+      setPreview(data); setPrevError('')
       if (!rut && data.receptor?.rut) setRut(prev => prev || data.receptor.rut)
-    }).catch(() => { if (vivo) setPreview(null) })
+    }).catch((e: any) => {
+      // Antes se tragaba el error: el botón quedaba gris sin decir por qué
+      if (!vivo) return
+      setPreview(null)
+      setPrevError(errMsg(e, 'No se pudo calcular la previsualización'))
+    })
     return () => { vivo = false }
   }, [ocId, montoNeto, adelSel, rutDebounced, razonDebounced])
 
   const toggleAdel = (id: number) => setAdelSel(prev => {
     const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s
   })
-  const puedeEmitir = !!preview && preview.puede_emitir && !!folio.trim() && !!rut.trim()
+  const puedeEmitir = !!preview && preview.puede_emitir && (modoSii || !!folio.trim()) && !!rut.trim()
+
+  // Payload común a ambos modos (el folio SOLO va en modo manual: en SII lo asigna el SII)
+  const armarPayload = () => ({
+    oc_cliente_id: Number(ocId), es_anticipo: true,
+    monto_neto_anticipo: Number(montoNeto), adelanto_ids: [...adelSel],
+    tipo_doc: 'factura', fecha_emision: fecha,
+    rut_cliente: rut || undefined,
+    razon_social_cliente: razonSocial.trim() || undefined,
+  })
 
   const submit = async () => {
     if (!ocId) { toast.error('Selecciona la OC'); return }
     if (!montoNeto || Number(montoNeto) <= 0) { toast.error('Indica el monto neto del anticipo'); return }
-    if (!folio.trim()) { toast.error('Ingresa el folio SII de la factura'); return }
     if (!rut.trim()) { toast.error('Ingresa el RUT del cliente'); return }
+    if (modoSii) {
+      setSiiPayload(armarPayload())  // pasa al flujo SII (preview Wasabil → emitir)
+      return
+    }
+    if (!folio.trim()) { toast.error('Ingresa el folio SII de la factura'); return }
     setSaving(true)
     try {
-      await contabilidadAPI.crearFactura({
-        oc_cliente_id: Number(ocId), es_anticipo: true,
-        monto_neto_anticipo: Number(montoNeto), adelanto_ids: [...adelSel],
-        numero_factura: folio, tipo_doc: 'factura', fecha_emision: fecha,
-        rut_cliente: rut || undefined,
-        razon_social_cliente: razonSocial.trim() || undefined,
-      })
+      await contabilidadAPI.crearFactura({ ...armarPayload(), numero_factura: folio })
       toast.success('Factura de anticipo emitida — al facturar el despacho real se descuenta sola')
       onDone(); onClose()
     } catch (e: any) { toast.error(errMsg(e, 'No se pudo emitir la factura de anticipo')) } finally { setSaving(false) }
   }
+
+  // Flujo SII en curso: el formulario cede el modal al componente de emisión
+  if (siiPayload) return (
+    <Modal title="Emitir factura de anticipo al SII" onClose={siiBusy ? () => {} : onClose} wide>
+      <EmisionFacturaSII payload={siiPayload} onDone={onDone}
+        onVolver={() => setSiiPayload(null)} onCerrar={onClose} onBusy={setSiiBusy} />
+    </Modal>
+  )
 
   return (
     <Modal title="Factura de anticipo (sin guía de despacho)" onClose={onClose} wide>
@@ -483,9 +820,18 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
         </Field>
       )}
       <div className="grid grid-cols-2 gap-3">
-        <Field label="N° Factura (folio SII) *"><input className={inputCls} style={inputStyle} value={folio} onChange={e => setFolio(e.target.value)} placeholder="Ej. 42" /></Field>
+        {modoSii ? (
+          <Field label="N° Factura (folio SII)">
+            <div className={inputCls} style={{ ...inputStyle, color: 'var(--text-faint)' }}>Lo asigna el SII al emitir</div>
+          </Field>
+        ) : (
+          <Field label="N° Factura (folio SII) *"><input className={inputCls} style={inputStyle} value={folio} onChange={e => setFolio(e.target.value)} placeholder="Ej. 42" /></Field>
+        )}
         <Field label="Fecha emisión"><input type="date" className={inputCls} style={inputStyle} value={fecha} onChange={e => setFecha(e.target.value)} /></Field>
       </div>
+      {prevError && !preview && (
+        <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-500">{prevError}</div>
+      )}
       {preview && (
         <div className="rounded-xl border p-3 text-xs space-y-1" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
           {preview.problemas.length > 0 && (
@@ -499,7 +845,10 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
         </div>
       )}
       <button onClick={submit} disabled={saving || !puedeEmitir} className="btn-primary w-full flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
-        {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <HandCoins className="w-4 h-4" />} Emitir factura de anticipo
+        {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <HandCoins className="w-4 h-4" />} {modoSii ? 'Emitir factura de anticipo al SII' : 'Registrar factura de anticipo emitida'}
+      </button>
+      <button type="button" onClick={() => setModoSii(m => !m)} className="w-full text-center text-[11px] underline underline-offset-2" style={{ color: 'var(--text-muted)' }}>
+        {modoSii ? '¿La factura ya fue emitida a mano en el SII? Regístrala con su folio' : '← Volver a emitir al SII (folio automático)'}
       </button>
     </Modal>
   )
@@ -587,10 +936,14 @@ function FactoringModal({ factura, onClose, onDone }: { factura: Factura; onClos
 }
 
 // ─── Fila de factura (expandible) ─────────────────────────────────────────────
-function FacturaRow({ f, onChanged, onCobrar, onFactoring }: { f: Factura; onChanged: () => void; onCobrar: (f: Factura) => void; onFactoring: (f: Factura) => void }) {
+function FacturaRow({ f, onChanged, onCobrar, onFactoring, onSii }: { f: Factura; onChanged: () => void; onCobrar: (f: Factura) => void; onFactoring: (f: Factura) => void; onSii: (f: Factura) => void }) {
   const [open, setOpen] = useState(false)
   const pago = PAGO[f.estado_pago] ?? { cls: 'bg-gray-500/10 text-gray-400', label: f.estado_pago }
   const pct = Math.min(100, f.monto_bruto > 0 ? Math.round((f.monto_pagado / f.monto_bruto) * 100) : 0)
+  // Estado de la emisión electrónica (si esta factura tiene DTE 33 asociado)
+  const siiEmitida = f.dte_estado === 'emitido'
+  const siiFallida = !!f.dte_estado && !siiEmitida && !!f.dte_puede_reintentar
+  const siiEnProceso = !!f.dte_estado && !siiEmitida && !siiFallida
   const liquidar = async () => {
     try { await contabilidadAPI.liquidarFactoring(f.id); toast.success('Factoring liquidado'); onChanged() }
     catch (e: any) { toast.error(errMsg(e, 'Error')) }
@@ -601,18 +954,45 @@ function FacturaRow({ f, onChanged, onCobrar, onFactoring }: { f: Factura; onCha
     catch (e: any) { toast.error(errMsg(e, 'Error')) }
   }
   const eliminar = async () => {
+    // Guards anticipados (el backend igual los valida): un DTE emitido al SII es un
+    // documento tributario real — no se borra, se anula en Wasabil con nota de crédito.
+    if (siiEmitida) { toast.error('Esta factura fue emitida al SII: anúlala primero en Wasabil (nota de crédito)'); return }
+    if (siiEnProceso) { toast.error('Hay una emisión SII en curso para esta factura: espera a que termine antes de eliminar'); return }
     if (!confirm('¿Eliminar esta factura? Solo se puede si no tiene pagos ni factoring (revierte las cobranzas primero).')) return
     try { await contabilidadAPI.eliminarFactura(f.id); toast.success('Factura eliminada'); onChanged() }
     catch (e: any) { toast.error(errMsg(e, 'Error')) }
   }
   return (
     <>
-      <tr className="hover:bg-[var(--surface-200)] transition-colors cursor-pointer" onClick={() => setOpen(o => !o)}>
+      {/* Fila expandible también por teclado: dentro viven acciones que sin esto
+          quedaban inalcanzables (PDF SII, Reintentar SII, eliminar). */}
+      <tr className="hover:bg-[var(--surface-200)] transition-colors cursor-pointer focus:outline-none focus:ring-2 focus:ring-brand-500/40"
+        role="button" tabIndex={0} aria-expanded={open}
+        onClick={() => setOpen(o => !o)}
+        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpen(o => !o) } }}>
         <td className="px-4 py-3 font-mono font-semibold text-brand-400 whitespace-nowrap">
           <span className="inline-flex items-center gap-1">{open ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}{f.numero_factura || `#${f.id}`}</span>
           {f.es_anticipo && (
             <span className="ml-1.5 inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-sans font-medium bg-emerald-500/10 text-emerald-500 border border-emerald-500/20">
               <HandCoins className="w-2.5 h-2.5" /> Anticipo
+            </span>
+          )}
+          {siiEmitida && (
+            <span className="ml-1.5 inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-sans font-medium bg-blue-500/10 text-blue-500 border border-blue-500/20"
+              title={`Emitida electrónicamente al SII (folio ${f.dte_folio || '—'})`}>
+              <CheckCircle2 className="w-2.5 h-2.5" /> SII
+            </span>
+          )}
+          {siiEnProceso && (
+            <span className="ml-1.5 inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-sans font-medium bg-amber-500/10 text-amber-500 border border-amber-500/20"
+              title="Emisión al SII en proceso — abre la fila para ver el estado">
+              <Loader2 className="w-2.5 h-2.5 animate-spin" /> SII en proceso
+            </span>
+          )}
+          {siiFallida && (
+            <span className="ml-1.5 inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-sans font-medium bg-red-500/10 text-red-500 border border-red-500/20"
+              title={f.dte_error || 'La emisión al SII falló — abre la fila para reintentar'}>
+              <AlertCircle className="w-2.5 h-2.5" /> SII fallida
             </span>
           )}
         </td>
@@ -700,6 +1080,18 @@ function FacturaRow({ f, onChanged, onCobrar, onFactoring }: { f: Factura; onCha
               </div>
               {/* Acciones + factoring */}
               <div className="space-y-2">
+                {siiEmitida && f.dte_pdf_url && (
+                  <button onClick={(e) => { e.stopPropagation(); window.open(f.dte_pdf_url!, '_blank', 'noopener,noreferrer') }}
+                    className="btn-secondary w-full flex items-center justify-center gap-2 text-xs">
+                    <FileText className="w-3.5 h-3.5" /> PDF SII{f.dte_folio ? ` · folio ${f.dte_folio}` : ''}
+                  </button>
+                )}
+                {(siiFallida || siiEnProceso) && (
+                  <button onClick={(e) => { e.stopPropagation(); onSii(f) }}
+                    className={`w-full flex items-center justify-center gap-2 text-xs rounded-lg py-1.5 border ${siiFallida ? 'text-red-500 border-red-500/30 hover:bg-red-500/10' : 'text-amber-500 border-amber-500/30 hover:bg-amber-500/10'}`}>
+                    <RefreshCw className="w-3.5 h-3.5" /> {siiFallida ? 'Reintentar emisión SII' : 'Ver emisión SII en curso'}
+                  </button>
+                )}
                 {f.saldo > 0 && (
                   <button onClick={(e) => { e.stopPropagation(); onCobrar(f) }} className="btn-secondary w-full flex items-center justify-center gap-2 text-xs">
                     <CreditCard className="w-3.5 h-3.5" /> Registrar cobranza
@@ -742,7 +1134,8 @@ export default function FacturasPage() {
   const [q, setQ] = useState('')
   const [estado, setEstado] = useState('')
   const [error, setError] = useState('')
-  const [modal, setModal] = useState<{ type: 'crear' | 'anticipo' | 'cobranza' | 'factoring'; factura?: Factura } | null>(null)
+  const [modal, setModal] = useState<{ type: 'crear' | 'anticipo' | 'cobranza' | 'factoring' | 'sii'; factura?: Factura } | null>(null)
+  const [siiBusy, setSiiBusy] = useState(false)   // envío en vuelo: el modal no se cierra
 
   const load = useCallback(async (search?: string, est?: string) => {
     setLoading(true); setError('')
@@ -860,7 +1253,8 @@ export default function FacturasPage() {
                 {facturas.map(f => (
                   <FacturaRow key={f.id} f={f} onChanged={reload}
                     onCobrar={(fa) => setModal({ type: 'cobranza', factura: fa })}
-                    onFactoring={(fa) => setModal({ type: 'factoring', factura: fa })} />
+                    onFactoring={(fa) => setModal({ type: 'factoring', factura: fa })}
+                    onSii={(fa) => setModal({ type: 'sii', factura: fa })} />
                 ))}
               </tbody>
             </table>
@@ -873,6 +1267,13 @@ export default function FacturasPage() {
       {modal?.type === 'anticipo' && <AnticipoFacturaModal onClose={() => setModal(null)} onDone={reload} />}
       {modal?.type === 'cobranza' && modal.factura && <CobranzaModal factura={modal.factura} onClose={() => setModal(null)} onDone={reload} />}
       {modal?.type === 'factoring' && modal.factura && <FactoringModal factura={modal.factura} onClose={() => setModal(null)} onDone={reload} />}
+      {modal?.type === 'sii' && modal.factura && (
+        <Modal title={`Emisión SII · factura ${modal.factura.numero_factura || '#' + modal.factura.id}`}
+          onClose={siiBusy ? () => {} : () => setModal(null)}>
+          <EmisionFacturaSII facturaId={modal.factura.id} onDone={reload}
+            onCerrar={() => setModal(null)} onBusy={setSiiBusy} />
+        </Modal>
+      )}
     </div>
   )
 }

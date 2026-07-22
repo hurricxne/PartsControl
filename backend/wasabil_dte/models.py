@@ -54,8 +54,11 @@ class WasabilDte(Base):
     __tablename__ = "wasabil_dte"
     __table_args__ = (
         # 1 guía electrónica por despacho, garantizado por la BD (los NULL de las
-        # futuras filas de facturas no colisionan en MySQL).
+        # filas de facturas no colisionan en MySQL).
         UniqueConstraint("despacho_id", name="uq_wasabil_dte_despacho"),
+        # 1 factura electrónica por factura de cliente (Fase B, DTE 33): mismo
+        # candado anti doble emisión que el de guías, ahora por el otro origen.
+        UniqueConstraint("factura_id", name="uq_wasabil_dte_factura"),
         # InnoDB explícito: SELECT ... FOR UPDATE (lock anti doble-emisión) lo requiere.
         {"mysql_engine": "InnoDB"},
     )
@@ -100,3 +103,4 @@ class WasabilDte(Base):
                         onupdate=func.now())
 
     despacho = relationship("Despacho")
+    factura = relationship("ContFacturaCliente")

@@ -164,7 +164,11 @@ def test_armar_guia_referencia_oc_con_fecha():
     assert ref["documentType"] == TIPO_REF_OC
     assert ref["folio"] == "OC-4501"
     assert ref["date"] == "2026-06-10"
-    assert len(ref["reason"]) <= REASON_MAX
+    # v3 (hallazgo folio 137): SIN `reason`. Wasabil imprime la etiqueta del tipo
+    # ("ORDEN DE COMPRA", derivada del 801) junto al folio, así que un reason como
+    # "Orden de compra OC-4501" hacía salir la etiqueta Y el número DOS veces en el
+    # papel. El campo es opcional (RazonRef del SII) y payload_a_rest lo omite.
+    assert "reason" not in ref, ref
 
 
 def test_armar_guia_referencia_interna_reencontrable():
@@ -411,3 +415,76 @@ def test_normalizar_cliente_formato_real():
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ─── FASE B: armadores del DTE 33 ───────────────────────────────────────────────
+def test_referencias_factura_matriz_completa():
+    from wasabil_dte.service import armar_referencias_factura
+    refs, problemas = armar_referencias_factura(
+        numero_oc="OC-4501", fecha_oc=date(2026, 6, 10),
+        guia_folio="136", guia_fecha=date(2026, 7, 20),
+        anticipos=[{"folio": "88", "fecha": date(2026, 7, 19)}])
+    assert problemas == []
+    assert [r["documentType"] for r in refs] == ["801", "52", "33"]
+    assert refs[1]["folio"] == "136" and refs[2]["folio"] == "88"
+
+
+def test_referencias_factura_bloqueos():
+    from wasabil_dte.service import armar_referencias_factura
+    # N° OC sobre 18 chars → bloquea (límite SII del folio de referencia)
+    _refs, p = armar_referencias_factura(numero_oc="X" * 19, fecha_oc=date(2026, 1, 1))
+    assert any("18" in x for x in p)
+    # anticipo sin folio SII (placeholder #id) → bloquea
+    _refs, p = armar_referencias_factura(
+        numero_oc="OC-1", fecha_oc=date(2026, 1, 1),
+        anticipos=[{"folio": "#77", "fecha": None}])
+    assert any("anticipo" in x.lower() for x in p)
+    # más de 5 referencias → bloquea
+    _refs, p = armar_referencias_factura(
+        numero_oc="OC-1", fecha_oc=date(2026, 1, 1), guia_folio="1",
+        anticipos=[{"folio": str(n), "fecha": None} for n in range(1, 6)])
+    assert any("máximo" in x or "5" in x for x in p)
+
+
+def test_armar_factura_estructura():
+    from wasabil_dte.service import armar_factura, TIPO_DOC_FACTURA
+    doc = armar_factura(
+        referencia_interna="FACT-9", lineas=[{"name": "X", "quantity": 1, "price": 10}],
+        referencias=[], client_id=160065, issue=False, payment_method="credito")
+    assert doc["siiDocumentTypeCode"] == TIPO_DOC_FACTURA
+    assert doc["issue"] is False           # el preview JAMÁS emite
+    assert doc["invoiceReference"] == "FACT-9"   # ancla v2: sin OC (Wasabil la imprime)
+    assert doc["paymentMethod"] == "credito"
+    rest = payload_a_rest(doc)
+    assert rest["payment_method"] == "credito" and rest["sii_document_type_code"] == 33
+
+
+def test_referencias_sin_texto_redundante_v3():
+    """v3 (hallazgo folio 137): el `reason` NUNCA repite lo que el tipo y el folio
+    ya imprimen. Wasabil escribe la etiqueta legible del tipo de referencia, así que
+    'Orden de compra 1788' junto a la 801 hacía salir la OC dos veces en el papel.
+
+    Se conserva el reason SOLO donde aporta algo que el tipo no dice: la referencia
+    33 a una factura de anticipo explica que se está DESCONTANDO (sin repetir la
+    palabra 'Factura' ni el folio, que ya se imprimen)."""
+    from datetime import date as _d
+    from wasabil_dte.service import armar_referencias_factura
+    refs, problemas = armar_referencias_factura(
+        numero_oc="1788", fecha_oc=_d(2026, 7, 13),
+        guia_folio="137", guia_fecha=_d(2026, 7, 21),
+        anticipos=[{"folio": "901", "fecha": _d(2026, 7, 20)}])
+    assert not problemas, problemas
+    por_tipo = {r["documentType"]: r for r in refs}
+
+    # 801 (OC) y 52 (guía): sin reason — el tipo ya imprime su etiqueta
+    assert "reason" not in por_tipo["801"], por_tipo["801"]
+    assert "reason" not in por_tipo["52"], por_tipo["52"]
+
+    # 33 (anticipo): conserva el motivo, pero sin repetir tipo ni folio
+    razon = por_tipo["33"]["reason"]
+    assert razon == "Descuento anticipo", razon
+    assert "901" not in razon and "actura" not in razon, razon
+
+    # y ningún reason del documento repite el folio de su propia referencia
+    for r in refs:
+        assert str(r["folio"]) not in (r.get("reason") or ""), r

@@ -1,8 +1,10 @@
-# Módulo Wasabil DTE — Guías de despacho electrónicas (SII tipo 52)
+# Módulo Wasabil DTE — Guías (52) y Facturas (33) electrónicas al SII
 
-Emisión de la guía de despacho electrónica **directo al SII vía Wasabil**
-(facturador electrónico de GRUPO AM SPA 77.977.813-4) desde el flujo de
-Despachos de Logística — sin portal MiPyme, sin firma manual.
+Emisión de la guía de despacho electrónica **y de la factura electrónica**
+**directo al SII vía Wasabil** (facturador electrónico de GRUPO AM SPA
+77.977.813-4) — guías desde Despachos de Logística (Fase A) y facturas desde
+Facturas y Cobranzas de Contabilidad (Fase B) — sin portal MiPyme, sin firma
+manual.
 
 ## Qué hace
 
@@ -76,6 +78,44 @@ re-crear. En la práctica la creación es de segundos; si alguna vez ocurre, el
 documento extra queda visible en Wasabil (misma referencia interna) y se anula
 allá (`full_annulment`).
 
+## Formato v3 — el motivo de la referencia (folio 137, 2026-07-21)
+
+Tras la SEGUNDA emisión real el dueño reportó que la orden de compra **seguía
+saliendo impresa dos veces**, pese a los dos arreglos del v2. Era una tercera
+fuente, distinta de las anteriores.
+
+Una referencia viaja con tres datos: **tipo** (801), **folio** (1788) y **motivo**
+(`reason`). Wasabil imprime la etiqueta legible del tipo — "ORDEN DE COMPRA",
+derivada del código del SII — junto al folio. Nuestro `reason` decía además
+"Orden de compra 1788", así que el papel mostraba:
+
+```
+ORDEN DE COMPRA  1788   Orden de compra 1788
+└─ lo pone Wasabil ─┘   └─ lo mandábamos nosotros ─┘
+```
+
+Regla que quedó: **el `reason` nunca repite lo que el tipo o el folio ya imprimen.**
+
+| Referencia | Antes | v3 |
+|---|---|---|
+| 801 — OC (guías y facturas) | "Orden de compra 1788" | *(sin motivo)* |
+| 52 — guía facturada | "Guía de despacho 137" | *(sin motivo)* |
+| 33 — anticipo descontado | "Descuento anticipo Factura 901" | "Descuento anticipo" |
+
+En la 33 se conserva porque explica algo que el tipo no dice (que esa factura se
+está descontando), pero sin repetir la palabra "Factura" ni el folio.
+
+**VERIFICADO CONTRA EL API REAL** (borrador `issue:false`, documento 20260700200782,
+2026-07-21): Wasabil **acepta** la referencia sin `reason` y la devuelve con
+`"reason": null`. El campo es opcional (RazonRef del SII) y `payload_a_rest` ya lo
+omitía cuando viene vacío. El mismo borrador confirmó que el camino de la app
+produce un documento idéntico al aprobado (misma cuadratura, mismas referencias);
+la única diferencia es `externalId` en las líneas, un id interno de trazabilidad que
+Wasabil ya aceptó en las guías reales 136 y 137.
+
+Protección de regresión: `test_referencias_sin_texto_redundante_v3` exige que
+**ningún motivo contenga el folio de su propia referencia**, en los tres tipos.
+
 ## Aprendizajes de la PRIMERA EMISIÓN REAL (folio 136, 2026-07-20)
 
 La guía salió válida, con dos defectos cosméticos corregidos en el formato **v2**:
@@ -91,6 +131,84 @@ La guía salió válida, con dos defectos cosméticos corregidos en el formato *
    ("ROD-INF-PV351 RODILLO INF"). Desde v2, `name` = la **descripción limpia**
    (truncada a 25 si excede); el N° de parte viaja en `code`, que la guía
    imprime como código — sin duplicar ni cortar a media palabra.
+
+## Fase B — Facturas electrónicas (DTE 33) desde Facturas y Cobranzas
+
+En **Facturas y Cobranzas**, los dos modales ("Emitir factura" desde guía
+firmada y "Factura de anticipo") parten en modo **Emitir al SII** (el folio lo
+asigna el SII); un enlace permite cambiar a **registrar una factura ya emitida
+a mano** con su folio (el modal clásico). El flujo SII es el mismo patrón de 2
+pasos de las guías: previsualizar (receptor real de la ficha Wasabil,
+referencias, descuento de anticipo, totales — sin tocar el SII) → confirmar →
+sondeo hasta Emitida (folio + PDF) o Fallida (reintento seguro).
+
+Diseño (espejo endurecido de la Fase A, con una diferencia estructural):
+
+1. **La factura local se crea PRIMERO sin folio** (`numero_factura` NULL) +
+   claim `wasabil_dte` (índice único `uq_wasabil_dte_factura`) **commiteados
+   ANTES del HTTP**. El folio del SII se graba en `_finalizar_factura_emitida`
+   (idempotente, locks en orden OC→factura).
+2. **Adelantos DIFERIDOS**: `_persistir_factura(aplicar_adelantos=False)` — una
+   factura que el SII rechaza NO movió plata; los adelantos se aplican recién
+   al quedar Emitida. La vía manual (folio digitado) sigue aplicando al tiro.
+3. **Referencias** (≤5, folio ≤18): 801 a la OC SIEMPRE; 52 a la guía si la
+   factura viene de un despacho (folio SII de la guía electrónica si existe,
+   si no el manual); 33 por cada factura de anticipo descontada (un anticipo
+   con folio placeholder bloquea la emisión).
+4. **Descuento del anticipo como `discount` % por línea** (greedy mayor-primero,
+   precisión float completa): el API real RECHAZA líneas con precio<0 o
+   cantidad<0, y no existe descuento a nivel documento. Verificado contra el
+   API real en borrador: cuadratura EXACTA. Un descuento que deja el documento
+   en $0 se bloquea (el SII no acepta doc sin montos).
+5. **Receptor más estricto que en guías**: ficha Wasabil inexistente o sin
+   giro/dirección/comuna BLOQUEA (emitir un 33 incompleto termina en rechazo).
+6. `paymentMethod` (contado|credito) es OBLIGATORIO en el 33 — se deriva del
+   plazo/condición de pago de la factura.
+7. `invoice_reference` = `FACT-<id local>` (formato v2: es el ancla interna de
+   recuperación, única por factura; Wasabil lo imprime, por eso NO lleva la OC).
+8. **Eliminar factura**: con DTE emitido → 409 (se anula en Wasabil con nota de
+   crédito); con emisión en curso → 409; con DTE fallido se borra junto.
+
+Endpoints: `POST /api/wasabil/facturas/preview` · `POST /api/wasabil/facturas/emitir`
+· `GET /api/wasabil/facturas/{id}/estado` · `POST /api/wasabil/facturas/{id}/reintentar`.
+Tests: `tests/test_facturas_integration.py` (TestClient + MySQL + Wasabil
+simulado que valida como el API real) + casos Fase B en `tests/test_service.py`.
+
+### Qué debe cumplir un despacho para ser facturable
+
+El selector de "Emitir factura" solo ofrece despachos con `estado='despachado'`
+(cerrado) **y** `guia_firmada=1`. Una guía electrónica recién emitida NO basta:
+primero viaja con la carga, el cliente la firma, se sube la foto y se cierra el
+despacho. Recién ahí aparece para facturar (`_despacho_items_de_oc`).
+
+### Endurecimiento anti doble emisión (auditoría 2026-07-21)
+
+Un enjambre de revisión probó empíricamente (4 de 4 rondas) que **dos clics
+simultáneos en Emitir creaban DOS facturas reales ante el SII**. Causa raíz y
+defensas que quedaron:
+
+1. **Snapshot viejo bajo el lock.** `_preparar_emision_factura` abre la
+   transacción (SELECTs + HTTP a Wasabil) *antes* del `FOR UPDATE` de la OC, y en
+   REPEATABLE READ todas las lecturas no bloqueantes siguientes servían ese
+   snapshot: la re-validación no veía la factura que el request gemelo acababa de
+   commitear. Ahora `emitir_factura_sii` hace `db.rollback()` **antes** de tomar el
+   lock, así el snapshot nace con él (la vía manual `crear_factura` ya era inmune:
+   toma el lock como primera sentencia).
+2. **Candado de intención por OC** (`_emision_33_en_vuelo_de_oc`): el índice único
+   `uq_wasabil_dte_factura` protege una factura YA creada, pero en este flujo cada
+   request crearía una factura nueva. Con una emisión 33 de claim vigente en la
+   misma OC, la segunda recibe 409. Es la única defensa en **anticipos**, que no
+   tienen tope de mercadería que los frene.
+3. **Puerta de una sola dirección en la UI**: tras disparar el POST, el modal ya no
+   vuelve al formulario (la respuesta pudo perderse con el documento ya creado).
+
+Otros arreglos de la misma auditoría: el botón Reintentar reventaba con 500
+(`factura.cotizacion` no existe en el modelo → se usa `factura.oc_cliente.cotizacion`);
+una factura cuya emisión nunca llegó a Wasabil quedaba **imborrable para siempre**
+(el guard pedía esperar un resultado que ya nunca llegaría) y secuestraba el tope
+facturable; Tesorería podía aplicar un adelanto a una factura en vuelo o rechazada
+por el SII (rompía el diferimiento); y un descuento repartido podía dejar el
+documento en centavos sin activar el bloqueo de "$0".
 
 ## Verificado contra el API real (2026-07-17) y lo que queda pendiente
 

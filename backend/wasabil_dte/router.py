@@ -601,3 +601,611 @@ def estado_batch(
         .all()
     )
     return {d.despacho_id: serialize_dte(d) for d in dtes}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FASE B — FACTURAS ELECTRÓNICAS (DTE 33)
+#
+# Mismo protocolo que las guías (preview → emitir con OK explícito → sondeo →
+# reintento seguro) y misma ancla anti doble emisión (fila wasabil_dte, ahora
+# única por factura_id). La diferencia estructural: la factura LOCAL se crea
+# PRIMERO (sin folio — numero_factura queda NULL) reutilizando la persistencia
+# de Contabilidad (_persistir_factura, la MISMA de crear_factura), y el folio
+# del SII se escribe al confirmarse la emisión. La aplicación de adelantos como
+# cobranza se DIFIERE hasta ese momento: una factura rechazada no movió plata.
+# ═══════════════════════════════════════════════════════════════════════════════
+from routers.contabilidad import (  # noqa: E402  (mismo patrón del import de arriba)
+    FacturaCreate, _construir_factura, _construir_factura_anticipo,
+    _persistir_factura, _aplicar_adelantos_pendientes,
+)
+from models.models import ContFacturaCliente, ContAdelanto  # noqa: E402
+from .service import (  # noqa: E402
+    TIPO_DOC_FACTURA, NETO_MINIMO_DTE, armar_factura, armar_lineas_factura,
+    armar_referencias_factura,
+)
+
+
+def _dte_de_factura(db: Session, factura_id: int, lock: bool = False) -> Optional[WasabilDte]:
+    q = db.query(WasabilDte).filter(WasabilDte.factura_id == factura_id)
+    if lock:
+        q = q.populate_existing().with_for_update()
+    return q.first()
+
+
+def _referencia_interna_factura(factura_id: int) -> str:
+    """Ancla anti doble emisión de la factura (formato v2: Wasabil la imprime,
+    así que NO lleva la OC — única por factura local)."""
+    return f"FACT-{factura_id}"
+
+
+def _guia_electronica_en_proceso(db: Session, despacho_id: int) -> bool:
+    """¿El despacho tiene una guía electrónica cuyo folio del SII TODAVÍA no llega?
+
+    (status 2 procesando / 6 pendiente, o un claim en vuelo sin respuesta.) En esa
+    ventana `despacho.numero_guia` aún conserva el N° manual viejo — el módulo lo pisa
+    con el folio real recién al confirmarse la emisión —, así que caer al fallback
+    manual haría que la factura saliera al SII referenciando un folio que el SII NO
+    conoce. Y eso es irreversible. Mejor bloquear y esperar el folio."""
+    dte = (db.query(WasabilDte)
+           .filter(WasabilDte.despacho_id == despacho_id,
+                   WasabilDte.tipo_dte == TIPO_DOC_GUIA)
+           .first())
+    if dte is None or dte.status_id == STATUS_EMITIDO:
+        return False
+    return bool(dte.uuid) or claim_vigente(dte)
+
+
+def _guia_referencia_de_factura(db: Session, factura) -> Tuple[Optional[str], Optional[object]]:
+    """(folio, fecha) de la guía a referenciar (tipo 52) en la factura.
+
+    Preferencia: la guía ELECTRÓNICA emitida del despacho (folio SII + fecha
+    tributaria del payload). Fallback: guía manual (despacho.numero_guia +
+    fecha_despacho). Sin despacho (anticipo) → (None, None).
+
+    OJO: si hay una guía electrónica EN PROCESO se devuelve (None, None) — nunca el
+    N° manual viejo (ver _guia_electronica_en_proceso). Quien arma el documento debe
+    tratar eso como bloqueo."""
+    if not factura.despacho_id:
+        return None, None
+    if _guia_electronica_en_proceso(db, factura.despacho_id):
+        return None, None
+    dte_guia = (db.query(WasabilDte)
+                .filter(WasabilDte.despacho_id == factura.despacho_id,
+                        WasabilDte.status_id == STATUS_EMITIDO)
+                .first())
+    if dte_guia and dte_guia.folio:
+        fecha = None
+        try:
+            payload = json.loads(dte_guia.payload_json or "{}")
+            if payload.get("documentDate"):
+                fecha = datetime.fromisoformat(payload["documentDate"]).date()
+        except (ValueError, TypeError):
+            fecha = None
+        if not fecha and dte_guia.created_at:
+            fecha = dte_guia.created_at.date()
+        return dte_guia.folio, fecha
+    desp = factura.despacho
+    if desp and (desp.numero_guia or "").strip():
+        fecha = desp.fecha_despacho.date() if desp.fecha_despacho else None
+        return desp.numero_guia.strip(), fecha
+    return None, None
+
+
+def _anticipos_referenciados(db: Session, factura) -> List[dict]:
+    """[{folio, fecha}] de las facturas de ANTICIPO descontadas en esta factura
+    (líneas negativas con anticipo_factura_id) — referencias tipo 33. El armado
+    de referencias bloquea si algún anticipo no tiene folio SII registrado."""
+    ids = {it.anticipo_factura_id for it in factura.items if it.anticipo_factura_id}
+    if not ids:
+        return []
+    out = []
+    for fa in db.query(ContFacturaCliente).filter(ContFacturaCliente.id.in_(ids)).all():
+        out.append({"folio": fa.numero_factura or f"#{fa.id}", "fecha": fa.fecha_emision})
+    return out
+
+
+def _receptor_factura(db: Session, rut: str, razon_social_local: Optional[str],
+                      problemas: List[str], advertencias: List[str]):
+    """Resuelve la ficha del cliente en Wasabil (client_id). La factura 33 es más
+    estricta que la guía: ficha inexistente o SIN giro/dirección/comuna BLOQUEA
+    (el SII exige receptor completo; emitir incompleto termina en rechazo)."""
+    receptor = {"rut": rut or None, "razon_social": razon_social_local,
+                "giro": None, "direccion": None, "comuna": None, "ciudad": None,
+                "fuente": "local"}
+    client_id = None
+    if not wasabil.esta_configurado():
+        problemas.append("Wasabil no está configurado (falta WASABIL_API_TOKEN en backend/.env): "
+                         "puedes previsualizar, pero no emitir")
+        return receptor, client_id
+    if not rut:
+        return receptor, client_id  # el RUT faltante ya lo reportó _construir_factura
+    try:
+        cli = wasabil.buscar_cliente_por_rut(rut)
+    except wasabil.WasabilError as e:
+        problemas.append(f"No se pudo consultar el cliente en Wasabil: {e}")
+        return receptor, client_id
+    if not cli:
+        problemas.append(
+            f"El cliente RUT {rut} no existe en Wasabil: créalo en app.wasabil.com "
+            "(con giro, dirección y comuna) y vuelve a intentar")
+        return receptor, client_id
+    client_id = cli.get("id")
+    receptor = {
+        "rut": cli.get("rut") or rut,
+        "razon_social": cli.get("name") or cli.get("razon_social") or razon_social_local,
+        "giro": cli.get("giro") or cli.get("activity"),
+        "direccion": cli.get("address") or cli.get("direccion"),
+        "comuna": cli.get("comuna") or cli.get("commune"),
+        "ciudad": cli.get("city") or cli.get("ciudad"),
+        "fuente": "wasabil",
+    }
+    faltantes = [n for n, v in (("giro", receptor["giro"]),
+                                ("dirección", receptor["direccion"]),
+                                ("comuna", receptor["comuna"])) if not (v or "").strip()]
+    if faltantes:
+        problemas.append(
+            f"La ficha del cliente en Wasabil no tiene {', '.join(faltantes)}: "
+            "la factura 33 exige receptor completo — complétala en app.wasabil.com")
+    return receptor, client_id
+
+
+def _payment_method(plazo_dias, condicion_pago: Optional[str] = None) -> str:
+    """paymentMethod del DTE 33 (OBLIGATORIO en el esquema): contado si el plazo es
+    0 días o la condición lo dice; crédito en el resto (default del negocio)."""
+    if plazo_dias is not None and int(plazo_dias) == 0:
+        return "contado"
+    if "contado" in (condicion_pago or "").lower():
+        return "contado"
+    return "credito"
+
+
+def _preparar_emision_factura(db: Session, payload: FacturaCreate) -> dict:
+    """Arma y valida TODO para emitir una factura NUEVA (SIN persistir ni locks;
+    puede llamar a Wasabil para la ficha del cliente). Única fuente de verdad de
+    la validación del preview — la emisión re-valida bajo lock con las mismas
+    funciones de Contabilidad."""
+    problemas: List[str] = []
+    advertencias: List[str] = []
+    if (payload.numero_factura or "").strip():
+        problemas.append("El folio lo asigna el SII al emitir: deja el N° de factura vacío "
+                         "(para registrar una factura ya emitida usa Contabilidad → Facturas)")
+    if (payload.tipo_doc or "factura") != "factura":
+        problemas.append("La emisión electrónica es para tipo 'factura' (DTE 33); "
+                         "las boletas se registran por la vía manual")
+
+    oc = db.query(OcCliente).filter(OcCliente.id == payload.oc_cliente_id).first()
+    if not oc or not oc.cotizacion:
+        raise HTTPException(404, "OC Cliente no encontrada")
+    cot = oc.cotizacion
+    empresa = "mineria"
+
+    if payload.es_anticipo:
+        datos = _construir_factura_anticipo(db, payload, oc, cot, empresa)
+    else:
+        datos = _construir_factura(db, payload, oc, cot, empresa)
+    problemas.extend(datos["problemas"])
+    advertencias.extend(datos["advertencias"])
+    # Mismo piso que aplicar_descuento_lineas: sin esto el preview decía "puede emitir"
+    # y el emitir moría en 409 DESPUÉS de haber creado la factura local (zombi).
+    if datos.get("neto") is not None and 0 <= float(datos["neto"]) < NETO_MINIMO_DTE:
+        problemas.append(
+            "El descuento del anticipo deja la factura en $0: el SII no acepta un "
+            "DTE en cero — ajusta el descuento o registra la factura por la vía manual")
+
+    # Receptor: ficha REAL en Wasabil (client_id) — bloqueo si está incompleta
+    rut = datos["receptor"].get("rut_normalizado") or (datos["receptor"].get("rut") or "")
+    receptor, client_id = _receptor_factura(
+        db, rut, datos["receptor"].get("razon_social"), problemas, advertencias)
+
+    # Referencias según la matriz de negocio (OC 801 + guía 52 + anticipos 33)
+    guia_folio, guia_fecha = None, None
+    if not payload.es_anticipo and payload.despacho_id and datos.get("desp"):
+        desp = datos["desp"]
+        dte_guia = (db.query(WasabilDte)
+                    .filter(WasabilDte.despacho_id == desp.id,
+                            WasabilDte.status_id == STATUS_EMITIDO).first())
+        if dte_guia and dte_guia.folio:
+            guia_folio = dte_guia.folio
+            try:
+                p = json.loads(dte_guia.payload_json or "{}")
+                guia_fecha = (datetime.fromisoformat(p["documentDate"]).date()
+                              if p.get("documentDate") else None)
+            except (ValueError, TypeError, KeyError):
+                guia_fecha = None
+            if not guia_fecha and dte_guia.created_at:
+                guia_fecha = dte_guia.created_at.date()
+        elif _guia_electronica_en_proceso(db, desp.id):
+            # El folio del SII viene en camino y `desp.numero_guia` todavía tiene el N°
+            # manual viejo: referenciarlo mandaría la factura al SII apuntando a un folio
+            # inexistente, y eso no se deshace. Se espera a que la guía quede emitida.
+            problemas.append(
+                "La guía electrónica de este despacho está EN PROCESO en el SII: espera a "
+                "que quede emitida (con su folio) antes de facturarla — si no, la factura "
+                "referenciaría un N° de guía que el SII no reconoce")
+        elif (desp.numero_guia or "").strip():
+            guia_folio = desp.numero_guia.strip()
+            guia_fecha = desp.fecha_despacho.date() if desp.fecha_despacho else None
+        else:
+            problemas.append("La guía del despacho no tiene folio registrado: emite la guía "
+                             "SII (o registra el N° manual) antes de facturarla")
+    anticipos_ref = []
+    for dsc in datos.get("descuentos", []):
+        fa = db.query(ContFacturaCliente).filter(
+            ContFacturaCliente.id == dsc["anticipo_factura_id"]).first()
+        anticipos_ref.append({"folio": (fa.numero_factura if fa else None) or f"#{dsc['anticipo_factura_id']}",
+                              "fecha": fa.fecha_emision if fa else None})
+    referencias, problemas_ref = armar_referencias_factura(
+        numero_oc=(oc.numero_oc or "").strip(),
+        fecha_oc=parse_fecha_oc(oc.fecha_oc),
+        guia_folio=guia_folio, guia_fecha=guia_fecha, anticipos=anticipos_ref)
+    problemas.extend(problemas_ref)
+
+    return {
+        "oc": oc, "cot": cot, "datos": datos, "receptor": receptor,
+        "client_id": client_id, "referencias": referencias,
+        "problemas": problemas, "advertencias": advertencias,
+    }
+
+
+def _armar_payload_factura(db: Session, factura, client_id: Optional[int],
+                           issue: bool) -> Tuple[dict, List[str]]:
+    """Payload del DTE 33 DESDE la factura local persistida (líneas congeladas):
+    lo emitido es EXACTAMENTE lo registrado — y el reintento re-arma lo mismo."""
+    lineas, problemas = armar_lineas_factura(list(factura.items))
+    oc = factura.oc_cliente
+    guia_folio, guia_fecha = _guia_referencia_de_factura(db, factura)
+    referencias, problemas_ref = armar_referencias_factura(
+        numero_oc=(oc.numero_oc or "").strip() if oc else "",
+        fecha_oc=parse_fecha_oc(oc.fecha_oc) if oc else None,
+        guia_folio=guia_folio, guia_fecha=guia_fecha,
+        anticipos=_anticipos_referenciados(db, factura))
+    problemas.extend(problemas_ref)
+    doc = armar_factura(
+        referencia_interna=_referencia_interna_factura(factura.id),
+        lineas=lineas, referencias=referencias, client_id=client_id,
+        fecha_emision=factura.fecha_emision, issue=issue,
+        payment_method=_payment_method(factura.plazo_dias, factura.condicion_pago),
+    )
+    return doc, problemas
+
+
+def _emision_33_en_vuelo_de_oc(db: Session, oc_id: int) -> Optional[WasabilDte]:
+    """DTE 33 con claim VIGENTE de cualquier factura de esta OC, si lo hay.
+
+    Candado de INTENCIÓN para el flujo "emitir factura NUEVA": el índice único
+    `uq_wasabil_dte_factura` protege una factura ya creada, pero aquí cada request
+    crearía una factura distinta (id distinto), así que no aplica. Sin este candado,
+    dos clics simultáneos en Emitir producen DOS documentos reales ante el SII —
+    especialmente en anticipos, donde no hay tope de mercadería que los frene."""
+    candidatos = (db.query(WasabilDte)
+                  .join(ContFacturaCliente, ContFacturaCliente.id == WasabilDte.factura_id)
+                  .filter(ContFacturaCliente.oc_cliente_id == oc_id,
+                          WasabilDte.tipo_dte == TIPO_DOC_FACTURA,
+                          WasabilDte.en_vuelo_desde.isnot(None))
+                  .populate_existing().all())
+    return next((d for d in candidatos if claim_vigente(d)), None)
+
+
+def _reclamar_emision_factura(db: Session, factura_id: int, para_reintento: bool,
+                              usuario_id: Optional[int], empresa: str) -> WasabilDte:
+    """Claim anti doble emisión de la factura (espejo de _reclamar_emision):
+    transacción CORTA bajo lock, commit antes de cualquier HTTP."""
+    factura = (db.query(ContFacturaCliente)
+               .filter(ContFacturaCliente.id == factura_id)
+               .populate_existing().with_for_update().first())
+    if not factura:
+        raise HTTPException(404, "Factura no encontrada")
+    dte = _dte_de_factura(db, factura_id, lock=True)
+    problema = _estado_dte_bloquea(dte, para_reintento)
+    if problema:
+        db.rollback()
+        raise HTTPException(409, problema)
+    ahora = datetime.utcnow()
+    if dte:
+        dte.en_vuelo_desde = ahora
+        dte.status_id = STATUS_PENDIENTE
+        dte.uuid = None
+        dte.error = None
+        dte.usuario_id = usuario_id or dte.usuario_id
+    else:
+        dte = WasabilDte(
+            empresa=empresa, tipo_dte=TIPO_DOC_FACTURA, factura_id=factura_id,
+            status_id=STATUS_PENDIENTE, en_vuelo_desde=ahora, usuario_id=usuario_id,
+        )
+        db.add(dte)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Ya existe una emisión para esta factura (refresca la página)")
+    db.refresh(dte)
+    return dte
+
+
+def _finalizar_factura_emitida(db: Session, dte: WasabilDte) -> None:
+    """Al confirmarse EMITIDO (status 3): folio del SII → numero_factura de la
+    factura local, y RECIÉN AHÍ se aplican los adelantos aprobados como cobranza
+    (diferidos desde la persistencia: una factura rechazada no movió plata).
+    Idempotente: si el folio ya está escrito, no repite nada."""
+    if dte.status_id != STATUS_EMITIDO or not dte.folio or not dte.factura_id:
+        return
+    factura = db.query(ContFacturaCliente).filter(
+        ContFacturaCliente.id == dte.factura_id).first()
+    if not factura or (factura.numero_factura or "").strip():
+        return  # ya finalizada (idempotencia del sondeo/reintento)
+    # Orden GLOBAL de locks de la casa: OC → factura (igual que eliminar/cobranzas)
+    oc = (db.query(OcCliente).filter(OcCliente.id == factura.oc_cliente_id)
+          .with_for_update().first())
+    factura = (db.query(ContFacturaCliente)
+               .filter(ContFacturaCliente.id == dte.factura_id)
+               .populate_existing().with_for_update().first())
+    if not factura or (factura.numero_factura or "").strip():
+        db.rollback()
+        return
+    try:
+        factura.numero_factura = str(dte.folio)
+        db.flush()
+    except IntegrityError:
+        # Colisión de folio (folio ya registrado a mano para otra factura): el DTE
+        # queda emitido igual; se anota para resolverlo a mano sin perder el folio.
+        db.rollback()
+        dte.error = (f"Folio {dte.folio} ya registrado en otra factura local: "
+                     "resolver duplicado a mano")[:2000]
+        db.commit()
+        return
+    if oc:
+        _aplicar_adelantos_pendientes(db, oc, factura, usuario_id=dte.usuario_id)
+    db.commit()
+
+
+@router.post("/facturas/preview")
+def preview_factura_sii(
+    payload: FacturaCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Previsualización de la factura 33: documento + referencias + receptor real
+    de Wasabil + validaciones. NO persiste, NO toca el SII."""
+    ctx = _preparar_emision_factura(db, payload)
+    datos = ctx["datos"]
+    return {
+        "puede_emitir": not ctx["problemas"],
+        "problemas": ctx["problemas"],
+        "advertencias": ctx["advertencias"],
+        "receptor": ctx["receptor"],
+        "lineas": datos["lineas"],
+        "totales": {"neto": datos["neto"], "iva": datos["iva"], "bruto": datos["bruto"]},
+        "referencias": [{"tipo": r["documentType"], "folio": r["folio"],
+                         "fecha": r.get("date"), "descripcion": r.get("reason")}
+                        for r in ctx["referencias"]],
+        "precio_de_guia": datos.get("precio_de_guia", False),
+        "descuentos": datos.get("descuentos", []),
+    }
+
+
+@router.post("/facturas/emitir")
+def emitir_factura_sii(
+    payload: FacturaCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """EMITE la factura al SII vía Wasabil (IRREVERSIBLE — el frontend solo habilita
+    este botón tras la previsualización). Crea la factura LOCAL sin folio + el claim
+    en la MISMA transacción; el folio del SII llega al confirmarse la emisión."""
+    ctx = _preparar_emision_factura(db, payload)
+    if ctx["problemas"]:
+        raise HTTPException(409, " · ".join(ctx["problemas"]))
+    empresa = getattr(current_user, "empresa", None) or "mineria"
+    usuario_id = getattr(current_user, "id", None)
+
+    # ── TX corta: lock OC → re-validar → persistir SIN folio → claim → COMMIT ──
+    # rollback ANTES del lock: _preparar_emision_factura ya abrió la transacción
+    # (SELECTs + HTTP a Wasabil), y bajo REPEATABLE READ todas las lecturas NO
+    # bloqueantes de más abajo servirían ese snapshot VIEJO — la re-validación no
+    # vería la factura que un request gemelo acaba de commitear y se emitirían DOS
+    # documentos reales al SII. Con el rollback, el snapshot nace con el FOR UPDATE.
+    db.rollback()
+    oc = (db.query(OcCliente).filter(OcCliente.id == payload.oc_cliente_id)
+          .with_for_update().first())
+    if not oc or not oc.cotizacion:
+        raise HTTPException(404, "OC Cliente no encontrada")
+    cot = oc.cotizacion
+    # Candado de intención (ver _emision_33_en_vuelo_de_oc): el índice único es por
+    # factura_id y aquí cada request crearía una factura nueva, así que el tope de
+    # mercadería es la única defensa — y en anticipos no existe.
+    en_vuelo = _emision_33_en_vuelo_de_oc(db, oc.id)
+    if en_vuelo is not None:
+        db.rollback()
+        raise HTTPException(409, "Ya hay una emisión de factura EN CURSO para esta venta "
+                                 "(otra pestaña u otro usuario). Espera su resultado antes "
+                                 "de emitir otra.")
+    if payload.es_anticipo:
+        datos = _construir_factura_anticipo(db, payload, oc, cot, empresa)
+    else:
+        datos = _construir_factura(db, payload, oc, cot, empresa)
+    if datos["problemas"]:
+        db.rollback()
+        raise HTTPException(409, " · ".join(datos["problemas"]))
+    try:
+        factura = _persistir_factura(
+            db, payload, oc, cot, datos, folio=None, tipo_doc="factura",
+            empresa=empresa, usuario_id=usuario_id, aplicar_adelantos=False)
+        db.flush()
+        dte = WasabilDte(
+            empresa=empresa, tipo_dte=TIPO_DOC_FACTURA, factura_id=factura.id,
+            status_id=STATUS_PENDIENTE, en_vuelo_desde=datetime.utcnow(),
+            usuario_id=usuario_id,
+        )
+        db.add(dte)
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "No se pudo registrar la factura (conflicto de integridad)")
+    db.refresh(dte)
+    factura_id = dte.factura_id
+
+    # ── Payload DESDE la factura persistida + HTTP (sin locks) ──
+    factura = db.query(ContFacturaCliente).filter(ContFacturaCliente.id == factura_id).first()
+    doc, problemas_doc = _armar_payload_factura(db, factura, ctx["client_id"], issue=True)
+    if problemas_doc:
+        # No debería ocurrir (el preview ya validó). Nada salió aún hacia Wasabil, así
+        # que se DESHACE la factura recién creada en vez de dejarla sin folio: si no,
+        # quedaba una factura zombi consumiendo el tope facturable del despacho.
+        try:
+            # Desvincular los adelantos ANTES de borrar (cont_adelanto.factura_anticipo_id
+            # es una FK sin ON DELETE: sin esto el DELETE choca con IntegrityError, la TX
+            # se revierte entera y queda algo peor — factura zombi + claim vivo bloqueando
+            # la OC 180 s). Mismo paso previo que hace eliminar_factura.
+            db.query(ContAdelanto).filter(
+                ContAdelanto.factura_anticipo_id == factura.id
+            ).update({ContAdelanto.factura_anticipo_id: None}, synchronize_session=False)
+            db.delete(dte)
+            db.delete(factura)
+            db.commit()
+        except IntegrityError:
+            # Red de seguridad: si algo más quedó referenciando la factura, no se puede
+            # deshacer — se libera al menos el claim para no bloquear la OC.
+            db.rollback()
+            dte_vivo = _dte_de_factura(db, factura_id)
+            if dte_vivo is not None:
+                dte_vivo.en_vuelo_desde = None
+                dte_vivo.error = " · ".join(problemas_doc)[:2000]
+                db.commit()
+        raise HTTPException(409, " · ".join(problemas_doc))
+    dte.payload_json = json.dumps(doc, ensure_ascii=False)[:60000]
+    dte.monto_neto, dte.iva, dte.monto_total = datos["neto"], datos["iva"], datos["bruto"]
+    db.commit()
+    try:
+        data = wasabil.crear_documento(payload_a_rest(doc))
+    except wasabil.WasabilError as e:
+        dte.error = (str(e) + (f" · {e.detalle[:500]}" if e.detalle else ""))[:2000]
+        if not e.ambiguo:
+            dte.en_vuelo_desde = None
+        db.commit()
+        raise HTTPException(502, f"No se pudo emitir en Wasabil: {e}")
+    _actualizar_desde_wasabil(db, dte, data)
+    db.commit()
+    _finalizar_factura_emitida(db, dte)
+    db.refresh(dte)
+    return {**serialize_dte(dte), "factura_id": factura_id}
+
+
+@router.get("/facturas/{factura_id}/estado")
+def estado_factura_sii(
+    factura_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Estado del DTE de la factura (sondeo del frontend). Al quedar Emitido,
+    escribe el folio en la factura local y aplica los adelantos diferidos."""
+    dte = _dte_de_factura(db, factura_id)
+    if not dte:
+        raise HTTPException(404, "Esta factura no tiene emisión electrónica")
+    if dte.uuid and dte.status_id not in (STATUS_EMITIDO, STATUS_FALLIDO):
+        try:
+            data = wasabil.estado_documento(dte.uuid)
+            if int(data.get("status_id") or 0) == STATUS_EMITIDO:
+                data = wasabil.obtener_documento(dte.uuid)
+            _actualizar_desde_wasabil(db, dte, data)
+            db.commit()
+            db.refresh(dte)
+        except wasabil.WasabilError as e:
+            return {**serialize_dte(dte), "factura_id": factura_id, "error_consulta": str(e)}
+    _finalizar_factura_emitida(db, dte)
+    db.refresh(dte)
+    return {**serialize_dte(dte), "factura_id": factura_id}
+
+
+@router.post("/facturas/{factura_id}/reintentar")
+def reintentar_factura_sii(
+    factura_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Reintento SEGURO de una emisión de factura fallida (espejo del de guías):
+    verifica el estado real en Wasabil (por uuid o por la referencia interna
+    FACT-<id>) ANTES de re-crear; si no puede verificar, ABORTA."""
+    dte = _dte_de_factura(db, factura_id)
+    if not dte:
+        raise HTTPException(404, "Esta factura no tiene emisión que reintentar")
+    if dte.status_id == STATUS_EMITIDO:
+        raise HTTPException(409, f"La factura ya está emitida (folio {dte.folio})")
+    if claim_vigente(dte):
+        raise HTTPException(409, "Hay una emisión EN CURSO para esta factura: "
+                                 "espera unos minutos y consulta el estado")
+
+    if dte.uuid:
+        try:
+            data = wasabil.estado_documento(dte.uuid)
+            if int(data.get("status_id") or 0) == STATUS_EMITIDO:
+                data = wasabil.obtener_documento(dte.uuid)
+            _actualizar_desde_wasabil(db, dte, data)
+            db.commit()
+            db.refresh(dte)
+        except wasabil.WasabilError:
+            raise HTTPException(502, "No se pudo verificar el estado real del documento en "
+                                     "Wasabil; reintenta en unos minutos (no se re-crea a ciegas)")
+        if dte.status_id in (STATUS_EMITIDO, STATUS_PROCESANDO, STATUS_PENDIENTE):
+            _finalizar_factura_emitida(db, dte)
+            db.refresh(dte)
+            return {**serialize_dte(dte), "factura_id": factura_id}
+    else:
+        ref = _referencia_interna_factura(factura_id)
+        try:
+            documentos, busqueda_completa = wasabil.buscar_documentos(ref)
+            for doc_w in documentos:
+                # Match EXACTO v2 (invoice_reference == FACT-<id>): sin formatos legados
+                if str(doc_w.get("invoice_reference") or "") == ref:
+                    if int(doc_w.get("status_id") or 0) == STATUS_EMITIDO and doc_w.get("uuid"):
+                        doc_w = wasabil.obtener_documento(doc_w["uuid"])
+                    _actualizar_desde_wasabil(db, dte, doc_w)
+                    db.commit()
+                    _finalizar_factura_emitida(db, dte)
+                    db.refresh(dte)
+                    return {**serialize_dte(dte), "factura_id": factura_id}
+        except wasabil.WasabilError:
+            raise HTTPException(502, "No se pudo verificar en Wasabil si el documento ya existe; "
+                                     "reintenta en unos minutos (no se re-crea a ciegas)")
+        if not busqueda_completa:
+            raise HTTPException(502, "La búsqueda en Wasabil quedó incompleta; reintenta en "
+                                     "unos minutos (no se re-crea a ciegas)")
+
+    # Documento confirmado fallido/inexistente → re-emitir DESDE la factura local
+    factura = db.query(ContFacturaCliente).filter(ContFacturaCliente.id == factura_id).first()
+    if not factura:
+        raise HTTPException(404, "Factura no encontrada")
+    problemas: List[str] = []
+    advertencias: List[str] = []
+    # La cotización se alcanza por la OC (ContFacturaCliente NO tiene relación
+    # `cotizacion`; solo la columna cotizacion_id y la relación `oc_cliente`).
+    cot_fac = factura.oc_cliente.cotizacion if factura.oc_cliente else None
+    rut = (cot_fac.rut_cliente if cot_fac else None) or ""
+    _receptor, client_id = _receptor_factura(
+        db, rut, cot_fac.cliente if cot_fac else None, problemas, advertencias)
+    doc, problemas_doc = _armar_payload_factura(db, factura, client_id, issue=True)
+    problemas.extend(problemas_doc)
+    if problemas:
+        raise HTTPException(409, " · ".join(problemas))
+
+    dte = _reclamar_emision_factura(
+        db, factura_id, para_reintento=True,
+        usuario_id=getattr(current_user, "id", None),
+        empresa=getattr(current_user, "empresa", None) or "mineria")
+    dte.payload_json = json.dumps(doc, ensure_ascii=False)[:60000]
+    db.commit()
+    try:
+        data = wasabil.crear_documento(payload_a_rest(doc))
+    except wasabil.WasabilError as e:
+        dte.error = (str(e) + (f" · {e.detalle[:500]}" if e.detalle else ""))[:2000]
+        if not e.ambiguo:
+            dte.en_vuelo_desde = None
+        db.commit()
+        raise HTTPException(502, f"No se pudo emitir en Wasabil: {e}")
+    _actualizar_desde_wasabil(db, dte, data)
+    db.commit()
+    _finalizar_factura_emitida(db, dte)
+    db.refresh(dte)
+    return {**serialize_dte(dte), "factura_id": factura_id}

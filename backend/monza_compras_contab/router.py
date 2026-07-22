@@ -153,7 +153,15 @@ def _crear_egreso(
             raise HTTPException(404, f"Compra {compra_id} no encontrada")
         if compra.anulado:
             raise HTTPException(400, f"La compra {compra_id} está anulada")
-        pagado_actual = sum(_f(d.monto_clp) for d in compra.egreso_detalles)
+        # Lectura BLOQUEANTE de los pagos ya imputados (espejo del fix de compras_contab):
+        # la relación perezosa es una lectura PLANA y bajo REPEATABLE READ sirve el
+        # snapshot abierto por la primera sentencia del request, ANTERIOR al lock. Dos
+        # egresos simultáneos a la misma compra pasaban AMBOS el tope y sobre-pagaban.
+        pagado_actual = sum(
+            _f(d.monto_clp) for d in
+            db.query(MonzaContEgresoDetalle)
+              .filter(MonzaContEgresoDetalle.compra_id == compra.id)
+              .populate_existing().with_for_update().all())
         saldo = round(_f(compra.monto_total_clp) - pagado_actual, 2)
         if monto > saldo + TOL_PAGO:
             raise HTTPException(400, f"El pago a la compra {compra_id} excede su saldo ({max(saldo, 0):.0f})")
