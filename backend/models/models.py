@@ -57,6 +57,13 @@ class Cotizacion(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     fase_comercial = Column(String(50), default="ingresada")
     origen = Column(String(20), default="costo")  # costo (proveedor USD) | venta_clp
+    # "Foto" de los parámetros de precio (dólar, shipping, agencia, margen, etc.) tomada
+    # al Cierre de Venta. Congela el precio: desde que se cierra la venta, el total no se
+    # mueve aunque después cambien los parámetros globales del cotizador. NULL = sin foto
+    # (borrador o venta cerrada antes de esta función) → el motor usa el config global vivo.
+    # Ver services/pricing_service.py:config_efectivo y docs/tc-congelado-cotizacion.md.
+    pricing_snapshot = Column(Text, nullable=True)
+    pricing_snapshot_at = Column(DateTime(timezone=True), nullable=True)
 
     user = relationship("User", back_populates="cotizaciones")
     items = relationship(

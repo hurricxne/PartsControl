@@ -14,6 +14,7 @@ python -m embarques_pricing.init_db    # peso editable por ítem (override)
 python -m tesoreria.init_db            # conc_* + conciliación de ingresos + adelantos
 python migrate_awb_numero.py           # columna awb_numero en embarques
 python -m migrations.fix_despacho_parcial_estado   # repara líneas 'despachado' de despachos parciales legados (si no se corrió antes)
+python -m migrations.cotizacion_pricing_snapshot   # TC congelado: 2 columnas en cotizaciones (sin backfill; ver docs/tc-congelado-cotizacion.md)
 ```
 
 Nota: la columna `cotizaciones.origen` ya existe en prod (vino de allá).

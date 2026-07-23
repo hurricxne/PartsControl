@@ -7,9 +7,12 @@ from typing import List, Optional
 import os
 import shutil
 import uuid
+import json
+
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import func
 
 from auth import get_current_user
 from empresa_guard import require_empresa
@@ -20,7 +23,9 @@ from models.models import (
     User, Proveedor, Embarque, EmbarqueItem, EmbarqueDocumento, PreEmbarque, PreEmbarqueItem,
     ConfiguracionCotizador, FacturaProveedor, FacturaProveedorItem,
 )
-from services.pricing_service import calcular_cotizacion
+from services.pricing_service import (
+    calcular_cotizacion, config_efectivo, CLAVES_PRICING, snapshot_desde_config,
+)
 
 router = APIRouter(prefix="/compras", tags=["compras"])
 
@@ -383,7 +388,9 @@ def _calc_pricing_for_items(items: list, cfg, db: Session) -> dict:
     cfg_dict = _cfg_to_dict(cfg)
     for cot_id, group_items in groups.items():
         item_dicts = [_item_obj_to_dict(i) for i in group_items]
-        calc = calcular_cotizacion(item_dicts, {**cfg_dict, "origen": (group_items[0].cotizacion.origen if group_items else None) or "costo"})
+        _cot = group_items[0].cotizacion if group_items else None
+        _cfg = config_efectivo(getattr(_cot, "pricing_snapshot", None), cfg_dict)
+        calc = calcular_cotizacion(item_dicts, {**_cfg, "origen": (_cot.origen if _cot else None) or "costo"})
         for calc_item in calc.get("items", []):
             result[calc_item["id"]] = calc_item.get("total_venta_clp", 0)
     return result
@@ -528,6 +535,17 @@ def crear_oc_cliente(
         return {"id": oc_existente.id, "cotizacion_id": oc_existente.cotizacion_id}
     oc = OcCliente(**body.dict())
     db.add(oc)
+    # Congelar la "foto" de precios en el momento del Cierre de Venta: desde aquí el total
+    # de la cotización NO se mueve aunque después cambien el dólar u otros parámetros
+    # globales del cotizador. Solo se congela al crear la OC (venta que se cierra a partir
+    # de esta función); las ventas cerradas ANTES quedan con snapshot NULL y siguen usando
+    # el config global (decisión del dueño: congelar solo de aquí en adelante).
+    if not cot.pricing_snapshot:
+        cfg_obj = db.query(ConfiguracionCotizador).filter(ConfiguracionCotizador.id == 1).first()
+        if cfg_obj is not None:
+            snap = snapshot_desde_config({k: getattr(cfg_obj, k, None) for k in CLAVES_PRICING})
+            cot.pricing_snapshot = json.dumps(snap)
+            cot.pricing_snapshot_at = func.now()
     # Mark all items of this cotizacion as cerrado
     db.query(ItemCotizacion).filter(
         ItemCotizacion.cotizacion_id == body.cotizacion_id,

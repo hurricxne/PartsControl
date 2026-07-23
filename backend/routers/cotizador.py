@@ -24,7 +24,7 @@ from models.models import (
     EstadoCotizacion, User, PartsCache,
 )
 from auth import get_current_user
-from services.pricing_service import calcular_cotizacion
+from services.pricing_service import calcular_cotizacion, config_efectivo
 from services.scraper import scrape_parts_batch
 
 router = APIRouter(prefix="/cotizador", tags=["cotizador"])
@@ -173,7 +173,8 @@ def get_editor(
     )
 
     items_raw = [_item_to_dict(i) for i in items]
-    _cfg = _config_to_dict(config)
+    # Foto congelada si la venta ya se cerró; si no (borrador), config global vivo.
+    _cfg = config_efectivo(getattr(c, "pricing_snapshot", None), _config_to_dict(config))
     _cfg["origen"] = (db.query(Cotizacion.origen).filter(Cotizacion.id == cotizacion_id).scalar() or "costo")
     resultado = calcular_cotizacion(items_raw, _cfg)
 
@@ -194,7 +195,11 @@ def get_editor(
         "created_at": c.created_at,
         "terminos_condiciones": c.terminos_condiciones,
         "fase_comercial": c.fase_comercial,
-        "config": _config_to_dict(config),
+        # Config EFECTIVO (la foto congelada si la venta ya se cerró): el editor del
+        # navegador re-calcula la tabla con este config, así lo que se ve en pantalla
+        # coincide con los totales congelados y con el PDF/Excel. Sin foto (borrador),
+        # config_efectivo devuelve el global vivo → comportamiento idéntico a antes.
+        "config": {k: v for k, v in _cfg.items() if k != "origen"},
         "items": resultado["items"],
         "totales": resultado["totales"],
     }
@@ -243,7 +248,7 @@ def update_item(
         _all = (db.query(ItemCotizacion)
                 .filter(ItemCotizacion.cotizacion_id == cotizacion_id)
                 .order_by(ItemCotizacion.item_num).all())
-        _cfg = _config_to_dict(_config); _cfg["origen"] = _origen
+        _cfg = config_efectivo(getattr(_cot, "pricing_snapshot", None), _config_to_dict(_config)); _cfg["origen"] = _origen
         _res = calcular_cotizacion([_item_to_dict(i) for i in _all], _cfg)
         _idx = next((k for k, i in enumerate(_all) if i.id == item.id), None)
         _costo = 0.0
@@ -298,14 +303,15 @@ def generar_formal(
     )
 
     items_raw = [_item_to_dict(i) for i in items]
-    _cfg = _config_to_dict(config)
+    # Foto congelada si la venta ya se cerró; si no (borrador), config global vivo.
+    _cfg = config_efectivo(getattr(c, "pricing_snapshot", None), _config_to_dict(config))
     _cfg["origen"] = (db.query(Cotizacion.origen).filter(Cotizacion.id == cotizacion_id).scalar() or "costo")
     resultado = calcular_cotizacion(items_raw, _cfg)
 
     # Generar Excel formal
     filename = f"formal_{cotizacion_id}_{uuid.uuid4().hex[:8]}.xlsx"
     filepath = os.path.join(RESULTS_DIR, filename)
-    _generar_excel_formal(c, resultado, filepath, _config_to_dict(config))
+    _generar_excel_formal(c, resultado, filepath, _cfg)
 
     c.archivo_formal = filename
     c.es_formal = 1
@@ -330,12 +336,13 @@ def download_formal(
         .all()
     )
     items_raw = [_item_to_dict(i) for i in items]
-    _cfg = _config_to_dict(config)
+    # Foto congelada si la venta ya se cerró; si no (borrador), config global vivo.
+    _cfg = config_efectivo(getattr(c, "pricing_snapshot", None), _config_to_dict(config))
     _cfg["origen"] = (db.query(Cotizacion.origen).filter(Cotizacion.id == cotizacion_id).scalar() or "costo")
     resultado = calcular_cotizacion(items_raw, _cfg)
     filename = f"formal_{cotizacion_id}_{uuid.uuid4().hex[:8]}.xlsx"
     filepath = os.path.join(RESULTS_DIR, filename)
-    _generar_excel_formal(c, resultado, filepath, _config_to_dict(config))
+    _generar_excel_formal(c, resultado, filepath, _cfg)
     c.archivo_formal = filename
     c.es_formal = 1
     db.commit()
@@ -1432,13 +1439,14 @@ def descargar_pdf(
         .all()
     )
     items_raw = [_item_to_dict(i) for i in items]
-    _cfg = _config_to_dict(config)
+    # Foto congelada si la venta ya se cerró; si no (borrador), config global vivo.
+    _cfg = config_efectivo(getattr(c, "pricing_snapshot", None), _config_to_dict(config))
     _cfg["origen"] = (db.query(Cotizacion.origen).filter(Cotizacion.id == cotizacion_id).scalar() or "costo")
     resultado = calcular_cotizacion(items_raw, _cfg)
 
     filename = f"pdf_{cotizacion_id}_{uuid.uuid4().hex[:8]}.pdf"
     filepath = os.path.join(RESULTS_DIR, filename)
-    _generar_pdf_formal(c, resultado, filepath, _config_to_dict(config))
+    _generar_pdf_formal(c, resultado, filepath, _cfg)
 
     return FileResponse(
         filepath,

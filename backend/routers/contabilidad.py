@@ -66,7 +66,7 @@ from models.models import (
 )
 from auth import get_current_user
 from empresa_guard import require_empresa
-from services.pricing_service import calcular_cotizacion
+from services.pricing_service import calcular_cotizacion, config_efectivo
 # Solo lectura del enlace de conciliación de Tesorería (abono ↔ cobranza): una cobranza
 # conciliada con el banco no se puede borrar sin desconciliarla primero allá.
 from tesoreria.models import ConciliacionIngreso
@@ -219,7 +219,9 @@ def _precios_de_cotizacion(db: Session, cot_id: int, cfg_dict: dict, items_db=No
         }
         for i in items_db
     ]
-    calc = calcular_cotizacion(item_dicts, {**cfg_dict, "origen": (items_db[0].cotizacion.origen if items_db else None) or "costo"})
+    _cot = items_db[0].cotizacion if items_db else None
+    _cfg = config_efectivo(getattr(_cot, "pricing_snapshot", None), cfg_dict)
+    calc = calcular_cotizacion(item_dicts, {**_cfg, "origen": (_cot.origen if _cot else None) or "costo"})
     pmap = {ci["id"]: ci for ci in calc.get("items", [])}
     return items_db, pmap, calc.get("totales", {})
 
