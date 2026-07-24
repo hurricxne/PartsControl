@@ -3,6 +3,7 @@ Router de Ventas — vista enriquecida de cotizaciones aceptadas con datos de OC
 """
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
@@ -145,6 +146,7 @@ def _build_venta(cot, items_db, cfg_dict, db):
 
 @router.get("/")
 def listar_ventas(
+    q: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -166,12 +168,26 @@ def listar_ventas(
     if not all_cot_ids:
         return []
 
-    cots = (
-        db.query(Cotizacion)
-        .filter(Cotizacion.id.in_(all_cot_ids))
-        .order_by(Cotizacion.created_at.desc())
-        .all()
-    )
+    cots_query = db.query(Cotizacion).filter(Cotizacion.id.in_(all_cot_ids))
+    if q and q.strip():
+        term = q.strip()
+        like = f"%{term}%"
+        # El N° OC del cliente vive en OcCliente (no en Cotizacion): matcheo por cot_id.
+        cot_ids_por_oc = {
+            oc.cotizacion_id for oc in ocs
+            if oc.numero_oc and term.lower() in oc.numero_oc.lower()
+        }
+        condiciones = [
+            Cotizacion.numero.ilike(like),
+            Cotizacion.cliente.ilike(like),
+            Cotizacion.referencia.ilike(like),
+            Cotizacion.rut_cliente.ilike(like),
+            Cotizacion.contacto_cliente.ilike(like),
+        ]
+        if cot_ids_por_oc:
+            condiciones.append(Cotizacion.id.in_(cot_ids_por_oc))
+        cots_query = cots_query.filter(or_(*condiciones))
+    cots = cots_query.order_by(Cotizacion.created_at.desc()).all()
 
     result = []
     for cot in cots:
