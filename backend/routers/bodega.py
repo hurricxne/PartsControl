@@ -382,16 +382,22 @@ def marcar_item(
 
     es_danado = "danado" in body.estado_recepcion
 
-    # Try by recepcion_item PK first, then by embarque_item_id
-    ri = db.query(RecepcionEmbarqueItem).filter(
-        RecepcionEmbarqueItem.recepcion_id == recepcion_id,
-        RecepcionEmbarqueItem.id == item_id,
-    ).first()
-
-    if not ri:
+    # Resolver la fila de recepción SIEMPRE por embarque_item_id (unívoco por recepción y
+    # SIEMPRE presente en el body). NO usar el item_id de la URL como PK: para ítems aún
+    # sin recepción el frontend manda ahí el embarque_item_id, que con muchos ítems colisiona
+    # con el PK (recepcion_item_id) de OTRA fila ya marcada -> se marcaba el ítem equivocado
+    # (bug "atascado al 63%": el progreso no subía porque el ítem objetivo nunca se creaba).
+    ri = None
+    if body.embarque_item_id is not None:
         ri = db.query(RecepcionEmbarqueItem).filter(
             RecepcionEmbarqueItem.recepcion_id == recepcion_id,
             RecepcionEmbarqueItem.embarque_item_id == body.embarque_item_id,
+        ).first()
+    # Fallback por PK solo si el body no trae embarque_item_id (compatibilidad).
+    if ri is None and body.embarque_item_id is None:
+        ri = db.query(RecepcionEmbarqueItem).filter(
+            RecepcionEmbarqueItem.recepcion_id == recepcion_id,
+            RecepcionEmbarqueItem.id == item_id,
         ).first()
 
     if not ri:
