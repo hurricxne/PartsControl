@@ -248,6 +248,16 @@ export const monzaLogsAPI = {
   summary: () => api.get("/logs/summary"),
 };
 
+// ── Tickets (soporte / solicitudes de cambio) — hilo de conversación ──────────
+export const monzaTicketsAPI = {
+  list: (params?: Record<string, unknown>) => api.get("/tickets", { params }),
+  counts: () => api.get("/tickets/counts"),
+  get: (id: number) => api.get(`/tickets/${id}`),
+  crear: (data: Record<string, unknown>) => api.post("/tickets", data),
+  responder: (id: number, mensaje: string) => api.post(`/tickets/${id}/respuestas`, { mensaje }),
+  cambiarEstado: (id: number, estado: string) => api.patch(`/tickets/${id}`, { estado }),
+};
+
 // ── Abastecimiento (Panel Compras + Seguimiento) ──────────────────────────────
 export const monzaAbastecimientoAPI = {
   kpis: () => api.get("/abastecimiento/kpis"),

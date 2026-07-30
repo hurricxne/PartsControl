@@ -524,3 +524,34 @@ class MonzaWebhookLog(Base):
     error = Column(String(400), nullable=True)
     external_id = Column(String(120), nullable=True)
     fecha = Column(DateTime, default=datetime.utcnow)
+
+
+class MonzaTicket(Base):
+    """Ticket de soporte / solicitud de cambio (MonzaParts). Hilo en MonzaTicketRespuesta."""
+    __tablename__ = "monza_tickets"
+    id = Column(Integer, primary_key=True)
+    numero = Column(String(30), unique=True, index=True)
+    titulo = Column(String(255), nullable=False)
+    descripcion = Column(Text, nullable=False)
+    categoria = Column(String(30), default="soporte")
+    prioridad = Column(String(20), default="media")
+    estado = Column(String(20), default="abierto")
+    solicitante_id = Column(Integer, nullable=True)
+    solicitante_nombre = Column(String(255), nullable=True)
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
+    fecha_actualizacion = Column(DateTime, default=datetime.utcnow)
+    fecha_cierre = Column(DateTime, nullable=True)
+    respuestas = relationship("MonzaTicketRespuesta", back_populates="ticket",
+                              cascade="all, delete-orphan")
+
+
+class MonzaTicketRespuesta(Base):
+    __tablename__ = "monza_ticket_respuestas"
+    id = Column(Integer, primary_key=True)
+    ticket_id = Column(Integer, ForeignKey("monza_tickets.id"), nullable=False, index=True)
+    autor_id = Column(Integer, nullable=True)
+    autor_nombre = Column(String(255), nullable=True)
+    es_solicitante = Column(Integer, default=0)
+    mensaje = Column(Text, nullable=False)
+    fecha_creacion = Column(DateTime, default=datetime.utcnow)
+    ticket = relationship("MonzaTicket", back_populates="respuestas")

@@ -14,6 +14,7 @@ from monza_router_cotizaciones import router as monza_cotizaciones_router
 from monza_router_ventas import router as monza_ventas_router
 from monza_router_despachos import router as monza_despachos_router
 from monza_router_logs import router as monza_logs_router
+from monza_router_tickets import router as monza_tickets_router
 from monza_router_abastecimiento import router as monza_abastecimiento_router
 from monza_router_bodega import router as monza_bodega_router
 from monza_router_logistica import router as monza_logistica_router
@@ -32,6 +33,7 @@ from monza_router_clientes import router as monza_clientes_router
 from routers.worker import worker_router, scraping_router
 from routers import notificaciones, bodega
 from routers import despachos
+from routers import tickets
 
 # Crear tablas que falten. OJO: NO agrega columnas a tablas existentes — para eso
 # correr los scripts de backend/migrations/ (leccion jul 2026: error 1054 en cascada).
@@ -68,6 +70,7 @@ app.include_router(facturas.router,       prefix="/api")
 app.include_router(notificaciones.router, prefix="/api")
 app.include_router(bodega.router,         prefix="/api")
 app.include_router(despachos.router,      prefix="/api")
+app.include_router(tickets.router,        prefix="/api")
 app.include_router(monza_config_router)
 app.include_router(monza_leads_router)
 app.include_router(monza_cotizador_router)
@@ -75,6 +78,7 @@ app.include_router(monza_cotizaciones_router)
 app.include_router(monza_ventas_router)
 app.include_router(monza_despachos_router)
 app.include_router(monza_logs_router)
+app.include_router(monza_tickets_router)
 app.include_router(monza_abastecimiento_router)
 app.include_router(monza_bodega_router)
 app.include_router(monza_logistica_router)

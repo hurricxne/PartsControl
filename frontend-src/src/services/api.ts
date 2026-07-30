@@ -205,6 +205,16 @@ export const notificacionesAPI = {
   marcarTodasLeidas: () => api.patch('/notificaciones/marcar-todas-leidas'),
 }
 
+// Tickets (soporte / solicitudes de cambio) — hilo de conversación
+export const ticketsAPI = {
+  list: (params?: Record<string, any>) => api.get('/tickets', { params }),
+  counts: () => api.get('/tickets/counts'),
+  get: (id: number) => api.get(`/tickets/${id}`),
+  crear: (data: Record<string, any>) => api.post('/tickets', data),
+  responder: (id: number, mensaje: string) => api.post(`/tickets/${id}/respuestas`, { mensaje }),
+  cambiarEstado: (id: number, estado: string) => api.patch(`/tickets/${id}`, { estado }),
+}
+
 // Bodega
 export const bodegaAPI = {
   listEmbarques: () => api.get('/bodega/embarques'),

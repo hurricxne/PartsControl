@@ -34,6 +34,7 @@ import ComprasContabPage from './compras-contab/ComprasContabPage'
 import TesoreriaPage from './tesoreria/TesoreriaPage'
 import UsuariosPage from './pages/UsuariosPage'
 import ProveedoresPage from './pages/ProveedoresPage'
+import TicketsPage from './pages/TicketsPage'
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated())
@@ -56,6 +57,7 @@ import MonzaCotizacionesPage from './pages/MonzaCotizacionesPage'
 import MonzaVentasPage from './pages/MonzaVentasPage'
 import MonzaConfigPage from './pages/MonzaConfigPage'
 import MonzaDespachosPage from './pages/MonzaDespachosPage'
+import MonzaTicketsPage from './pages/MonzaTicketsPage'
 import MonzaLogsPage from './pages/MonzaLogsPage'
 import MonzaAbastecimientoPage from './pages/MonzaAbastecimientoPage'
 import MonzaSeguimientoPage from './pages/MonzaSeguimientoPage'
@@ -111,6 +113,7 @@ export default function App() {
         <Route path="conciliacion" element={<Navigate to="/tesoreria" replace />} />
         <Route path="usuarios"      element={<UsuariosPage />} />
         <Route path="proveedores"   element={<ProveedoresPage />} />
+        <Route path="tickets"       element={<TicketsPage />} />
       </Route>
 
       {/* MonzaParts */}
@@ -139,6 +142,7 @@ export default function App() {
         <Route path="bodega" element={<MonzaBodegaPage />} />
         <Route path="perfil" element={<MonzaPerfilPage />} />
         <Route path="despachos"      element={<MonzaDespachosPage />} />
+        <Route path="tickets"        element={<MonzaTicketsPage />} />
         <Route path="logs"           element={<MonzaLogsPage />} />
         <Route path="configuracion" element={<MonzaConfigPage />} />
       </Route>

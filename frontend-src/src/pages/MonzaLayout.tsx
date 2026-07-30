@@ -4,7 +4,7 @@ import { monzaNotificacionesAPI } from "../services/monzaApi";
 import {
   Users, FileText, TrendingUp, Settings, LogOut,
   ChevronDown, Bell, LayoutDashboard, Car, Sun, Moon, Truck, ScrollText,
-  ShoppingCart, PackageSearch, Ship, Boxes, UserCog, Wallet, Receipt, DollarSign, Calculator, CreditCard, Landmark,
+  ShoppingCart, PackageSearch, Ship, Boxes, UserCog, Wallet, Receipt, DollarSign, Calculator, CreditCard, Landmark, LifeBuoy,
 } from "lucide-react";
 import { useAuthStore } from "../stores/authStore";
 
@@ -78,6 +78,7 @@ const NAV_CONTABILIDAD = MONZA_CONTAB
     ].includes(i.to));
 
 const NAV_TAIL = [
+  { to: "/monzaparts/tickets",      label: "Tickets",       icon: LifeBuoy },
   { to: "/monzaparts/logs",         label: "Logs",          icon: ScrollText },
   { to: "/monzaparts/configuracion",label: "Configuración", icon: Settings },
 ];
@@ -117,6 +118,7 @@ const BREADCRUMB: Record<string, string> = {
   "/monzaparts/logistica":      "Logística / Importación",
   "/monzaparts/bodega":         "Bodega / Recepción",
   "/monzaparts/despachos":      "Histórico Despachos",
+  "/monzaparts/tickets":        "Tickets de Soporte",
   "/monzaparts/logs":           "Logs de Operaciones",
   "/monzaparts/perfil":         "Mi Perfil",
   "/monzaparts/configuracion":  "Configuración",

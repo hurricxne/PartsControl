@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     # Sin token, el módulo wasabil_dte permite previsualizar pero NO emitir.
     WASABIL_API_TOKEN: str = ""
     WASABIL_API_BASE: str = "https://api.wasabil.com/api"
+    # Correo saliente de la app (tickets/avisos). Casilla no-reply@bigcode.cl.
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASS: str = ""
+    MAIL_FROM: str = "no-reply@bigcode.cl"
+    MAIL_SOPORTE: str = "soporte@bigcode.cl"
 
     class Config:
         env_file = ".env"

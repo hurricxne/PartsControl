@@ -669,3 +669,36 @@ class ContAdelanto(Base):
     oc_cliente = relationship("OcCliente")
     factura_anticipo = relationship("ContFacturaCliente",
                                     foreign_keys=[factura_anticipo_id])
+
+
+class Ticket(Base):
+    """Ticket de soporte / solicitud de cambio (MachParts). Hilo en TicketRespuesta."""
+    __tablename__ = "tickets"
+    id = Column(Integer, primary_key=True, index=True)
+    numero = Column(String(30), unique=True, index=True)
+    empresa = Column(String(50), nullable=False, server_default="mineria")
+    titulo = Column(String(255), nullable=False)
+    descripcion = Column(Text, nullable=False)
+    categoria = Column(String(30), default="soporte")   # bug|mejora|soporte|consulta
+    prioridad = Column(String(20), default="media")     # baja|media|alta|urgente
+    estado = Column(String(20), default="abierto")      # abierto|en_progreso|resuelto|cerrado
+    solicitante_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    solicitante_nombre = Column(String(255), nullable=True)
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_actualizacion = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_cierre = Column(DateTime(timezone=True), nullable=True)
+    respuestas = relationship("TicketRespuesta", back_populates="ticket",
+                              cascade="all, delete-orphan")
+
+
+class TicketRespuesta(Base):
+    """Cada mensaje del hilo de un ticket (solicitante o equipo)."""
+    __tablename__ = "ticket_respuestas"
+    id = Column(Integer, primary_key=True, index=True)
+    ticket_id = Column(Integer, ForeignKey("tickets.id"), nullable=False, index=True)
+    autor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    autor_nombre = Column(String(255), nullable=True)
+    es_solicitante = Column(Boolean, default=False)
+    mensaje = Column(Text, nullable=False)
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    ticket = relationship("Ticket", back_populates="respuestas")

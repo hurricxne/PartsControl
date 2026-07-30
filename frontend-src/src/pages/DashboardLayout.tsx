@@ -6,6 +6,7 @@ import {
   FileText, TrendingUp, Ship, DollarSign, Users, BarChart3,
   ShoppingCart, Package, Receipt, Settings, UserCog,
   FileSignature, PackageSearch, Banknote, Calculator, Building2, Anchor, Truck, Wallet, Landmark,
+  LifeBuoy,
 } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
 import { useTheme } from '../context/ThemeContext'
@@ -81,6 +82,7 @@ const navGroups: NavGroup[] = [
       { to: '/proveedores',   icon: Building2, label: 'Proveedores',    exact: false },
       { to: '/configuracion', icon: Settings,  label: 'Configuración', exact: false },
       { to: '/usuarios',      icon: UserCog,   label: 'Usuarios',       exact: false },
+      { to: '/tickets',       icon: LifeBuoy,  label: 'Tickets',        exact: false },
     ],
   },
 ]
