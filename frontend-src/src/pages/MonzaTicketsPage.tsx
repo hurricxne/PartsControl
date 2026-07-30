@@ -3,6 +3,7 @@ import { LifeBuoy, Plus, RefreshCw, Send, X, MessageSquare, Clock } from "lucide
 import { monzaTicketsAPI } from "../services/monzaApi";
 import { useMonzaTheme } from "./MonzaLayout";
 import { useAuthStore } from "../stores/authStore";
+import MonzaDocs from "./MonzaDocs";
 import toast from "react-hot-toast";
 
 interface Respuesta {
@@ -363,6 +364,11 @@ function DetalleModal({ dark, id, currentUserId, onClose }: { dark: boolean; id:
                   </div>
                 );
               })}
+
+              <div style={{ border: `1px solid ${bd}`, borderRadius: 10, padding: 12, background: dark ? "#0f1629" : "#F8FAFC" }}>
+                <MonzaDocs entidad="ticket" entidadId={id}
+                  categorias={["imagen", "documento", "otro"]} titulo="Adjuntos" />
+              </div>
             </>
           )}
         </div>

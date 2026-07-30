@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   LifeBuoy, Plus, RefreshCw, Send, X, MessageSquare, ArrowLeft, Clock,
+  Paperclip, Upload, Download, Trash2, FileText, Image as ImageIcon,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { ticketsAPI } from '../services/api'
@@ -372,6 +373,8 @@ function TicketDetalle({ id, currentUserId, onClose }: { id: number; currentUser
                   </div>
                 )
               })}
+
+              <AdjuntosPanel ticketId={id} />
             </>
           )}
         </div>
@@ -408,6 +411,109 @@ function TicketDetalle({ id, currentUserId, onClose }: { id: number; currentUser
           )}
         </div>
       </div>
+    </div>
+  )
+}
+
+interface Adjunto {
+  id: number
+  original_name: string
+  content_type: string | null
+  size_bytes: number | null
+  uploaded_by: string | null
+  fecha: string | null
+  es_imagen: boolean
+}
+
+function fmtSize(b: number | null) {
+  if (!b) return ''
+  if (b < 1024) return `${b} B`
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)} KB`
+  return `${(b / 1024 / 1024).toFixed(1)} MB`
+}
+
+const ADJ_ACCEPT = '.jpg,.jpeg,.png,.gif,.webp,.pdf,.doc,.docx,.xls,.xlsx,.txt,.csv'
+
+function AdjuntosPanel({ ticketId }: { ticketId: number }) {
+  const qc = useQueryClient()
+  const fileRef = useRef<HTMLInputElement>(null)
+  const [uploading, setUploading] = useState(false)
+
+  const { data: adjuntos = [] } = useQuery({
+    queryKey: ['ticket-adjuntos', ticketId],
+    queryFn: async () => (await ticketsAPI.listAdjuntos(ticketId)).data as Adjunto[],
+  })
+
+  const onPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) e.target.value = ''
+    if (!file) return
+    if (file.size > 15 * 1024 * 1024) { toast.error('El archivo supera los 15 MB'); return }
+    setUploading(true)
+    try {
+      await ticketsAPI.subirAdjunto(ticketId, file)
+      qc.invalidateQueries({ queryKey: ['ticket-adjuntos', ticketId] })
+      toast.success('Adjunto subido')
+    } catch (err: any) {
+      toast.error(err?.response?.data?.detail || 'No se pudo subir el archivo')
+    } finally { setUploading(false) }
+  }
+
+  const descargar = async (a: Adjunto) => {
+    try {
+      const resp = await ticketsAPI.descargarAdjunto(a.id)
+      const blob = new Blob([resp.data], { type: a.content_type || 'application/octet-stream' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url; link.download = a.original_name
+      document.body.appendChild(link); link.click(); document.body.removeChild(link)
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch { toast.error('No se pudo descargar') }
+  }
+
+  const borrar = async (a: Adjunto) => {
+    try {
+      await ticketsAPI.borrarAdjunto(a.id)
+      qc.invalidateQueries({ queryKey: ['ticket-adjuntos', ticketId] })
+    } catch { toast.error('No se pudo eliminar') }
+  }
+
+  return (
+    <div className="rounded-lg border p-3" style={{ borderColor: 'var(--border)' }}>
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-xs font-semibold flex items-center gap-1.5" style={{ color: 'var(--text-primary)' }}>
+          <Paperclip className="w-3.5 h-3.5" /> Adjuntos {adjuntos.length > 0 && `(${adjuntos.length})`}
+        </span>
+        <input ref={fileRef} type="file" accept={ADJ_ACCEPT} className="hidden" onChange={onPick} />
+        <button onClick={() => fileRef.current?.click()} disabled={uploading}
+          className="px-2.5 py-1 rounded-md text-xs font-medium border flex items-center gap-1.5 transition"
+          style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
+          {uploading ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Upload className="w-3 h-3" />}
+          {uploading ? 'Subiendo...' : 'Subir archivo'}
+        </button>
+      </div>
+      {adjuntos.length === 0 ? (
+        <p className="text-xs" style={{ color: 'var(--text-faint)' }}>
+          Sin archivos. Imágenes o documentos (PDF, Word, Excel, TXT, CSV), hasta 15 MB.
+        </p>
+      ) : (
+        <div className="space-y-1.5">
+          {adjuntos.map((a) => (
+            <div key={a.id} className="flex items-center gap-2 rounded-md px-2 py-1.5" style={{ background: 'var(--surface-100)' }}>
+              {a.es_imagen ? <ImageIcon className="w-4 h-4 shrink-0" style={{ color: 'var(--text-faint)' }} />
+                : <FileText className="w-4 h-4 shrink-0" style={{ color: 'var(--text-faint)' }} />}
+              <div className="min-w-0 flex-1">
+                <div className="text-xs font-medium truncate" style={{ color: 'var(--text-primary)' }}>{a.original_name}</div>
+                <div className="text-xs" style={{ color: 'var(--text-faint)' }}>
+                  {fmtSize(a.size_bytes)}{a.uploaded_by ? ` · ${a.uploaded_by}` : ''}
+                </div>
+              </div>
+              <button onClick={() => descargar(a)} title="Descargar" style={{ color: 'var(--text-muted)' }}><Download className="w-4 h-4" /></button>
+              <button onClick={() => borrar(a)} title="Eliminar" style={{ color: '#EF4444' }}><Trash2 className="w-4 h-4" /></button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

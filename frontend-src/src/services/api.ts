@@ -213,6 +213,14 @@ export const ticketsAPI = {
   crear: (data: Record<string, any>) => api.post('/tickets', data),
   responder: (id: number, mensaje: string) => api.post(`/tickets/${id}/respuestas`, { mensaje }),
   cambiarEstado: (id: number, estado: string) => api.patch(`/tickets/${id}`, { estado }),
+  listAdjuntos: (id: number) => api.get(`/tickets/${id}/adjuntos`),
+  subirAdjunto: (id: number, file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return api.post(`/tickets/${id}/adjuntos`, fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+  },
+  descargarAdjunto: (adjId: number) => api.get(`/tickets/adjuntos/${adjId}/download`, { responseType: 'arraybuffer' }),
+  borrarAdjunto: (adjId: number) => api.delete(`/tickets/adjuntos/${adjId}`),
 }
 
 // Bodega

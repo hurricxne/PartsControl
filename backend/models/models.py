@@ -702,3 +702,16 @@ class TicketRespuesta(Base):
     mensaje = Column(Text, nullable=False)
     fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
     ticket = relationship("Ticket", back_populates="respuestas")
+
+
+class TicketAdjunto(Base):
+    """Archivo adjunto de un ticket (imagen o documento). Descarga autenticada."""
+    __tablename__ = "ticket_adjuntos"
+    id = Column(Integer, primary_key=True, index=True)
+    ticket_id = Column(Integer, ForeignKey("tickets.id"), nullable=False, index=True)
+    filename = Column(String(255), nullable=False)          # nombre en disco
+    original_name = Column(String(255), nullable=True)
+    content_type = Column(String(120), nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    uploaded_by = Column(String(255), nullable=True)
+    fecha = Column(DateTime(timezone=True), server_default=func.now())

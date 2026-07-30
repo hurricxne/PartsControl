@@ -1,17 +1,19 @@
 """Tickets de soporte / solicitudes de cambio (MachParts). Hilo de conversación:
 el solicitante y el equipo pueden responder y re-responder. Notifica in-app + correo
 a soporte@bigcode.cl (best-effort)."""
+import os
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import get_db
 from auth import get_current_user
-from models.models import User, Ticket, TicketRespuesta
+from models.models import User, Ticket, TicketRespuesta, TicketAdjunto
 from config import settings
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
@@ -19,6 +21,12 @@ router = APIRouter(prefix="/tickets", tags=["tickets"])
 CATEGORIAS = {"bug", "mejora", "soporte", "consulta"}
 PRIORIDADES = {"baja", "media", "alta", "urgente"}
 ESTADOS = {"abierto", "en_progreso", "resuelto", "cerrado"}
+
+# Adjuntos (imágenes + documentos). Descarga autenticada.
+ADJ_DIR = "uploads/tickets"
+ADJ_MAX_BYTES = 15 * 1024 * 1024
+ADJ_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp",
+           ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".csv"}
 
 
 class TicketCreate(BaseModel):
@@ -194,3 +202,84 @@ def cambiar_estado(ticket_id: int, body: EstadoUpdate, db: Session = Depends(get
     db.refresh(t)
     _notificar(db, f"Ticket {t.numero} → {t.estado}", f"{t.titulo}", t.id)
     return _ticket_dict(t, con_hilo=True)
+
+
+# ── Adjuntos ──────────────────────────────────────────────────────────────────
+def _adj_dict(a: TicketAdjunto) -> dict:
+    return {
+        "id": a.id, "ticket_id": a.ticket_id, "original_name": a.original_name,
+        "content_type": a.content_type, "size_bytes": a.size_bytes,
+        "uploaded_by": a.uploaded_by,
+        "fecha": a.fecha.isoformat() if a.fecha else None,
+        "es_imagen": (a.content_type or "").startswith("image/"),
+    }
+
+
+@router.get("/{ticket_id}/adjuntos")
+def listar_adjuntos(ticket_id: int, db: Session = Depends(get_db),
+                    current_user: User = Depends(get_current_user)):
+    if not db.query(Ticket).filter(Ticket.id == ticket_id).first():
+        raise HTTPException(404, "Ticket no encontrado")
+    rows = (db.query(TicketAdjunto).filter(TicketAdjunto.ticket_id == ticket_id)
+            .order_by(TicketAdjunto.id.desc()).all())
+    return [_adj_dict(a) for a in rows]
+
+
+@router.post("/{ticket_id}/adjuntos", status_code=201)
+async def subir_adjunto(ticket_id: int, file: UploadFile = File(...),
+                        db: Session = Depends(get_db),
+                        current_user: User = Depends(get_current_user)):
+    t = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    if not t:
+        raise HTTPException(404, "Ticket no encontrado")
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ADJ_EXT:
+        raise HTTPException(400, f"Tipo de archivo no permitido ({ext or 'sin extensión'}). "
+                                 "Permitidos: imágenes, PDF, Word, Excel, TXT, CSV.")
+    content = await file.read()
+    if len(content) > ADJ_MAX_BYTES:
+        raise HTTPException(400, "El archivo supera el máximo de 15 MB.")
+    if not content:
+        raise HTTPException(400, "El archivo está vacío.")
+    os.makedirs(ADJ_DIR, exist_ok=True)
+    fname = f"tck{ticket_id}_{int(datetime.utcnow().timestamp()*1000)}{ext}"
+    with open(os.path.join(ADJ_DIR, fname), "wb") as fh:
+        fh.write(content)
+    a = TicketAdjunto(
+        ticket_id=t.id, filename=fname, original_name=file.filename or fname,
+        content_type=file.content_type, size_bytes=len(content),
+        uploaded_by=current_user.nombre,
+    )
+    db.add(a)
+    t.fecha_actualizacion = func.now()
+    db.commit()
+    db.refresh(a)
+    return _adj_dict(a)
+
+
+@router.get("/adjuntos/{adj_id}/download")
+def descargar_adjunto(adj_id: int, db: Session = Depends(get_db),
+                      current_user: User = Depends(get_current_user)):
+    a = db.query(TicketAdjunto).filter(TicketAdjunto.id == adj_id).first()
+    if not a:
+        raise HTTPException(404, "Adjunto no encontrado")
+    path = os.path.join(ADJ_DIR, a.filename)
+    if not os.path.exists(path):
+        raise HTTPException(404, "Archivo no encontrado")
+    return FileResponse(path, filename=a.original_name or a.filename,
+                        media_type=a.content_type or "application/octet-stream")
+
+
+@router.delete("/adjuntos/{adj_id}")
+def borrar_adjunto(adj_id: int, db: Session = Depends(get_db),
+                   current_user: User = Depends(get_current_user)):
+    a = db.query(TicketAdjunto).filter(TicketAdjunto.id == adj_id).first()
+    if not a:
+        raise HTTPException(404, "Adjunto no encontrado")
+    try:
+        os.remove(os.path.join(ADJ_DIR, a.filename))
+    except Exception:
+        pass
+    db.delete(a)
+    db.commit()
+    return {"ok": True}
