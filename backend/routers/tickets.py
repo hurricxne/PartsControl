@@ -29,6 +29,11 @@ ADJ_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp",
            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".csv"}
 
 
+def _es_soporte(user) -> bool:
+    """Solo el equipo de soporte (cuentas @bigcode.cl) gestiona el estado / cierra tickets."""
+    return (getattr(user, "email", "") or "").lower().endswith("@bigcode.cl")
+
+
 class TicketCreate(BaseModel):
     titulo: str
     descripcion: str
@@ -193,6 +198,8 @@ def cambiar_estado(ticket_id: int, body: EstadoUpdate, db: Session = Depends(get
     t = db.query(Ticket).filter(Ticket.id == ticket_id).first()
     if not t:
         raise HTTPException(404, "Ticket no encontrado")
+    if not _es_soporte(current_user):
+        raise HTTPException(403, "Solo el equipo de soporte puede cambiar el estado o cerrar el ticket.")
     if body.estado not in ESTADOS:
         raise HTTPException(400, f"Estado inválido: {body.estado}")
     t.estado = body.estado

@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from "react";
-import { LifeBuoy, Plus, RefreshCw, Send, X, MessageSquare, Clock } from "lucide-react";
-import { monzaTicketsAPI } from "../services/monzaApi";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { LifeBuoy, Plus, RefreshCw, Send, X, MessageSquare, Clock, Paperclip, Trash2, FileText, Image as ImageIcon } from "lucide-react";
+import { monzaTicketsAPI, monzaDocumentosAPI } from "../services/monzaApi";
 import { useMonzaTheme } from "./MonzaLayout";
 import { useAuthStore } from "../stores/authStore";
 import MonzaDocs from "./MonzaDocs";
@@ -205,10 +205,18 @@ export default function MonzaTicketsPage() {
       )}
       {selId != null && (
         <DetalleModal dark={dark} id={selId} currentUserId={currentUser?.id ?? null}
+          esSoporte={(currentUser?.email || "").toLowerCase().endsWith("@bigcode.cl")}
           onClose={() => { setSelId(null); fetchAll(); }} />
       )}
     </div>
   );
+}
+
+const ADJ_ACCEPT = ".jpg,.jpeg,.png,.gif,.webp,.pdf,.doc,.docx,.xls,.xlsx,.txt,.csv";
+function fmtSize(b: number) {
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)} KB`;
+  return `${(b / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function NuevoModal({ dark, onClose, onCreated }: { dark: boolean; onClose: () => void; onCreated: (id: number) => void }) {
@@ -216,7 +224,16 @@ function NuevoModal({ dark, onClose, onCreated }: { dark: boolean; onClose: () =
   const [descripcion, setDescripcion] = useState("");
   const [categoria, setCategoria] = useState("soporte");
   const [prioridad, setPrioridad] = useState("media");
+  const [files, setFiles] = useState<File[]>([]);
   const [saving, setSaving] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const onPick = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const picked = Array.from(e.target.files || []);
+    e.target.value = "";
+    const ok = picked.filter((f) => { if (f.size > 15 * 1024 * 1024) { toast.error(`"${f.name}" supera los 15 MB`); return false; } return true; });
+    if (ok.length) setFiles((prev) => [...prev, ...ok]);
+  };
 
   const bg  = dark ? "#131b3e" : "white";
   const bd  = dark ? "#1e2a4a" : "#E2E8F0";
@@ -229,7 +246,12 @@ function NuevoModal({ dark, onClose, onCreated }: { dark: boolean; onClose: () =
     setSaving(true);
     try {
       const { data } = await monzaTicketsAPI.crear({ titulo, descripcion, categoria, prioridad });
-      toast.success(`Ticket ${data.numero} creado`);
+      let subidos = 0;
+      for (const f of files) {
+        try { await monzaDocumentosAPI.upload("ticket", data.id, f, f.type.startsWith("image/") ? "imagen" : "documento"); subidos++; }
+        catch { toast.error(`No se pudo adjuntar "${f.name}"`); }
+      }
+      toast.success(`Ticket ${data.numero} creado${files.length ? ` (${subidos}/${files.length} adjuntos)` : ""}`);
       onCreated(data.id);
     } catch { toast.error("No se pudo crear el ticket"); }
     finally { setSaving(false); }
@@ -266,6 +288,29 @@ function NuevoModal({ dark, onClose, onCreated }: { dark: boolean; onClose: () =
               </select>
             </div>
           </div>
+          <div>
+            <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: sub, marginBottom: 5 }}>Adjuntos (opcional)</label>
+            <input ref={fileRef} type="file" accept={ADJ_ACCEPT} multiple style={{ display: "none" }} onChange={onPick} />
+            <button type="button" onClick={() => fileRef.current?.click()}
+              style={{ width: "100%", padding: "8px 10px", borderRadius: 8, border: `1px dashed ${bd}`, background: dark ? "#0d1321" : "white", color: sub, cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <Paperclip size={14} /> Agregar imágenes o documentos
+            </button>
+            {files.length > 0 && (
+              <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+                {files.map((f, i) => (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, background: dark ? "#0f1629" : "#F8FAFC", borderRadius: 6, padding: "6px 8px" }}>
+                    {f.type.startsWith("image/") ? <ImageIcon size={15} color={sub} /> : <FileText size={15} color={sub} />}
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div style={{ fontSize: 12, fontWeight: 500, color: txt, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</div>
+                      <div style={{ fontSize: 11, color: sub }}>{fmtSize(f.size)}</div>
+                    </div>
+                    <button onClick={() => setFiles((prev) => prev.filter((_, j) => j !== i))} title="Quitar"
+                      style={{ border: "none", background: "none", cursor: "pointer", color: "#DC2626" }}><Trash2 size={15} /></button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, padding: "14px 18px", borderTop: `1px solid ${bd}` }}>
           <button onClick={onClose} style={{ padding: "8px 14px", borderRadius: 8, border: `1px solid ${bd}`, background: bg, color: sub, cursor: "pointer", fontSize: 13 }}>Cancelar</button>
@@ -279,7 +324,7 @@ function NuevoModal({ dark, onClose, onCreated }: { dark: boolean; onClose: () =
   );
 }
 
-function DetalleModal({ dark, id, currentUserId, onClose }: { dark: boolean; id: number; currentUserId: number | null; onClose: () => void }) {
+function DetalleModal({ dark, id, currentUserId, esSoporte, onClose }: { dark: boolean; id: number; currentUserId: number | null; esSoporte: boolean; onClose: () => void }) {
   const [t, setT] = useState<Ticket | null>(null);
   const [loading, setLoading] = useState(true);
   const [msg, setMsg] = useState("");
@@ -390,7 +435,7 @@ function DetalleModal({ dark, id, currentUserId, onClose }: { dark: boolean; id:
               </button>
             </div>
           )}
-          {t && (
+          {esSoporte && t && (
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
               <span style={{ fontSize: 12, color: sub }}>Cambiar estado:</span>
               {ESTADOS.filter((e) => e.v !== t.estado).map((e) => (

@@ -217,6 +217,7 @@ export default function TicketsPage() {
         <TicketDetalle
           id={selId}
           currentUserId={currentUser?.id ?? null}
+          esSoporte={(currentUser?.email || '').toLowerCase().endsWith('@bigcode.cl')}
           onClose={() => { setSelId(null); qc.invalidateQueries({ queryKey: ['tickets'] }); qc.invalidateQueries({ queryKey: ['tickets-counts'] }) }}
         />
       )}
@@ -229,12 +230,36 @@ function NuevoTicketModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [descripcion, setDescripcion] = useState('')
   const [categoria, setCategoria] = useState('soporte')
   const [prioridad, setPrioridad] = useState('media')
+  const [files, setFiles] = useState<File[]>([])
+  const [saving, setSaving] = useState(false)
+  const fileRef = useRef<HTMLInputElement>(null)
 
-  const crear = useMutation({
-    mutationFn: async () => (await ticketsAPI.crear({ titulo, descripcion, categoria, prioridad })).data as Ticket,
-    onSuccess: (t) => { toast.success(`Ticket ${t.numero} creado`); onCreated(t.id) },
-    onError: () => toast.error('No se pudo crear el ticket'),
-  })
+  const onPick = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const picked = Array.from(e.target.files || [])
+    e.target.value = ''
+    const ok = picked.filter((f) => {
+      if (f.size > 15 * 1024 * 1024) { toast.error(`"${f.name}" supera los 15 MB`); return false }
+      return true
+    })
+    if (ok.length) setFiles((prev) => [...prev, ...ok])
+  }
+
+  const submit = async () => {
+    if (!titulo.trim() || !descripcion.trim()) return
+    setSaving(true)
+    try {
+      const t = (await ticketsAPI.crear({ titulo, descripcion, categoria, prioridad })).data as Ticket
+      let subidos = 0
+      for (const f of files) {
+        try { await ticketsAPI.subirAdjunto(t.id, f); subidos++ }
+        catch { toast.error(`No se pudo adjuntar "${f.name}"`) }
+      }
+      toast.success(`Ticket ${t.numero} creado${files.length ? ` (${subidos}/${files.length} adjuntos)` : ''}`)
+      onCreated(t.id)
+    } catch {
+      toast.error('No se pudo crear el ticket')
+    } finally { setSaving(false) }
+  }
 
   const inputCls = 'w-full px-3 py-2 rounded-lg text-sm border outline-none'
   const inputStyle = { background: 'var(--surface-100)', borderColor: 'var(--border)', color: 'var(--text-primary)' }
@@ -273,13 +298,39 @@ function NuevoTicketModal({ onClose, onCreated }: { onClose: () => void; onCreat
               </select>
             </div>
           </div>
+          <div>
+            <label className="block text-xs font-medium mb-1" style={{ color: 'var(--text-muted)' }}>Adjuntos (opcional)</label>
+            <input ref={fileRef} type="file" accept={ADJ_ACCEPT} multiple className="hidden" onChange={onPick} />
+            <button type="button" onClick={() => fileRef.current?.click()}
+              className="px-3 py-2 rounded-lg text-sm border flex items-center gap-2 w-full justify-center"
+              style={{ borderColor: 'var(--border)', color: 'var(--text-muted)', background: 'var(--surface-100)' }}>
+              <Paperclip className="w-4 h-4" /> Agregar imágenes o documentos
+            </button>
+            {files.length > 0 && (
+              <div className="mt-2 space-y-1.5">
+                {files.map((f, i) => (
+                  <div key={i} className="flex items-center gap-2 rounded-md px-2 py-1.5" style={{ background: 'var(--surface-100)' }}>
+                    {f.type.startsWith('image/') ? <ImageIcon className="w-4 h-4 shrink-0" style={{ color: 'var(--text-faint)' }} />
+                      : <FileText className="w-4 h-4 shrink-0" style={{ color: 'var(--text-faint)' }} />}
+                    <div className="min-w-0 flex-1">
+                      <div className="text-xs font-medium truncate" style={{ color: 'var(--text-primary)' }}>{f.name}</div>
+                      <div className="text-xs" style={{ color: 'var(--text-faint)' }}>{fmtSize(f.size)}</div>
+                    </div>
+                    <button onClick={() => setFiles((prev) => prev.filter((_, j) => j !== i))} title="Quitar" style={{ color: '#EF4444' }}>
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
         <div className="flex items-center justify-end gap-2 px-5 py-4 border-t" style={{ borderColor: 'var(--border)' }}>
           <button onClick={onClose} className="btn-secondary text-sm">Cancelar</button>
           <button className="btn-primary text-sm"
-            disabled={!titulo.trim() || !descripcion.trim() || crear.isPending}
-            onClick={() => crear.mutate()}>
-            {crear.isPending ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />} Crear ticket
+            disabled={!titulo.trim() || !descripcion.trim() || saving}
+            onClick={submit}>
+            {saving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />} Crear ticket
           </button>
         </div>
       </div>
@@ -287,7 +338,7 @@ function NuevoTicketModal({ onClose, onCreated }: { onClose: () => void; onCreat
   )
 }
 
-function TicketDetalle({ id, currentUserId, onClose }: { id: number; currentUserId: number | null; onClose: () => void }) {
+function TicketDetalle({ id, currentUserId, esSoporte, onClose }: { id: number; currentUserId: number | null; esSoporte: boolean; onClose: () => void }) {
   const qc = useQueryClient()
   const [msg, setMsg] = useState('')
 
@@ -397,7 +448,7 @@ function TicketDetalle({ id, currentUserId, onClose }: { id: number; currentUser
             </div>
           )}
 
-          {t && (
+          {esSoporte && t && (
             <div className="flex items-center gap-2 flex-wrap">
               <span className="text-xs" style={{ color: 'var(--text-faint)' }}>Cambiar estado:</span>
               {ESTADOS.filter((e) => e.v !== t.estado).map((e) => (
