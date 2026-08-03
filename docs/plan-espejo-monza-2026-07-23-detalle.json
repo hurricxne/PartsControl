@@ -1,0 +1,818 @@
+[
+ {
+  "area": "sii_emision",
+  "resumen": "Monza NO tiene NINGUNA emisión electrónica al SII: es el hueco más grande del roadmap. Todo es manual — MonzaDespacho.numero_guia (monza_models.py:497) y MonzaCotizacion.numero_factura \"folio SII\" (monza_models.py:265) son Strings tecleados a mano; crear_factura recibe numero_factura como input manual (monza_contabilidad/schemas.py:28) y guia-firmada (monza_contabilidad/router.py:398) es solo informativo. No existe ningún paquete/archivo wasabil ni _dte del lado Monza (confirmado con find). Para que Monza emita guías 52 y facturas 33 hay que PORTAR el paquete completo wasabil_dte/ (config/token, tabla DTE, client HTTP, service de armado, router preview/emitir/estado/reintentar, candado, init_db, frontend) creando un monza_wasabil_dte/ propio: el módulo actual está clavado a Grupo AM (tabla con FK a despachos.id/cont_factura_cliente.id en models.py:71-73, router candado require_empresa(\"mineria\") en router.py:61, y guards anti-huérfano acoplados en routers/despachos.py:23-26). Además hay 3 gaps que bloquearían incluso un port directo: (1) TENANT — MonzaParts SpA (RUT 78.121.316-0) es otra persona jurídica: necesita su PROPIA cuenta/token Wasabil; config.py es single-tenant (un solo WASABIL_API_TOKEN) y client.py lo lee hardcodeado; (2) referencia 801 — Monza solo guarda oc_cliente como String número (monza_models.py:260), sin fecha de OC, que la referencia 801 exige; (3) receptor SII — MonzaCliente solo tiene rut NULLABLE (monza_models.py:14) y carece de giro/dirección/comuna. Lo que SÍ está a favor: hay neto por línea (MonzaCotizacionItem.precio_unitario_clp) y candado \"automotriz\" ya probado (monza_contabilidad usa require_empresa(\"automotriz\")).",
+  "capacidades": [
+   {
+    "capacidad": "Config/token Wasabil del emisor (cuenta SII)",
+    "ga_ref": "config.py:19-22 (WASABIL_API_TOKEN / WASABIL_API_BASE); client.py:62,69 lo lee",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe",
+    "impacto": "CRITICO",
+    "esfuerzo": "BAJO",
+    "nota": "Sin token no se emite nada. OJO tenant: MonzaParts SpA (RUT 78.121.316-0, monza_models.py:321) es otra persona jurídica con su PROPIA cuenta Wasabil → hace falta un WASABIL_MONZA_API_TOKEN separado en config y que el client HTTP elija el token por empresa (hoy client._headers() usa settings.WASABIL_API_TOKEN hardcodeado, single-tenant). Dependencia: el dueño debe abrir/entregar la cuenta+token Wasabil de Monza."
+   },
+   {
+    "capacidad": "Tabla DTE / ancla anti-doble-emisión (claim en vuelo, uuid, folio, estado)",
+    "ga_ref": "wasabil_dte/models.py:52-107 (WasabilDte + UniqueConstraint despacho/factura + en_vuelo_desde)",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe",
+    "impacto": "CRITICO",
+    "esfuerzo": "MEDIO",
+    "nota": "La tabla actual NO se puede reutilizar: sus FKs apuntan a despachos.id y cont_factura_cliente.id (models.py:71-73), que son tablas de Grupo AM. Monza necesita su propia tabla (monza_wasabil_dte) con FKs a monza_despachos.id y monza_cont_factura_cliente.id, con el mismo candado único por despacho/factura y el claim en_vuelo. Sin esto no hay protección anti doble emisión."
+   },
+   {
+    "capacidad": "Cliente HTTP del API Wasabil (crear/estado/obtener documento, buscar cliente por RUT, envelope, errores ambiguo/no-ambiguo)",
+    "ga_ref": "wasabil_dte/client.py:1-290",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe",
+    "impacto": "ALTO",
+    "esfuerzo": "BAJO",
+    "nota": "Es la pieza MÁS reutilizable: casi todo es agnóstico de marca. Solo _headers() (client.py:65-71) está clavado al token único. Se puede compartir tal cual parametrizando el token por empresa, o duplicar. buscar_cliente_por_rut resuelve el client_id del receptor desde la ficha de Wasabil — clave para Monza (ver receptor SII)."
+   },
+   {
+    "capacidad": "Service de armado de guía de despacho 52 (líneas, IVA half-up, nombre 25 chars, referencia 801, claim, serialize)",
+    "ga_ref": "wasabil_dte/service.py:122-331 (armar_lineas/armar_guia/cuadratura/serialize_dte)",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe",
+    "impacto": "CRITICO",
+    "esfuerzo": "MEDIO",
+    "nota": "armar_lineas() lee DespachoItem.item_cotizacion + precios_por_item de Grupo AM; para Monza hay que reescribir el mapeo a MonzaDespachoItem (qty_despachada, item_id) + MonzaCotizacionItem.precio_unitario_clp (neto por unidad, SÍ existe → factible). El resto (IVA 19% half-up, tope 25 chars, tipos de traslado) es reutilizable casi literal."
+   },
+   {
+    "capacidad": "Service de armado de factura electrónica 33 (líneas persistidas, descuento de anticipo como %, referencias OC+guía+anticipos)",
+    "ga_ref": "wasabil_dte/service.py:334-528 (armar_factura/armar_lineas_factura/armar_referencias_factura)",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "Emite desde la factura local congelada. Para Monza la fuente sería MonzaContFacturaClienteItem (monza_contabilidad/models.py:83). La lógica de descuento de anticipo como discount % y las referencias 33 son portables, pero dependen de que Monza tenga folios SII de guía/anticipo referenciables (ver 801 y receptor)."
+   },
+   {
+    "capacidad": "Router de emisión de GUÍAS: preview / emitir / estado / reintentar / estado-batch + candado empresa",
+    "ga_ref": "wasabil_dte/router.py:401-627 (endpoints) + :61 dependencies require_empresa('mineria')",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe",
+    "impacto": "CRITICO",
+    "esfuerzo": "ALTO",
+    "nota": "Es el corazón del flujo (lock FOR UPDATE, reclamar emisión, actualizar desde Wasabil, protocolo issue=False→confirmación→issue=True). Portar a Monza con candado require_empresa('automotriz') (patrón ya usado en monza_contabilidad/router.py:87) y sobre modelos Monza. Depende de la tabla DTE Monza y del contexto OC (ver 801)."
+   },
+   {
+    "capacidad": "Router de emisión de FACTURAS 33: preview / emitir / estado / reintentar",
+    "ga_ref": "wasabil_dte/router.py:961-1123 (preview_factura_sii/emitir_factura_sii/estado/reintentar) + _receptor_factura:707 + _payment_method:752",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe",
+    "impacto": "ALTO",
+    "esfuerzo": "ALTO",
+    "nota": "Incluye resolución de receptor por RUT, referencia a guía SII de la factura y a facturas de anticipo, y bloqueo si hay guía electrónica en vuelo. Portar sobre MonzaContFacturaCliente. Depende del receptor SII de Monza (rut nullable) y de que las guías se emitan primero."
+   },
+   {
+    "capacidad": "Referencia 801 a la OC del cliente (N° + FECHA de la OC)",
+    "ga_ref": "service.py:170-211 (armar_guia references 801 con fecha_oc) + parse_fecha_oc:78; OcCliente con fecha_oc en Grupo AM",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_models.py:260 (oc_cliente String(100), solo el número; NO hay fecha_oc)",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "GAP de datos que bloquea el port directo: la referencia 801 del SII exige N° Y fecha de la OC. Grupo AM tiene la entidad OcCliente con fecha (parche 'OC obligatoria'). Monza solo guarda oc_cliente como texto/número en la cotización, sin fecha. Hay que agregar columna fecha_oc (y N° obligatorio) y capturarla en la venta Monza antes de poder emitir."
+   },
+   {
+    "capacidad": "Receptor SII completo (RUT + giro + dirección + comuna del cliente)",
+    "ga_ref": "client.buscar_cliente_por_rut:175-189 → client_id; router.py:707 _receptor_factura",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_models.py:14 (MonzaCliente.rut NULLABLE; sin giro/direccion/comuna)",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "Grupo AM manda clientId y Wasabil autocompleta razón/giro/dirección/comuna desde su ficha. Monza puede seguir el mismo camino SOLO si sus clientes están dados de alta en la cuenta Wasabil de Monza y con RUT válido — pero MonzaCliente.rut es nullable y no hay giro/dirección/comuna. Riesgo: emitir con receptor incompleto lo rechaza el SII. Requiere RUT obligatorio para clientes facturables + alta en Wasabil (o cargar giro/dirección/comuna en Monza)."
+   },
+   {
+    "capacidad": "Candado anti-huérfano en Despachos: una guía electrónica viva bloquea anular/pisar el despacho",
+    "ga_ref": "routers/despachos.py:23-26 (import wasabil) + :263-275 _guia_electronica_activa (guard)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_despachos.py (sin ninguna referencia a DTE/guía electrónica)",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "Sin este guard, un despacho de Monza con guía SII ya emitida (folio legal) podría anularse/pisarse dejando el DTE huérfano. Hay que agregar en monza_router_despachos.py los mismos bloqueos que Grupo AM al anular/editar/re-despachar cuando existe un DTE en estado emitido/procesando/pendiente."
+   },
+   {
+    "capacidad": "Cableado del módulo en main.py (montaje del router)",
+    "ga_ref": "main.py:28,89 (import wasabil_dte_router + include_router prefix /api)",
+    "estado_monza": "ausente",
+    "monza_ref": "main.py:71-104 (monta routers Monza; ninguno de emisión SII)",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "Trivial una vez exista el router Monza: agregar import + include_router (idealmente bajo el flag MONZA_CONTAB_ENABLED, junto a monza_contabilidad, config.py:14)."
+   },
+   {
+    "capacidad": "Init_db standalone del módulo (crea la tabla DTE + columnas/índices nuevos)",
+    "ga_ref": "wasabil_dte/init_db.py:1-46",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "Patrón ya conocido en Monza (cada módulo trae su init_db). Portar creando la tabla monza_wasabil_dte. Debe correrse en deploy ANTES de reiniciar."
+   },
+   {
+    "capacidad": "Frontend: botón 'Emitir guía SII' + modal 2 pasos (preview→confirmar) + badge estado + reintentar (estado-batch)",
+    "ga_ref": "frontend-src/src/pages/DespachosPage.tsx:346-359,405-444,585-626 (EmitirGuiaSIIModal inline + wasabilAPI.estadoBatch)",
+    "estado_monza": "ausente",
+    "monza_ref": "frontend-src/src/pages/MonzaDespachosPage.tsx (sin wasabil/emitir SII)",
+    "impacto": "ALTO",
+    "esfuerzo": "ALTO",
+    "nota": "MonzaDespachosPage no tiene ningún cableado de emisión. Portar el modal de 2 pasos (previsualizar con problemas bloqueantes → confirmar issue=true), el badge de estado por despacho, el botón reintentar y el estado-batch, más un monzaWasabilAPI en el services/api de Monza. Respetar el protocolo de seguridad (borrador primero, nunca emitir sin confirmación explícita)."
+   },
+   {
+    "capacidad": "Frontend: emisión de FACTURA 33 desde Facturas/Ventas-Contab",
+    "ga_ref": "wasabil_dte/router.py:961-1123 consumido desde FacturasPage/VentasContabPage (Grupo AM)",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe (MonzaFacturasPage crea factura con folio manual)",
+    "impacto": "ALTO",
+    "esfuerzo": "ALTO",
+    "nota": "Hoy Monza teclea el folio SII a mano al crear la factura (schemas.py:28). Reemplazar por el flujo preview/emitir 33 que devuelve el folio real desde Wasabil, con estado y reintento, análogo a las guías."
+   },
+   {
+    "capacidad": "Identidad del emisor en config (razón social/RUT/giro/dirección)",
+    "ga_ref": "N/A en wasabil_dte (Grupo AM toma el emisor de su cuenta Wasabil)",
+    "estado_monza": "presente",
+    "monza_ref": "monza_models.py:320-323 (MonzaConfig razon_social='MonzaParts SpA', rut_empresa='78.121.316-0', direccion, giro)",
+    "impacto": "BAJO",
+    "esfuerzo": "BAJO",
+    "nota": "Monza YA tiene la identidad del emisor en su config, pero para Wasabil el emisor lo define la CUENTA/token, no el ERP: es informativo. Sirve para textos/PDF locales, no reemplaza la necesidad de la cuenta Wasabil de Monza."
+   }
+  ]
+ },
+ {
+  "area": "despachos_flujo (Despachos + Bodega)",
+  "resumen": "Monza tiene el ANDAMIAJE base del flujo, portado como \"alineación MachParts\" pero en el modelo single-step ANTIGUO que Grupo AM ya superó. Presente: recepción física por embarque (abrir/marcar/cerrar) con los mismos 6 estados y foto obligatoria para dañados; despacho como entidad (MonzaDespacho/Item) que voltea la cotización a \"despachado\"; y la firma de guía (informativa) via monza_contabilidad. Lo que FALTA es toda la capa de endurecimiento que Grupo AM construyó encima. Dos brechas son CRÍTICAS y están acopladas: (1) la regla \"qty RECIBIDA gobierna\" (tope físico min(vendido,recibido)−despachado) — Monza NUNCA consulta qty_recibida al despachar, así que puede entregar más de lo que Bodega recibió y qty_recibida queda como dato muerto; (2) la recepción parcial PARTICIONADA en el cierre — Monza manda la línea ENTERA a reclamo cuando el estado no está en A_BODEGA ('faltante' no lo está), dejando indespachable lo que SÍ llegó (exactamente el bug que Grupo AM corrigió). Además faltan: despacho parcial por cantidad (Monza siempre despacha la línea completa), ciclo de vida en_preparacion→cerrar→anular (Monza nace \"despachado\", irreversible), N° de expedición, guards de guía SII 52 (dependen de Wasabil, inexistente en Monza) y el blindaje de concurrencia (0 locks/retry; la Fase 1 c4bd1b4 solo blindó cobranzas/adelantos, no tocó despachos ni bodega). Recomendación de secuencia: portar juntos tope físico + cierre particionado + despacho parcial (van de la mano) y recién ahí el blindaje de concurrencia se vuelve obligatorio.",
+  "capacidades": [
+   {
+    "capacidad": "Recepción física por embarque: abrir → marcar ítem × ítem → cerrar, con los 6 estados de recepción y foto obligatoria para dañados (baseline ya alineado)",
+    "ga_ref": "routers/bodega.py:250-273 (iniciar), 365-421 (marcar), 547-669 (cerrar), 359-362 (ESTADOS_VALIDOS), 407-412 (foto dañado)",
+    "estado_monza": "presente",
+    "monza_ref": "monza_router_bodega.py:24 (ESTADOS_RECEP), 88-99 (recibir), 143-162 (marcar), 166-207 (cerrar), 148-151 (foto dañado)",
+    "impacto": "BAJO",
+    "esfuerzo": "BAJO",
+    "nota": "El andamiaje está portado; la brecha NO es este flujo sino la LÓGICA de cierre parcial que Grupo AM le agregó encima. Diferencia menor: Monza guarda fotos en MonzaDocumento genérico (entidad='recepcion_item'), Grupo AM en RecepcionItemFoto dedicado con endpoint de upload propio."
+   },
+   {
+    "capacidad": "Regla 'qty RECIBIDA gobierna': tope físico de despacho = min(vendido, recibido)−ya_despachado, sumando recepciones de embarque cerradas + nacionales",
+    "ga_ref": "routers/despachos.py:197-260 (_qty_recibida_utilizable + _tope_fisico), aplicado en detalle 557,574 y en creación 745,758-766",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_despachos.py:188 (solo filtra estado_linea=='en_bodega', sin consultar qty_recibida)",
+    "impacto": "CRITICO",
+    "esfuerzo": "ALTO",
+    "nota": "Monza despacha la cantidad VENDIDA completa sin mirar cuánto recibió Bodega → puede entregar/facturar más de lo físicamente recibido. Hoy qty_recibida se registra en la recepción pero NO se consume aguas abajo (dato muerto). Acoplado a las caps de despacho parcial y cierre particionado."
+   },
+   {
+    "capacidad": "Recepción parcial PARTICIONADA al cerrar: lo que llegó queda en bodega DESPACHABLE (topeado por qty_recibida) y solo el faltante REAL va a reclamo",
+    "ga_ref": "routers/bodega.py:603-652 (rama 'faltante' con recibida>0 parte la línea; 'completo' con menos unidades genera reclamo del faltante)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_bodega.py:25 (A_BODEGA sin 'faltante'), 184-195 (línea ENTERA a 'reclamo' si el estado no está en A_BODEGA)",
+    "impacto": "CRITICO",
+    "esfuerzo": "ALTO",
+    "nota": "En Monza 'faltante' NO está en A_BODEGA: la llegada parcial manda TODA la línea a reclamo y lo que SÍ llegó queda indespachable. Es literalmente el bug que Grupo AM corrigió ('Antes la línea ENTERA caía a reclamo y lo recibido quedaba indespachable'). Sin la cap de tope físico, además, no habría cómo despachar lo parcial aunque se marcara en_bodega."
+   },
+   {
+    "capacidad": "Reclamo del faltante REAL acumulando lo recibido en recepciones previas (una línea repartida en 2 embarques o una reposición NO genera reclamo fantasma)",
+    "ga_ref": "routers/bodega.py:581-588 (recibido_previo vía _qty_recibida_utilizable), 620-622 (faltante_pendiente = vendido − (previo + esta recepción)), 630-631,639-640",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_bodega.py:189-194 (qty_afectada = qty_danada or it.cantidad, sin comparar contra lo ya recibido)",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "Monza no acumula recepciones anteriores: cada cierre evalúa la línea en aislamiento → una reposición o una línea en 2 embarques reclamaría mercadería que ya está en bodega. Depende de portar _qty_recibida_utilizable a Monza."
+   },
+   {
+    "capacidad": "'completo' con MENOS unidades que lo vendido → reclamo del faltante real (no se pierde el faltante sin traza)",
+    "ga_ref": "routers/bodega.py:624-631",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_bodega.py:184-186 (estado en A_BODEGA → en_bodega, sin comparar recibida vs cantidad)",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "Monza con 'completo' pasa a bodega y jamás compara qty_recibida contra la cantidad vendida: si llegaron menos unidades, el faltante desaparece sin reclamo. Requiere comparar recibida vs cantidad (ya se registra qty_recibida)."
+   },
+   {
+    "capacidad": "Despacho PARCIAL por cantidad: qty_despachada por línea con validación de disponible; la línea pasa a 'despachado' solo al quedar cubierta completa, el remanente sigue en bodega",
+    "ga_ref": "routers/despachos.py:95-97 (DespachoItemIn.qty_despachada), 747-770 (validación disponible), 922-940 (flip solo si cubierto por cerrados)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_despachos.py:199-201 (qty_despachada = it.cantidad or 1; marca el ítem despachado de inmediato)",
+    "impacto": "ALTO",
+    "esfuerzo": "ALTO",
+    "nota": "Monza permite ELEGIR qué ítems despachar (item_ids) pero cada uno sale por su cantidad COMPLETA; no hay despacho parcial de una línea ni remanente. Va de la mano con el tope físico y la cobertura acumulada."
+   },
+   {
+    "capacidad": "Ciclo de vida del despacho: estado 'en_preparacion' (borrador) → cerrar (→'despachado', voltea línea/embarque) → anular (con reversa de línea y de embarque a 'en_bodega')",
+    "ga_ref": "routers/despachos.py:781 (nace en_preparacion), 874-990 (cerrar + auto-transición embarque), 1035-1113 (anular + reversa defensiva embarque)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_despachos.py:196 (estado='despachado' al crear); no existen endpoints cerrar ni anular",
+    "impacto": "ALTO",
+    "esfuerzo": "ALTO",
+    "nota": "El despacho de Monza nace confirmado e irreversible: no hay borrador ni forma de corregir un despacho errado (anular). Sin cerrar/anular tampoco cabe la cobertura por 'solo cerrados' ni la reversa del estado de embarque."
+   },
+   {
+    "capacidad": "Flujo guía-primero: crear el despacho SIN N° de guía y completar transportista / N° guía / expedición DESPUÉS (PUT de cabecera), incluso con el despacho ya cerrado",
+    "ga_ref": "routers/despachos.py:100-118 (DespachoCreate/Update opcionales), 849-871 (PUT update de cabecera post-cierre)",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_router_despachos.py:173-181 (numero_guia/transportista opcionales al crear), sin endpoint PUT para editarlos después",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "Monza acepta crear sin guía (campos opcionales), pero al ser single-step no hay ciclo en_preparacion ni forma de completar/corregir transportista, guía o expedición después (el courier suele dar el N° tras el despacho)."
+   },
+   {
+    "capacidad": "Guía firmada por el cliente como RESPALDO obligatorio (archivo validado en disco) y condición para facturar esos ítems",
+    "ga_ref": "routers/despachos.py:993-1032 (firmar: archivo OBLIGATORIO + _exists_in_docs + requiere estado 'despachado')",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_contabilidad/router.py:398-423 (marcar_guia_firmada); columnas guia_firmada/_archivo en monza_despachos via monza_contabilidad/init_db.py:87-96",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "Monza SÍ registra guía firmada, pero informativa: archivo OPCIONAL, sin validar que el archivo exista y explícitamente 'NO es requisito para facturar' (router.py:405-406). Grupo AM la exige con archivo y la usa como gate de facturación. Evaluar si el gate aplica al negocio automotriz."
+   },
+   {
+    "capacidad": "N° de expedición de la guía (dato del courier compartido por los ítems, se completa tras el despacho)",
+    "ga_ref": "routers/despachos.py:104,114 (numero_expedicion), editable post-cierre 861-869",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_models.py:491-504 (MonzaDespacho sin columna numero_expedicion)",
+    "impacto": "BAJO",
+    "esfuerzo": "BAJO",
+    "nota": "Falta la columna en monza_despachos y exponerla en la edición de cabecera. Cae junto con la cap de flujo guía-primero (PUT)."
+   },
+   {
+    "capacidad": "Guards de guía electrónica SII 52 VIVA: bloquear anular el despacho o pisar el N° de guía a mano cuando hay DTE emitido/en vuelo (el N° correcto es el folio del SII)",
+    "ga_ref": "routers/despachos.py:263-312 (_guia_electronica_activa, _rechazar_si_pisa_folio), aplicado en update 866, firmar 1010, anular 1058-1070",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe (Monza no tiene paquete wasabil_dte ni emisión de guías 52)",
+    "impacto": "ALTO",
+    "esfuerzo": "ALTO",
+    "nota": "PREREQUISITO externo: depende de portar todo Wasabil DTE a Monza (hoy inexistente). Sin emisión SII no hay folio que proteger, pero apenas exista, estos guards son indispensables para no dejar guías tributarias huérfanas / doble emisión."
+   },
+   {
+    "capacidad": "Blindaje de concurrencia en despacho: FOR UPDATE sobre ítems, retry del correlativo DSP ante IntegrityError, retry 1213/1205 al cerrar, populate_existing en lecturas bloqueantes",
+    "ga_ref": "routers/despachos.py:145-166 (con_lock), 693-711 (retry correlativo), 726-738 (FOR UPDATE items), 880-890 (retry deadlock cerrar)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_despachos.py:183-213 (crear sin lock; 0 with_for_update/populate_existing/retry en todo el archivo)",
+    "impacto": "MEDIO",
+    "esfuerzo": "MEDIO",
+    "nota": "La Fase 1 (c4bd1b4) blindó cobranzas/adelantos, NO despachos ni bodega. Hoy el riesgo es acotado (sin partial, dos despachos de la misma línea chocan en el filtro en_bodega), pero el correlativo DSP y el doble-despacho siguen expuestos; al portar partial+tope físico se vuelve OBLIGATORIO — hacerlo en el mismo lote."
+   },
+   {
+    "capacidad": "Anti-sobredespacho, rechazo de líneas de ítem duplicadas y validación de pertenencia del ítem a la OC",
+    "ga_ref": "routers/despachos.py:721-770 (ítems repetidos, no-pertenece-a-OC, qty ≤ disponible)",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_router_despachos.py:188 (solo filtra en_bodega; no valida repetidos ni cantidades)",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "Monza previene el re-despacho porque un ítem ya despachado deja de estar en_bodega, pero no valida cantidades ni líneas duplicadas (irrelevante mientras despache full). Se vuelve obligatorio al introducir despacho parcial."
+   },
+   {
+    "capacidad": "Guard de integridad en recepción: rechazar marcar ítems sobre una recepción CERRADA y rechazar qty_recibida negativa",
+    "ga_ref": "routers/bodega.py:373-381 (rec no encontrada/cerrada + qty<0), 433-441",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_bodega.py:143-162 (marcar_item nunca carga MonzaRecepcion para verificar estado; no valida qty negativa)",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "En Monza se pueden escribir ítems sobre una recepción ya cerrada (el upsert es por recepcion_id+item_id sin chequear estado) y aceptar cantidades negativas. Fix chico de alto valor de integridad."
+   },
+   {
+    "capacidad": "Cierre de recepción FORZADO (forzar=true) con reclamo TRAZABLE 'no_llego' para ítems sin marcar (no quedan atascados invisibles)",
+    "ga_ref": "routers/bodega.py:542-544 (forzar), 571-579, 603-616 (ítem sin marcar → reclamo_proveedor trazable)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_bodega.py:196-197 (si hay pendientes → HTTP 400, sin escape ni traza)",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "Monza bloquea el cierre por completo si falta marcar algún ítem; no hay salida ni forma de dejar traza del ítem que no llegó. El comportamiento por defecto (bloquear) es seguro, pero pierde la escotilla que Grupo AM necesitó en operación real."
+   },
+   {
+    "capacidad": "Post-cierre de recepción: evaluar cada OC-Cliente y notificar a Ventas cuando queda LISTA para despacho, o alertar plazo crítico (≤3 días)",
+    "ga_ref": "routers/bodega.py:666-734 (_evaluar_ocs_cliente), 815-845 (listo-para-despachar), 848-900 (alertas-plazo-critico)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_bodega.py:205-206 (solo notifica reclamos al cerrar; sin evaluación de OC lista ni plazo crítico)",
+    "impacto": "MEDIO",
+    "esfuerzo": "MEDIO",
+    "nota": "Factible en Monza usando MonzaCotizacion.fecha_entrega_est (monza_models.py:257) para el plazo. Existe /listos en despachos (cotizaciones con ítems en_bodega) que cubre parte de 'listo-para-despachar', pero no hay alerta de plazo crítico ni notificación automática al cerrar la recepción."
+   },
+   {
+    "capacidad": "Vista OC en Despachos con barra de avance, buckets de pipeline (pendiente/en_compras/en_transito/en_bodega/despachado/reclamo), disponibilidad por ítem y días restantes por plazo",
+    "ga_ref": "routers/despachos.py:57-91 (_STATE_BUCKETS/_item_deadline), 315-413 (_serialize_oc_card), 452-533 (oc-clientes por tab listas/en_curso/historial), 536-690 (detalle con deadline/dias)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_despachos.py:46-102 (lista plana de cotizaciones 'despachado'), 148-170 (/listos sin barra/buckets/plazos)",
+    "impacto": "MEDIO",
+    "esfuerzo": "ALTO",
+    "nota": "Monza lista cotizaciones despachadas y 'listos' de forma plana, sin barra de avance, buckets de estado ni plazos por ítem. SOLAPA fuerte con el trabajo G15 de Ventas-Contab; coordinar para no duplicar el cálculo de avance/por_facturar."
+   },
+   {
+    "capacidad": "Historial de embarques ya recepcionados o despachados (separado de los pendientes de recepción)",
+    "ga_ref": "routers/bodega.py:161-206 (/embarques/historial)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_bodega.py:69-84 (solo /embarques a recibir; sin endpoint de historial)",
+    "impacto": "BAJO",
+    "esfuerzo": "BAJO",
+    "nota": "Monza solo expone embarques pendientes de recibir; no hay vista de historial de recepciones cerradas/despachadas. Operativo/cosmético."
+   }
+  ]
+ },
+ {
+  "area": "ventas_contab",
+  "resumen": "Monza tiene el ESQUELETO completo de Ventas—Contabilidad y de facturación (listado por cotización vendida/despachada con resumen de cobranza, detalle con ítems+guías+facturas, aging de cartera 0-30/31-60/61-90/91+, factoring, cobranzas, borrado seguro, KPIs, y un adelanto simple verificado por Contabilidad), y hasta un modo que Grupo AM NO tiene aquí: 'Retiro en oficina / sin_guia' (facturar el saldo de la venta sin despacho). PERO le falta TODO el desglose G15 y varias piezas de facturación de Grupo AM. Lo central ausente: (1) 'por facturar' con base FÍSICA — el _resumen_cobranza de Monza (monza_contabilidad/service.py:182) solo devuelve facturado/cobrado/por_cobrar del saldo de facturas EMITIDAS; nunca calcula la mercadería vendida aún sin facturar; (2) la barra de avance de la plata de la OC (cobrado/facturado sin cobrar/por facturar); (3) mercaderia_pendiente_clp y anticipo_por_descontar_clp; (4) la tabla de ítems plegada >10 con buscador; (5) el bloque 'Facturas de la OC' con desglose; (6) preview de factura (fuente única lo-que-ves-es-lo-que-emites); (7) validación de RUT con dígito verificador + razón social obligatoria al emitir (hoy Monza emite con RUT nulo en silencio); (8) factura de anticipo (doc 33 sin guía + descuento automático). La página MonzaVentasContabPage.tsx quedó congelada en la versión pre-G15 (Jul 16) mientras VentasContabPage.tsx de Grupo AM recibió el rediseño G15 (Jul 19). Buena noticia para el port: como los ítems Monza ya traen precio_unitario_clp/subtotal congelados (TC congelado), la 'base física' es MÁS simple de portar que en Grupo AM (no hay que llamar a pricing_service). Notas de diseño deliberado (NO portar sin decisión de negocio): Monza factura una guía 'despachado' SIN exigir firma (en Grupo AM la firma es obligatoria), y el adelanto de Monza es único por venta y la ORDEN la da Tesorería (Ventas quedó solo-lectura), no el ciclo informar/editar/anular/múltiples de Grupo AM.",
+  "capacidades": [
+   {
+    "capacidad": "por_facturar_clp con base FÍSICA: mercadería vendida aún sin facturar (Σ qty pendiente × precio vigente) − anticipo por descontar. La REGLA DE ORO del G15 (jamás total-vivo − brutos congelados).",
+    "ga_ref": "backend/routers/contabilidad.py:476 (_mercaderia_pendiente_bruto) + 853-856 (listado) + 967-981 (detalle)",
+    "estado_monza": "ausente",
+    "monza_ref": "backend/monza_contabilidad/service.py:182 (_resumen_cobranza sólo devuelve facturado/cobrado/por_cobrar, nunca 'por facturar')",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "Es la pieza insignia del G15: saber cuánta plata de la venta AÚN no llegó a factura. En Monza es más simple que en GA: los ítems ya traen precio_unitario_clp/subtotal_clp congelados (TC congelado), así que no hace falta pricing_service — basta Σ(cantidad − facturada)×precio_unit del ítem, prorrateado, sobre los MonzaContFacturaClienteItem. Requiere agregar el campo a _resumen_cobranza y calcular qty_facturada_por_item (ya existe helper en router.py:117)."
+   },
+   {
+    "capacidad": "Barra de avance de la plata de la OC: ▓ cobrado · ▒ facturado sin cobrar · ░ por facturar, con nota del anticipo.",
+    "ga_ref": "frontend-src/src/pages/VentasContabPage.tsx:274 (AvanceOc) + contabilidad.py:958-981",
+    "estado_monza": "ausente",
+    "monza_ref": "frontend-src/src/pages/MonzaVentasContabPage.tsx:222 (sólo un footer estático Neto/IVA/Total; la tarjeta muestra 'Por cobrar' en la línea 150 pero no 'por facturar')",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "Depende de por_facturar_clp (fila anterior). Es puro frontend una vez que el backend expone el campo. Patrón 'Estado de Avance' ya usado en Despachos."
+   },
+   {
+    "capacidad": "mercaderia_pendiente_clp: cifra autoritativa de la mercadería físicamente sin facturar (evita que el frontend la reconstruya como por_facturar + anticipo y sobredeclare con clamp).",
+    "ga_ref": "backend/routers/contabilidad.py:981 (detalle_venta)",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "Va junto con por_facturar_clp en el mismo endpoint detalle_venta (monza_contabilidad/router.py:279). Sin factura de anticipo en Monza, mercaderia_pendiente == por_facturar hasta que exista la vía B."
+   },
+   {
+    "capacidad": "anticipo_por_descontar_clp: neto de facturas de anticipo aún no descontado en facturas del despacho real, en bruto, para explicar la brecha entre 'mercadería sin facturar' y 'por facturar'.",
+    "ga_ref": "backend/routers/contabilidad.py:713 (_anticipos_pendientes_de_descuento) + 962-977",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe",
+    "impacto": "MEDIO",
+    "esfuerzo": "ALTO",
+    "nota": "BLOQUEADO por la falta de factura de anticipo en Monza (ver fila 'Factura de anticipo'). El adelanto de Monza hoy sólo entra como cobranza medio='adelanto' (vía A), que NO necesita este campo. Sólo aplica si se porta la vía B."
+   },
+   {
+    "capacidad": "Tabla de ítems PLEGADA sobre umbral (>10) con buscador por N° parte / descripción / marca (anti-muro en OCs grandes).",
+    "ga_ref": "frontend-src/src/pages/VentasContabPage.tsx:420-475 (UMBRAL_TABLA_PLEGADA=10 + filtro)",
+    "estado_monza": "ausente",
+    "monza_ref": "frontend-src/src/pages/MonzaVentasContabPage.tsx:184-205 (renderiza SIEMPRE la tabla completa; sin colapso ni buscador por ítem)",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "Puro frontend. El buscador del tope de MonzaVentasContabPage (línea 308) es sólo del LISTADO de ventas, no de los ítems dentro del detalle."
+   },
+   {
+    "capacidad": "Bloque 'Facturas de la OC' expandible con sus ítems/cobranzas y la nota de 'por facturar'.",
+    "ga_ref": "frontend-src/src/pages/VentasContabPage.tsx:302-353 (FacturasDeOc)",
+    "estado_monza": "parcial",
+    "monza_ref": "frontend-src/src/pages/MonzaVentasContabPage.tsx:197-199 (sólo muestra el N° de factura por ítem en la tabla) — el backend YA devuelve las facturas serializadas en monza_contabilidad/router.py:366",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "El dato ya viaja del backend (detalle_venta incluye 'facturas'); falta el componente de UI que las liste con desglose. Trabajo mayormente de frontend."
+   },
+   {
+    "capacidad": "'Por facturar' agrupado por estado logístico: etiquetas que responden POR QUÉ un ítem aún no se factura (en tránsito, en bodega, etc.).",
+    "ga_ref": "frontend-src/src/pages/VentasContabPage.tsx:249-273 + 355 (agrupación por estado logístico)",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe (el dato item.estado_linea SÍ viaja en el detalle, monza_contabilidad/router.py:347; el pipeline ORDER_LINEA existe en monza_router_ventas.py:71)",
+    "impacto": "MEDIO",
+    "esfuerzo": "MEDIO",
+    "nota": "Monza ya tiene estado_linea por ítem y un orden de pipeline; falta mapearlo a etiquetas y agrupar en la UI. Frontend + quizá pequeño ajuste de labels."
+   },
+   {
+    "capacidad": "Preview de factura antes de emitir con fuente ÚNICA de verdad (lo que se previsualiza es exactamente lo que se emite): líneas derivadas, receptor, neto/IVA/bruto, problemas/advertencias.",
+    "ga_ref": "backend/routers/contabilidad.py:1368 (_construir_factura) + 1714 (POST /facturas/preview); frontend FacturasPage.tsx (previewFactura)",
+    "estado_monza": "ausente",
+    "monza_ref": "backend/monza_contabilidad/router.py:524 (crear_factura arma las líneas INLINE, sin builder compartido ni endpoint preview); no hay previewFactura en frontend-src/src/services/monzaApi.ts:24",
+    "impacto": "MEDIO",
+    "esfuerzo": "MEDIO",
+    "nota": "En GA el preview es doblemente valioso porque muestra el receptor real de Wasabil; en Monza (sin SII) su valor es sobre todo UX/seguridad. Requiere extraer un _construir_factura compartido desde crear_factura."
+   },
+   {
+    "capacidad": "Completitud de datos al emitir: validación de RUT con dígito verificador + razón social obligatoria; permite completar RUT/razón social faltantes en el modal y los guarda en la venta.",
+    "ga_ref": "backend/routers/contabilidad.py:173-190 (_rut_saneado/_rut_canonico/_rut_valido) + 1378-1404",
+    "estado_monza": "ausente",
+    "monza_ref": "backend/monza_contabilidad/router.py:698-699 (snapshotea cli.nombre/cli.rut SIN validar; FacturaCreate en schemas.py:17 no acepta rut_cliente/razon_social override)",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "Hoy Monza puede emitir una factura con RUT nulo o inválido en silencio si el MonzaCliente no lo tiene. Es requisito de datos correctos ANTES de cualquier futura emisión SII (Wasabil) de Monza. Portar los 3 helpers de RUT + campos de override en el schema y el modal."
+   },
+   {
+    "capacidad": "Factura de ANTICIPO (doc 33 sin guía) que respalda el adelanto ante el SII y genera línea de descuento negativa automática en las facturas del despacho real (vía B).",
+    "ga_ref": "backend/routers/contabilidad.py:1242 (FacturaCreate.es_anticipo) + 713 (_anticipos_pendientes_de_descuento) + 1368 (descuento en _construir_factura)",
+    "estado_monza": "ausente",
+    "monza_ref": "backend/monza_contabilidad/schemas.py:17 (FacturaCreate sin es_anticipo); monza_contabilidad sólo aplica el adelanto como cobranza automática (router.py:189 _aplicar_adelanto, vía A)",
+    "impacto": "MEDIO",
+    "esfuerzo": "ALTO",
+    "nota": "Solapa con el área de Adelantos. Monza HOY resuelve el adelanto sólo por vía A (cobranza medio='adelanto'), que funciona. La vía B (factura formal de anticipo + descuento) sólo hace falta si clientes Monza exigen boleta/factura de anticipo. Alto esfuerzo (toca modelos, schema, builder de factura y descuentos)."
+   },
+   {
+    "capacidad": "Precios CONGELADOS de la guía electrónica (52) al construir la factura, para que la factura cuadre con lo enviado al SII y no recalcule con la config del día.",
+    "ga_ref": "backend/routers/contabilidad.py:1315-1365 (_precios_congelados_guia)",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe",
+    "impacto": "BAJO",
+    "esfuerzo": "BAJO",
+    "nota": "BLOQUEADO/N-A: depende de wasabil_dte, que no existe en Monza. Además Monza ya factura al precio congelado del ítem (TC congelado), así que el riesgo que esto mitiga en GA no aplica hoy. Sólo relevante si Monza incorpora emisión SII."
+   },
+   {
+    "capacidad": "Adelantos: ciclo completo informar/listar/editar/anular, VARIOS por venta y tope Σ adelantos ≤ total de la venta.",
+    "ga_ref": "backend/routers/contabilidad.py:1089-1207 (informar/listar/editar/anular) + 1068 (_validar_tope_adelantos)",
+    "estado_monza": "parcial",
+    "monza_ref": "backend/monza_contabilidad/router.py:426 (verificar_adelanto: ÚNICO por cotización, con tope monto≤total en línea 451; sin editar/anular/múltiples)",
+    "impacto": "MEDIO",
+    "esfuerzo": "ALTO",
+    "nota": "DIFERENCIA DE DISEÑO DELIBERADA (ver memoria): en Monza la ORDEN del adelanto la da Tesorería y Ventas quedó solo-lectura; hay 1 adelanto por venta. No es un simple 'falta portar': decidir con el dueño si Monza quiere el modelo multi-adelanto de GA o conserva el suyo. Solapa con las áreas adelantos/tesorería."
+   },
+   {
+    "capacidad": "Emisión de una guía 'despachado' EXIGE guía firmada por el cliente (gate anti-facturar-sin-entrega).",
+    "ga_ref": "backend/routers/contabilidad.py:1439-1441 (bloquea si estado!='despachado' o no guia_firmada)",
+    "estado_monza": "parcial",
+    "monza_ref": "backend/monza_contabilidad/router.py:594 (sólo exige estado 'despachado'; la firma es OPCIONAL/registrable, marcar_guia_firmada en router.py:398)",
+    "impacto": "BAJO",
+    "esfuerzo": "BAJO",
+    "nota": "DIVERGENCIA DELIBERADA documentada (monza_contabilidad/router.py:11-12 y schemas.py:61): Monza factura sin exigir firma a propósito. NO portar el gate sin una decisión de negocio; incluido sólo para que el roadmap no lo trate como bug."
+   },
+   {
+    "capacidad": "Badge/estado SII (DTE) por factura y PDF en el listado de facturas (relación 1:1 factura↔DTE).",
+    "ga_ref": "backend/routers/contabilidad.py:1278-1280 (_dtes_de_facturas) + _serialize_factura(dte=...)",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe (monza_contabilidad/service.py:108 _serialize_factura no trae DTE)",
+    "impacto": "BAJO",
+    "esfuerzo": "MEDIO",
+    "nota": "BLOQUEADO por la falta de wasabil_dte en Monza — pertenece al área Wasabil DTE. Sólo tendrá sentido cuando Monza emita al SII."
+   }
+  ]
+ },
+ {
+  "area": "oc_cliente",
+  "resumen": "Monza NO tiene la OC de cliente como entidad: el \"Cierre de Venta\" es un PATCH genérico sobre la cotización (monza_router_cotizaciones.py:312) que setea estado=\"vendida\", fija fecha_venta y avanza los ítems cotizado→por_comprar. oc_cliente es solo una columna String(100) OPCIONAL en MonzaCotizacion (monza_models.py:260), desacoplada del cierre y editable sin candados. Grupo AM, en cambio, tiene OcCliente como entidad de primera clase con N° obligatorio, idempotencia, edición ex-post protegida por rol/empresa y guard de guía SII viva (routers/compras.py:515 y :589). GAPS reales: obligatoriedad del N° OC al cerrar (ALTO), candado rol/empresa en la edición (MEDIO), idempotencia/anti re-venta del cierre (MEDIO), guard de documento SII (ausente pero DEPENDIENTE de portar Wasabil a Monza). El TC congelado YA existe en Monza (config_snapshot en la cotización) y NO es gap; el flip de ítems al vender SÍ está presente y equivale a \"marcar cerrado\".",
+  "capacidades": [
+   {
+    "capacidad": "OC de cliente como entidad de primera clase (tabla OcCliente + endpoint de creación, listado y descarga Excel, referenciable desde despachos/facturas)",
+    "ga_ref": "routers/compras.py:515",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_models.py:260",
+    "impacto": "MEDIO",
+    "esfuerzo": "MEDIO",
+    "nota": "Monza guarda oc_cliente como String(100) nullable directamente en MonzaCotizacion (monza_models.py:260). NO hay tabla OcCliente, ni endpoint crear/listar/Excel, ni FK desde despachos/facturas hacia una OC. Sí existe MonzaOcProveedor (OC al proveedor, monza_models.py:371), que es otra cosa. Toda la trazabilidad de la OC del cliente descansa en un texto libre."
+   },
+   {
+    "capacidad": "N° OC del cliente OBLIGATORIO al cerrar la venta (backend rechaza 400 + frontend con campo marcado con asterisco)",
+    "ga_ref": "routers/compras.py:524",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_router_cotizaciones.py:319",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "El cierre Monza (PATCH estado='vendida', monza_router_cotizaciones.py:319) NO pide ni valida oc_cliente. El modal 'Cerrar venta' solo captura condición de pago y confirmarVenta envía estado+pct_adelanto+forma_pago sin oc_cliente (MonzaCotizacionesPage.tsx:163-167). oc_cliente se ingresa aparte, opcional e inline (MonzaVentasPage.tsx:96). GA en cambio bloquea el cierre sin N° OC en backend (compras.py:524) y en front (CierreVentaPage.tsx:316,595). Sin OC obligatoria la venta queda sin referencia del cliente para guía/factura."
+   },
+   {
+    "capacidad": "Cierre idempotente / anti-duplicado (reintento del cierre NO duplica la OC ni re-vende; devuelve la existente)",
+    "ga_ref": "routers/compras.py:529",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_router_cotizaciones.py:312",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "GA es idempotente por cotización: si ya hay OC la devuelve sin duplicar (compras.py:529-535) + debounce en el front. En Monza update_cotizacion (monza_router_cotizaciones.py:312) no toma FOR UPDATE ni bloquea re-marcar 'vendida'; fecha_venta solo se fija una vez (línea 319) pero el resto del cierre puede reejecutarse. No hay OC que duplicar, pero tampoco control del cierre. FASE 1 (c4bd1b4) NO tocó este path (solo cobranzas/adelantos/factoring)."
+   },
+   {
+    "capacidad": "Edición ex-post de la OC con candado de rol/empresa + validación de asesor (existe/activo/misma empresa, distingue null explícito)",
+    "ga_ref": "routers/compras.py:589",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_router_cotizaciones.py:317",
+    "impacto": "MEDIO",
+    "esfuerzo": "MEDIO",
+    "nota": "oc_cliente se puede editar en Monza vía el PATCH genérico model_dump(exclude_none=True) (monza_router_cotizaciones.py:317), abierto a cualquier usuario autenticado, SIN require_empresa('automotriz') ni require_rol; asesor_id ni siquiera figura en CotUpdate. GA restringe el PUT a comercial/contabilidad/admin de la empresa correcta (compras.py:584-587) y valida el asesor (compras.py:620-638). Además Monza no revalida que el N° OC editado quede no-vacío."
+   },
+   {
+    "capacidad": "Guard de documento legal SII vivo al editar N°/fecha de la OC (409 si una guía 52 emitida/en emisión referencia esa OC)",
+    "ga_ref": "routers/compras.py:643",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe",
+    "impacto": "BAJO",
+    "esfuerzo": "MEDIO",
+    "nota": "Monza NO tiene Wasabil DTE (no emite guías 52 ni facturas 33), así que HOY no hay documento SII que desincronizar y el guard no aplica. Es un gap DEPENDIENTE: cuando se porte Wasabil a Monza habrá que replicar el 409 de GA (compras.py:643-666) para bloquear cambios de N°/fecha de OC con guía viva. Impacto BAJO hoy, sube a ALTO al portar Wasabil."
+   },
+   {
+    "capacidad": "Marca los ítems como cerrados al cerrar la venta (arranca el pipeline de abastecimiento)",
+    "ga_ref": "routers/compras.py:550",
+    "estado_monza": "presente",
+    "monza_ref": "monza_router_cotizaciones.py:321",
+    "impacto": "BAJO",
+    "esfuerzo": "BAJO",
+    "nota": "Equivalente funcional presente: al vender, Monza avanza estado_linea de 'cotizado' a 'por_comprar' (monza_router_cotizaciones.py:321-324), lo que dispara Abastecimiento. GA hace lo análogo pasando ItemCotizacion de 'ingresado' a 'cerrado' (compras.py:550-553). NO es gap."
+   }
+  ]
+ },
+ {
+  "area": "Adelantos de clientes",
+  "resumen": "Monza tiene SOLO la Vía A (adelanto informado por Comercial vía columna pct_adelanto → Tesorería/Contabilidad lo verifica en 1 registro MonzaContAdelanto único por cotización → al emitir la factura se aplica como cobranza automática medio='adelanto'). Esa vía funciona y está blindada en concurrencia (fase 1, c4bd1b4). Lo que le FALTA a Monza es toda la Vía B de Grupo AM: la factura de ANTICIPO (es_anticipo=1, sin guía de despacho firmada) que respalda el adelanto ante el SII, y el DESCUENTO AUTOMÁTICO (línea negativa) que esa factura de anticipo genera en las facturas del despacho real para no cobrar dos veces, más el flujo del excedente. En Monza esos tres conceptos NO existen en ningún archivo (grep vacío de es_anticipo/factura_anticipo/descuento). Además la máquina de estados de Grupo AM (informado→aprobado→anulado, múltiples adelantos por OC, editar/anular) está reducida en Monza a un único registro sin estado; y faltan varios endurecimientos de la aplicación (guard de factoring vigente, cap por saldo, aplicación retroactiva a facturas ya existentes al aprobar). El lado de conciliación bancaria (abono↔adelanto, exclusión de medio='adelanto') sí está portado a Monza.",
+  "capacidades": [
+   {
+    "capacidad": "Vía A: adelanto verificado se aplica automáticamente como cobranza medio='adelanto' al emitir la factura (descuenta saldo; monto_aplicado soporta facturación parcial y evita doble aplicación)",
+    "ga_ref": "routers/contabilidad.py:614 (_aplicar_adelantos_pendientes); tesoreria/router.py:407 (aprobar_adelanto)",
+    "estado_monza": "presente",
+    "monza_ref": "monza_contabilidad/router.py:189 (_aplicar_adelanto), :727 (llamada en crear_factura)",
+    "impacto": "CRITICO",
+    "esfuerzo": "BAJO",
+    "nota": "Núcleo del adelanto: presente y ya endurecido en concurrencia (fase 1). No es gap. Diferencia menor: Monza aplica sólo desde crear_factura; ver capacidad de aplicación retroactiva."
+   },
+   {
+    "capacidad": "Vía B: factura de ANTICIPO (es_anticipo=1) — documento que respalda el adelanto ante el SII SIN exigir guía de despacho firmada (única excepción a la regla 'sin guía no hay factura')",
+    "ga_ref": "models/models.py:532 (es_anticipo); routers/contabilidad.py:1627 (_construir_factura_anticipo); :1242 (FacturaCreate.es_anticipo/monto_neto_anticipo/adelanto_ids)",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe (grep es_anticipo/_construir_factura_anticipo en monza_* = vacío; MonzaContFacturaCliente no tiene columna es_anticipo, models.py:26)",
+    "impacto": "ALTO",
+    "esfuerzo": "ALTO",
+    "nota": "Es la mitad faltante del módulo. Requiere: columna es_anticipo en monza_cont_factura_cliente, rama de construcción de factura de anticipo, schema de emisión (monto_neto_anticipo, adelanto_ids), y ligar el adelanto a esa factura. Sin esto no hay forma de facturar el 50% al SII antes de despachar."
+   },
+   {
+    "capacidad": "Descuento AUTOMÁTICO en la factura final: línea negativa que referencia el folio de la factura de anticipo, para que Σ facturas de la venta == total y el cliente NO pague dos veces",
+    "ga_ref": "routers/contabilidad.py:713 (_anticipos_pendientes_de_descuento), :1540-1573 (bloque de descuentos en _construir_factura); models/models.py:572 (ContFacturaClienteItem.anticipo_factura_id)",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe (MonzaContFacturaClienteItem no tiene anticipo_factura_id, models.py:83; grep 'descuento anticipo' = vacío)",
+    "impacto": "ALTO",
+    "esfuerzo": "ALTO",
+    "nota": "Depende de la Vía B. Sin el descuento, emitir una factura de anticipo y luego facturar el despacho completo cobraría dos veces. Incluye el guard: anticipo sin folio SII bloquea la factura del despacho (contabilidad.py:1558)."
+   },
+   {
+    "capacidad": "Flujo del EXCEDENTE del adelanto ligado (adelanto > bruto de su factura de anticipo): una vez saldado el anticipo, el sobrante rebaja las facturas del despacho real (misma regla que Vía A)",
+    "ga_ref": "routers/contabilidad.py:659-687 (anticipos_saldados + rama de excedente en _aplicar_adelantos_pendientes)",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe (Monza no tiene factura de anticipo ni el concepto de excedente ligado)",
+    "impacto": "MEDIO",
+    "esfuerzo": "MEDIO",
+    "nota": "Depende de Vía B. Cerrado en Grupo AM por enjambre (commit 38e1594). Sólo relevante una vez que exista la factura de anticipo en Monza."
+   },
+   {
+    "capacidad": "Máquina de estados explícita del adelanto (informado → aprobado → anulado) y MÚLTIPLES adelantos por una misma venta",
+    "ga_ref": "models/models.py:632-653 (ContAdelanto.estado, sin UNIQUE por OC); routers/contabilidad.py:1089 (informar), :1140 (editar), :1184 (anular)",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_contabilidad/models.py:130-137 (MonzaContAdelanto con UNIQUE(cotizacion_id), SIN columna estado; la existencia del registro = 'verificado')",
+    "impacto": "MEDIO",
+    "esfuerzo": "ALTO",
+    "nota": "Monza modela 1 solo adelanto por venta y sin estados: 'informar' es la columna pct_adelanto al cerrar, y 'verificar/aprobar' crea el registro. No hay editar-lo-informado ni anular. Migrar exige soltar el UNIQUE + columna estado + endpoints; alto riesgo sobre datos vivos."
+   },
+   {
+    "capacidad": "Comercial informa monto esperado / % con tope Σ adelantos (no anulados) + nuevo ≤ total de la venta",
+    "ga_ref": "routers/contabilidad.py:1033 (AdelantoInformarIn), :1068 (_validar_tope_adelantos), :1102-1110 (deriva monto desde pct)",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_router (pct_adelanto se fija al cerrar la cotización; monza_models.py:246); tope en verificar_adelanto sólo 'monto ≤ total_bruto' (monza_contabilidad/router.py:451)",
+    "impacto": "MEDIO",
+    "esfuerzo": "MEDIO",
+    "nota": "Monza sólo guarda un % y valida contra el total; no hay 'monto esperado' informado como registro editable ni suma de varios adelantos (porque sólo admite uno). Suficiente para el caso 50% típico, insuficiente para varios anticipos parciales."
+   },
+   {
+    "capacidad": "Aprobación por Tesorería (la orden la da Tesorería, sin exigir cartola) — registra monto/fecha/banco/N° operación y destraba el flujo",
+    "ga_ref": "tesoreria/router.py:407 (aprobar_adelanto)",
+    "estado_monza": "presente",
+    "monza_ref": "monza_tesoreria/router.py:318 (aprobar_adelanto) — misma regla; también existe la gemela en Contabilidad monza_contabilidad/router.py:426 (verificar_adelanto)",
+    "impacto": "ALTO",
+    "esfuerzo": "BAJO",
+    "nota": "Presente y en sync entre Tesorería y Contabilidad. En Monza el cortafuego de Abastecimiento (bloquea comprar si pct_adelanto>0 sin verificar) exige que se apruebe antes de avanzar."
+   },
+   {
+    "capacidad": "Al APROBAR el adelanto, se aplica de inmediato a las facturas que YA existen de la venta (no sólo a las futuras)",
+    "ga_ref": "tesoreria/router.py:463-472 (loop _aplicar_adelantos_pendientes sobre facturas existentes, anticipos primero)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_tesoreria/router.py:318-362 y monza_contabilidad/router.py:426-477 — aprobar/verificar sólo registra el adelanto; la aplicación ocurre SÓLO en crear_factura (:727)",
+    "impacto": "BAJO",
+    "esfuerzo": "BAJO",
+    "nota": "Gap real pero mitigado: el cortafuego de Abastecimiento impide que existan facturas antes de verificar el adelanto, así que en el camino normal la factura siempre viene después. Sólo mordería si se aprueba un adelanto tarde sobre una venta ya facturada."
+   },
+   {
+    "capacidad": "Guard: NO aplicar el adelanto a una factura con factoring VIGENTE (su saldo es la retención del factor, no deuda del cliente)",
+    "ga_ref": "routers/contabilidad.py:636-638 (_factoring_bloqueado en _aplicar_adelantos_pendientes)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_contabilidad/router.py:189-213 (_aplicar_adelanto no consulta factoring)",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "Endurecimiento faltante. En Monza, si una factura ya está cedida a factoring y luego entra un adelanto, lo aplicaría contra un saldo que es retención del factor. Poco probable en el orden normal, pero es un cruce de plata sin candado."
+   },
+   {
+    "capacidad": "Cap de la aplicación por el SALDO actual de la factura (convive con cobranzas manuales previas), no por el bruto total",
+    "ga_ref": "routers/contabilidad.py:678-690 (lee cobranzas bajo lock, saldo = bruto − pagado, aplica min(pendiente, saldo))",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_contabilidad/router.py:203 (aplica min(pendiente, factura.monto_bruto) — usa BRUTO, no saldo)",
+    "impacto": "BAJO",
+    "esfuerzo": "BAJO",
+    "nota": "En el camino normal (aplica en crear_factura, factura recién creada → saldo==bruto) no falla. Pero si alguna vez se aplicara sobre una factura con cobranza previa, sobrescribiría el tope. Endurecimiento menor a alinear con Grupo AM."
+   },
+   {
+    "capacidad": "Revertir la cobranza de adelanto devuelve el monto a monto_aplicado (con lock) para poder re-aplicar / re-aprobar",
+    "ga_ref": "routers/contabilidad.py (eliminar_cobranza revierte monto_aplicado; invariante monto_aplicado == Σ cobranzas 'adelanto')",
+    "estado_monza": "presente",
+    "monza_ref": "monza_contabilidad/router.py:842-848 (eliminar_cobranza: si medio='adelanto' resta de monto_aplicado bajo lock)",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "Presente y verificado en la fase 1 de concurrencia (test_concurrencia_plata revertir 2 cobranzas en paralelo)."
+   },
+   {
+    "capacidad": "Cobranzas medio='adelanto' se EXCLUYEN de la conciliación bancaria de ingresos (no son depósito nuevo; la plata se cruza abono↔adelanto)",
+    "ga_ref": "tesoreria/router.py:20-23 (exclusión documentada + derivación abono↔cont_adelanto)",
+    "estado_monza": "presente",
+    "monza_ref": "monza_tesoreria/router.py:725, :808, :908, :999 (filter medio != MEDIO_ADELANTO); cruce abono↔adelanto en la cola de aprobaciones :318",
+    "impacto": "ALTO",
+    "esfuerzo": "BAJO",
+    "nota": "Portado (commit 279ee7a). No es gap: el lado de tesorería/conciliación del adelanto está completo en Monza."
+   },
+   {
+    "capacidad": "Bloqueo de anular/editar un adelanto ya aplicado o ya conciliado con el banco (integridad del cruce)",
+    "ga_ref": "routers/contabilidad.py:1200-1203 (anular); tesoreria/router.py:441-444 (aprobar)",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_contabilidad/router.py:454-463 y monza_tesoreria/router.py:342-348 (re-verificar bloqueado si aplicado o conciliado)",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "Los guards de 'ya aplicado' y 'ya conciliado' existen en Monza para re-verificar. Falta el endpoint de ANULAR como tal (Monza no tiene estado 'anulado'); corregir un adelanto mal informado se hace re-verificando, no anulando."
+   }
+  ]
+ },
+ {
+  "area": "compras_nacionales",
+  "resumen": "El área de Compras Nacionales de Grupo AM (paquete backend/recepcion_nacional/ + la porción nacional de compras_contab/) está COMPLETAMENTE AUSENTE en Monza: ninguna de sus capacidades existe, ni parcial. El modelo de abastecimiento de Monza asume 100% importación: monza_oc_proveedor no tiene columna tipo_origen (moneda default EUR, campos awb/tracking), y monza_recepciones.embarque_id es NOT NULL (monza_models.py:471), es decir NO existe recepción sin embarque — el único camino de recepción es monza_router_bodega.py:96 que crea MonzaRecepcion(embarque_id=emb_id). El pipeline Monza es rígido: comprar → preparar → logística(embarque) → bodega(recepción por embarque) → despacho, sin ninguna vía nacional que salte el embarque. En compras/CxP, MonzaContCompra solo admite origen MANUAL|EMBARQUE con punteros a embarque; no tiene oc_proveedor_id, no existe MonzaContCompraItem (sin costo por ítem) y CompraCreate no lleva items. El frontend MonzaComprasPage.tsx no tiene modo nacional. Consecuencia práctica: hoy una compra a proveedor chileno en Monza NO tiene domicilio — no se puede recibir (recepción exige embarque), no se puede costear por ítem, y no capa físicamente el despacho (monza_router_despachos.py no tiene ningún tope por recibido). Portar el área es un trabajo NET-NEW en espejo de recepcion_nacional + la rebanada nacional de compras_contab + el UNION en despachos + el guard anti-embarque + el modo nacional del front. Impacto global MEDIO-ALTO, condicionado a la pregunta de negocio: ¿Monza compra repuestos en Chile? Si es solo importación EUR, el gap es tolerable; si compra local, es bloqueante. Recomiendo confirmar la necesidad con el dueño antes de dimensionar la fase.",
+  "capacidades": [
+   {
+    "capacidad": "Distinción OC nacional vs internacional (columna oc_proveedor.tipo_origen='nacional'|'internacional', default internacional). Es el enabler foundacional: separa el camino nacional (recepción sin embarque) del internacional (embarque) y gatilla todos los guards.",
+    "ga_ref": "recepcion_nacional/router.py:187 (valida tipo_origen); recepcion_nacional/init_db.py crea la columna via ALTER idempotente; recepcion_nacional/README.md:30",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_models.py:371 (MonzaOcProveedor sin tipo_origen; moneda default EUR, awb/tracking → asume importación)",
+    "impacto": "ALTO",
+    "esfuerzo": "BAJO",
+    "nota": "Es solo una columna + índice, pero sin ella nada del flujo nacional puede distinguirse. Monza no tiene ningún concepto de OC nacional; toda OC nace 'internacional' implícitamente."
+   },
+   {
+    "capacidad": "Libro de recepción física SIN embarque (tablas recepcion_nacional + recepcion_nacional_item): registra 'cuánto llegó' por ítem cuando el camión del proveedor nacional entrega su guía de despacho, con entregas parciales sucesivas = filas nuevas, sin clonar líneas ni forzar reclamos.",
+    "ga_ref": "recepcion_nacional/models.py:33 (RecepcionNacional) y :63 (RecepcionNacionalItem)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_models.py:468 (MonzaRecepcion.embarque_id NOT NULL en :471 → recepción SIEMPRE ligada a embarque); monza_router_bodega.py:96 (única creación de recepción, exige emb_id)",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "Es el corazón del área. En Monza hoy una compra nacional NO se puede recibir sin inventar un embarque falso. La MonzaRecepcion de bodega es un modelo distinto (por embarque), no reutilizable tal cual."
+   },
+   {
+    "capacidad": "API de recepción nacional: registrar entrega (POST), cerrar recepción abierta, pendientes por recibir de la OC (remanente = vendido − Σ recibido), listar y detalle. Backend autoridad: valida pertenencia a la OC, que la OC sea nacional, y no confía en el cliente para el tope.",
+    "ga_ref": "recepcion_nacional/router.py:168 (registrar), :262 (cerrar), :404 (pendientes), :452 (listar), :465 (detalle)",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe (no hay paquete monza_recepcion_nacional ni endpoint /recepcion-nacional)",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "Router completo a portar en espejo. El endpoint /pendientes es la fuente del modal 'Registrar entrega nacional'."
+   },
+   {
+    "capacidad": "Anulación segura de recepción con reversa direccionalmente segura + guards concurrentes: abierta→borra sin guardas; cerrada→409 si dejaría el tope por debajo de lo ya despachado o costeado (hay que anular esos documentos aguas abajo primero), si es segura revierte en_bodega→comprado. Locks FOR UPDATE en orden canónico id ASC + retry ante deadlock (1213/1205).",
+    "ga_ref": "recepcion_nacional/router.py:286 (anular) y :295-400 (_anular_recepcion_tx con serialización anti write-skew); :75 (_con_retry_deadlock)",
+    "estado_monza": "ausente",
+    "monza_ref": "no existe",
+    "impacto": "MEDIO",
+    "esfuerzo": "MEDIO",
+    "nota": "El endurecimiento de concurrencia (ronda G13 en GA) es parte inseparable de portar bien; sin él la anulación puede desacotar el tope físico bajo carga."
+   },
+   {
+    "capacidad": "Integración de lo recibido nacional al TOPE FÍSICO de Despachos: UNION aditivo que suma Σ qty_recibida utilizable (recepción cerrada) al dict por item_cotizacion_id, de modo que para un ítem nacional el tope baja de 'todo lo vendido' a min(vendido, recibido). Impide despachar/facturar más de lo que el proveedor entregó (regla de oro G6).",
+    "ga_ref": "routers/despachos.py:232-240 (import + UNION dentro de _qty_recibida_utilizable, línea 197); recepcion_nacional/README.md:14-21",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_despachos.py (sin ningún tope por recibido: grep de recibid/tope/min/qty_recibida no arroja nada)",
+    "impacto": "ALTO",
+    "esfuerzo": "MEDIO",
+    "nota": "Depende de que Monza tenga primero un tope físico en despachos (área bodega-despachos, fuera de mi scope). Si Monza aún despacha contra lo vendido sin tope por recibido, este UNION no tiene dónde engancharse: es una dependencia de secuenciación entre fases."
+   },
+   {
+    "capacidad": "Transición de estado del ítem comprado→en_bodega al cerrar la recepción, SIN pasar por preparado/embarcado (un ítem nacional nunca entra al pipeline de embarque). Solo avanza desde 'comprado' para no retroceder un ítem ya despachado.",
+    "ga_ref": "recepcion_nacional/router.py:94-123 (_cerrar) y :46 (_ESTADOS_ITEM_RECIBIBLES = comprado, en_bodega)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_abastecimiento.py:288 (preparar solo hace comprado→preparado hacia Logística/embarque; no hay salto nacional comprado→en_bodega)",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "En Monza el estado_linea del ítem solo avanza por la vía de embarque; falta la máquina de estado nacional. Verificar el vocabulario de estado_linea de MonzaCotizacionItem al portar."
+   },
+   {
+    "capacidad": "Guard anti-embarque: un ítem asignado a una OC nacional es rechazado (400) por TODOS los caminos que lo meterían a un embarque (preparar / preparar-parcial / agregar a pre-embarque), con mensaje que redirige a 'Registrar entrega nacional'. Backend autoridad: ni una llamada directa al API los cuela.",
+    "ga_ref": "routers/compras.py::_rechazar_items_nacionales (documentado en recepcion_nacional/README.md:115-127)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_router_abastecimiento.py:288 (preparar no filtra por tipo_origen); no existe el concepto",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "Sólo tiene sentido una vez que exista tipo_origen y el flujo nacional; protege contra que un ítem nacional se contamine con el pipeline internacional."
+   },
+   {
+    "capacidad": "Costo por ítem de compra nacional (tabla cont_compra_item): la factura ES el costo del repuesto (neto en CLP, sin prorrateo; el IVA es crédito fiscal y NO capitaliza). Alta con líneas por ítem y guards: A) doble costeo internacional (ítem con emb_pricing_item)→409, B) doble costeo nacional en otras compras activas, C) Σ cantidad costeada ≤ recibido nacional utilizable → 409, bajo lock.",
+    "ga_ref": "compras_contab/models.py:180 (ContCompraItem); compras_contab/router.py:288 (_crear_items_costeo) y :335-379 (guards A/B/C); schemas.py:24 (CompraItemIn), :63 (items)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_compras_contab/models.py (no existe MonzaContCompraItem); monza_compras_contab/schemas.py:28 (CompraCreate sin items ni oc_proveedor_id)",
+    "impacto": "MEDIO",
+    "esfuerzo": "ALTO",
+    "nota": "En GA la rentabilidad quedó DIFERIDA por el dueño (README recepcion_nacional:95-102), y cont_compra_item es la BASE de esa rentabilidad futura. Para Monza es igual de diferible: portarlo tiene sentido solo si se quiere costo unitario nacional. Es la pieza más pesada del área."
+   },
+   {
+    "capacidad": "Enlace compra↔OC nacional (cont_compra.oc_proveedor_id) + catálogo de OC nacionales costeables (endpoint /compras-contab/oc-nacionales) que por ítem entrega cantidad vendida, recibido nacional utilizable y ya_costeado (disponible a costear).",
+    "ga_ref": "compras_contab/models.py:107 (cont_compra.oc_proveedor_id); compras_contab/router.py:641 (oc_nacionales)",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_compras_contab/models.py:54 (MonzaContCompra sin oc_proveedor_id, solo embarque_id/emb_pricing_gasto_id); router sin endpoint oc-nacionales",
+    "impacto": "MEDIO",
+    "esfuerzo": "MEDIO",
+    "nota": "Es el pegamento que conecta la compra nacional con su OC y alimenta el selector del front. Va junto con cont_compra_item."
+   },
+   {
+    "capacidad": "Frontend: modo NACIONAL en la página de Compras (toggle gasto|nacional, selector de OC nacional, líneas de costo por ítem con tope 'disponible a costear', fuerza cuenta Existencias/COGS + CLP + IVA no capitaliza).",
+    "ga_ref": "frontend-src/src/compras-contab/ComprasContabPage.tsx:83-106 (origenTipo, esNacional, ocNacionales); api.ts:134 (ocNacionales); types.ts:141-159 (OcNacional)",
+    "estado_monza": "ausente",
+    "monza_ref": "frontend-src/src/pages/MonzaComprasPage.tsx (solo origen MANUAL|EMBARQUE; grep de 'nacional' en todo frontend-src/src solo matchea archivos GA compras-contab, ninguno Monza)",
+    "impacto": "MEDIO",
+    "esfuerzo": "MEDIO",
+    "nota": "El front de Monza (MonzaComprasPage) es más simple que el de GA (que ya tiene modo nacional). Portar la UI implica también portar api.ts/types.ts nacionales."
+   }
+  ]
+ },
+ {
+  "area": "embarques_tesoreria",
+  "resumen": "Tesorería está prácticamente a la par: la conciliación bancaria de 3 vías (cargo↔egreso / abono↔cobranza / abono↔adelanto), el flujo de caja NIC 7, el blindaje de concurrencia FASE 1 (locks with_for_update, recuperación de carrera por IntegrityError) y las exclusiones clave (medio='adelanto', facturas factorizadas) YA están portados y calzan casi línea por línea (monza_tesoreria/router.py:742-975 espeja tesoreria/router.py:812-1066). Infra transversal: READ COMMITTED vive en database.py COMPARTIDO (cubre Monza automáticamente) y el fix de /register vive en routers/auth.py COMPARTIDO (cubre ambas marcas) — NINGUNO es gap. Los gaps REALES están en tres frentes: (1) dos mejoras de Embarques Pricing que Grupo AM recibió DESPUÉS del port de Monza y nunca se replicaron — peso editable por ítem (AUSENTE en Monza) y N° AWB separado del adjunto (PARCIAL); (2) el FOB real desde factura de proveedor, que Monza no cablea (usa solo el costo estimado de la cotización); y (3) el candado de empresa 'automotriz', que en Monza cubre SOLO los 4 módulos contables y NO los 15 routers operativos — notablemente monza_router_despachos.py queda SIN candado, mientras que en Grupo AM routers/despachos.py sí lo tiene. Hay además un detalle menor de robustez en el desconciliar (Monza no guarda snapshot de fecha/ref previa).",
+  "capacidades": [
+   {
+    "capacidad": "Peso editable por ítem en Embarques Pricing (override manual del peso que gobierna el prorrateo del flete, espejo del override de FOB, con tri-estado auto/manual)",
+    "ga_ref": "embarques_pricing/models.py:100 (peso_origen) + router.py:159-163,457-458,562-586",
+    "estado_monza": "ausente",
+    "monza_ref": "monza_embarques_pricing/models.py:100-102 (solo peso_unit_kg/peso_total_kg, sin peso_origen); router.py:361-364 (ItemOverrideIn solo trae fob_unit/fob_manual)",
+    "impacto": "MEDIO",
+    "esfuerzo": "MEDIO",
+    "nota": "El peso manda el prorrateo del flete internacional. En Monza el peso siempre sale de cot.peso_kg (router.py:120) y NO hay forma de corregir un peso mal cargado en la cotización → el costo landed queda distorsionado sin arreglo posible salvo tocar la cotización. Portar: agregar columna peso_origen (migración/init_db), extender ItemOverrideIn con peso_unit/peso_manual, manejar el override en _build_inputs y persistirlo en _persist_snapshot. Es la tarea G10 de Grupo AM sin replicar."
+   },
+   {
+    "capacidad": "N° AWB/BL escribible, visible y buscable, SEPARADO del archivo adjunto (columna awb_numero indexada, distinta del filename del adjunto)",
+    "ga_ref": "models/models.py:214 (awb_numero indexed) + embarques_pricing/router.py:295,395,407",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_models.py:449,451 (MonzaEmbarque tiene awb + tracking, sin awb_numero indexado); monza_embarques_pricing/router.py:309 (el buscador cubre numero/forwarder/awb, NO tracking)",
+    "impacto": "BAJO",
+    "esfuerzo": "BAJO",
+    "nota": "Grupo AM separó el N° universal de AWB/BL (awb_numero, indexado y buscable en toda la lista de pricing) del adjunto (awb = filename). Monza tiene un campo tracking que parcialmente cumple ese rol pero NO está cableado al buscador del pricing y no es un awb_numero dedicado. Es traza/UX, no plata. Tarea G11 de Grupo AM sin replicar."
+   },
+   {
+    "capacidad": "FOB real por ítem tomado de la factura del proveedor (FOB comprado), con fallback a cotización y luego 0",
+    "ga_ref": "embarques_pricing/router.py:72-127 (_fob_defaults prioriza FacturaProveedorItem.unit_price_usd → cotización → 0)",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_embarques_pricing/router.py:76-89 (_fob_defaults usa SOLO cot.costo; si no hay, 0)",
+    "impacto": "MEDIO",
+    "esfuerzo": "ALTO",
+    "nota": "Grupo AM alimenta el costo landed con el FOB REAL de la factura del proveedor (lo comprado), no el estimado. Monza usa únicamente el costo estimado de la cotización salvo override manual del usuario → el landed puede desviarse del precio efectivamente pagado. Esfuerzo ALTO: depende de cablear la estructura de compras/factura de proveedor de Monza (monza_compras_contab) al pricing; verificar primero que exista el equivalente a FacturaProveedorItem.unit_price_usd por par (ítem, OC)."
+   },
+   {
+    "capacidad": "Candado de empresa ('automotriz') en TODOS los routers Monza, incluidos los operativos y despachos",
+    "ga_ref": "empresa_guard.py (compartido) + routers/despachos.py y routers/compras.py candados con require_empresa('mineria')",
+    "estado_monza": "parcial",
+    "monza_ref": "Candado SOLO en monza_contabilidad/router.py:87, monza_tesoreria/router.py:65, monza_compras_contab/router.py:44, monza_embarques_pricing/router.py:36. SIN candado: monza_router_despachos.py, _ventas, _bodega, _abastecimiento, _logistica, _cotizaciones, _clientes, _config, _catalog, _documentos, _integraciones, _leads, _logs, _notificaciones, _cotizador (15 archivos)",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "empresa_guard.py es compartido y funciona, pero en Monza solo protege los 4 paquetes contables. Asimetría clave: Grupo AM SÍ candó routers/despachos.py y routers/compras.py; Monza dejó monza_router_despachos.py (y todo lo operativo) SIN candado → un usuario 'mineria' con token válido puede pegarle a endpoints operativos de Monza. Es la misma postura diferida que el dueño eligió para los routers operativos de Grupo AM, pero el candado de despachos/compras que Grupo AM sí tiene falta en Monza. Bajo esfuerzo (una dependency por router) pero el dueño históricamente DIFIRIÓ candar routers operativos del programador — confirmar antes."
+   },
+   {
+    "capacidad": "Conciliación bancaria de 3 vías: cargo↔egreso (Compras), abono↔cobranza (Facturas) y abono↔adelanto (cliente), con tolerancia de monto y exclusión de medio='adelanto'",
+    "ga_ref": "tesoreria/router.py:812-907 (conciliar) + 967-993 (cobranzas-pendientes)",
+    "estado_monza": "presente",
+    "monza_ref": "monza_tesoreria/router.py:742-827 (conciliar) + 896-920 (cobranzas-pendientes)",
+    "impacto": "ALTO",
+    "esfuerzo": "BAJO",
+    "nota": "PARIDAD. Mismas 3 ramas, misma tolerancia TOL, misma exclusión de cobranzas medio='adelanto' (para no duplicar el depósito), mismo lock combinado cobranza+factura. No es gap; se confirma que la FASE 1 ya cubrió esto. Solo se lista para dejar constancia de que está verificado."
+   },
+   {
+    "capacidad": "Flujo de caja NIC 7 por buckets de vencimiento, con exclusión de facturas factorizadas (su caja pendiente es la retención, informada aparte)",
+    "ga_ref": "tesoreria/router.py:997-1065 (flujo-caja)",
+    "estado_monza": "presente",
+    "monza_ref": "monza_tesoreria/router.py:924-975 (flujo-caja)",
+    "impacto": "MEDIO",
+    "esfuerzo": "BAJO",
+    "nota": "PARIDAD e incluso Monza agrega 'adelantos_por_aprobar' al flujo. Ambos excluyen estado_pago='factorizada' e informan retenciones de factoring por separado. No es gap."
+   },
+   {
+    "capacidad": "Blindaje de concurrencia del flujo de plata: lecturas de decisión bajo with_for_update, recuperación de carrera por IntegrityError, y auto-creación idempotente del pricing",
+    "ga_ref": "tesoreria/router.py:93,102,835,862,883,903 + embarques_pricing/integration.py:132-135",
+    "estado_monza": "presente",
+    "monza_ref": "monza_tesoreria/router.py:91,99,765,786,804,823 + monza_embarques_pricing/integration.py:118-120",
+    "impacto": "ALTO",
+    "esfuerzo": "BAJO",
+    "nota": "PARIDAD (FASE 1, commit c4bd1b4). Los mismos puntos de decisión de plata leen bajo lock y capturan IntegrityError; ensure_pricing_for_embarque maneja la carrera del UNIQUE embarque_id en ambas marcas. No es gap."
+   },
+   {
+    "capacidad": "READ COMMITTED en el engine (renueva la foto de datos en cada sentencia; cierra la clase de fugas por lecturas viejas bajo REPEATABLE READ)",
+    "ga_ref": "database.py:29-34 (isolation_level='READ COMMITTED')",
+    "estado_monza": "presente",
+    "monza_ref": "database.py (COMPARTIDO — Monza usa el mismo engine/SessionLocal)",
+    "impacto": "ALTO",
+    "esfuerzo": "BAJO",
+    "nota": "database.py es compartido → Monza corre bajo READ COMMITTED automáticamente. NO es gap. Recordatorio de despliegue (no de código): requiere binlog_format ROW/MIXED y reinicio COMPLETO de uvicorn (no --reload) para que ninguna conexión quede con el nivel viejo."
+   },
+   {
+    "capacidad": "Fix del registro público (/register ya no es anónimo; exige usuario autenticado y HEREDA la empresa del creador para que una marca no fabrique cuentas de la otra)",
+    "ga_ref": "routers/auth.py:44-68 (register con current_user + empresa heredada)",
+    "estado_monza": "presente",
+    "monza_ref": "routers/auth.py (COMPARTIDO — Monza autentica con el mismo auth.py)",
+    "impacto": "ALTO",
+    "esfuerzo": "BAJO",
+    "nota": "auth.py es compartido → el fix cubre ambas marcas por igual. NO es gap. El usuario nuevo hereda empresa=getattr(current_user,'empresa') → no se puede saltar el candado de empresa creando cuentas cruzadas."
+   },
+   {
+    "capacidad": "Restauración robusta al desconciliar: snapshot de fecha/ref bancaria previa del egreso (guardado al conciliar) para devolver EXACTAMENTE lo que el operador tenía, incluso si coincidía con el banco",
+    "ga_ref": "tesoreria/models.py:146-147 (fecha_egreso_previa/referencia_egreso_previa) + router.py:845-848,931-934",
+    "estado_monza": "parcial",
+    "monza_ref": "monza_tesoreria/models.py:123 (MonzaTesConciliacion sin columnas de snapshot); router.py:848-851 (heurística: solo nulifica fecha/ref si == mov)",
+    "impacto": "BAJO",
+    "esfuerzo": "BAJO",
+    "nota": "Grupo AM guarda la fecha/ref previa en el enlace de conciliación y la restaura al desconciliar. Monza usa una heurística que nulifica la fecha/ref del egreso solo si coinciden con las del movimiento → caso borde: si el operador había cargado a mano en Compras una fecha/ref que casualmente igualaba la del banco, desconciliar se la borra (pérdida del dato manual). Bajo impacto; portar = 2 columnas + guardar snapshot al conciliar + restaurar al desconciliar."
+   }
+  ]
+ }
+]

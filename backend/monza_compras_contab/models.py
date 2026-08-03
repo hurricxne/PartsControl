@@ -11,6 +11,8 @@ empresa vive en el router).
   monza_cont_egreso         → Comprobante de Egreso: UNA salida real de dinero (puede
                               pagar varias compras) y unidad que se concilia con el banco.
   monza_cont_egreso_detalle → asignación egreso → compra (cuánto pagó a cada compra).
+  monza_cont_compra_item    → costo por ítem de la compra NACIONAL (la factura ES el
+                              costo; espejo de cont_compra_item de Grupo AM).
 
 Se crean con `monza_compras_contab/init_db.py` o con el create_all de main.py.
 Dinero en Numeric (decimal exacto). InnoDB explícito (SELECT ... FOR UPDATE).
@@ -23,6 +25,11 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from database import Base
+# La FK emb_pricing_gasto_id (abajo) exige que monza_emb_pricing_gasto esté en el
+# metadata al CONFIGURAR los mappers: sin este import, cualquier consumidor que
+# importe estas tablas de forma aislada (un test del paquete, un script) muere con
+# NoReferencedTableError según el ORDEN de imports (hallazgo del multienjambre F8).
+import monza_embarques_pricing.models  # noqa: F401  (registra la tabla referenciada)
 
 
 class MonzaContPlanCuenta(Base):
@@ -122,6 +129,11 @@ class MonzaContCompra(Base):
     # (el puntero solo se pierde como traza; origen queda 'EMBARQUE' como marca histórica).
     embarque_id = Column(Integer, ForeignKey("monza_embarques.id", ondelete="SET NULL"), nullable=True, index=True)
     emb_pricing_gasto_id = Column(Integer, ForeignKey("monza_emb_pricing_gasto.id", ondelete="SET NULL"), nullable=True, index=True)
+    # FK suave a la OC-Proveedor (compra nacional): solo pista/filtro de cabecera; el
+    # costo real por ítem vive en monza_cont_compra_item. SET NULL: borrar la OC no borra
+    # la compra. La columna en BD viva la crea monza_compras_contab/init_db (create_all
+    # no altera tablas ya existentes). Espejo de cont_compra.oc_proveedor_id (GA).
+    oc_proveedor_id = Column(Integer, ForeignKey("monza_oc_proveedor.id", ondelete="SET NULL"), nullable=True, index=True)
 
     observaciones = Column(Text, nullable=True)
     usuario_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
@@ -131,6 +143,42 @@ class MonzaContCompra(Base):
     egreso_detalles = relationship("MonzaContEgresoDetalle", back_populates="compra",
                                    cascade="all, delete-orphan")
     cuenta = relationship("MonzaContPlanCuenta", foreign_keys=[cuenta_contable_id])
+    items = relationship("MonzaContCompraItem", back_populates="compra",
+                         cascade="all, delete-orphan")
+
+
+class MonzaContCompraItem(Base):
+    """Costo por ítem de una compra NACIONAL (la factura ES el costo; sin flete-por-peso
+    ni gastos-por-CIF). Espejo conceptual de monza_emb_pricing_item, SIN prorrateo.
+    Costo = NETO de la línea en CLP; el IVA es crédito fiscal recuperable → NO
+    capitaliza (distinto del iva_importacion internacional). La tabla la crea
+    monza_compras_contab/init_db.
+
+    ADAPTACIÓN Monza (vs cont_compra_item de GA): SIN oc_proveedor_item_id — Monza no
+    tiene tabla de asignación; el vínculo ítem↔OC es directo vía
+    MonzaCotizacionItem.oc_proveedor_id (monza_models.py), y la pertenencia se valida
+    contra esa columna en el router."""
+    __tablename__ = "monza_cont_compra_item"
+    __table_args__ = (
+        Index("ix_monza_cont_compra_item_compra", "compra_id"),
+        Index("ix_monza_cont_compra_item_itemcot", "item_cotizacion_id"),
+        {"mysql_engine": "InnoDB"},
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    compra_id = Column(Integer, ForeignKey("monza_cont_compra.id", ondelete="CASCADE"), nullable=False)
+    # Clave de costeo: liga la línea de la factura al repuesto vendido.
+    item_cotizacion_id = Column(Integer, ForeignKey("monza_cotizacion_items.id", ondelete="SET NULL"), nullable=True)
+    oc_proveedor_id = Column(Integer, nullable=True)               # trazabilidad (pista, sin FK dura)
+    numero_parte = Column(String(100), nullable=True)              # snapshot
+    descripcion = Column(String(500), nullable=True)               # snapshot
+    cantidad = Column(Numeric(12, 4), default=0)
+    precio_unit = Column(Numeric(16, 4), default=0)                # neto unit en moneda factura (auditoría)
+    costo_unit_clp = Column(Numeric(16, 2), default=0)             # = precio_unit × compra.tc
+    costo_total_clp = Column(Numeric(16, 2), default=0)            # = cantidad × costo_unit_clp (BASE rentabilidad futura)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    compra = relationship("MonzaContCompra", back_populates="items")
 
 
 class MonzaContEgreso(Base):

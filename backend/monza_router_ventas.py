@@ -68,10 +68,52 @@ def list_ventas(
     }
 
 
-ORDER_LINEA = ["cotizado","por_comprar","comprado","en_transito","por_recibir","en_bodega","despachado"]
+# Vocabulario de SALIDA del badge de la lista de Ventas (las claves de PIPELINE_CFG
+# en MonzaVentasPage.tsx). NO es el vocabulario de estado_linea: el pipeline REAL
+# escribe 'preparado' y 'embarcado', y NUNCA escribe 'en_transito' ni 'por_recibir'
+# (0 filas con esos valores; ver el comentario del KPI en monza_router_abastecimiento).
+ORDER_LINEA = ["cotizado", "por_comprar", "comprado", "en_transito", "por_recibir",
+               "en_bodega", "despachado", "reclamo"]
+
+# BUG VIVO que arregla la Fase 9b: 'preparado' y 'embarcado' NO estaban en la lista,
+# así que caían al `else 0` = "cotizado" y una venta con TODO preparado se mostraba
+# como "Sin abastecer" en Ventas. Con la partición de líneas el síntoma pasaría de
+# esporádico a permanente: el remanente en 'comprado'/'preparado' sería el mínimo de
+# casi todas las ventas partidas. El mapeo espeja _STATE_BUCKETS de
+# monza_router_despachos.py (preparado/embarcado = tramo "volando"), que es la fuente
+# de verdad de los buckets, y traduce al vocabulario que el badge ya conoce.
+_LINEA_A_PIPELINE = {
+    "cotizado": "cotizado",
+    "por_comprar": "por_comprar",
+    "comprado": "comprado",
+    "preparado": "en_transito",     # listo en el proveedor: ya "volando" para Ventas
+    "embarcado": "en_transito",
+    "en_transito": "en_transito",    # valores legados: se toleran, no se escriben
+    "por_recibir": "por_recibir",
+    "en_bodega": "en_bodega",
+    "despachado": "despachado",
+    # 'reclamo' va ÚLTIMO en ORDER_LINEA (igual que en _BUCKET_ORDER de despachos):
+    # solo gana el min cuando TODAS las líneas están en reclamo, así una venta mixta
+    # sigue mostrando la etapa que realmente la está frenando.
+    "reclamo": "reclamo",
+}
+
+
 def _pipeline_estado(items):
-    if not items: return None
-    idxs=[ORDER_LINEA.index(i.estado_linea) if (i.estado_linea in ORDER_LINEA) else 0 for i in items]
+    """Etapa de la venta = la línea MENOS avanzada (lo que la está frenando).
+
+    Un estado desconocido se IGNORA en vez de contarse como "cotizado": ese `else 0`
+    era justamente el bug — un solo valor nuevo arrastraba la venta entera al primer
+    casillero. Si ninguna línea tiene estado reconocible se devuelve None (el front
+    simplemente no pinta el badge)."""
+    if not items:
+        return None
+    idxs = [
+        ORDER_LINEA.index(_LINEA_A_PIPELINE[i.estado_linea])
+        for i in items if i.estado_linea in _LINEA_A_PIPELINE
+    ]
+    if not idxs:
+        return None
     return ORDER_LINEA[min(idxs)]
 
 def _venta_dict(c: MonzaCotizacion) -> dict:

@@ -123,6 +123,67 @@ def _cerrar(db: Session, rec: RecepcionNacional) -> None:
     rec.fecha_cierre = datetime.utcnow()
 
 
+def _avisar_ventas_listas(db: Session, item_ids: list) -> None:
+    """Avisa a Ventas «OC lista para despacho» / «plazo crítico» al cerrar la entrega.
+
+    La vía EMBARQUE ya lo hacía al cerrar la recepción de bodega
+    (`routers/bodega.py::_evaluar_ocs_cliente`, reglas B6/B7) y la vía NACIONAL no:
+    el proveedor chileno entregaba, la OC quedaba completa y Ventas no se enteraba
+    hasta el barrido de las 06:00 del día siguiente (latencia, no pérdida).
+
+    Se REUSA `_evaluar_ocs_cliente_por_items` de `routers.bodega` en vez de duplicar
+    las reglas: ahí viven la idempotencia de 24 h (`crear_notificacion` con `regla=`)
+    y los textos/roles exactos, así que las dos vías no se pueden desincronizar.
+
+    Import LOCAL dentro de la función (mismo patrón que compras_contab →
+    recepcion_nacional): verificado que `routers/bodega.py` NO importa este módulo,
+    así que no hay ciclo.
+
+    SIEMPRE fuera de la transacción (después del commit): `crear_notificacion`
+    commitea por su cuenta. Y envuelto en try/except — un fallo de notificación
+    jamás puede tumbar una recepción que ya está persistida. El `rollback` del
+    except deja la sesión limpia para el `serialize_recepcion` del llamador (sin él,
+    un fallo acá haría reventar con PendingRollbackError una operación exitosa).
+    """
+    if not item_ids:
+        return
+    try:
+        from routers.bodega import _evaluar_ocs_cliente_por_items
+        _evaluar_ocs_cliente_por_items(list(item_ids), db)
+    except Exception:
+        db.rollback()
+
+
+def _costeo_por_item_disponible(db: Session) -> bool:
+    """¿Existe la tabla de costeo por ítem (`cont_compra_item`) en esta base?
+
+    Los módulos satélite pueden no tener su `init_db` corrido en un deploy: MySQL
+    1146 (tabla inexistente) significa que ese módulo JAMÁS registró nada que
+    proteger, así que la comprobación se apaga sola en vez de tumbar la anulación
+    con un 500 (patrón de `monza_router_despachos::_opcional`).
+
+    Se pregunta ACÁ, al principio del endpoint y ANTES de tomar cualquier lock, y no
+    envolviendo la query del guard: ese `db.rollback()` SUELTA los locks del llamador
+    (el de `ItemCotizacion` en orden id ASC que serializa costeo/despachos/anulación),
+    y volver a leer sin lock reabriría exactamente el write-skew que el guard existe
+    para cerrar. Acá el rollback no cuesta nada: todavía no se leyó ni se lockeó nada.
+    """
+    from sqlalchemy.exc import ProgrammingError
+    try:
+        from compras_contab.models import ContCompraItem
+    except ImportError:
+        # Módulo de compras no instalado → no hay costeo que proteger.
+        return False
+    try:
+        db.query(ContCompraItem.id).limit(1).all()
+        return True
+    except ProgrammingError as e:
+        if getattr(getattr(e, "orig", None), "args", [None])[0] == 1146:
+            db.rollback()
+            return False
+        raise
+
+
 def _despachado_por_item(db: Session, item_ids: list) -> dict:
     """{item_cotizacion_id: Σ qty_despachada} de despachos NO anulados. Batch."""
     if not item_ids:
@@ -255,7 +316,14 @@ def _registrar_entrega_tx(payload: RegistrarEntregaIn, db: Session, current_user
         _cerrar(db, rec)
     db.commit()
     db.refresh(rec)
-    return serialize_recepcion(rec)
+    # El payload se arma ANTES de notificar: el aviso commitea por su cuenta y no
+    # puede dejar la sesión en un estado que haga fallar la respuesta de una
+    # recepción que ya quedó guardada.
+    out = serialize_recepcion(rec)
+    if payload.cerrar:
+        _avisar_ventas_listas(db, [ln.item_cotizacion_id for ln, _it, _a in lineas
+                                   if ln.item_cotizacion_id])
+    return out
 
 
 # ─── Cerrar (para una recepción creada 'abierta') ────────────────────────────
@@ -277,9 +345,12 @@ def _cerrar_recepcion_tx(recepcion_id: int, db: Session):
     if rec.estado == "cerrada":
         raise HTTPException(400, "La recepción ya está cerrada")
     _cerrar(db, rec)
+    item_ids = [ri.item_cotizacion_id for ri in rec.items if ri.item_cotizacion_id]
     db.commit()
     db.refresh(rec)
-    return serialize_recepcion(rec)
+    out = serialize_recepcion(rec)
+    _avisar_ventas_listas(db, item_ids)
+    return out
 
 
 # ─── Anular (con reversa direccionalmente segura) ────────────────────────────
@@ -299,6 +370,11 @@ def _anular_recepcion_tx(recepcion_id: int, db: Session, current_user: User):
     esos documentos aguas abajo. Si es segura, revierte 'en_bodega'→'comprado' donde
     ya no quede nada recibido y borra la recepción (CASCADE borra sus líneas)."""
     empresa = empresa_de(current_user)
+    # Antes de tomar el PRIMER lock: ¿está desplegada la tabla de costeo por ítem? Si
+    # no (deploy sin `compras_contab.init_db`), la comprobación de costeo se apaga en
+    # vez de reventar con un 500 en medio de la anulación. Va acá porque su rollback
+    # de rescate soltaría los locks si se preguntara más abajo.
+    costeo_disponible = _costeo_por_item_disponible(db)
     rec = (db.query(RecepcionNacional)
            .filter(RecepcionNacional.id == recepcion_id)
            .with_for_update().first())
@@ -332,16 +408,17 @@ def _anular_recepcion_tx(recepcion_id: int, db: Session, current_user: User):
     # un deadlock residual lo absorbe el retry del endpoint. Nota: un ítem nacional
     # no participa en embarques, así que su tope proviene solo de recepciones
     # nacionales (la parte de embarque del tope compartido es 0 para estos ítems).
-    from compras_contab.models import ContCompra, ContCompraItem
     costeado: dict = {}
-    for iid, cant in (db.query(ContCompraItem.item_cotizacion_id, ContCompraItem.cantidad)
-                      .join(ContCompra, ContCompra.id == ContCompraItem.compra_id)
-                      .filter(ContCompraItem.item_cotizacion_id.in_(item_ids),
-                              ContCompra.empresa == empresa,
-                              ContCompra.anulado.is_(False))
-                      .with_for_update().all()):
-        if iid is not None:
-            costeado[iid] = costeado.get(iid, 0.0) + _f(cant)
+    if costeo_disponible:
+        from compras_contab.models import ContCompra, ContCompraItem
+        for iid, cant in (db.query(ContCompraItem.item_cotizacion_id, ContCompraItem.cantidad)
+                          .join(ContCompra, ContCompra.id == ContCompraItem.compra_id)
+                          .filter(ContCompraItem.item_cotizacion_id.in_(item_ids),
+                                  ContCompra.empresa == empresa,
+                                  ContCompra.anulado.is_(False))
+                          .with_for_update().all()):
+            if iid is not None:
+                costeado[iid] = costeado.get(iid, 0.0) + _f(cant)
     tope_actual: dict = {}
     for iid, qty in (db.query(RecepcionNacionalItem.item_cotizacion_id,
                               RecepcionNacionalItem.qty_recibida)

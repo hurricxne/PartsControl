@@ -201,7 +201,7 @@ def run():
 
     # ── Tope: no facturar más de lo disponible (quedan 6, pedir 7) ──
     rover = client.post("/api/monza/contabilidad/facturas", json={
-        "cotizacion_id": cot_id,
+        "cotizacion_id": cot_id, "numero_factura": f"{MARK}-FOVER",
         "items": [{"item_cotizacion_id": item_id, "despacho_item_id": desp_item_id, "cantidad": 7}],
     })
     check("sobre-facturación 409", rover.status_code == 409, rover.text)
@@ -217,7 +217,7 @@ def run():
     # ── Ya no quedan guías facturables ──
     fac2 = client.get(f"/api/monza/contabilidad/ventas/{cot_id}/despachos-facturables").json()
     check("sin guías facturables tras facturar todo", len(fac2) == 0, fac2)
-    r3 = client.post("/api/monza/contabilidad/facturas", json={"cotizacion_id": cot_id, "despacho_id": desp_id})
+    r3 = client.post("/api/monza/contabilidad/facturas", json={"cotizacion_id": cot_id, "despacho_id": desp_id, "numero_factura": f"{MARK}-F3"})
     check("re-facturar despacho 409", r3.status_code == 409, r3.text)
 
     # ── Cobranzas sobre f1 (476.000) ──
@@ -289,7 +289,7 @@ def run():
     fr = rret.json()
     check("retiro neto = 5×50.000", fr.get("monto_neto") == 250000, fr)
     check("retiro sin guía -> numero_guia None", fr.get("numero_guia") is None, fr)
-    rret2 = client.post("/api/monza/contabilidad/facturas", json={"cotizacion_id": cot_ret, "sin_guia": True})
+    rret2 = client.post("/api/monza/contabilidad/facturas", json={"cotizacion_id": cot_ret, "sin_guia": True, "numero_factura": f"{MARK}-FRET2"})
     check("re-facturar retiro completo -> 409", rret2.status_code == 409, rret2.text)
     # sin_guia es excluyente: combinarlo con despacho → 400
     rmix = client.post("/api/monza/contabilidad/facturas",
@@ -316,6 +316,18 @@ def run():
         return False
     print("=== TODO OK ===")
     return True
+
+
+def test_monza_contabilidad_integration():
+    """Wrapper para pytest (espejo de tesoreria/tests/test_integration.py de GA):
+    sin él la suite era INVISIBLE al gate rutinario 'pytest verde'."""
+    seed()
+    ok = False
+    try:
+        ok = run()
+    finally:
+        cleanup()
+    assert ok, f"fallas: {_fails}"
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ import { fmtClp, fmtDate } from '../utils/format'
 import { tesoreriaAPI } from './api'
 import type {
   Cuenta, Movimiento, EgresoMatch, CobranzaMatch, AdelantoMatch, Destino, Resumen,
-  CompraPorPagar, PorPagarResp, FlujoCaja, Bucket, Adelanto, AprobacionesResp,
+  CompraPorPagar, PorPagarResp, FlujoCaja, Bucket, BucketInfo, Adelanto, AprobacionesResp,
 } from './types'
 
 // ─── Helpers UI ────────────────────────────────────────────────────────────────
@@ -55,6 +55,42 @@ const BUCKET_LABEL: Record<Bucket, string> = {
   d31_60: '31–60 días', d61_mas: '61+ días', sin_fecha: 'Sin fecha',
 }
 const MEDIOS_PAGO = ['transferencia', 'cheque', 'efectivo', 'tarjeta']
+
+// Bancos sugeridos (los que ya usan las cuentas registradas) para TODOS los campos
+// "Banco" de la página, no solo el de la cuenta: escribir "BCI", "Bci" y "B.C.I." en
+// pagos y adelantos rompe cualquier agrupación o búsqueda posterior por banco.
+function BancosDatalist({ id, bancos }: { id: string; bancos: string[] }) {
+  return <datalist id={id}>{bancos.map(b => <option key={b} value={b} />)}</datalist>
+}
+
+// Totales del flujo de caja sumando TODAS las ventanas: sin ellos la pantalla obliga a
+// sumar 6 columnas a mano para saber cuánto hay que pagar y cuánto va a entrar.
+const sumaBuckets = (buckets: Bucket[], filas: Record<Bucket, BucketInfo>): BucketInfo =>
+  buckets.reduce<BucketInfo>((acc, b) => ({
+    monto: acc.monto + (filas[b]?.monto || 0),
+    n: acc.n + (filas[b]?.n || 0),
+  }), { monto: 0, n: 0 })
+const sumaNeto = (buckets: Bucket[], neto: Record<Bucket, number>): number =>
+  buckets.reduce((s, b) => s + (neto[b] || 0), 0)
+
+// Destino de una conciliación en una línea (egreso de Compras / cobranza / adelanto).
+// A nivel de módulo para poder nombrarlo también en el confirm de "Desconciliar".
+const destinoTexto = (d: Destino): string => d.clase === 'egreso'
+  ? `${d.beneficiario || 'egreso'} · ${d.n_compras} gasto${d.n_compras !== 1 ? 's' : ''} · ${fmtClp(d.monto_total_clp)}`
+  : d.clase === 'adelanto'
+    ? `Adelanto ${d.cliente || ''}${d.numero_oc ? ` · OC ${d.numero_oc}` : ''} · ${fmtClp(d.monto)}`
+    : `Factura ${d.numero_factura || d.factura_id} · ${fmtClp(d.monto)}`
+
+// Tarjeta del encabezado. Tipada aparte porque `sub` solo la usan algunas (sin el tipo
+// explícito TS infiere el elemento sin `sub` y no deja leerla).
+interface KpiCard {
+  icon: React.ComponentType<{ className?: string }>
+  label: string
+  value: number
+  color: string
+  money: boolean
+  sub?: string
+}
 
 // ─── Modal: cuenta bancaria ─────────────────────────────────────────────────────
 function CuentaModal({ cuenta, bancos, onClose, onDone }: { cuenta: Cuenta | null; bancos: string[]; onClose: () => void; onDone: () => void }) {
@@ -166,7 +202,7 @@ function MovManualModal({ cuentaId, onClose, onDone }: { cuentaId: number; onClo
 }
 
 // ─── Modal: aprobar pago (Tesorería da la orden) ────────────────────────────────
-function PagoModal({ compras, onClose, onDone }: { compras: CompraPorPagar[]; onClose: () => void; onDone: () => void }) {
+function PagoModal({ compras, bancos, onClose, onDone }: { compras: CompraPorPagar[]; bancos: string[]; onClose: () => void; onDone: () => void }) {
   const [fecha, setFecha] = useState(hoyISO())
   const [medio, setMedio] = useState('transferencia')
   const [banco, setBanco] = useState('')
@@ -217,7 +253,10 @@ function PagoModal({ compras, onClose, onDone }: { compras: CompraPorPagar[]; on
             {MEDIOS_PAGO.map(m => <option key={m} value={m}>{m}</option>)}
           </select>
         </Field>
-        <Field label="Banco"><input className={inputCls} style={inputStyle} value={banco} onChange={e => setBanco(e.target.value)} /></Field>
+        <Field label="Banco">
+          <input className={inputCls} style={inputStyle} list="bancos-pago" value={banco} onChange={e => setBanco(e.target.value)} />
+          <BancosDatalist id="bancos-pago" bancos={bancos} />
+        </Field>
         <Field label="N° operación"><input className={inputCls} style={inputStyle} value={numeroOperacion} onChange={e => setNumeroOperacion(e.target.value)} /></Field>
       </div>
       <Field label="Beneficiario"><input className={inputCls} style={inputStyle} value={beneficiario} onChange={e => setBeneficiario(e.target.value)} placeholder={acreedores.length > 1 ? 'Varios acreedores (opcional)' : ''} /></Field>
@@ -279,8 +318,20 @@ function AdelantoCard({ a, onVincular }: { a: AdelantoMatch; onVincular: () => v
   )
 }
 
+// Total de la venta DERIVADO de lo informado (monto esperado ÷ %). El backend arma
+// monto_esperado = total bruto de la venta × pct / 100 (contabilidad.informar_adelanto),
+// así que la inversa reconstruye ese total. Quien aprueba necesita verlo: sin él lee
+// "esperado $3.000.000 (50%)" sin poder validar que el 50% sea de la venta correcta.
+// null cuando Comercial informó un monto exacto sin % (no hay nada que derivar).
+const totalVentaDerivado = (a: Adelanto): number | null => {
+  const pct = Number(a.pct) || 0
+  const esperado = Number(a.monto_esperado) || 0
+  if (pct <= 0 || pct > 100 || esperado <= 0) return null
+  return Math.round((esperado * 100) / pct)
+}
+
 // ─── Modal: aprobar adelanto (Tesorería confirma la plata recibida) ─────────────
-function AprobarAdelantoModal({ adelanto, onClose, onDone }: { adelanto: Adelanto; onClose: () => void; onDone: () => void }) {
+function AprobarAdelantoModal({ adelanto, bancos, onClose, onDone }: { adelanto: Adelanto; bancos: string[]; onClose: () => void; onDone: () => void }) {
   const sugerido = adelanto.abono_sugerido
   const [monto, setMonto] = useState(String(Math.round(sugerido?.monto || adelanto.monto_esperado || 0) || ''))
   const [fecha, setFecha] = useState(sugerido?.fecha || hoyISO())
@@ -307,6 +358,10 @@ function AprobarAdelantoModal({ adelanto, onClose, onDone }: { adelanto: Adelant
       <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
         Confirma la plata recibida del cliente (no exige cartola: la conciliación con el abono viene después).
         {adelanto.monto_esperado > 0 && <> Comercial informó <b>{fmtClp(adelanto.monto_esperado)}</b>{adelanto.pct ? ` (${adelanto.pct}%)` : ''}.</>}
+        {/* Total de la venta: sin él el % informado no se puede validar */}
+        {totalVentaDerivado(adelanto) !== null && (
+          <> Total de la venta <b>{fmtClp(totalVentaDerivado(adelanto)!)}</b> c/IVA.</>
+        )}
       </p>
       {sugerido && (
         <div className="rounded-lg border px-3 py-2 text-xs" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
@@ -317,7 +372,10 @@ function AprobarAdelantoModal({ adelanto, onClose, onDone }: { adelanto: Adelant
       <div className="grid grid-cols-2 gap-3">
         <Field label="Monto recibido (CLP)"><input type="number" className={inputCls} style={inputStyle} value={monto} onChange={e => setMonto(e.target.value)} /></Field>
         <Field label="Fecha del pago"><input type="date" className={inputCls} style={inputStyle} value={fecha} onChange={e => setFecha(e.target.value)} /></Field>
-        <Field label="Banco"><input className={inputCls} style={inputStyle} value={banco} onChange={e => setBanco(e.target.value)} /></Field>
+        <Field label="Banco">
+          <input className={inputCls} style={inputStyle} list="bancos-adelanto" value={banco} onChange={e => setBanco(e.target.value)} />
+          <BancosDatalist id="bancos-adelanto" bancos={bancos} />
+        </Field>
         <Field label="N° operación"><input className={inputCls} style={inputStyle} value={numeroOperacion} onChange={e => setNumeroOperacion(e.target.value)} /></Field>
       </div>
       <Field label="Observaciones"><input className={inputCls} style={inputStyle} value={obs} onChange={e => setObs(e.target.value)} /></Field>
@@ -516,6 +574,12 @@ export default function TesoreriaPage() {
   }
 
   const desconciliar = async (m: Movimiento) => {
+    // Deshacer una conciliación desarma el enlace cartola↔egreso/cobranza/adelanto que
+    // alguien ya revisó (y en el caso del adelanto libera el candado del banco). Antes
+    // bastaba UN clic sin aviso, al lado del botón de eliminar. Se confirma como el
+    // borrado, y nombrando el destino para que se vea qué se está desarmando.
+    const destino = m.destino ? destinoTexto(m.destino) : null
+    if (!confirm(`¿Deshacer la conciliación de este movimiento${destino ? ` con ${destino}` : ''}?`)) return
     try { await tesoreriaAPI.desconciliar(m.id); toast.success('Conciliación deshecha'); refrescar() }
     catch (e: any) { toast.error(e?.response?.data?.detail || 'Error') }
   }
@@ -535,11 +599,24 @@ export default function TesoreriaPage() {
 
   if (loading) return <div className="flex items-center justify-center py-20"><Loader2 className="w-7 h-7 animate-spin text-brand-400" /></div>
 
-  const destinoLinea = (d: Destino) => d.clase === 'egreso'
-    ? `↔ ${d.beneficiario || 'egreso'} · ${d.n_compras} gasto${d.n_compras !== 1 ? 's' : ''} · ${fmtClp(d.monto_total_clp)}`
-    : d.clase === 'adelanto'
-      ? `↔ Adelanto ${d.cliente || ''}${d.numero_oc ? ` · OC ${d.numero_oc}` : ''} · ${fmtClp(d.monto)}`
-      : `↔ Factura ${d.numero_factura || d.factura_id} · ${fmtClp(d.monto)}`
+  const destinoLinea = (d: Destino) => `↔ ${destinoTexto(d)}`
+
+  // Tarjetas del encabezado. "Adelantos por aprobar" muestra el MONTO (el backend ya lo
+  // manda en adelantos_por_aprobar_clp) con el conteo debajo: "3 adelantos" no dice si la
+  // cola vale $300.000 o $30.000.000, que es lo que decide si hay que aprobar hoy.
+  const kpiCards: KpiCard[] = resumen ? [
+    { icon: Banknote, label: 'Por pagar (saldo)', value: resumen.monto_por_pagar_clp, color: 'text-brand-400', money: true },
+    { icon: CalendarClock, label: 'Vencido por pagar', value: resumen.por_pagar_vencido_clp, color: 'text-red-400', money: true },
+    {
+      icon: HandCoins, label: 'Adelantos por aprobar',
+      value: resumen.adelantos_por_aprobar_clp ?? 0, color: 'text-emerald-500', money: true,
+      sub: `${resumen.adelantos_por_aprobar} adelanto${resumen.adelantos_por_aprobar !== 1 ? 's' : ''} informado${resumen.adelantos_por_aprobar !== 1 ? 's' : ''}`,
+    },
+    { icon: AlertCircle, label: 'Cargos pendientes', value: resumen.cargos_pendientes, color: 'text-amber-400', money: false },
+    { icon: Wallet, label: 'Abonos pendientes', value: resumen.abonos_pendientes, color: 'text-emerald-500', money: false },
+    { icon: Link2, label: 'Egresos sin conciliar', value: resumen.egresos_sin_conciliar, color: 'text-brand-400', money: false },
+    { icon: Receipt, label: 'Cobranzas sin conciliar', value: resumen.cobranzas_sin_conciliar, color: 'text-emerald-500', money: false },
+  ] : []
 
   return (
     <div className="space-y-6">
@@ -562,19 +639,12 @@ export default function TesoreriaPage() {
       {/* Resumen */}
       {resumen && (
         <div className="grid grid-cols-2 lg:grid-cols-6 gap-3">
-          {[
-            { icon: Banknote, label: 'Por pagar (saldo)', value: resumen.monto_por_pagar_clp, color: 'text-brand-400', money: true },
-            { icon: CalendarClock, label: 'Vencido por pagar', value: resumen.por_pagar_vencido_clp, color: 'text-red-400', money: true },
-            { icon: HandCoins, label: 'Adelantos por aprobar', value: resumen.adelantos_por_aprobar, color: 'text-emerald-500', money: false },
-            { icon: AlertCircle, label: 'Cargos pendientes', value: resumen.cargos_pendientes, color: 'text-amber-400', money: false },
-            { icon: Wallet, label: 'Abonos pendientes', value: resumen.abonos_pendientes, color: 'text-emerald-500', money: false },
-            { icon: Link2, label: 'Egresos sin conciliar', value: resumen.egresos_sin_conciliar, color: 'text-brand-400', money: false },
-            { icon: Receipt, label: 'Cobranzas sin conciliar', value: resumen.cobranzas_sin_conciliar, color: 'text-emerald-500', money: false },
-          ].map(s => (
+          {kpiCards.map(s => (
             <div key={s.label} className="rounded-2xl p-3 sm:p-4 border" style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
               <div className="w-8 h-8 rounded-xl flex items-center justify-center mb-2" style={{ backgroundColor: 'var(--surface-300)' }}><s.icon className={`w-4 h-4 ${s.color}`} /></div>
               <p className="text-[10px] uppercase tracking-widest leading-tight" style={{ color: 'var(--text-faint)' }}>{s.label}</p>
               <p className={`text-base sm:text-lg font-bold mt-0.5 ${s.color}`}>{s.money ? fmtClp(s.value) : s.value}</p>
+              {s.sub && <p className="text-[10px] leading-tight" style={{ color: 'var(--text-faint)' }}>{s.sub}</p>}
             </div>
           ))}
         </div>
@@ -712,12 +782,19 @@ export default function TesoreriaPage() {
                   {aprobaciones.por_aprobar.map(a => (
                     <div key={a.id} className="flex items-center justify-between gap-3 rounded-xl border px-4 py-3" style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
                       <div className="min-w-0">
+                        {/* Contexto de la VENTA: quien aprueba tiene que poder validar que el
+                            % pedido corresponda. RUT para identificar al cliente sin ambigüedad. */}
                         <p className="font-medium text-sm truncate" style={{ color: 'var(--text-primary)' }}>
-                          {a.cliente || '—'}{a.numero_oc ? ` · OC ${a.numero_oc}` : ''}{a.numero_cotizacion ? ` · COT ${a.numero_cotizacion}` : ''}
+                          {a.cliente || '—'}{a.rut_cliente ? ` · ${a.rut_cliente}` : ''}
+                          {a.numero_oc ? ` · OC ${a.numero_oc}` : ''}{a.numero_cotizacion ? ` · COT ${a.numero_cotizacion}` : ''}
                         </p>
-                        <p className="text-xs truncate" style={{ color: 'var(--text-faint)' }}>
+                        {/* Sin truncate: con el total de la venta y la fecha, la línea ya no
+                            cabe en una sola y el dato para validar el % quedaría cortado. */}
+                        <p className="text-xs leading-relaxed" style={{ color: 'var(--text-faint)' }}>
                           Esperado: <b>{fmtClp(a.monto_esperado)}</b>{a.pct ? ` (${a.pct}%)` : ''}
-                          {a.abono_sugerido ? <span className="text-emerald-500"> · hay un abono en la cartola que calza ({fmtDate(a.abono_sugerido.fecha)})</span> : ''}
+                          {totalVentaDerivado(a) !== null && <> de una venta de <b>{fmtClp(totalVentaDerivado(a)!)}</b> c/IVA</>}
+                          {a.created_at ? ` · informado ${fmtDate(a.created_at)}` : ''}
+                          {a.abono_sugerido ? <span className="text-emerald-500"> · hay un abono en la cartola que calza ({fmtDate(a.abono_sugerido.fecha)} · {fmtClp(a.abono_sugerido.monto)})</span> : ''}
                           {a.observaciones ? ` · ${a.observaciones}` : ''}
                         </p>
                       </div>
@@ -785,21 +862,35 @@ export default function TesoreriaPage() {
                   <thead><tr className="border-b" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
                     <th className="text-left px-4 py-3 text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>Flujo (NIC 7)</th>
                     {flujo.buckets.map(b => <th key={b} className="text-right px-4 py-3 text-xs font-semibold uppercase tracking-wider whitespace-nowrap" style={{ color: b === 'vencido' ? undefined : 'var(--text-faint)' }} >{BUCKET_LABEL[b]}</th>)}
+                    {/* TOTAL de todas las ventanas: la tabla obligaba a sumar 6 columnas a mano
+                        (el mismo total que ya muestra la pantalla de MonzaParts). */}
+                    <th className="text-right px-4 py-3 text-xs font-semibold uppercase tracking-wider whitespace-nowrap border-l" style={{ color: 'var(--text-muted)', borderColor: 'var(--border)' }}>Total</th>
                   </tr></thead>
                   <tbody>
                     <tr className="border-b" style={{ borderColor: 'var(--border)' }}>
                       <td className="px-4 py-2.5 font-medium text-emerald-500">Por cobrar (facturas)</td>
                       {flujo.buckets.map(b => <td key={b} className="px-4 py-2.5 text-right whitespace-nowrap" style={{ color: 'var(--text-primary)' }}>{fmtClp(flujo.por_cobrar[b].monto)}<span className="text-[10px] ml-1" style={{ color: 'var(--text-faint)' }}>({flujo.por_cobrar[b].n})</span></td>)}
+                      <td className="px-4 py-2.5 text-right whitespace-nowrap font-bold border-l text-emerald-500" style={{ borderColor: 'var(--border)' }}>
+                        {fmtClp(sumaBuckets(flujo.buckets, flujo.por_cobrar).monto)}
+                        <span className="text-[10px] ml-1 font-normal" style={{ color: 'var(--text-faint)' }}>({sumaBuckets(flujo.buckets, flujo.por_cobrar).n})</span>
+                      </td>
                     </tr>
                     <tr className="border-b" style={{ borderColor: 'var(--border)' }}>
                       <td className="px-4 py-2.5 font-medium text-red-400">Por pagar (compras)</td>
                       {flujo.buckets.map(b => <td key={b} className="px-4 py-2.5 text-right whitespace-nowrap" style={{ color: 'var(--text-primary)' }}>{fmtClp(flujo.por_pagar[b].monto)}<span className="text-[10px] ml-1" style={{ color: 'var(--text-faint)' }}>({flujo.por_pagar[b].n})</span></td>)}
+                      <td className="px-4 py-2.5 text-right whitespace-nowrap font-bold border-l text-red-400" style={{ borderColor: 'var(--border)' }}>
+                        {fmtClp(sumaBuckets(flujo.buckets, flujo.por_pagar).monto)}
+                        <span className="text-[10px] ml-1 font-normal" style={{ color: 'var(--text-faint)' }}>({sumaBuckets(flujo.buckets, flujo.por_pagar).n})</span>
+                      </td>
                     </tr>
                     <tr>
                       <td className="px-4 py-2.5 font-semibold" style={{ color: 'var(--text-primary)' }}>Neto</td>
                       {flujo.buckets.map(b => (
                         <td key={b} className={`px-4 py-2.5 text-right whitespace-nowrap font-semibold ${flujo.neto[b] < 0 ? 'text-red-400' : 'text-emerald-500'}`}>{fmtClp(flujo.neto[b])}</td>
                       ))}
+                      <td className={`px-4 py-2.5 text-right whitespace-nowrap font-bold border-l ${sumaNeto(flujo.buckets, flujo.neto) < 0 ? 'text-red-400' : 'text-emerald-500'}`} style={{ borderColor: 'var(--border)' }}>
+                        {fmtClp(sumaNeto(flujo.buckets, flujo.neto))}
+                      </td>
                     </tr>
                   </tbody>
                 </table>
@@ -842,11 +933,12 @@ export default function TesoreriaPage() {
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead><tr className="border-b" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
-                    {['Fecha', 'Glosa', 'Tipo', 'Monto', 'Estado', ''].map(h => <th key={h} className="text-left px-4 py-3 text-xs font-semibold uppercase tracking-wider whitespace-nowrap" style={{ color: 'var(--text-faint)' }}>{h}</th>)}
+                    {['Fecha', 'Glosa', 'Referencia', 'Tipo', 'Monto', 'Estado', ''].map(h => <th key={h} className="text-left px-4 py-3 text-xs font-semibold uppercase tracking-wider whitespace-nowrap" style={{ color: 'var(--text-faint)' }}>{h}</th>)}
                   </tr></thead>
                   <tbody>
                     {movs.map(m => {
                       const tb = TIPO_BADGE[m.tipo] ?? { cls: 'bg-gray-500/10 text-gray-400', label: m.tipo }
+                      const esCargo = m.tipo === 'cargo'
                       return (
                         <tr key={m.id} className="border-b" style={{ borderColor: 'var(--border)' }}>
                           <td className="px-4 py-2.5 whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{fmtDate(m.fecha)}</td>
@@ -854,8 +946,18 @@ export default function TesoreriaPage() {
                             <span className="block truncate">{m.glosa || '—'}</span>
                             {m.conciliado && m.destino && <span className="block text-[11px] text-emerald-500 truncate">{destinoLinea(m.destino)}</span>}
                           </td>
+                          {/* Referencia del banco (N° de operación / documento de la cartola): es
+                              el dato con que el tesorero busca el movimiento en el banco, y la
+                              pantalla lo guardaba sin mostrarlo nunca. */}
+                          <td className="px-4 py-2.5 max-w-[160px] text-xs font-mono" style={{ color: 'var(--text-muted)' }}>
+                            <span className="block truncate" title={m.referencia || undefined}>{m.referencia || '—'}</span>
+                          </td>
                           <td className="px-4 py-2.5"><span className={`inline-flex px-2 py-0.5 rounded-full text-[11px] font-medium ${tb.cls}`}>{tb.label}</span></td>
-                          <td className="px-4 py-2.5 whitespace-nowrap font-semibold" style={{ color: m.tipo === 'cargo' ? 'var(--text-primary)' : undefined }}>{fmtClp(m.monto)}</td>
+                          {/* Monto CON SIGNO: la cartola mezcla cargos y abonos y ambos venían en
+                              positivo, así que la columna no se podía leer ni sumar de un vistazo. */}
+                          <td className={`px-4 py-2.5 whitespace-nowrap font-semibold ${esCargo ? 'text-red-400' : 'text-emerald-500'}`}>
+                            {esCargo ? '−' : '+'}{fmtClp(m.monto)}
+                          </td>
                           <td className="px-4 py-2.5 whitespace-nowrap">{m.conciliado
                             ? <span className="inline-flex items-center gap-1 text-emerald-500 text-xs"><CheckCircle2 className="w-3.5 h-3.5" /> Conciliado</span>
                             : <span className="text-xs" style={{ color: 'var(--text-faint)' }}>Pendiente</span>}</td>
@@ -902,8 +1004,8 @@ export default function TesoreriaPage() {
       {modal?.type === 'cuenta' && <CuentaModal cuenta={modal.cuenta ?? null} bancos={bancos} onClose={() => setModal(null)} onDone={loadCuentas} />}
       {modal?.type === 'import' && cuentaId != null && <ImportModal cuentaId={cuentaId} onClose={() => setModal(null)} onDone={refrescar} />}
       {modal?.type === 'manual' && cuentaId != null && <MovManualModal cuentaId={cuentaId} onClose={() => setModal(null)} onDone={refrescar} />}
-      {modal?.type === 'pago' && comprasSeleccionadas.length > 0 && <PagoModal compras={comprasSeleccionadas} onClose={() => setModal(null)} onDone={refrescar} />}
-      {modal?.type === 'aprobar-adelanto' && modal.adelanto && <AprobarAdelantoModal adelanto={modal.adelanto} onClose={() => setModal(null)} onDone={refrescar} />}
+      {modal?.type === 'pago' && comprasSeleccionadas.length > 0 && <PagoModal compras={comprasSeleccionadas} bancos={bancos} onClose={() => setModal(null)} onDone={refrescar} />}
+      {modal?.type === 'aprobar-adelanto' && modal.adelanto && <AprobarAdelantoModal adelanto={modal.adelanto} bancos={bancos} onClose={() => setModal(null)} onDone={refrescar} />}
     </div>
   )
 }

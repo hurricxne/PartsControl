@@ -22,6 +22,11 @@ const PIPELINE_CFG: Record<string, { bg: string; color: string; label: string }>
   por_recibir: { bg: "#E0F2FE", color: "#0369A1", label: "En recepción" },
   en_bodega:   { bg: "#DCFCE7", color: "#15803D", label: "En bodega" },
   despachado:  { bg: "#D1FAE5", color: "#047857", label: "Despachada" },
+  // El backend manda 'reclamo' solo cuando TODAS las líneas de la venta están en
+  // reclamo al proveedor (no llegó / dañado no utilizable). Sin esta entrada la venta
+  // se quedaba sin badge; antes se pintaba "Sin abastecer", que era mentira: la
+  // mercadería sí se compró, el proveedor falló y hay un reclamo abierto en Bodega.
+  reclamo:     { bg: "#FEE2E2", color: "#B91C1C", label: "Reclamo al proveedor" },
 };
 interface KPIs { vendidas_mes: number; total_mes: number; pendientes_entrega: number; }
 interface CotItem { id: number; descripcion: string; numero_parte?: string; marca?: string; cantidad: number; precio_unitario_clp?: number; subtotal_clp?: number; plazo_entrega?: string; calidad?: string; }

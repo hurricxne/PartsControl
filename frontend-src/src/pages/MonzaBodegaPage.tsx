@@ -1,14 +1,26 @@
 import { useState, useEffect, useCallback } from "react";
 import { Boxes, Package, RefreshCw, X, CheckCircle, AlertTriangle, Truck, Ship } from "lucide-react";
 import { monzaBodegaAPI } from "../services/monzaApi";
+// Cliente axios base (baseURL /api): el historial de recepcionados (Fase 4) se
+// llama directo aquí para no tocar monzaApi.ts en paralelo con otros constructores.
+import api from "../services/api";
 import { useMonzaTheme } from "./MonzaLayout";
 import MonzaDocs from "./MonzaDocs";
 import toast from "react-hot-toast";
 
 interface EmbRecv { id: number; numero: string; estado: string; awb?: string; forwarder?: string; tracking?: string; fecha_llegada_est?: string; items_count: number; recepcion_id?: number; recepcion_abierta?: boolean; }
+// ─── Historial de embarques recepcionados (Fase 4 espejo GA) ──────────────────
+// El criterio del backend es la RECEPCIÓN cerrada (no el estado del embarque);
+// fecha_llegada_est es texto libre en el modelo y se muestra tal cual.
+interface EmbHist { id: number; numero: string; estado: string; awb?: string | null; forwarder?: string | null; tracking?: string | null; fecha_llegada_est?: string | null; items_count: number; recepcion?: { id: number; fecha_cierre?: string | null; usuario_email?: string | null } | null; }
 interface RecItem { id: number; cot_numero?: string; cliente?: string; descripcion: string; numero_parte?: string; marca?: string; cantidad: number; ocp_proveedor?: string; estado_recepcion?: string; qty_recibida?: number; qty_danada?: number; observacion?: string; fotos?: number; }
 interface Recepcion { id: number; embarque_numero?: string; estado: string; total: number; marcados: number; items: RecItem[]; }
-interface BodegaItem { id: number; cot_numero?: string; cliente?: string; descripcion: string; numero_parte?: string; marca?: string; cantidad: number; ocp_proveedor?: string; }
+// Hallazgo #10: `cantidad` es lo VENDIDO. En una llegada parcial el bodeguero leía
+// "10 en bodega" + "6 reclamadas" = 16 unidades sobre una línea de 10, mientras
+// Despachos ofrecía 4. El backend ahora manda además lo realmente RECIBIDO
+// (qty_recibida, null si el ítem no tiene recepción registrada — dato legado) y el
+// cupo aún despachable (qty_disponible, ya descontados borradores y despachos).
+interface BodegaItem { id: number; cot_numero?: string; cliente?: string; descripcion: string; numero_parte?: string; marca?: string; cantidad: number; ocp_proveedor?: string; qty_recibida?: number | null; qty_disponible?: number; }
 interface Reclamo { id: number; cot_numero?: string; descripcion?: string; motivo: string; qty_afectada: number; estado: string; observacion?: string; ocp_proveedor?: string; fecha_creacion?: string; }
 interface KPIs { a_recibir: number; en_bodega: number; despachado: number; reclamos_pendientes: number; }
 
@@ -33,13 +45,30 @@ function RecepcionPanel({ recId, onClose, onClosed }: { recId: number; onClose: 
   const { dark } = useMonzaTheme();
   const [rec, setRec] = useState<Recepcion | null>(null);
   const [closing, setClosing] = useState(false);
+  // Cantidad recibida editable por ítem (llegadas PARCIALES): por defecto la
+  // cantidad completa; si llegó menos, se ajusta antes de marcar. Lo recibido queda
+  // despachable y solo el faltante real va a reclamo (Fase 2 espejo Grupo AM).
+  const [qtys, setQtys] = useState<Record<number, number>>({});
   const bg = dark ? "#131b3e" : "white"; const bd = dark ? "#1e2a4a" : "#E2E8F0"; const txt = dark ? "white" : "#1E293B"; const sub = dark ? "#8899cc" : "#64748B";
   const load = useCallback(async () => { try { const r = await monzaBodegaAPI.getRecepcion(recId); setRec(r.data); } catch { toast.error("Error"); } }, [recId]);
   useEffect(() => { load(); }, [load]);
 
+  const qtyDe = (it: RecItem) => {
+    const v = qtys[it.id];
+    if (v !== undefined && Number.isFinite(v) && v >= 0) return v;
+    return it.qty_recibida ?? it.cantidad;
+  };
+
   const marcar = async (it: RecItem, estado: string) => {
+    // 'Faltante' exige decir CUÁNTO llegó: sin ajustar el input, el default (todo lo
+    // vendido) inflaría el tope físico sin dejar reclamo. El backend además lo rechaza.
+    if (estado === "faltante" && qtys[it.id] === undefined && it.qty_recibida == null) {
+      toast.error("Indica cuántas unidades llegaron realmente en el campo Recibido");
+      return;
+    }
+    const qty = estado === "no_llego" ? 0 : qtyDe(it);
     try {
-      await monzaBodegaAPI.marcarItem(recId, it.id, { estado_recepcion: estado, qty_recibida: it.cantidad, qty_danada: estado.includes("danado") ? it.cantidad : 0 });
+      await monzaBodegaAPI.marcarItem(recId, it.id, { estado_recepcion: estado, qty_recibida: qty, qty_danada: estado.includes("danado") ? it.cantidad : 0 });
       load();
     } catch (e: unknown) {
       const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || "Error al marcar";
@@ -47,8 +76,11 @@ function RecepcionPanel({ recId, onClose, onClosed }: { recId: number; onClose: 
     }
   };
   const cerrar = async () => {
+    const pendientes = rec ? rec.total - rec.marcados : 0;
+    const forzar = pendientes > 0;
+    if (forzar && !window.confirm(`Quedan ${pendientes} ítem(s) sin marcar. Si cierras igual, quedarán como reclamo "no llegó" (trazable). ¿Cerrar la recepción?`)) return;
     setClosing(true);
-    try { const r = await monzaBodegaAPI.cerrarRecepcion(recId); toast.success(`Recepción cerrada · ${r.data.en_bodega} a bodega, ${r.data.reclamos} reclamo(s)`); onClosed(); }
+    try { const r = await monzaBodegaAPI.cerrarRecepcion(recId, forzar); toast.success(`Recepción cerrada · ${r.data.en_bodega} a bodega, ${r.data.reclamos} reclamo(s)`); onClosed(); }
     catch (e: unknown) { toast.error((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || "Error al cerrar"); }
     finally { setClosing(false); }
   };
@@ -69,7 +101,17 @@ function RecepcionPanel({ recId, onClose, onClosed }: { recId: number; onClose: 
                   <div style={{ fontSize: 11, color: sub }}>{[it.cot_numero, it.numero_parte, it.marca, it.cliente].filter(Boolean).join(" · ")}</div></div>
                 {it.estado_recepcion && <CheckCircle size={16} color="#16A34A" />}
               </div>
-              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8, alignItems: "center" }}>
+                <label style={{ fontSize: 11, color: sub, display: "flex", alignItems: "center", gap: 4 }}>
+                  Recibido:
+                  <input
+                    type="number" min={0} step={1}
+                    value={qtyDe(it)}
+                    onChange={(e) => setQtys((p) => ({ ...p, [it.id]: Math.max(0, Math.round(Number(e.target.value) || 0)) }))}
+                    style={{ width: 58, padding: "3px 6px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 12, background: dark ? "#0d1321" : "#F8FAFC", color: txt, textAlign: "right" }}
+                  />
+                  <span>/ {it.cantidad}</span>
+                </label>
                 {RECEP_OPTS.map((o) => (
                   <button key={o.v} onClick={() => marcar(it, o.v)} style={{ padding: "4px 10px", borderRadius: 6, border: `1px solid ${it.estado_recepcion === o.v ? o.color : bd}`, background: it.estado_recepcion === o.v ? `${o.color}18` : "transparent", color: it.estado_recepcion === o.v ? o.color : sub, cursor: "pointer", fontSize: 11, fontWeight: 600 }}>{o.label}</button>
                 ))}
@@ -83,7 +125,7 @@ function RecepcionPanel({ recId, onClose, onClosed }: { recId: number; onClose: 
           <span style={{ fontSize: 12, color: sub }}>{rec ? `${rec.marcados}/${rec.total} marcados` : ""}</span>
           <div style={{ display: "flex", gap: 8 }}>
             <button onClick={onClose} style={{ padding: "8px 18px", border: `1px solid ${bd}`, borderRadius: 8, background: "transparent", color: sub, cursor: "pointer", fontSize: 13 }}>Cerrar ventana</button>
-            <button onClick={cerrar} disabled={closing || !rec || rec.marcados < rec.total} style={{ padding: "8px 20px", background: rec && rec.marcados >= rec.total ? "#10B981" : "#94A3B8", border: "none", borderRadius: 8, color: "white", cursor: rec && rec.marcados >= rec.total ? "pointer" : "not-allowed", fontWeight: 700, fontSize: 13 }}>{closing ? "Cerrando..." : "Cerrar recepción"}</button>
+            <button onClick={cerrar} disabled={closing || !rec} style={{ padding: "8px 20px", background: rec && rec.marcados >= rec.total ? "#10B981" : "#F59E0B", border: "none", borderRadius: 8, color: "white", cursor: "pointer", fontWeight: 700, fontSize: 13 }}>{closing ? "Cerrando..." : rec && rec.marcados < rec.total ? "Cerrar con pendientes" : "Cerrar recepción"}</button>
           </div>
         </div>
       </div>
@@ -93,10 +135,11 @@ function RecepcionPanel({ recId, onClose, onClosed }: { recId: number; onClose: 
 
 export default function MonzaBodegaPage() {
   const { dark } = useMonzaTheme();
-  const [tab, setTab] = useState<"recibir" | "en_bodega" | "reclamos">("recibir");
+  const [tab, setTab] = useState<"recibir" | "en_bodega" | "reclamos" | "historial">("recibir");
   const [embs, setEmbs] = useState<EmbRecv[]>([]);
   const [enBodega, setEnBodega] = useState<BodegaItem[]>([]);
   const [reclamos, setReclamos] = useState<Reclamo[]>([]);
+  const [hist, setHist] = useState<EmbHist[]>([]);
   const [kpis, setKpis] = useState<KPIs | null>(null);
   const [loading, setLoading] = useState(true);
   const [recId, setRecId] = useState<number | null>(null);
@@ -108,6 +151,9 @@ export default function MonzaBodegaPage() {
     try { const [k, e, b, r] = await Promise.all([monzaBodegaAPI.kpis(), monzaBodegaAPI.embarques(), monzaBodegaAPI.enBodega(), monzaBodegaAPI.listReclamos()]);
       setKpis(k.data); setEmbs(e.data); setEnBodega(b.data); setReclamos(r.data); }
     catch { toast.error("Error al cargar bodega"); } finally { setLoading(false); }
+    // Historial de recepcionados con catch PROPIO: si el deploy sirve un backend
+    // previo sin el endpoint, la pestaña degrada a vacío sin tumbar el resto.
+    try { const h = await api.get("/monza/bodega/embarques/historial"); setHist(Array.isArray(h.data) ? h.data : []); } catch {}
   }, []);
   useEffect(() => { fetchAll(); }, [fetchAll]);
 
@@ -116,7 +162,15 @@ export default function MonzaBodegaPage() {
   };
   const resolver = async (r: Reclamo, estado: string) => { try { await monzaBodegaAPI.updateReclamo(r.id, { estado }); toast.success(`Reclamo → ${estado}`); fetchAll(); } catch { toast.error("Error"); } };
 
-  const tabs = [["recibir", "Por recibir", embs.length], ["en_bodega", "En bodega", enBodega.length], ["reclamos", "Reclamos", reclamos.filter((r) => ["pendiente", "reclamado"].includes(r.estado)).length]] as const;
+  const tabs = [["recibir", "Por recibir", embs.length], ["en_bodega", "En bodega", enBodega.length], ["reclamos", "Reclamos", reclamos.filter((r) => ["pendiente", "reclamado"].includes(r.estado)).length], ["historial", "Historial", hist.length]] as const;
+
+  // fecha_cierre llega ISO desde el backend; si viniera basura, se muestra tal
+  // cual en vez de "Invalid Date" (defensivo, mismo criterio que fecha_llegada_est)
+  const fmtCierre = (s?: string | null) => {
+    if (!s) return "—";
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? s : d.toLocaleString("es-CL", { dateStyle: "short", timeStyle: "short" });
+  };
 
   return (
     <div>
@@ -162,13 +216,21 @@ export default function MonzaBodegaPage() {
                   <td style={{ padding: "9px 12px", fontWeight: 600, color: "var(--monza-accent)", fontSize: 12 }}>{it.cot_numero}</td>
                   <td style={{ padding: "9px 12px", color: txt }}>{it.cliente || "—"}</td>
                   <td style={{ padding: "9px 12px" }}><div style={{ color: txt, fontWeight: 500 }}>{it.descripcion}</div>{it.numero_parte && <div style={{ fontSize: 10, color: sub }}>{it.numero_parte}</div>}</td>
-                  <td style={{ padding: "9px 12px", textAlign: "right", color: txt }}>{it.cantidad}</td>
+                  {/* Hallazgo #10: si llegó MENOS de lo vendido se muestra "4 de 10"
+                      (no "10" a secas) y, cuando ya no queda cupo despachable, se
+                      avisa debajo para que el bodeguero no contradiga a Despachos. */}
+                  <td style={{ padding: "9px 12px", textAlign: "right", color: txt }}>
+                    <div>{it.qty_recibida != null && it.qty_recibida < it.cantidad ? `${it.qty_recibida} de ${it.cantidad}` : it.cantidad}</div>
+                    {it.qty_disponible != null && it.qty_recibida != null && it.qty_disponible < it.qty_recibida && (
+                      <div style={{ fontSize: 10, color: sub }}>{it.qty_disponible === 0 ? "0 despachables" : `${it.qty_disponible} despachables`}</div>
+                    )}
+                  </td>
                   <td style={{ padding: "9px 12px", color: sub, fontSize: 12 }}>{it.ocp_proveedor || "—"}</td>
                   <td style={{ padding: "9px 12px" }}><span style={{ fontSize: 11, background: "#DCFCE7", color: "#15803D", padding: "3px 10px", borderRadius: 10, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 4 }}><CheckCircle size={11} /> En bodega</span></td>
                 </tr>
               ))}</tbody>
             </table>
-        ) : (
+        ) : tab === "reclamos" ? (
           reclamos.length === 0 ? <div style={{ padding: 48, textAlign: "center", color: "#94A3B8" }}><AlertTriangle size={32} color="#E2E8F0" style={{ display: "block", margin: "0 auto 8px" }} />No hay reclamos.</div>
           : <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
               <thead><tr style={{ background: dark ? "#0d1321" : "#F8FAFC", borderBottom: `1px solid ${bd}` }}>{["N° COT", "Repuesto", "Motivo", "Qty", "Proveedor", "Estado", "Acciones"].map((h) => <th key={h} style={{ padding: "10px 12px", textAlign: "left", fontWeight: 600, fontSize: 11, color: sub, textTransform: "uppercase" as const }}>{h}</th>)}</tr></thead>
@@ -185,6 +247,24 @@ export default function MonzaBodegaPage() {
                     <button onClick={() => resolver(r, "resuelto")} style={{ padding: "4px 9px", border: "1px solid #15803D", borderRadius: 6, background: "transparent", color: "#15803D", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>Resolver</button>
                   </div>}</td>
                 </tr>); })}</tbody>
+            </table>
+        ) : (
+          /* ── Historial: embarques con recepción CERRADA (Fase 4 espejo GA) ── */
+          hist.length === 0 ? <div style={{ padding: 48, textAlign: "center", color: "#94A3B8" }}><Ship size={32} color="#E2E8F0" style={{ display: "block", margin: "0 auto 8px" }} />Aún no hay embarques recepcionados.</div>
+          : <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead><tr style={{ background: dark ? "#0d1321" : "#F8FAFC", borderBottom: `1px solid ${bd}` }}>{["N° Embarque", "AWB", "Forwarder", "Llegada est.", "Recepción cerrada", "Recepcionó", "Ítems"].map((h) => <th key={h} style={{ padding: "10px 12px", textAlign: h === "Ítems" ? "right" : "left", fontWeight: 600, fontSize: 11, color: sub, textTransform: "uppercase" as const }}>{h}</th>)}</tr></thead>
+              <tbody>{hist.map((e) => (
+                <tr key={e.id} style={{ borderBottom: `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}` }}>
+                  <td style={{ padding: "9px 12px", fontWeight: 700, color: "var(--monza-accent)", fontSize: 12 }}>{e.numero}{e.tracking && <div style={{ fontSize: 10, color: sub, fontWeight: 400 }}>Track {e.tracking}</div>}</td>
+                  <td style={{ padding: "9px 12px", color: txt, fontSize: 12 }}>{e.awb || "—"}</td>
+                  <td style={{ padding: "9px 12px", color: sub, fontSize: 12 }}>{e.forwarder || "—"}</td>
+                  {/* Texto libre en el modelo (String 30): tal cual, sin parseo */}
+                  <td style={{ padding: "9px 12px", color: sub, fontSize: 12 }}>{e.fecha_llegada_est || "—"}</td>
+                  <td style={{ padding: "9px 12px", color: txt, fontSize: 12, fontWeight: 600 }}>{fmtCierre(e.recepcion?.fecha_cierre)}</td>
+                  <td style={{ padding: "9px 12px", color: sub, fontSize: 12 }}>{e.recepcion?.usuario_email || "—"}</td>
+                  <td style={{ padding: "9px 12px", textAlign: "right", color: txt }}>{e.items_count}</td>
+                </tr>
+              ))}</tbody>
             </table>
         )}
       </div>

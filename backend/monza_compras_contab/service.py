@@ -34,6 +34,7 @@ ESTADOS_PAGO = ["pendiente", "parcial", "pagado", "vencido", "anulado"]
 CUENTA_DEFAULT_CODIGO = {
     ("EMBARQUE", "cogs"): "1.3.02",              # mercadería en tránsito (se capitaliza)
     ("MANUAL", "cogs"): "1.3.01",               # existencias / mercadería
+    ("NACIONAL", "cogs"): "1.3.01",             # compra nacional → Existencias (activo), no gasto
     ("MANUAL", "gasto_operacional"): "6.2.04",  # gastos generales de oficina
     ("MANUAL", "gasto_no_operacional"): "6.4.01",
     ("MANUAL", "otros"): "6.4.01",
@@ -157,6 +158,21 @@ def serialize_egreso(e) -> dict:
     }
 
 
+def _serialize_compra_item(it) -> dict:
+    """Línea de costeo por ítem de una compra nacional (monza_cont_compra_item).
+    ADAPTACIÓN Monza: sin oc_proveedor_item_id (no hay tabla de asignación)."""
+    return {
+        "id": it.id,
+        "item_cotizacion_id": it.item_cotizacion_id,
+        "numero_parte": it.numero_parte,
+        "descripcion": it.descripcion,
+        "cantidad": _f(it.cantidad),
+        "precio_unit": _f(it.precio_unit),
+        "costo_unit_clp": _f(it.costo_unit_clp),
+        "costo_total_clp": _f(it.costo_total_clp),
+    }
+
+
 def _serialize_compra(compra) -> dict:
     saldo = _f(compra.saldo_clp)
     return {
@@ -197,9 +213,11 @@ def _serialize_compra(compra) -> dict:
         "motivo_anulacion": compra.motivo_anulacion,
         "embarque_id": compra.embarque_id,
         "emb_pricing_gasto_id": compra.emb_pricing_gasto_id,
+        "oc_proveedor_id": getattr(compra, "oc_proveedor_id", None),
         "observaciones": compra.observaciones,
         "created_at": compra.created_at.isoformat() if compra.created_at else None,
         "updated_at": compra.updated_at.isoformat() if getattr(compra, "updated_at", None) else None,
         "usuario_id": getattr(compra, "usuario_id", None),
         "pagos": [_serialize_pago(d) for d in sorted(compra.egreso_detalles, key=lambda x: x.id)],
+        "items": [_serialize_compra_item(it) for it in sorted(compra.items, key=lambda x: x.id)],
     }

@@ -40,6 +40,7 @@ Endpoints (todos requieren autenticación):
   DELETE /facturas/{id}/cobranzas/{id}        revertir un pago
   POST   /facturas/{id}/factoring             ceder la factura a un factor (adelanto/retención)
   POST   /facturas/{id}/factoring/liquidar    liquidar el factoring (cierra el saldo a 0)
+  POST   /facturas/{id}/factoring/revertir    revertir la cesión (sólo si el DTE nunca existió)
   GET    /kpis                                indicadores de cobranza (ver get_kpis)
   POST   /ventas/adelantos                    informar un adelanto (Comercial; acepta cotizacion_id)
   GET    /ventas/{oc}/adelantos               adelantos de la venta (con estados derivados)
@@ -47,14 +48,15 @@ Endpoints (todos requieren autenticación):
   POST   /adelantos/{id}/anular               anular (no aplicado ni conciliado)
 """
 import json
+import logging
 from datetime import datetime, date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional, List
+from typing import Literal, Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session, selectinload, joinedload
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from pydantic import BaseModel, Field
 
 from database import get_db
@@ -66,17 +68,29 @@ from models.models import (
 )
 from auth import get_current_user
 from empresa_guard import require_empresa
+from role_guard import require_rol
 from services.pricing_service import calcular_cotizacion, config_efectivo
 # Solo lectura del enlace de conciliación de Tesorería (abono ↔ cobranza): una cobranza
 # conciliada con el banco no se puede borrar sin desconciliarla primero allá.
 from tesoreria.models import ConciliacionIngreso
 
+logger = logging.getLogger("contabilidad")
+
 # Módulo SOLO MachParts (Grupo AM = 'mineria'): el guard a nivel de router deniega (403)
 # a usuarios de otra empresa que intenten llegar por la API por fuera de la app.
+# Y candado de ROL (role_guard, mismo uso que routers/compras.py y monza_router_cotizaciones):
+# aquí se EMITEN y ELIMINAN facturas, se registran/revierten cobranzas y se ceden facturas
+# a un factor — bodega, logística y abastecimiento no tienen nada que hacer acá. Se admite
+# 'comercial' porque el Cierre de Venta informa los adelantos y consulta /ventas, y
+# 'gerencia' por los KPIs de cobranza. El guard es PERMISIVO mientras `User.rol` no exista
+# (ver role_guard.py): hoy no cambia nada operativo y candará solo al provisionar roles.
 router = APIRouter(
     prefix="/contabilidad",
     tags=["contabilidad"],
-    dependencies=[Depends(require_empresa("mineria"))],
+    dependencies=[
+        Depends(require_empresa("mineria")),
+        Depends(require_rol("admin", "gerencia", "contabilidad", "comercial")),
+    ],
 )
 
 IVA_RATE = 0.19      # IVA Chile (19%); mantener sincronizado con pricing_service
@@ -340,6 +354,122 @@ def _factoring_bloqueado(db: Session, factura_id: int):
     return (db.query(ContFactoring)
             .filter(ContFactoring.factura_id == factura_id)
             .populate_existing().with_for_update().first())
+
+
+def _dte_emitido_ante_sii(dte) -> bool:
+    """ÚNICA definición de «este documento tributario EXISTE y está IDENTIFICADO ante el
+    SII»: status EMITIDO **Y** folio. Las dos condiciones, no una.
+
+    Por qué el folio también (el bug que cerró esto): el criterio original era sólo
+    `status_id != 3`, así que el estado CONTRADICTORIO «status 3 · folio NULL» —Wasabil
+    dice que el SII lo aceptó pero no tenemos el correlativo— contaba como emitido y la
+    plata entraba: cobranza 200 y factoring 200 contra una factura sin folio en ninguna
+    parte (ni en `numero_factura`, que se escribe justamente DESDE ese folio, ni en el
+    DTE). Y el módulo de al lado ya trataba ese mismo estado como NO referenciable para
+    la 52/33 (wasabil_dte/router.py: `_guia_no_referenciable`, "status 3 y folio vacío"),
+    o sea: dos criterios distintos para el MISMO estado, en el mismo commit.
+
+    Regla de la casa ante un documento tributario IRREVERSIBLE: si el estado remoto es
+    ambiguo o contradictorio, se BLOQUEA y se pide intervención humana. Un 409 que obliga
+    a mirar es más barato que una nota de crédito. La salida del operador es «Reintentar»
+    (consulta a Wasabil y adopta el folio) — apenas el folio existe, todo se acepta.
+
+    `getattr` en `folio`: en un esquema anterior a la columna, la ausencia se lee como
+    "sin folio" → bloquea. Fail CLOSED, nunca al revés."""
+    from wasabil_dte.models import STATUS_EMITIDO
+    return (dte.status_id == STATUS_EMITIDO
+            and bool(str(getattr(dte, "folio", "") or "").strip()))
+
+
+def _dte_factura_no_emitido(db: Session, factura_id: int) -> bool:
+    """True si la factura tiene un DTE electrónico (factura 33) que AÚN no está emitido
+    ante el SII (borrador, en vuelo, procesando, rechazado, o EMITIDO SIN FOLIO) — o sea:
+    plata que NO debe entrar todavía. Única fuente de verdad del guard SII de la plata de
+    este módulo; el criterio de "emitido" es _dte_emitido_ante_sii y sólo ese.
+
+    Import LOCAL del paquete wasabil_dte (mismo patrón que _precios_congelados_guia):
+    evita el ciclo de imports contabilidad ↔ wasabil y no carga el módulo DTE en los
+    caminos que no lo necesitan.
+
+    Tolerancias, deliberadamente ASIMÉTRICAS (el porqué de cada una — molde
+    monza_contabilidad/router.py):
+      · Módulo ausente o modelo sin la columna `factura_id` (código anterior a la Fase B)
+        → False: si el código no existe, no puede existir una factura electrónica que
+        proteger.
+      · Error de ESQUEMA en la BD (tabla/columna faltante por un deploy A MEDIAS) → 503
+        explícito, NUNCA False. Aquí sí puede haber facturas electrónicas vivas, y apagar
+        el guard en silencio movería plata contra un documento que el SII no conoce. Se
+        falla ruidoso pidiendo correr el init_db, que es la regla de la casa. Antes esto
+        era un 500 crudo de SQLAlchemy sin pista de qué hacer.
+        Sin db.rollback(): este helper corre DENTRO de crear_factura, con la factura y
+        sus líneas ya flusheadas.
+    """
+    try:
+        from wasabil_dte.models import WasabilDte
+    except ImportError:
+        return False
+    col = getattr(WasabilDte, "factura_id", None)
+    if col is None:
+        return False
+    try:
+        dtes = db.query(WasabilDte).filter(col == factura_id).all()
+    except (ProgrammingError, OperationalError) as e:
+        logger.error("Guard SII de la plata: esquema de wasabil_dte incompleto: %s", e)
+        raise HTTPException(
+            503,
+            "El módulo de facturas electrónicas está a medio instalar: corre "
+            "backend/wasabil_dte/init_db.py y reinicia el backend",
+        ) from e
+    # `.all()` + `any(...)` en vez de `.first()`: hoy el UniqueConstraint("factura_id") de
+    # wasabil_dte deja a lo más UNA fila, así que es la misma consulta; si esa llave
+    # desapareciera, CUALQUIER fila no emitida bloquea la plata (fail closed) en vez de
+    # decidir con la primera que devuelva la BD.
+    return any(not _dte_emitido_ante_sii(d) for d in dtes)
+
+
+def _plata_bloqueada_por_sii(db: Session, factura: ContFacturaCliente) -> bool:
+    """True si NO debe entrar plata contra esta factura porque su documento electrónico
+    todavía no existe ante el SII. PUERTA ÚNICA del guard: la usan los TRES caminos por
+    los que entra plata a una factura —cobranza manual (registrar_cobranza), cesión al
+    factor (set_factoring/liquidar_factoring) y aplicación de adelantos
+    (_aplicar_adelantos_pendientes)—, así que agregar un cuarto camino de plata es
+    agregar una línea, no re-derivar la regla.
+
+    Por qué existe como helper y no como 4 líneas repetidas: la primera versión del guard
+    vivió sólo en registrar_cobranza y el factoring —la misma plata, la función de al
+    lado— quedó abierto: se podía ceder al factor una factura que el SII nunca conoció,
+    dejarla 'factorizada' (con lo que la aplicación automática de adelantos devuelve 0) y
+    encima IMBORRABLE (eliminar_factura rechaza toda factura con factoring), secuestrando
+    para siempre el cupo facturable de esa mercadería.
+
+    Sólo se consulta al módulo DTE cuando NO hay folio Y el documento es FACTURA: una
+    factura con folio ya está ante el SII y una BOLETA jamás tiene un DTE 33, así que ni
+    una ni otra se exponen a un 503 gratuito en una BD sin migrar.
+
+    El criterio de "el documento ya existe ante el SII" NO se re-deriva acá: es
+    _dte_emitido_ante_sii (status EMITIDO **y** folio), el mismo que usa el módulo que
+    arma las referencias tributarias. Una sola definición, tres puertas de plata."""
+    return ((factura.tipo_doc or "factura") == "factura"
+            and not (factura.numero_factura or "").strip()
+            and _dte_factura_no_emitido(db, factura.id))
+
+
+def _exigir_sii_emitido(db: Session, factura: ContFacturaCliente, accion: str,
+                        salida: Optional[str] = None) -> None:
+    """409 accionable si la factura electrónica aún no tiene folio del SII. `accion` es la
+    frase que cierra el mensaje ('registrar pagos', 'cederla al factoring', …) para que el
+    operador sepa qué quedó sin hacer. La salida siempre es la misma: esperar el folio o
+    usar «Reintentar» (que consulta a Wasabil). Apenas el SII confirma, la operación se
+    acepta sin más trámite.
+
+    `salida`: frase EXTRA para los caminos donde «Reintentar» puede no alcanzar. Existe
+    porque el guard de la liquidación, sin ella, era un callejón: si el SII nunca va a
+    confirmar ese documento, el operador quedaba sin ninguna acción posible (ver
+    revertir_factoring). Un 409 sin salida es un ticket de soporte garantizado."""
+    if _plata_bloqueada_por_sii(db, factura):
+        raise HTTPException(409, "Esta factura todavía no está emitida ante el SII: "
+                                 f"espera el folio (o usa «Reintentar») antes de {accion}"
+                                 + (f". {salida}" if salida else ""))
 
 
 def _recompute_factura(factura: ContFacturaCliente, cobranzas: Optional[list] = None) -> None:
@@ -642,15 +772,23 @@ def _aplicar_adelantos_pendientes(db: Session, oc: OcCliente,
     # en esa ventana dejaba la factura fantasma "pagada", amarraba el adelanto a un
     # documento inexistente ante el SII y bloqueaba su borrado. La aplicación ocurre
     # igual, apenas el SII confirma, desde _finalizar_factura_emitida.
-    if not (factura.numero_factura or "").strip():
-        from wasabil_dte.models import WasabilDte as _WDte, STATUS_EMITIDO as _ST_OK
-        _dte = db.query(_WDte).filter(_WDte.factura_id == factura.id).first()
-        if _dte is not None and _dte.status_id != _ST_OK:
-            return 0.0
+    # Consulta al DTE por _plata_bloqueada_por_sii —la misma puerta que usan la cobranza
+    # manual y el factoring, así la regla vive en UN solo lugar— (ImportError → False,
+    # esquema a medias → 503 accionable): antes el import y la query iban pelados y un
+    # deploy sin el init_db de wasabil_dte reventaba en 500 crudo, sin decir qué correr.
+    # Acá el guard NO es un 409: el adelanto queda pendiente y se aplica solo cuando el
+    # SII confirma (desde _finalizar_factura_emitida).
+    if _plata_bloqueada_por_sii(db, factura):
+        return 0.0
+    # populate_existing (regla 3 de docs/regla-lecturas-de-plata.md): sin él SQLAlchemy
+    # devuelve los adelantos que ya están en el identity map —los metió la lectura PLANA
+    # de _adelantos_de_oc / del serializador— y DESCARTA los valores frescos que trajo el
+    # FOR UPDATE. Acá se decide plata con `monto_aplicado`: con el valor viejo, el mismo
+    # depósito se aplicaba DOS VECES (rompiendo monto_aplicado == Σ cobranzas 'adelanto').
     q = (db.query(ContAdelanto)
          .filter(ContAdelanto.oc_cliente_id == oc.id,
                  ContAdelanto.estado == "aprobado")
-         .with_for_update())
+         .populate_existing().with_for_update())
     if factura.es_anticipo:
         q = q.filter(ContAdelanto.factura_anticipo_id == factura.id)
     adelantos = q.order_by(ContAdelanto.id.asc()).all()
@@ -692,7 +830,9 @@ def _aplicar_adelantos_pendientes(db: Session, oc: OcCliente,
             continue
         cob = ContCobranza(
             factura_id=factura.id, adelanto_id=adel.id,
-            fecha=adel.fecha_pago or date.today(), monto=aplicar,
+            # Fecha del depósito; si Tesorería no la registró, la de CHILE (no date.today(),
+            # que es UTC en el server y a fin de mes cae en el período equivocado).
+            fecha=adel.fecha_pago or _hoy_chile(), monto=aplicar,
             medio=MEDIO_ADELANTO, banco=adel.banco,
             numero_operacion=adel.numero_operacion,
             observaciones="Aplicación automática de adelanto aprobado por Tesorería",
@@ -1018,6 +1158,11 @@ def despachos_facturables(
         e = by_desp.setdefault(d.id, {
             "id": d.id, "numero_despacho": d.numero_despacho,
             "numero_guia": d.numero_guia, "numero_expedicion": d.numero_expedicion,
+            # Fecha de EMISIÓN de la guía: la referencia 52 del DTE 33 la exige, así que
+            # una guía en papel sin ella NO se puede facturar al SII. Viaja hasta acá para
+            # que el selector lo avise ANTES de elegirla — quien factura (Contabilidad) no
+            # es quien la carga (Bodega), y si no se ve acá el bloqueo sorprende al final.
+            "fecha_guia": d.fecha_guia.isoformat() if d.fecha_guia else None,
             "guia_firmada_archivo": d.guia_firmada_archivo,
             "items_count": 0, "facturable": 0.0,
         })
@@ -1190,9 +1335,11 @@ def anular_adelanto(
     """Anula un adelanto que no prosperó (el cliente nunca depositó, o se informó por
     error). Bloqueado si ya se aplicó a una factura (revertir esa cobranza primero) o si
     está conciliado con el banco (desconciliar en Tesorería primero)."""
+    # populate_existing: el guard de abajo decide sobre plata (monto_aplicado) y el
+    # listado de la venta ya pudo cargar este adelanto con una lectura plana.
     adel = (db.query(ContAdelanto)
             .filter(ContAdelanto.id == adelanto_id)
-            .with_for_update().first())
+            .populate_existing().with_for_update().first())
     if not adel:
         raise HTTPException(404, "Adelanto no encontrado")
     if adel.estado == "anulado":
@@ -1225,10 +1372,16 @@ class FacturaCreate(BaseModel):
     oc_cliente_id: int
     despacho_id: Optional[int] = None
     numero_factura: Optional[str] = None
-    tipo_doc: str = "factura"
+    # Lista BLANCA (no un str libre): el folio SII es obligatorio solo para 'factura', así
+    # que cualquier otro valor —un typo como 'Factura', o 'nota'— SALTEABA el folio
+    # obligatorio y persistía un documento tributario sin N°. Los dos valores son los que
+    # admite la columna (models.py: "factura | boleta") y los únicos que manda la pantalla.
+    tipo_doc: Literal["factura", "boleta"] = "factura"
     fecha_emision: Optional[str] = None
     condicion_pago: Optional[str] = None
-    plazo_dias: Optional[int] = Field(None, ge=0)
+    # le=3650 (10 años): sin techo, `fecha_emision + timedelta(days=plazo)` reventaba con
+    # OverflowError → 500 en vez de un 422 del borde.
+    plazo_dias: Optional[int] = Field(None, ge=0, le=3650)
     items: Optional[List[FacturaItemIn]] = None
     observaciones: Optional[str] = None
     rut_cliente: Optional[str] = None
@@ -1243,6 +1396,13 @@ class FacturaCreate(BaseModel):
     monto_neto_anticipo: Optional[float] = Field(None, gt=0)
     adelanto_ids: Optional[List[int]] = None
     descripcion_anticipo: Optional[str] = None
+    # Puerta EXPLÍCITA para un SEGUNDO anticipo de la misma venta. Emitir un DTE 33 es
+    # IRREVERSIBLE y el candado anti doble emisión solo dura mientras el HTTP está en
+    # vuelo: sin esto, dos clics tranquilos emitían dos facturas de anticipo REALES por el
+    # mismo adelanto. Aquí NO se prohíbe (en Grupo AM una OC puede tener varios adelantos,
+    # cada uno ligado a su anticipo por cont_adelanto.factura_anticipo_id): se exige
+    # decirlo a propósito. Ver _construir_factura_anticipo.
+    confirmar_segundo_anticipo: bool = False
 
 
 class FacturaPreview(BaseModel):
@@ -1256,6 +1416,10 @@ class FacturaPreview(BaseModel):
     monto_neto_anticipo: Optional[float] = Field(None, gt=0)
     adelanto_ids: Optional[List[int]] = None
     descripcion_anticipo: Optional[str] = None
+    # Mismo campo que FacturaCreate: el preview tiene que poder mostrar el aviso del
+    # segundo anticipo Y desbloquearlo cuando el operador marca la casilla, o el modal
+    # pintaría "no se puede emitir" sobre algo que el emitir sí acepta.
+    confirmar_segundo_anticipo: bool = False
 
 
 @router.get("/facturas")
@@ -1365,6 +1529,50 @@ def _precios_congelados_guia(db: Session, despacho_id: Optional[int]):
     return por_di, por_parte
 
 
+def _ligar_lineas_a_su_guia(desp: Despacho, lineas: list, nombres: dict) -> tuple:
+    """Liga al ítem de despacho de LA GUÍA declarada (`desp`) toda línea que no lo declare.
+    Devuelve (líneas nuevas, problemas). NO muta el payload: cada línea resuelta es una
+    COPIA (regla de inmutabilidad de la casa).
+
+    POR QUÉ (el agujero que cierra). El tope por GUÍA sólo se aplicaba «si se indicó
+    despacho_item_id», y ese campo es OPCIONAL: mandando `items` sueltos contra
+    `despacho_id` = guía A se facturaban unidades que salieron en la guía B, y la factura
+    quedaba persistida con `despacho_item_id = NULL`. Consecuencias medidas: la referencia
+    52 del DTE 33 citaba la guía que NO trasladó esa mercadería (documento tributario
+    irreversible), el cinturón del reintento de wasabil_dte —que mira justamente esos
+    despacho_item_id— quedaba CIEGO, y `_qty_facturada_por_despacho_item` (que ignora los
+    NULL) no descontaba el cupo de la guía.
+
+    Regla que queda: una línea facturada BAJO una guía está LIGADA a esa guía, siempre.
+    Si no se puede ligar, no se factura — nunca se adivina:
+      · 1 ítem de despacho de esa parte en la guía → se adopta su id (y con eso el tope
+        por guía, que antes se saltaba, empieza a aplicar).
+      · 0 → la mercadería no salió en esta guía: BLOQUEA (facturar cada guía por separado).
+      · >1 (mismo ítem partido en dos líneas de la MISMA guía) → ambiguo: BLOQUEA pidiendo
+        el despacho_item_id explícito. Fail closed: repartir la cantidad a dedo sería
+        inventar de cuál de las dos salió."""
+    por_item = {}
+    for di in desp.items:
+        por_item.setdefault(di.item_cotizacion_id, []).append(di)
+    out, problemas = [], []
+    guia = (desp.numero_guia or desp.numero_despacho or "").strip() or f"#{desp.id}"
+    for ln in lineas:
+        if ln.despacho_item_id is not None:
+            out.append(ln)
+            continue
+        cands = por_item.get(ln.item_cotizacion_id) or []
+        nombre = nombres.get(ln.item_cotizacion_id) or f"ítem {ln.item_cotizacion_id}"
+        if len(cands) == 1:
+            out.append(ln.model_copy(update={"despacho_item_id": cands[0].id}))
+        elif not cands:
+            problemas.append(f"{nombre} no salió en la guía {guia}: no se puede facturar "
+                             f"bajo esta guía (factura la guía que trasladó esa mercadería)")
+        else:
+            problemas.append(f"{nombre} aparece en {len(cands)} líneas de la guía {guia}: "
+                             f"indica el despacho_item_id de la que estás facturando")
+    return out, problemas
+
+
 def _construir_factura(db: Session, payload, oc: OcCliente, cot, empresa: str) -> dict:
     """Deriva y valida las líneas + montos de una factura SIN persistir ni tomar locks.
     Fuente ÚNICA de verdad: el preview y crear_factura la usan (lo que se previsualiza es
@@ -1470,6 +1678,15 @@ def _construir_factura(db: Session, payload, oc: OcCliente, cot, empresa: str) -
             problemas.append("El despacho ya fue facturado por completo")
     if not lineas and not problemas:
         problemas.append("Debe indicar ítems o un despacho a facturar")
+
+    # Toda línea que se factura BAJO una guía queda ligada al ítem de despacho de ESA guía
+    # (ver _ligar_lineas_a_su_guia). En el camino derivado ya vienen ligadas y esto es un
+    # no-op; el que importa es el de `items` sueltos + despacho_id, por donde entraba una
+    # línea de otra guía con `despacho_item_id = NULL`.
+    if guia_ok and desp is not None and lineas:
+        lineas, problemas_liga = _ligar_lineas_a_su_guia(
+            desp, lineas, {i.id: (i.numero_parte or "").strip() for i in items_db})
+        problemas.extend(problemas_liga)
 
     # Validación por línea con acumuladores unificados (guía + ítem) en este request
     usado_di, usado_item = {}, {}
@@ -1582,12 +1799,21 @@ def _construir_factura(db: Session, payload, oc: OcCliente, cot, empresa: str) -
     # payload: los precios derivados (guía congelada / pricing) respetan el
     # invariante por construcción, pero un precio del payload podría inflar la
     # factura por sobre la venta (espejo del tope de _construir_factura_anticipo).
-    if validadas and not problemas and any(
-            ln.precio_unit_neto is not None for _it, ln, *_r in validadas):
+    # ADEMÁS (cierre de paridad 2026-07-28): si lo YA facturado consumió el total
+    # completo, se bloquea CUALQUIER factura nueva — sin esto, una explícita inflada
+    # que agotó el total dejaba pasar a la derivada siguiente en silencio (bypass
+    # por orden). Deliberadamente NO se chequea el invariante completo en derivadas
+    # con total parcial: las ventas SIN foto de TC recalculan el total con el config
+    # vivo y una tanda vieja legítima podría exceder el total nuevo (falso 409).
+    if validadas and not problemas:
+        hay_explicito = any(ln.precio_unit_neto is not None for _it, ln, *_r in validadas)
         total_venta = _total_bruto_venta(db, cot.id)
         if total_venta > 0:
-            facturado = sum(_f(f.monto_bruto) for f in _facturas_de_oc(db, oc.id, empresa))
-            if facturado + neto + iva > total_venta + TOL_PAGO:
+            facturas_previas = _facturas_de_oc(db, oc.id, empresa)
+            facturado = sum(_f(f.monto_bruto) for f in facturas_previas)
+            tope_agotado = facturado >= total_venta - TOL_PAGO * (len(facturas_previas) + 1)
+            if (hay_explicito or tope_agotado) and \
+                    facturado + neto + iva > total_venta + TOL_PAGO * (len(facturas_previas) + 1):
                 disponible = max(total_venta - facturado, 0.0)
                 problemas.append(
                     f"La factura excede el total de la venta "
@@ -1651,6 +1877,33 @@ def _construir_factura_anticipo(db: Session, payload, oc: OcCliente, cot, empres
     neto = round(_f(getattr(payload, "monto_neto_anticipo", None)), 2)
     if neto <= 0:
         problemas.append("Indica el monto NETO del anticipo (mayor a 0)")
+
+    # UN anticipo por venta salvo confirmación EXPLÍCITA. Emitir un DTE 33 es
+    # IRREVERSIBLE y el candado anti doble emisión de wasabil_dte solo dura mientras el
+    # HTTP está en vuelo: apenas responde la primera emisión, la segunda pasa libre. Sin
+    # esto, dos clics tranquilos emitían DOS facturas de anticipo REALES por el mismo
+    # adelanto (y el tope Σ brutos no lo frena: dos anticipos de la mitad caben perfecto).
+    # Aquí NO se prohíbe —a diferencia de Monza, en Grupo AM una OC puede tener VARIOS
+    # adelantos y cada uno se liga a SU anticipo por cont_adelanto.factura_anticipo_id, así
+    # que el anticipo parcial pactado es un caso legítimo—: se exige decirlo a propósito
+    # (confirmar_segundo_anticipo), con el folio y el monto del que ya existe a la vista.
+    # Espejo del bloqueo que _construir_factura ya hacía en el otro sentido (un anticipo
+    # sin folio frena la factura del despacho).
+    if not getattr(payload, "confirmar_segundo_anticipo", False):
+        previo = (
+            db.query(ContFacturaCliente)
+            .filter(ContFacturaCliente.oc_cliente_id == oc.id,
+                    ContFacturaCliente.empresa == empresa,
+                    ContFacturaCliente.es_anticipo == 1)
+            .order_by(ContFacturaCliente.id.asc()).first()
+        )
+        if previo is not None:
+            ident = (previo.numero_factura or "").strip() or f"#{previo.id}"
+            monto_txt = f"{_f(previo.monto_bruto):,.0f}".replace(",", ".")
+            problemas.append(
+                f"Esta venta ya tiene una factura de anticipo (N° {ident}, ${monto_txt}). "
+                "Si de verdad necesitas un segundo anticipo, márcalo explícitamente."
+            )
 
     # Tope: lo ya facturado (todas las facturas de la OC: anticipos brutos + finales ya
     # con descuento) + este anticipo no puede superar el total de la venta.
@@ -1769,9 +2022,43 @@ def crear_factura(
     tipo_doc = payload.tipo_doc or "factura"
     if payload.es_anticipo and tipo_doc != "factura":
         raise HTTPException(400, "La factura de anticipo debe ser tipo 'factura' (no boleta)")
+    # Una BOLETA no puede descontar un anticipo: el descuento se apoya en una referencia al
+    # FOLIO de una factura y una boleta no referencia facturas. Sin este guard salía una
+    # boleta con la línea «Descuento anticipo Factura N° …» —insostenible ante el SII— y
+    # además ese descuento CONSUMÍA el pendiente del anticipo (se deriva de esas líneas,
+    # ver _anticipos_pendientes_de_descuento): el anticipo quedaba contablemente descontado
+    # contra un documento que no puede citarlo. La mercadería de una venta con anticipo se
+    # FACTURA. Molde monza_contabilidad/router.py (su hallazgo A-5); acá el guard vive en
+    # crear_factura porque en Grupo AM el `tipo_doc` no llega al constructor (la vía
+    # electrónica ya rechaza todo lo que no sea factura, wasabil_dte/router.py).
+    if tipo_doc != "factura" and not payload.es_anticipo and \
+            _anticipos_pendientes_de_descuento(db, oc.id, empresa):
+        raise HTTPException(
+            400, "Esta venta tiene una factura de anticipo por descontar: la mercadería "
+                 "debe emitirse como FACTURA (no boleta), que es el único documento que "
+                 "puede referenciar el folio del anticipo")
     folio = (payload.numero_factura or "").strip()
     if tipo_doc == "factura" and not folio:
         raise HTTPException(400, "Ingresa el folio SII de la factura (o cámbialo a boleta)")
+    # Folio NUMÉRICO cuando la factura es un ANTICIPO. La factura del despacho lo va a citar
+    # en una referencia tipo 33, y el SII exige que el FolioRef sea el folio correlativo
+    # —un número— del DTE referenciado. wasabil_dte/service.py lo valida al armar esa
+    # referencia, pero ahí es TARDE y LEJOS: el folio se teclea AQUÍ, al registrar un
+    # anticipo ya emitido, y el error aparecía semanas después al facturar el despacho —que
+    # no se puede emitir hasta arreglarlo— con el anticipo ya descontando cupo. Reproducido
+    # con 'N/A-99', 'FAC 123', 'N/A' y '0'. SOLO sobre el anticipo: una factura normal puede
+    # traer un folio legado no numérico y romper su registro sería una regresión gratuita
+    # (nadie referencia esas). (`isascii` además de `isdigit`: '٣'.isdigit() es True y no es
+    # un folio del SII.) El tope de 18 caracteres es el del folio de una referencia del SII
+    # y de paso evita que el int() sobre miles de dígitos reviente por el límite de Python.
+    if payload.es_anticipo and folio and (
+            len(folio) > 18 or not (folio.isascii() and folio.isdigit()) or int(folio) <= 0):
+        raise HTTPException(
+            400,
+            f"El folio de la factura de anticipo ('{folio}') debe ser el número "
+            "correlativo que le asignó el SII: la factura de la mercadería lo va a "
+            "referenciar (referencia tipo 33) y el SII solo acepta folios numéricos de "
+            "hasta 18 dígitos. Escríbelo con dígitos, sin letras, guiones ni espacios.")
     if folio:
         dup = db.query(ContFacturaCliente).filter(
             ContFacturaCliente.empresa == empresa,
@@ -1859,9 +2146,13 @@ def _persistir_factura(db: Session, payload, oc: OcCliente, cot, datos: dict, *,
         # adelanto: anular/editar solo bloquean la fila del adelanto (no la OC), así
         # que el chequeo del preview pudo quedar obsoleto.
         if payload.adelanto_ids:
+            # populate_existing: la re-validación decide plata (monto_aplicado) y el
+            # preview de esta misma request ya cargó estos adelantos con una lectura
+            # PLANA — sin él SQLAlchemy sirve esa copia del identity map y el
+            # FOR UPDATE queda decorativo (regla de lecturas de plata, regla 3).
             adelantos_link = (db.query(ContAdelanto)
                               .filter(ContAdelanto.id.in_(payload.adelanto_ids))
-                              .with_for_update().all())
+                              .populate_existing().with_for_update().all())
             if len(adelantos_link) != len(set(payload.adelanto_ids)):
                 raise HTTPException(409, "Alguno de los adelantos indicados ya no existe")
             for a in adelantos_link:
@@ -1872,6 +2163,10 @@ def _persistir_factura(db: Session, payload, oc: OcCliente, cot, datos: dict, *,
                 a.factura_anticipo_id = factura.id
     else:
         for it, ln, cantidad, p2, total in datos["validadas"]:
+            # despacho_item_id: con una guía declarada SIEMPRE viene (lo garantiza
+            # _ligar_lineas_a_su_guia; antes podía quedar NULL y con eso el cinturón del
+            # reintento de wasabil_dte —que valida las líneas contra la guía que la 52
+            # cita— se quedaba sin nada que mirar, y el cupo de la guía sin descontar).
             db.add(ContFacturaClienteItem(
                 factura_id=factura.id, item_cotizacion_id=ln.item_cotizacion_id,
                 despacho_item_id=ln.despacho_item_id,
@@ -1920,11 +2215,20 @@ def registrar_cobranza(
     current_user: User = Depends(get_current_user),
 ):
     """Registra un pago real del cliente. Bloquea la factura (lock de fila), rechaza medios de
-    factoring y el SOBRE-PAGO (recalcula el saldo desde las cobranzas reales). Si la factura
-    tiene factoring vigente, exige liquidarlo antes. Recalcula saldo y estado."""
+    factoring, la factura de ANTICIPO y el SOBRE-PAGO (recalcula el saldo desde las cobranzas
+    reales). Si la factura tiene factoring vigente, exige liquidarlo antes; si es una factura
+    ELECTRÓNICA que el SII todavía no confirmó (sin folio, DTE en vuelo/rechazado), tampoco
+    recibe plata hasta que llegue el folio. Recalcula saldo y estado."""
+    # populate_existing: regla 3 de docs/regla-lecturas-de-plata.md — es OBLIGATORIO en toda
+    # lectura bloqueante, porque si la fila ya está en la sesión SQLAlchemy devuelve el
+    # objeto cacheado y DESCARTA los valores frescos que trajo el FOR UPDATE (a cualquier
+    # nivel de aislamiento). Importa acá porque los campos que se validan abajo
+    # (es_anticipo, monto_bruto) deciden si entra plata y cuánta. Paridad con
+    # monza_contabilidad/router.py:registrar_cobranza, que sí lo tenía.
     factura = (
         db.query(ContFacturaCliente)
         .filter(ContFacturaCliente.id == factura_id)
+        .populate_existing()
         .with_for_update()
         .first()
     )
@@ -1936,19 +2240,48 @@ def registrar_cobranza(
         raise HTTPException(400, "Las cobranzas de factoring se gestionan desde el panel de factoring")
     if (payload.medio or "") == MEDIO_ADELANTO:
         raise HTTPException(400, "Las cobranzas de adelanto las genera el sistema al aplicar un adelanto aprobado por Tesorería")
+    # PARIDAD CON MONZA (monza_contabilidad/router.py:registrar_cobranza): una factura de
+    # ANTICIPO (vía B) se salda SOLO con la aplicación del adelanto que aprueba Tesorería.
+    # Si un administrativo la salda A MANO con la transferencia del cliente, ese mismo
+    # depósito se cuenta DOS VECES: _aplicar_adelantos_pendientes ve el anticipo ya sin
+    # saldo y aplica 0 (corta en `saldo <= TOL_PAGO`), pero lo cuenta como SALDADO, así que
+    # libera el adelanto ligado y su plata cae COMPLETA en la factura del despacho real.
+    # Reproducido: el cliente depositó $59.500 y la venta quedó facturada 119.000 / cobrada
+    # 119.000, con saldo 0. La empresa deja de perseguir plata que nunca entró.
+    # Mismo espíritu que el rechazo de medio='adelanto' de arriba: la plata del adelanto
+    # entra por UNA sola puerta (Tesorería).
+    if factura.es_anticipo:
+        raise HTTPException(409, "Una factura de anticipo se salda con el adelanto que aprueba "
+                                 "Tesorería, no con una cobranza manual: informe el depósito "
+                                 "en Tesorería y apruébelo ahí")
     # Lecturas BLOQUEANTES (no las relaciones perezosas): ver _cobranzas_bloqueadas.
     # Sin esto, dos cobranzas simultáneas por el saldo completo pasaban AMBAS el tope.
     fact_vig = _factoring_bloqueado(db, factura.id)
     if fact_vig and fact_vig.estado == "vigente":
         raise HTTPException(409, "La factura tiene un factoring vigente; liquide el factoring antes de registrar cobranzas")
+    # Guard SII (paridad con monza_contabilidad/router.py:registrar_cobranza): espejo del
+    # que _aplicar_adelantos_pendientes ya tenía para la plata AUTOMÁTICA. Una factura
+    # ELECTRÓNICA sin folio y con su DTE en vuelo / borrador / rechazado no debe recibir
+    # plata: si el SII termina rechazándola, quedaba dinero contabilizado contra un
+    # documento tributario que nunca existió, la factura marcada 'pagada' y —peor— zombi
+    # IMBORRABLE («revierta las cobranzas antes de eliminar»), secuestrando el cupo
+    # facturable de esa mercadería. La asimetría era interna: el adelanto protegido, el
+    # pago manual no. Apenas el SII confirma el folio, la misma cobranza se acepta.
+    # (La regla completa —y por qué es un helper compartido con el factoring— en
+    # _plata_bloqueada_por_sii.)
+    _exigir_sii_emitido(db, factura, "registrar pagos")
     # Recalcular el saldo desde las cobranzas reales dentro de la transacción (no del campo cacheado)
     cobs_frescas = _cobranzas_bloqueadas(db, factura.id)
     pagado_actual = sum(_f(c.monto) for c in cobs_frescas)
     saldo_actual = round(_f(factura.monto_bruto) - pagado_actual, 2)
     if payload.monto > saldo_actual + TOL_PAGO:
         raise HTTPException(400, f"El monto excede el saldo pendiente ({max(saldo_actual, 0):.0f})")
+    # Fecha de CHILE cuando el operador no la indica (no date.today(), que es UTC en el
+    # server): un pago registrado pasadas las ~20:00 de Chile quedaba fechado al día
+    # siguiente y a fin de mes caía en el PERÍODO CONTABLE equivocado. Mismo helper que
+    # ya usaba fecha_emision (_hoy_chile).
     nueva = ContCobranza(
-        factura_id=factura.id, fecha=_parse_date(payload.fecha) or date.today(),
+        factura_id=factura.id, fecha=_parse_date(payload.fecha) or _hoy_chile(),
         monto=payload.monto, medio=payload.medio or "transferencia",
         banco=payload.banco, numero_operacion=payload.numero_operacion,
         observaciones=payload.observaciones, usuario_id=getattr(current_user, "id", None),
@@ -2012,9 +2345,11 @@ def eliminar_cobranza(
     # (bajo lock) para que quede disponible para otra factura. Mantiene el INVARIANTE
     # monto_aplicado == Σ cobranzas medio='adelanto' del adelanto.
     if c.medio == MEDIO_ADELANTO and c.adelanto_id:
+        # populate_existing: se resta sobre `monto_aplicado`, así que el valor tiene que
+        # ser el fresco del FOR UPDATE y no el que dejó una lectura plana anterior.
         adel = (db.query(ContAdelanto)
                 .filter(ContAdelanto.id == c.adelanto_id)
-                .with_for_update().first())
+                .populate_existing().with_for_update().first())
         if adel:
             adel.monto_aplicado = round(max(_f(adel.monto_aplicado) - _f(c.monto), 0.0), 2)
     # Totales desde la lectura BLOQUEANTE menos la fila borrada: la relación perezosa
@@ -2053,9 +2388,12 @@ def set_factoring(
     """Crea o actualiza el factoring (1 por factura). Valida adelanto <= cupo (bruto - pagos
     reales), deriva la retención si falta, y genera SOLO la cobranza de ADELANTO
     (medio 'factoring_adelanto'). Registra quién lo hizo. No editable si ya está liquidado."""
+    # populate_existing: el cupo que se cede al factor se calcula con `monto_bruto` y el
+    # guard mira `es_anticipo` — plata pura; sin él sería la copia del identity map.
     factura = (
         db.query(ContFacturaCliente)
         .filter(ContFacturaCliente.id == factura_id)
+        .populate_existing()
         .with_for_update()
         .first()
     )
@@ -2063,6 +2401,20 @@ def set_factoring(
         raise HTTPException(404, "Factura no encontrada")
     if factura.es_anticipo:
         raise HTTPException(409, "No se puede hacer factoring de una factura de anticipo (respalda un adelanto ya recibido)")
+    # Guard SII — MISMA plata que registrar_cobranza, por la puerta de al lado: el
+    # factoring genera una cobranza real ('factoring_adelanto') con el dinero que
+    # entrega el factor. Ceder una factura cuyo DTE está en vuelo o RECHAZADO metía
+    # plata contra un documento que el SII nunca conoció y dejaba la factura
+    # 'factorizada' → la aplicación automática de adelantos devuelve 0 y
+    # eliminar_factura la rechaza por tener factoring: zombi permanente que secuestra
+    # el cupo facturable. Apenas llega el folio, la cesión se acepta igual.
+    # La `salida` nombra revertir_factoring porque ESTE endpoint es también el que usaba el
+    # operador para deshacer una cesión (upsert a monto 0): con el guard puesto, esa
+    # maniobra ya no pasa y el caso legado necesita saber por dónde salir.
+    _exigir_sii_emitido(db, factura, "cederla al factoring",
+                        salida="Si ya hay una cesión registrada contra este documento y el "
+                               "documento nunca llegó a existir ante el SII, revierte la "
+                               "cesión al factor (queda la traza con el motivo)")
     # Lecturas BLOQUEANTES: el cupo que se cede al factor se calcula sobre los pagos
     # REALES del cliente, y la relación perezosa sirve el snapshot viejo del request.
     fac = _factoring_bloqueado(db, factura.id)
@@ -2087,7 +2439,9 @@ def set_factoring(
     fac.usuario_id = getattr(current_user, "id", None)
     fac.empresa_factoring = payload.empresa_factoring
     fac.id_operacion = payload.id_operacion
-    fac.fecha_operacion = _parse_date(payload.fecha_operacion) or date.today()
+    # Fecha de CHILE por defecto (ver la nota de registrar_cobranza): la fecha de la
+    # operación de factoring es un dato contable, no la hora UTC del server.
+    fac.fecha_operacion = _parse_date(payload.fecha_operacion) or _hoy_chile()
     fac.monto_adelantado = payload.monto_adelantado
     fac.costo_factoring = payload.costo_factoring
     fac.retencion = retencion
@@ -2133,17 +2487,37 @@ def liquidar_factoring(
     """Liquida el factoring vigente: libera el saldo pendiente REAL como retención (cobranza
     'factoring_retencion'), cerrando la factura en saldo 0, y marca estado 'liquidada' con
     quién y cuándo."""
+    # populate_existing: se libera contra `monto_bruto` (plata) — el valor tiene que ser
+    # el del FOR UPDATE, no el de una lectura plana previa del request.
     factura = (
         db.query(ContFacturaCliente)
         .filter(ContFacturaCliente.id == factura_id)
+        .populate_existing()
         .with_for_update()
         .first()
     )
     if not factura:
         raise HTTPException(404, "Factura no encontrada")
-    fac = factura.factoring
+    # Lectura BLOQUEANTE del factoring (_factoring_bloqueado, el mismo helper que usa
+    # set_factoring): con la relación perezosa `factura.factoring` el estado venía del
+    # snapshot del inicio del request, y justo debajo se ESCRIBE `fac.retencion` y se
+    # cierra la factura en 0 — una cesión/liquidación commiteada en paralelo era
+    # invisible y se liquidaba dos veces sobre datos viejos.
+    fac = _factoring_bloqueado(db, factura.id)
     if not fac or fac.estado != "vigente":
         raise HTTPException(400, "No hay factoring vigente para liquidar")
+    # Guard SII — la liquidación es la SEGUNDA entrada de plata del factoring (libera la
+    # retención como cobranza 'factoring_retencion' y cierra la factura en saldo 0). Con
+    # el guard puesto en set_factoring este estado ya no se puede crear, pero sí existe
+    # como LEGADO (cesiones registradas antes de este candado), y cerrar en 0 una factura
+    # que el SII no conoce es justo el asiento que no debe quedar. Va DESPUÉS del chequeo
+    # de factoring vigente a propósito: si no hay nada que liquidar, el operador tiene que
+    # leer eso y no «espera el folio». Salida: «Reintentar» hasta que llegue el folio y,
+    # si ese documento NUNCA va a existir, revertir la cesión (revertir_factoring) — sin
+    # esa segunda salida este guard convertía el caso legado en un callejón sin salida.
+    _exigir_sii_emitido(db, factura, "liquidar el factoring",
+                        salida="Si ese documento nunca llegó a existir ante el SII, "
+                               "revierte la cesión al factor (queda la traza con el motivo)")
     # Liberar el saldo pendiente REAL (no un valor fijo) para cerrar exacto en 0.
     # Lectura BLOQUEANTE: con la relación perezosa, un pago del cliente commiteado en
     # paralelo era invisible y el factor liberaba de más (o de menos) que lo pactado.
@@ -2152,14 +2526,17 @@ def liquidar_factoring(
     liberar = round(max(_f(factura.monto_bruto) - pagado_actual, 0.0), 2)
     # La retención refleja SIEMPRE lo realmente liberado por el factor en esta liquidación
     fac.retencion = liberar
+    # Fecha de CHILE (ver la nota de registrar_cobranza): la cobranza de la retención y la
+    # fecha de liquidación son el MISMO hecho contable y tienen que llevar la misma fecha.
+    hoy = _hoy_chile()
     if liberar > TOL:
         db.add(ContCobranza(
-            factura_id=factura.id, fecha=date.today(), monto=liberar,
+            factura_id=factura.id, fecha=hoy, monto=liberar,
             medio=MEDIO_FACT_RETENCION, banco=fac.banco, numero_operacion=fac.id_operacion,
             observaciones="Liquidación retención factoring", usuario_id=getattr(current_user, "id", None),
         ))
     fac.estado = "liquidada"
-    fac.fecha_liquidacion = date.today()
+    fac.fecha_liquidacion = hoy
     fac.usuario_liquidacion_id = getattr(current_user, "id", None)
     db.flush()
     db.refresh(factura, with_for_update=True)
@@ -2168,6 +2545,269 @@ def liquidar_factoring(
     db.commit()
     db.refresh(factura, with_for_update=True)
     return _serialize_factura(factura)
+
+
+class RevertirFactoringIn(BaseModel):
+    """Reversión de una cesión al factor registrada contra un documento que el SII nunca
+    llegó a conocer. `motivo` es OBLIGATORIO: queda en la factura y en el log del server
+    (la operación de factoring desaparece, así que la traza es lo único que queda)."""
+    motivo: str = Field(..., min_length=5, max_length=400)
+
+
+@router.post("/facturas/{factura_id}/factoring/revertir")
+def revertir_factoring(
+    factura_id: int,
+    payload: RevertirFactoringIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CONTRAPARTIDA del guard SII del factoring: la salida —única y auditada— del caso
+    LEGADO en que una factura quedó cedida al factor contra un documento tributario que
+    nunca existió.
+
+    POR QUÉ EXISTE (el zombi imborrable). Antes de los guards SII se podía ceder al factor
+    una factura sin folio. Con los guards puestos, esa fila legada quedó cerrada por los
+    TRES lados a la vez: no se puede liquidar (guard SII de liquidar_factoring), no se
+    puede EDITAR a 0 (guard SII de set_factoring, que es la única forma que tenía el
+    módulo de deshacer una cesión), no se puede eliminar la factura (`if factura.factoring`
+    responde 409) y la aplicación automática de adelantos devuelve 0. Resultado: plata del
+    factor amarrada a un documento inexistente y el cupo facturable de esa mercadería
+    secuestrado PARA SIEMPRE. Mejorar la puerta de entrada sin abrir una de salida es
+    dejar plata atrapada; eso no es aceptable.
+
+    LA PUERTA ES EXACTAMENTE LA INVERSA DEL GUARD: se revierte SÓLO donde el guard
+    bloquea (`_plata_bloqueada_por_sii` == True: factura, sin folio, con DTE que no está
+    emitido-con-folio). Si el documento SÍ existe ante el SII, la cesión es un hecho
+    financiero real y no se borra por acá: se liquida cuando el factor paga la retención,
+    o se corrige volviendo a registrar el factoring (set_factoring es un upsert). Una sola
+    condición de apertura, derivada del mismo helper: no hay un segundo criterio que se
+    pueda desalinear.
+
+    POR QUÉ BORRA LA FILA y no la marca 'revertida': mientras exista una fila en
+    cont_factoring, `eliminar_factura` sigue respondiendo 409 y la factura sigue siendo
+    imborrable — o sea, el zombi seguiría vivo con otro nombre. Es además la convención de
+    la casa para plata sin huella contable (eliminar_cobranza / eliminar_factura). El hecho
+    NO se pierde: queda en `factura.observaciones` (visible en la ficha) y en el log del
+    server, con motivo, montos, id de operación y usuario.
+
+    QUÉ **NO** HACE: no toca las cobranzas del cliente (medio ≠ factoring; ésas se
+    revierten una por una con su propio endpoint y sus propios candados) ni el DTE ni el
+    registro tributario. Después de revertir, la factura queda borrable por el camino
+    normal — que sigue exigiendo lo suyo: si el DTE puede existir ante el SII (emisión
+    ambigua sin confirmar, o emitida), `eliminar_factura` sigue pidiendo intervención
+    humana. La plata sale; el documento irreversible sigue necesitando un humano."""
+    # Orden GLOBAL de locks: OC → factura (el mismo de eliminar_factura/eliminar_cobranza;
+    # sin él, esta reversión y la aprobación de adelantos de Tesorería se cruzan).
+    ref = db.query(ContFacturaCliente).filter(ContFacturaCliente.id == factura_id).first()
+    if not ref:
+        raise HTTPException(404, "Factura no encontrada")
+    if ref.oc_cliente_id:
+        db.query(OcCliente).filter(OcCliente.id == ref.oc_cliente_id).with_for_update().first()
+    # populate_existing: se decide sobre `numero_factura`/`tipo_doc` (la apertura de la
+    # puerta) y se reescriben totales — valores del FOR UPDATE, no del snapshot del request.
+    factura = (db.query(ContFacturaCliente)
+               .filter(ContFacturaCliente.id == factura_id)
+               .populate_existing().with_for_update().first())
+    if not factura:
+        raise HTTPException(404, "Factura no encontrada")
+    motivo = (payload.motivo or "").strip()
+    if len(motivo) < 5:  # min_length de Pydantic no ve los espacios en blanco
+        raise HTTPException(400, "Escribe el motivo de la reversión: queda registrado en "
+                                 "la factura y es lo único que explica por qué desapareció "
+                                 "la operación de factoring")
+    fac = _factoring_bloqueado(db, factura.id)
+    if not fac:
+        raise HTTPException(404, "Esta factura no tiene una operación de factoring registrada")
+    if not _plata_bloqueada_por_sii(db, factura):
+        raise HTTPException(
+            409, "Esta factura SÍ está registrada ante el SII: la cesión al factor es un "
+                 "hecho financiero real y no se borra desde aquí. Liquida el factoring "
+                 "cuando el factor pague la retención, o corrige la operación volviendo a "
+                 "registrar el factoring con los montos correctos.")
+    # Cobranzas que nacieron de la cesión (adelanto del factor y, si se liquidó antes del
+    # guard, su retención). Lectura BLOQUEANTE: son plata.
+    cobs = _cobranzas_bloqueadas(db, factura.id)
+    del_cobs = [c for c in cobs if _es_medio_factoring(c.medio)]
+    # Mismo candado que set_factoring: si el abono del factor ya está conciliado con la
+    # cartola en Tesorería, borrar la cobranza dejaría el movimiento bancario sin destino
+    # (y el ON DELETE CASCADE del enlace se llevaría la conciliación en silencio).
+    if del_cobs:
+        conciliadas = (db.query(ConciliacionIngreso)
+                       .filter(ConciliacionIngreso.cobranza_id.in_([c.id for c in del_cobs]))
+                       .all())
+        if conciliadas:
+            raise HTTPException(
+                409, "El abono del factoring está conciliado con el banco: desconcílielo "
+                     "en Tesorería antes de revertir la cesión")
+    traza = {
+        "factoring_id": fac.id,
+        "empresa_factoring": fac.empresa_factoring,
+        "id_operacion": fac.id_operacion,
+        "estado": fac.estado,
+        "monto_adelantado": _f(fac.monto_adelantado),
+        "retencion": _f(fac.retencion),
+        "motivo": motivo,
+        "cobranzas_eliminadas": [{"id": c.id, "medio": c.medio, "monto": _f(c.monto)}
+                                 for c in del_cobs],
+        "usuario_id": getattr(current_user, "id", None),
+    }
+    # Traza EN EL PRODUCTO (no sólo en el log): la ficha de la factura muestra
+    # `observaciones`. Fecha de CHILE, como el resto de los hechos contables del módulo.
+    nota = (f"[{_hoy_chile().isoformat()}] Factoring REVERTIDO — "
+            f"{fac.empresa_factoring or 'sin factor'}"
+            f"{' · op ' + fac.id_operacion if fac.id_operacion else ''}"
+            f" · adelanto {_f(fac.monto_adelantado):.0f}"
+            f" · estado {fac.estado} · usuario {getattr(current_user, 'id', None)}"
+            f" — motivo: {motivo}")
+    previo = (factura.observaciones or "").rstrip()
+    # [-60000:]: la columna es TEXT (65.535 bytes). Reversiones repetidas no pueden
+    # reventar el UPDATE con un 500; si hay que cortar, se pierde lo MÁS VIEJO.
+    factura.observaciones = ((previo + "\n" if previo else "") + nota)[-60000:]
+    for c in del_cobs:
+        db.delete(c)
+    db.delete(fac)
+    db.flush()
+    # refresh bloqueante por FRESCURA de los montos (la nota de _cobranzas_bloqueadas),
+    # igual que eliminar_cobranza. `_estado_pago` lee además `factura.factoring` para
+    # decidir 'factorizada': acá esa relación NO está cargada (nadie la tocó en este
+    # request; el factoring se leyó por query), así que el lazy load posterior al flush
+    # del DELETE ya devuelve None. MEDIDO con un mutante: una línea `db.expire(...)`
+    # extra no cambiaba nada, así que se sacó en vez de dejar código sin sonda.
+    db.refresh(factura, with_for_update=True)
+    _recompute_factura(factura, cobranzas=[c for c in cobs if not _es_medio_factoring(c.medio)])
+    db.commit()
+    logger.warning("Factoring REVERTIDO factura=%s %s", factura.id, traza)
+    db.refresh(factura, with_for_update=True)
+    return {**_serialize_factura(factura), "factoring_revertido": traza}
+
+
+def _referencia_ancla_factura(factura_id: int) -> str:
+    """La referencia interna con la que el DTE 33 de esta factura vive en Wasabil.
+
+    Fuente ÚNICA: `wasabil_dte/router.py:_referencia_interna_factura`. Se importa (no se
+    duplica el formato) para que un cambio de formato no deje esta nota citando una
+    referencia que ya no existe; el literal es sólo el plan B si el módulo DTE no está
+    instalado, caso en que tampoco habría anclas que conservar."""
+    try:
+        from wasabil_dte.router import _referencia_interna_factura
+        return _referencia_interna_factura(factura_id)
+    except Exception:                                        # pragma: no cover
+        return f"FACT-{factura_id}"
+
+
+def _conservar_ancla_dte(db: Session, dte, factura_id: int, usuario_id) -> None:
+    """DESLIGA el ancla de la factura que se está borrando, en vez de DESTRUIRLA.
+
+    EL PORQUÉ (hallazgo ALTO-3 de la re-refutación): `uuid` es el identificador que
+    Wasabil asigna AL CREAR el documento, así que `uuid IS NOT NULL` significa que el
+    documento EXISTE allá — el `status 4` local sólo dice que la última vez que
+    preguntamos el SII lo había rechazado, y esa foto puede quedar obsoleta (es la misma
+    premisa que adopta el cinturón anti doble emisión del reintento: el estado remoto
+    puede contradecir al local). Si además se borra la fila, desaparece la ÚNICA llave
+    hacia ese documento real: la factura nueva por la misma mercadería nacerá con otro id
+    y por lo tanto con otra referencia (FACT-<id nuevo>), así que ni el rescate ni el
+    cinturón podrán encontrar el viejo, y la única defensa que quedaría es el tope de
+    cantidad facturable.
+
+    Conservarla no cuesta nada: la fila huérfana (factura_id NULL, que en MySQL no
+    colisiona con el único `uq_wasabil_dte_factura`) no la lista ninguna pantalla —todas
+    las consultas del módulo son por factura_id o despacho_id— y satisface la FK RESTRICT
+    que impide borrar la factura con el ancla apuntándola.
+
+    Lo que queda escrito en `error` no es decoración: es lo que un humano necesita para
+    cerrar el caso desde Wasabil (uuid + referencia + factura borrada + quién y cuándo).
+    Se PREPONE al error previo, que se conserva."""
+    ref = _referencia_ancla_factura(factura_id)
+    nota = (f"[{_hoy_chile().isoformat()}] ANCLA CONSERVADA — la factura local "
+            f"#{factura_id} (referencia {ref}) fue ELIMINADA en PartsControl"
+            f"{' por el usuario ' + str(usuario_id) if usuario_id else ''}. El documento "
+            f"uuid={dte.uuid} EXISTE en Wasabil; último estado conocido aquí: rechazado "
+            f"por el SII (status {dte.status_id})"
+            f"{', folio ' + str(dte.folio) if dte.folio else ', sin folio'}. Si en Wasabil "
+            f"figura EMITIDO, esta fila es su ÚNICO rastro: no emitas otra vez la misma "
+            f"mercadería sin revisarlo (búscalo por ese uuid o por la referencia).")
+    previo = (dte.error or "").rstrip()
+    # [:60000]: la columna es TEXT (65.535 bytes). Si hay que cortar, se pierde lo MÁS
+    # VIEJO — la nota que dice dónde está el documento va primero.
+    dte.error = (nota + ("\n" + previo if previo else ""))[:60000]
+    dte.factura_id = None
+    # flush explícito: el UPDATE del ancla tiene que llegar ANTES del DELETE de la
+    # factura (FK RESTRICT `wasabil_dte.factura_id` → 1451). El orden natural de la
+    # unidad de trabajo ya lo hace, pero de eso no depende un candado anti doble emisión.
+    db.flush()
+    logger.warning("Ancla DTE CONSERVADA (factura %s eliminada): uuid=%s status=%s ref=%s",
+                   factura_id, dte.uuid, dte.status_id, ref)
+
+
+def _resolver_ancla_dte_al_eliminar(db: Session, factura_id: int, usuario_id=None) -> None:
+    """Guard SII del BORRADO de una factura Y destino de su ANCLA anti doble emisión.
+
+    LA REGLA, en una línea: el ancla se BORRA sólo cuando consta que el documento NO
+    existe en Wasabil; si el documento EXISTE (hay uuid) se CONSERVA; y si no se puede
+    CONCLUIR qué hay allá, el borrado se BLOQUEA (fail-closed).
+
+    La tabla completa de estados (uuid × status × claim/en_vuelo), que es el contrato:
+
+      | uuid | estado local        | en vuelo | ¿se concluye?          | acción            |
+      |------|---------------------|----------|------------------------|-------------------|
+      |  —   | (cualquiera ≠ 2/6)  |   no     | NUNCA nació documento  | borra el ancla    |
+      |  —   | procesando/pendiente|   no     | NO (dice vivo sin id)  | 409               |
+      |  —   | cualquiera          |   sí     | NO (ambiguo)           | 409               |
+      | sí   | emitido (3)         |    ·     | existe CON folio       | 409 (nota crédito)|
+      | sí   | procesando/pendiente|    ·     | existe y VIVO          | 409               |
+      | sí   | cualquiera          |   sí     | NO (claim/ambiguo)     | 409               |
+      | sí   | rechazado (4)       |   no     | existe, último: rechazo| CONSERVA el ancla |
+      | sí   | desconocido (None…) |   no     | NO                     | 409               |
+
+    Por qué el rechazado (4) NO bloquea el borrado: un rechazo no tiene folio que
+    perder, y bloquearlo dejaría la factura imborrable PARA SIEMPRE secuestrando el cupo
+    facturable de esa mercadería (el único remedio ofrecido, «Reintentar», reenvía el
+    MISMO payload: si la causa del rechazo está en la factura, el SII la rechaza otra
+    vez). Se borra la factura, sí — pero NO el ancla: ver `_conservar_ancla_dte`.
+
+    Por qué el estado DESCONOCIDO con uuid sí bloquea: hay documento en Wasabil y no
+    sabemos en qué quedó. Un guard que protege un documento IRREVERSIBLE y no puede
+    concluir debe fallar CERRADO y decirle al humano qué revisar; la salida es consultar
+    el estado / «Reintentar», que pregunta por ese uuid y deja la fila concluyente."""
+    from wasabil_dte.models import (
+        WasabilDte, STATUS_EMITIDO as _ST_EMITIDO, STATUS_PROCESANDO as _ST_PROCESANDO,
+        STATUS_PENDIENTE as _ST_PENDIENTE, STATUS_FALLIDO as _ST_FALLIDO,
+    )
+    from wasabil_dte.service import claim_vigente as _claim_vigente
+    # populate_existing + FOR UPDATE: datos FRESCOS bajo el lock (sin esto se decidiría
+    # con la versión del identity map, ignorando el claim que otro request acaba de
+    # commitear).
+    dte = (db.query(WasabilDte).filter(WasabilDte.factura_id == factura_id)
+           .populate_existing().with_for_update().first())
+    if dte is None:
+        return
+    if dte.status_id == _ST_EMITIDO:
+        raise HTTPException(
+            409, f"Esta factura tiene DTE emitido al SII (folio {dte.folio}): "
+                 "anúlala primero en Wasabil (nota de crédito) y luego elimínala aquí")
+    if _claim_vigente(dte) or dte.status_id in (_ST_PROCESANDO, _ST_PENDIENTE):
+        raise HTTPException(
+            409, "Esta factura tiene una emisión SII en curso: espera el resultado "
+                 "(Emitida o Fallida) antes de eliminar")
+    if dte.en_vuelo_desde is not None:
+        raise HTTPException(
+            409, "No hay confirmación de Wasabil sobre esta emisión (se cortó la "
+                 "comunicación): la factura PUEDE existir ya ante el SII. Usa "
+                 "«Reintentar» para que el sistema lo verifique; si confirma que no se "
+                 "emitió, podrás eliminarla.")
+    if dte.uuid is None:
+        # Consta que el documento NUNCA nació (jamás hubo respuesta con documento) y el
+        # fallo fue CONFIRMADO (sin claim en vuelo): no hay llave que perder, y el ancla
+        # se limpia con la factura para que la mercadería vuelva a ser facturable.
+        db.delete(dte)
+        return
+    if dte.status_id != _ST_FALLIDO:
+        raise HTTPException(
+            409, "Hay un documento en Wasabil para esta factura (identificador interno "
+                 f"{dte.uuid}) y aquí no consta en qué quedó ante el SII: consulta su "
+                 "estado con «Reintentar» antes de eliminarla. Si Wasabil lo muestra "
+                 "EMITIDO, no se elimina: se anula allá con una nota de crédito.")
+    _conservar_ancla_dte(db, dte, factura_id, usuario_id)
 
 
 @router.delete("/facturas/{factura_id}")
@@ -2195,54 +2835,39 @@ def eliminar_factura(
                .populate_existing().with_for_update().first())
     if not factura:
         raise HTTPException(404, "Factura no encontrada")
-    # Borrado seguro: no destruir pagos reales ni operaciones de factoring (vigentes o liquidadas)
+    # Borrado seguro: no destruir pagos reales ni operaciones de factoring (vigentes o
+    # liquidadas). El 409 NOMBRA las dos salidas —liquidar, o revertir la cesión cuando el
+    # documento nunca existió ante el SII (revertir_factoring)—: antes era un callejón que
+    # no decía qué hacer, y en el caso legado NINGUNA de las dos existía.
     if factura.factoring:
-        raise HTTPException(409, "La factura tiene una operación de factoring; no se puede eliminar")
+        raise HTTPException(409, "La factura tiene una operación de factoring; no se puede "
+                                 "eliminar. Liquida el factoring, o —si su documento nunca "
+                                 "llegó a existir ante el SII— revierte la cesión al factor "
+                                 "(queda la traza con el motivo) y vuelve a eliminarla")
     if any(not _es_medio_factoring(c.medio) for c in factura.cobranzas):
         raise HTTPException(409, "Revierta las cobranzas antes de eliminar la factura")
-    # Guard SII (Fase B): con factura ELECTRÓNICA emitida o en emisión, el registro
-    # local no se borra — el DTE existe ante el SII (anular allá primero). Un DTE
-    # fallido/no enviado sí se limpia junto con la factura (FK del ancla).
-    from wasabil_dte.models import WasabilDte, STATUS_EMITIDO as _ST_EMITIDO
-    from wasabil_dte.service import claim_vigente as _claim_vigente
-    dte_fac = (db.query(WasabilDte).filter(WasabilDte.factura_id == factura.id)
-               .populate_existing().with_for_update().first())
-    if dte_fac:
-        if dte_fac.status_id == _ST_EMITIDO:
-            raise HTTPException(
-                409, f"Esta factura tiene DTE emitido al SII (folio {dte_fac.folio}): "
-                     "anúlala primero en Wasabil (nota de crédito) y luego elimínala aquí")
-        # Solo se borra el ancla cuando consta que el documento NO existe en Wasabil:
-        #   uuid IS NULL          → nunca se recibió respuesta con documento, Y
-        #   en_vuelo_desde IS NULL → el fallo fue CONFIRMADO no ambiguo (4xx, token malo,
-        #                            red caída). Un fallo AMBIGUO (timeout/5xx) conserva el
-        #                            timestamp: ahí el documento PUDO nacer con folio real,
-        #                            y borrar el ancla FACT-<id> lo volvería inadoptable y
-        #                            habilitaría un SEGUNDO DTE por la misma mercadería.
-        #                            La salida de ese caso es Reintentar, que CONSULTA a
-        #                            Wasabil: si adopta el documento, queda emitido; si
-        #                            confirma que no existe, limpia el timestamp y entonces
-        #                            sí se puede eliminar aquí.
-        ambiguo_sin_resolver = dte_fac.uuid is None and dte_fac.en_vuelo_desde is not None
-        if _claim_vigente(dte_fac) or (dte_fac.uuid and dte_fac.status_id in (2, 6)):
-            raise HTTPException(
-                409, "Esta factura tiene una emisión SII en curso: espera el resultado "
-                     "(Emitida o Fallida) antes de eliminar")
-        if ambiguo_sin_resolver:
-            raise HTTPException(
-                409, "No hay confirmación de Wasabil sobre esta emisión (se cortó la "
-                     "comunicación): la factura PUEDE existir ya ante el SII. Usa "
-                     "«Reintentar» para que el sistema lo verifique; si confirma que no se "
-                     "emitió, podrás eliminarla.")
-        db.delete(dte_fac)  # fallo CONFIRMADO no enviado: se limpia el ancla con la factura
+    # Vía B: una factura de anticipo YA DESCONTADA en facturas del despacho real no se
+    # borra — dejaría descuentos colgando citando un folio inexistente (y la FK de la línea
+    # de descuento lo impediría igual, pero con un IntegrityError 500 en vez de este 409).
+    # Va ANTES del guard SII a propósito (paridad con monza_contabilidad/router.py): ese
+    # guard TOCA el ancla —la borra, o la desliga con un flush— y rechazar después obliga
+    # a confiar en el rollback implícito del cierre de la sesión para deshacerlo. Confiar
+    # en un efecto secundario para no perder el ancla anti doble emisión es inaceptable:
+    # sin ese ancla, la misma mercadería puede emitirse DOS veces al SII.
     if factura.es_anticipo:
-        # Una factura de anticipo ya DESCONTADA en facturas del despacho real no se borra:
-        # dejaría descuentos colgando (y la FK de la línea de descuento lo impediría igual).
         descontada = (db.query(ContFacturaClienteItem)
                       .filter(ContFacturaClienteItem.anticipo_factura_id == factura.id)
                       .first())
         if descontada:
             raise HTTPException(409, "La factura de anticipo ya fue descontada en otra factura; elimine primero esa factura")
+    # Guard SII (Fase B): con factura ELECTRÓNICA emitida o en emisión, el registro
+    # local no se borra — el DTE existe ante el SII (anular allá primero). El ancla
+    # anti doble emisión se borra SÓLO cuando consta que el documento nunca nació; si
+    # hay uuid (documento existente) se CONSERVA huérfana. La tabla completa de estados,
+    # con el porqué de cada rama, está en `_resolver_ancla_dte_al_eliminar`.
+    _resolver_ancla_dte_al_eliminar(db, factura.id, getattr(current_user, "id", None))
+    if factura.es_anticipo:
+        # (El 409 de "anticipo ya descontado" se evaluó ARRIBA, antes del guard SII.)
         # Los adelantos que respaldaba vuelven a la vía A (sin factura de anticipo).
         # Sin aplicaciones que revertir: si las hubiera, el chequeo de cobranzas de
         # arriba ya bloqueó el borrado.

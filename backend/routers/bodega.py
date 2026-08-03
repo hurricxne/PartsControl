@@ -362,6 +362,51 @@ ESTADOS_VALIDOS = {
 }
 
 
+def _validar_item_de_recepcion(db: Session, rec: RecepcionEmbarque, body) -> None:
+    """Guards de PERTENENCIA y de COHERENCIA DEL FALTANTE (paridad inversa con
+    monza_router_bodega.py:227-254, que los ganó en la Fase 2 del espejo).
+
+    1) PERTENENCIA — el `embarque_item_id` tiene que venir en el embarque de ESTA recepción.
+       Una fila espuria con un ítem ajeno infla el tope físico de OTRA OC: el cierre la ignora
+       (itera los ítems del embarque), pero `_qty_recibida_utilizable` de despachos une
+       EmbarqueItem ↔ RecepcionEmbarqueItem filtrando SOLO por recepción cerrada y sí la
+       cuenta. Queda invisible y activa. Solo es alcanzable por API, no por la pantalla.
+
+    2) COHERENCIA DEL FALTANTE — marcar 'faltante' con recibido >= vendido es la combinación
+       más cara del módulo, y es UN CLIC: el input de BodegaPage.tsx:95 viene precargado con
+       la cantidad VENDIDA, así que el bodeguero marca Faltante y no toca el número. Efecto:
+       'faltante' está en _RECEPCION_UTILIZABLE (despachos.py), así que el tope queda en
+       min(vendido, recibido) = vendido y la línea entera sale despachable; y en el cierre
+       faltante_pendiente = 0, así que NO se crea reclamo. Las unidades que nunca llegaron
+       desaparecen sin traza, el proveedor no recibe reclamo, y sale guía 52 + factura 33 por
+       mercadería inexistente. Si llegó todo, el estado correcto es 'completo'.
+
+    Adaptación respecto de Monza: acá la cantidad vendida NO está en el ítem del body — hay
+    que pasar por EmbarqueItem.item_cotizacion_id, porque en Grupo AM el id que viaja es el
+    del ítem del EMBARQUE, no el de la cotización.
+    """
+    emb_item = (
+        db.query(EmbarqueItem)
+        .filter(EmbarqueItem.id == body.embarque_item_id)
+        .first()
+    )
+    if not emb_item or emb_item.embarque_id != rec.embarque_id:
+        raise HTTPException(400, "El ítem no pertenece al embarque de esta recepción")
+
+    if body.estado_recepcion == "faltante" and body.qty_recibida is not None:
+        cant_vendida = (
+            db.query(ItemCotizacion.cantidad)
+            .filter(ItemCotizacion.id == emb_item.item_cotizacion_id)
+            .scalar()
+        ) or 0
+        if cant_vendida and body.qty_recibida >= cant_vendida:
+            raise HTTPException(
+                400,
+                "Con estado Faltante la cantidad recibida debe ser MENOR que la vendida "
+                f"({cant_vendida:g}); si llegó todo, usa Completo",
+            )
+
+
 @router.patch("/recepciones/{recepcion_id}/items/{item_id}")
 def marcar_item(
     recepcion_id: int,
@@ -370,7 +415,17 @@ def marcar_item(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    rec = db.query(RecepcionEmbarque).filter(RecepcionEmbarque.id == recepcion_id).first()
+    # Lectura BLOQUEANTE de la recepción (paridad con monza_router_bodega.py:218-224): el
+    # chequeo de `estado == "cerrada"` no protege sin lock — dos cierres simultáneos lo pasan
+    # ambos y DUPLICAN los ReclamoProveedor. populate_existing porque la primera sentencia del
+    # request (el SELECT de usuarios del guard de auth) ya abrió el read view.
+    rec = (
+        db.query(RecepcionEmbarque)
+        .filter(RecepcionEmbarque.id == recepcion_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
     if not rec or rec.estado == "cerrada":
         raise HTTPException(400, "Recepción no encontrada o ya cerrada")
 
@@ -379,6 +434,10 @@ def marcar_item(
     # qty_recibida alimenta el tope de despacho: negativa no tiene sentido físico
     if (body.qty_recibida or 0) < 0:
         raise HTTPException(400, "La cantidad recibida no puede ser negativa")
+    if (body.qty_danada or 0) < 0:
+        raise HTTPException(400, "La cantidad dañada no puede ser negativa")
+    # Pertenencia + coherencia del 'faltante' (paridad con monza_router_bodega.py:227-254).
+    _validar_item_de_recepcion(db, rec, body)
 
     es_danado = "danado" in body.estado_recepcion
 
@@ -430,7 +489,17 @@ def crear_recepcion_item(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    rec = db.query(RecepcionEmbarque).filter(RecepcionEmbarque.id == recepcion_id).first()
+    # Lectura BLOQUEANTE de la recepción (paridad con monza_router_bodega.py:218-224): el
+    # chequeo de `estado == "cerrada"` no protege sin lock — dos cierres simultáneos lo pasan
+    # ambos y DUPLICAN los ReclamoProveedor. populate_existing porque la primera sentencia del
+    # request (el SELECT de usuarios del guard de auth) ya abrió el read view.
+    rec = (
+        db.query(RecepcionEmbarque)
+        .filter(RecepcionEmbarque.id == recepcion_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
     if not rec or rec.estado == "cerrada":
         raise HTTPException(400, "Recepción no encontrada o ya cerrada")
 
@@ -439,6 +508,10 @@ def crear_recepcion_item(
     # qty_recibida alimenta el tope de despacho: negativa no tiene sentido físico
     if (body.qty_recibida or 0) < 0:
         raise HTTPException(400, "La cantidad recibida no puede ser negativa")
+    if (body.qty_danada or 0) < 0:
+        raise HTTPException(400, "La cantidad dañada no puede ser negativa")
+    # Pertenencia + coherencia del 'faltante' (paridad con monza_router_bodega.py:227-254).
+    _validar_item_de_recepcion(db, rec, body)
 
     es_danado = "danado" in body.estado_recepcion
 
@@ -551,7 +624,17 @@ def cerrar_recepcion(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    rec = db.query(RecepcionEmbarque).filter(RecepcionEmbarque.id == recepcion_id).first()
+    # Lectura BLOQUEANTE (paridad con monza_router_bodega.py:291-297): sin el lock, dos clics
+    # simultáneos en "Cerrar recepción" pasan ambos el chequeo de abajo y DUPLICAN los
+    # ReclamoProveedor que crea el cierre — el proveedor recibe dos reclamos por el mismo
+    # faltante y el conteo de reclamos deja de cuadrar.
+    rec = (
+        db.query(RecepcionEmbarque)
+        .filter(RecepcionEmbarque.id == recepcion_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
     if not rec:
         raise HTTPException(404, "Recepción no encontrada")
     if rec.estado == "cerrada":
@@ -671,15 +754,43 @@ def cerrar_recepcion(
 
 def _evaluar_ocs_cliente(embarque_id: int, db: Session):
     """Check if any OC-Cliente is fully in bodega and notify Ventas."""
-    from datetime import date
-    from models.models import Cotizacion, OcCliente
-
     emb_items = db.query(EmbarqueItem).filter(EmbarqueItem.embarque_id == embarque_id).all()
     cot_ids = {
         ei.item_cotizacion.cotizacion_id
         for ei in emb_items
         if ei.item_cotizacion
     }
+    _notificar_ocs_cliente(cot_ids, db)
+
+
+def _evaluar_ocs_cliente_por_items(item_ids: list, db: Session):
+    """Misma evaluación B6/B7, pero anclada en ÍTEMS en vez de en un embarque.
+
+    La recepción NACIONAL (`recepcion_nacional/`) no pasa por `embarque_items`: el
+    proveedor chileno llega con su camión y su guía, y los ítems pasan a 'en_bodega'
+    sin haber estado nunca en un embarque. Por eso esa vía no podía usar
+    `_evaluar_ocs_cliente(embarque_id, ...)` y la OC quedaba lista para despacho sin
+    que Ventas se enterara hasta el barrido de las 06:00 del día siguiente.
+
+    Aditivo: la firma y el comportamiento de la vía embarque quedan intactos; las dos
+    variantes solo resuelven las `cotizacion_id` afectadas y delegan en el MISMO
+    `_notificar_ocs_cliente` (una sola definición de las reglas B6/B7, para que no se
+    puedan desincronizar).
+    """
+    if not item_ids:
+        return
+    cot_ids = {
+        r[0] for r in db.query(ItemCotizacion.cotizacion_id)
+        .filter(ItemCotizacion.id.in_(list(item_ids))).all()
+        if r[0] is not None
+    }
+    _notificar_ocs_cliente(cot_ids, db)
+
+
+def _notificar_ocs_cliente(cot_ids, db: Session):
+    """Reglas B6/B7 sobre las OC-Cliente de esas cotizaciones (cuerpo original)."""
+    from datetime import date
+    from models.models import Cotizacion, OcCliente
 
     for cot_id in cot_ids:
         oc = db.query(OcCliente).filter(OcCliente.cotizacion_id == cot_id).first()

@@ -91,5 +91,13 @@ def run():
     print("=== TODO OK ===")
 
 
+def test_monza_contabilidad_service():
+    """Wrapper para pytest (espejo GA): sin él la suite era INVISIBLE al gate
+    rutinario 'pytest verde'. Si un check falla, run() corta con SystemExit(1)
+    y pytest lo reporta como FAILED igual."""
+    run()
+    assert not _fails, f"fallas: {_fails}"
+
+
 if __name__ == "__main__":
     run()

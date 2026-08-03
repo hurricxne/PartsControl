@@ -42,13 +42,30 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/register", status_code=201)
-def register(data: RegisterRequest, db: Session = Depends(get_db)):
+def register(
+    data: RegisterRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Crea un usuario. EXIGE sesión: NO es un registro público.
+
+    Antes este endpoint era ANÓNIMO y creaba un usuario ACTIVO sin empresa (o sea,
+    'mineria' por el server_default). Verificado en vivo el 2026-07-22: un desconocido
+    podía llamarlo sin credenciales, iniciar sesión con la cuenta recién creada y leer
+    /api/contabilidad/facturas y /api/contabilidad/kpis de GRUPO AM — toda la
+    contabilidad de la empresa. Ningún punto del frontend lo llamaba: era código muerto
+    abierto a internet.
+
+    El usuario nuevo HEREDA la empresa de quien lo crea, para que una cuenta de una
+    marca no pueda fabricar cuentas de la otra y saltarse el candado de empresa.
+    """
     if db.query(User).filter(User.email == data.email).first():
         raise HTTPException(status_code=400, detail="El email ya está registrado")
     user = User(
         email=data.email,
         nombre=data.nombre,
-        hashed_password=get_password_hash(data.password)
+        hashed_password=get_password_hash(data.password),
+        empresa=getattr(current_user, "empresa", None) or "mineria",
     )
     db.add(user)
     db.commit()

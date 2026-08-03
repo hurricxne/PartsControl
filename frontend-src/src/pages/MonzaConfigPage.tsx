@@ -14,6 +14,17 @@ interface Config {
 }
 const DEFAULTS: Partial<Config> = { tc_usd_clp: 900, tc_eur_clp: 1060, tarifa_aerea_por_kg: 4.5, moneda_tarifa: "EUR", iva_pct: 19 };
 
+// Hallazgo #5 (auditoría integral Monza): guardar iva_pct = 0 aquí hacía nacer TODA cotización
+// nueva con IVA 0, pero la facturación no distingue "sin dato" de "0 % explícito" y volvía a
+// aplicar 19 %: la primera factura salía al SII con IVA inventado y el resto de la mercadería
+// quedaba imposible de facturar (excede el total de la venta). Como el campo es numérico,
+// Number("") === 0 se guardaba en silencio. El backend ahora exige gt=0 / le=100; acá se avisa
+// ANTES de disparar el PUT. NO se soporta "0 = exento": la tubería DTE no sabe expresar exención.
+const ivaValido = (v: unknown): boolean => {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 && n <= 100;
+};
+
 // ── Cliente types ─────────────────────────────────────────────────────────────
 interface Cliente {
   id: number; nombre: string; rut?: string; telefono?: string; email?: string;
@@ -260,6 +271,12 @@ export default function MonzaConfigPage() {
 
   const handleSave = async () => {
     if (!cfg) return;
+    // Hallazgo #5: no enviar Number(cfg.iva_pct) a ciegas. Un campo vacío o en 0 se guardaba
+    // en silencio y contaminaba todas las ventas nuevas (ver nota de ivaValido arriba).
+    if (!ivaValido(cfg.iva_pct)) {
+      toast.error("La tasa de IVA debe ser mayor a 0 y hasta 100 (en Chile: 19). No se guardó nada.");
+      return;
+    }
     setSaving(true);
     try {
       const r = await monzaConfigAPI.update({
@@ -336,6 +353,13 @@ export default function MonzaConfigPage() {
                 </Field>
                 <Field label="IVA (%)" help="Tasa de IVA aplicada al neto. Chile: 19%.">
                   <Inp type="number" value={cfg.iva_pct} onChange={(v) => set("iva_pct", v)} />
+                  {/* Hallazgo #5: aviso en el punto de entrada, para que el 0 no llegue nunca al guardado. */}
+                  {!ivaValido(cfg.iva_pct) && (
+                    <p style={{ fontSize: 11, color: "#B91C1C", margin: "4px 0 0" }}>
+                      Debe ser mayor a 0 y hasta 100. Con IVA 0 la venta se cierra sin impuesto pero la
+                      factura vuelve a aplicar 19%, y esa mercadería ya no se puede facturar.
+                    </p>
+                  )}
                 </Field>
               </Grid2>
               {cfg.ultima_actualizacion && (

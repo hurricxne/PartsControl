@@ -153,6 +153,13 @@ class MonzaTesConciliacion(Base):
     monto_conciliado_clp = Column(Numeric(16, 2), default=0)
     usuario_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Snapshot del egreso ANTES de que la cartola lo enriqueciera al conciliar:
+    # desconciliar RESTAURA estos valores (deshacer = volver al estado previo),
+    # conservando lo que el operador ingresó a mano incluso si coincidía con lo
+    # del banco (la igualdad de valores no distingue el origen del dato).
+    # Espejo de tesoreria/models.py (GA); migración aditiva en init_db.py.
+    fecha_egreso_previa = Column(Date, nullable=True)
+    referencia_egreso_previa = Column(String(120), nullable=True)
 
     movimiento = relationship("MonzaTesMovimiento", back_populates="conciliaciones")
 

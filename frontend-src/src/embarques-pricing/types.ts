@@ -99,6 +99,10 @@ export interface PricingDetail {
     observaciones: string | null
     calculado_at: string | null
   }
+  // Avisos NO bloqueantes del backend (hoy: ítems en más de una moneda, que hace que el
+  // costo landed se calcule con UN solo TC y quede mal en las líneas de la otra moneda).
+  // Lista vacía = todo en orden. Espejo de MonzaParts, que ya los expone.
+  advertencias: string[]
   gastos: GastoLinea[]
   totales_gastos: {
     total_capitaliza: number

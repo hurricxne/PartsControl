@@ -14,8 +14,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from sqlalchemy import inspect, text  # noqa: E402
 
 from database import engine, Base  # noqa: E402
-import models.models  # noqa: E402,F401  registra despachos/cont_factura_cliente/users:
-                      # sin esto SQLAlchemy no resuelve las FK de wasabil_dte (NoReferencedTableError)
 from wasabil_dte import models  # noqa: E402  (registra la tabla en Base.metadata)
 
 

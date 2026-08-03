@@ -28,8 +28,23 @@ que luego se concilia con el banco).
   vía columna generada `numero_documento_activo`).
 - **Moneda extranjera (NIC 21)**: compras en USD/EUR llevan TC obligatorio; el egreso
   guarda tc/monto en la moneda del pago para la diferencia de cambio.
+- **Compra NACIONAL con costeo por ítem** (Fase 8, espejo GA): una compra con
+  `origen=NACIONAL` + `oc_proveedor_id` + `items[]` guarda el costo POR ÍTEM en
+  `monza_cont_compra_item` — **la factura ES el costo** (NETO de la línea en CLP; el IVA
+  es crédito fiscal recuperable → NO capitaliza, distinto del iva_importacion
+  internacional). Cuenta default NACIONAL+cogs → `1.3.01` Existencias (NIC 2). Guards
+  bajo lock canónico (`MonzaCotizacionItem` id ASC + `populate_existing().with_for_update()`,
+  lecciones G13): **A)** ítem con costo internacional (`monza_emb_pricing_item`) → 409;
+  **B/C)** Σ cantidad costeada en compras ACTIVAS ≤ recibido nacional utilizable
+  (recepciones CERRADAS de `monza_recepcion_nacional`) con `TOL_QTY=0.001` en UNIDADES
+  → 409 "registre primero la recepción"; **D)** Σ líneas ≤ neto CLP (+1 CLP; cobertura
+  parcial LEGAL) → 400; **E)** pertenencia ítem↔OC vía
+  `MonzaCotizacionItem.oc_proveedor_id` directo (adaptación Monza: sin tabla
+  `OcProveedorItem` ni `oc_proveedor_item_id`) → 400. Crear compra reintenta deadlocks
+  1213/1205 ×3 (gap locks de InnoDB deadlockean incluso ítems distintos). Anular la
+  compra LIBERA el cupo costeado (los guards filtran `anulado=False`).
 
-## Datos (4 tablas nuevas, aditivas)
+## Datos (5 tablas nuevas, aditivas)
 
 | Tabla | Rol |
 |---|---|
@@ -37,10 +52,12 @@ que luego se concilia con el banco).
 | `monza_cont_compra` | 1 fila por compra/gasto (clasificación, cuenta imputada, montos congelados, condición y estado de pago derivado). |
 | `monza_cont_egreso` | Comprobante de Egreso: UNA salida real de dinero (con campos de conciliación bancaria para el futuro módulo Monza). |
 | `monza_cont_egreso_detalle` | Asignación egreso → compra (cuánto pagó a cada una). |
+| `monza_cont_compra_item` | Costo por ítem de la compra NACIONAL (snapshot n° parte/descr., cantidad, precio_unit, costo_unit/total CLP). Sin `oc_proveedor_item_id` (adaptación Monza). |
 
 No tocan ninguna tabla existente. Dinero en `Numeric`. InnoDB explícito (locks).
 Punteros suaves: `proveedor_id → monza_proveedores`, `embarque_id → monza_embarques`,
-`emb_pricing_gasto_id → monza_emb_pricing_gasto` (todos `SET NULL`).
+`emb_pricing_gasto_id → monza_emb_pricing_gasto`, `oc_proveedor_id → monza_oc_proveedor`
+(todos `SET NULL`; la columna `oc_proveedor_id` en BD viva la crea `init_db`).
 
 ## API — `prefix /api/monza/compras-contab` (candado `automotriz`)
 
@@ -51,6 +68,7 @@ Punteros suaves: `proveedor_id → monza_proveedores`, `embarque_id → monza_em
 | GET | `/kpis` | Total comprado / pagado / por pagar / vencido / por tipo de gasto. |
 | GET | `/catalogos` | Tipos de gasto, categorías, medios, proveedores (monza_proveedores), plan de cuentas imputable, cuenta default por tipo. |
 | GET | `/costos-embarque` | **Overlay en vivo** de los gastos de Embarques Pricing + marca de cuáles ya son compra (`compra_id`). |
+| GET | `/oc-nacionales` | Catálogo de OC `tipo_origen='nacional'` con sus ítems costeables: `cantidad`, `recibido`, `ya_costeado`, `disponible_costear = max(min(recibido, cantidad) − ya_costeado, 0)`. Alimenta el modo "compra nacional por ítem" del front. |
 | GET/POST | `/egresos` | Listar / crear egreso CONSOLIDADO (una salida paga varias compras). |
 | PATCH/DELETE | `/egresos/{id}` | Completar fecha banco/referencia · revertir egreso completo (rechaza si conciliado). |
 | GET | `/{id}` | Detalle de la compra con sus pagos. |
@@ -61,13 +79,20 @@ Punteros suaves: `proveedor_id → monza_proveedores`, `embarque_id → monza_em
 
 ## Puesta en marcha (una vez por entorno)
 
+**ORDEN DE DEPLOY (Fase 8)**: correr PRIMERO `monza_recepcion_nacional/init_db` (crea
+las tablas de recepción + la columna `monza_oc_proveedor.tipo_origen`) y DESPUÉS este
+init_db, AMBOS antes de reiniciar el backend.
+
 ```bash
 cd backend
-python -m monza_compras_contab.init_db              # crea las 4 tablas (idempotente)
+python -m monza_recepcion_nacional.init_db          # 1° — recepción nacional + tipo_origen
+python -m monza_compras_contab.init_db              # 2° — crea las 5 tablas + migra oc_proveedor_id (idempotente)
 python -m monza_compras_contab.import_plan_cuentas  # importa el plan NIIF del Excel (upsert)
 ```
 
-`main.py` ya monta el router (create_all también crea las tablas al levantar).
+`main.py` ya monta el router (create_all también crea las tablas al levantar; la
+columna `oc_proveedor_id` en una BD ya poblada SOLO la crea el init_db — create_all no
+altera tablas existentes).
 
 ## Tests
 
@@ -75,6 +100,7 @@ python -m monza_compras_contab.import_plan_cuentas  # importa el plan NIIF del E
 cd backend
 ./venv/bin/python monza_compras_contab/tests/test_service.py       # lógica pura (semáforo, estados, cuentas default)
 ./venv/bin/python monza_compras_contab/tests/test_integration.py   # API + BD + overlay embarques + candado
+./venv/bin/python monza_compras_contab/tests/test_nacional.py      # costeo por ítem nacional + guards + circuito Tesorería + carreras G13
 ```
 
 La integración ejerce: contado auto-egreso, crédito/pagos/sobre-pago/revertir, unicidad y

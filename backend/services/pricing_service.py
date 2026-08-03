@@ -87,7 +87,7 @@ def calcular_cotizacion(items: List[Dict], config: Dict) -> Dict:
             _qty = float(_it.get("cantidad") or 0)
             _costo = float(_it.get("precio_unit_cotizacion") or 0)
             _margen = float(_it.get("margen_pct") or 0)
-            _pv = round(_costo * (1 + _margen))  # CLP: peso entero (exactitud del round-trip precio<->margen)
+            _pv = _costo * (1 + _margen)
             _tv = _pv * _qty
             _res.append({**_it, "peso_total_kg": 0.0, "cif_clp": 0.0, "gastos_locales_clp": 0.0,
                          "costo_total_clp": _tv, "costo_unitario_clp": _costo,
@@ -139,7 +139,7 @@ def calcular_cotizacion(items: List[Dict], config: Dict) -> Dict:
         qty = float(r.get("cantidad") or 1)
         costo_unit = costo_total / qty if qty else 0
         margen = float(r.get("margen_pct") or margen_default)
-        precio_venta = round(costo_unit * (1 + margen))  # CLP: peso entero
+        precio_venta = costo_unit * (1 + margen)
         total_venta = precio_venta * qty
 
         result_items.append({

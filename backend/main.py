@@ -19,6 +19,7 @@ from monza_router_bodega import router as monza_bodega_router
 from monza_router_logistica import router as monza_logistica_router
 from monza_router_notificaciones import router as monza_notif_router
 from monza_router_integraciones import router as monza_integraciones_router
+from monza_recepcion_nacional.router import router as monza_recep_nac_router  # camino físico de la compra nacional Monza
 from routers import contabilidad
 from routers import venta_clp
 from embarques_pricing.router import router as embarques_pricing_router
@@ -80,6 +81,7 @@ app.include_router(monza_bodega_router)
 app.include_router(monza_logistica_router)
 app.include_router(monza_notif_router)
 app.include_router(monza_integraciones_router)
+app.include_router(monza_recep_nac_router)  # /api/monza/recepcion-nacional (SIN prefix extra: el router ya lo trae)
 app.include_router(contabilidad.router, prefix="/api")
 app.include_router(venta_clp.router)
 app.include_router(embarques_pricing_router, prefix="/api")
@@ -95,10 +97,14 @@ if settings.MONZA_CONTAB_ENABLED:
     from monza_embarques_pricing.router import router as monza_embarques_pricing_router
     from monza_compras_contab.router import router as monza_compras_contab_router
     from monza_tesoreria.router import router as monza_tesoreria_router
+    # Wasabil DTE Monza (guías 52 al SII con el RUT de MonzaParts): dentro del gate
+    # a propósito — apagado, el módulo ni se importa ni create_all crea su tabla.
+    from monza_wasabil_dte.router import router as monza_wasabil_router
     app.include_router(monza_contabilidad_router)
     app.include_router(monza_embarques_pricing_router)
     app.include_router(monza_compras_contab_router)
     app.include_router(monza_tesoreria_router)
+    app.include_router(monza_wasabil_router, prefix="/api")  # /api/monza/wasabil/...
 app.include_router(monza_docs_router)
 app.include_router(monza_catalog_router)
 app.include_router(monza_clientes_router)

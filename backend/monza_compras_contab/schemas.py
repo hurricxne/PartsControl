@@ -25,6 +25,17 @@ class PagoInline(BaseModel):
     observaciones: Optional[str] = Field(None, max_length=500)
 
 
+class CompraItemIn(BaseModel):
+    """Línea de costeo por ítem de una compra NACIONAL (la factura ES el costo).
+    ADAPTACIÓN Monza: sin oc_proveedor_item_id — la pertenencia ítem↔OC se valida en
+    el router contra MonzaCotizacionItem.oc_proveedor_id (no hay tabla de asignación)."""
+    item_cotizacion_id: int
+    numero_parte: Optional[str] = Field(None, max_length=100)
+    descripcion: Optional[str] = Field(None, max_length=500)
+    cantidad: float = Field(..., gt=0)
+    precio_unit: float = Field(..., ge=0)   # NETO unitario en moneda factura (CLP en nacional)
+
+
 class CompraCreate(BaseModel):
     """Alta de una compra/gasto. Si condicion_pago='contado' y no viene `pago`, se genera
     automáticamente un egreso por el total (sale del banco el mismo día)."""
@@ -32,6 +43,8 @@ class CompraCreate(BaseModel):
     categoria: Optional[str] = Field(None, max_length=80)
     cuenta_contable_id: Optional[int] = None
     es_anticipo: bool = False
+    # MANUAL | EMBARQUE | NACIONAL — 'NACIONAL' es valor legal explícito: elige la
+    # cuenta default de Existencias (1.3.01, NIC 2) y habilita el detalle por ítem.
     origen: str = Field("MANUAL", max_length=20)
     proveedor_id: Optional[int] = None
     acreedor: Optional[str] = Field(None, max_length=255)
@@ -51,6 +64,9 @@ class CompraCreate(BaseModel):
     plazo_dias: Optional[int] = Field(None, ge=0, le=3650)
     embarque_id: Optional[int] = None
     emb_pricing_gasto_id: Optional[int] = None
+    # Compra NACIONAL con detalle de ítems: la factura ES el costo de esos repuestos.
+    oc_proveedor_id: Optional[int] = None
+    items: Optional[List[CompraItemIn]] = None
     observaciones: Optional[str] = Field(None, max_length=65535)
     pago: Optional[PagoInline] = None
 

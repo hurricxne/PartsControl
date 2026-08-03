@@ -258,6 +258,10 @@ class MonzaCotizacion(Base):
     fecha_venta = Column(DateTime, nullable=True)
     fecha_entrega_est = Column(Date, nullable=True)
     oc_cliente = Column(String(100), nullable=True)
+    # Fecha de la OC del cliente (Fase 3 espejo GA): la referencia 801 del SII exige
+    # N° Y fecha de la OC — sin esta columna la guía/factura electrónica (Fase 5/6)
+    # no puede armar la referencia. Se pide junto al N° al cerrar la venta.
+    oc_fecha = Column(Date, nullable=True)
     vin = Column(String(50), nullable=True)
     asesor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     condiciones_servicio = Column(Text, nullable=True)
@@ -268,6 +272,10 @@ class MonzaCotizacion(Base):
     # Snapshot de config al momento de crear
     tc_usd_clp = Column(Float, nullable=True)
     tc_eur_clp = Column(Float, nullable=True)
+    # Moneda de la tarifa aérea al momento de cotizar (EUR/USD): sin congelarla la
+    # foto de precios no es reproducible (espejo del pricing_snapshot de GA).
+    # Freeze-forward: cotizaciones anteriores quedan NULL, sin backfill.
+    moneda_tarifa = Column(String(10), nullable=True)
     tarifa_aerea = Column(Float, nullable=True)
     iva_pct = Column(Float, nullable=True)
     archivo_pdf = Column(String(200), nullable=True)
@@ -316,6 +324,23 @@ class MonzaConfig(Base):
     tarifa_aerea_por_kg = Column(Float, default=4.5)
     moneda_tarifa = Column(String(10), default="EUR")  # EUR/USD
     iva_pct = Column(Float, default=19)
+    # ── Gastos locales de internación por DEFECTO (CLP, netos) ────────────────
+    # Con estos montos nacen las 3 líneas afectas del pricing de cada embarque
+    # (Desconsolidación / Almacenaje / Agencia de Aduana). Espejo de
+    # ConfiguracionCotizador.{desconsolidado_clp, bodegaje_clp,
+    # costo_agencia_minimo_clp} de Grupo AM, con los mismos nombres para que
+    # `seed_gastos` sea idéntico en las dos marcas.
+    # POR QUÉ: Monza sembraba las 6 líneas en 0, así que si el contador se olvidaba
+    # de cargarlas el costo landed se CONGELABA sin gastos de internación
+    # (cerrar_pricing solo exige costo_total > 0) y todos los ítems del embarque
+    # quedaban subvaluados, en silencio.
+    # DEFAULT 0 a propósito: NO se copian los montos de Grupo AM (otro negocio, otra
+    # logística — inventar montos sería peor que no tenerlos). Mientras estén en 0 el
+    # comportamiento es idéntico al de hoy; el contador los carga UNA vez en
+    # Configuración en vez de en cada embarque, y siguen siendo editables por embarque.
+    desconsolidado_clp = Column(Float, default=0)
+    bodegaje_clp = Column(Float, default=0)
+    costo_agencia_minimo_clp = Column(Float, default=0)
     # Datos empresa MonzaParts (para PDF)
     razon_social = Column(String(200), default="MonzaParts SpA")
     rut_empresa = Column(String(20), default="78.121.316-0")
@@ -377,6 +402,14 @@ class MonzaOcProveedor(Base):
     proveedor_nombre = Column(String(200), nullable=True)
     pais             = Column(String(100), nullable=True)
     moneda           = Column(String(10), default="EUR")
+    # Origen de la compra: 'internacional' (embarque + aduana + costo landed) o
+    # 'nacional' (camión + guía de despacho del proveedor, sin embarque). Fuente
+    # ÚNICA de verdad del camino físico y de la UI; NO se deriva de pais/moneda
+    # (pais es texto libre y un proveedor nacional podría facturar en USD). Todo lo
+    # histórico queda 'internacional'. La columna la crea monza_recepcion_nacional/init_db
+    # (create_all NO altera tablas ya existentes). Lectura SIEMPRE coalescida:
+    # (ocp.tipo_origen or "internacional").
+    tipo_origen      = Column(String(20), nullable=False, server_default="internacional", index=True)
     estado           = Column(String(30), default="emitida")  # emitida en_transito recibida cancelada
     plazo_dias       = Column(Integer, nullable=True)
     numero_oc        = Column(String(100), nullable=True)   # N OC manual del proveedor
@@ -421,6 +454,22 @@ class MonzaNotificacion(Base):
     link       = Column(String(200), nullable=True)
     leida      = Column(Integer, default=0)
     fecha      = Column(DateTime, default=datetime.utcnow)
+    # ── Endurecimiento para el barrido diario de alertas (paridad con la tabla
+    # `notificaciones` de Grupo AM, models/models.py:381) ─────────────────────────
+    # `regla` es la LLAVE de la idempotencia de 24 h: el job de las 06:00 vuelve a
+    # evaluar las mismas condiciones todos los días, y sin un identificador estable de
+    # la regla cada corrida crearía otra vez el mismo aviso hasta que el dueño deje de
+    # mirar la campana (ruido = peor que no tener alertas).
+    # `destinatario_rol` dice A QUIÉN le toca actuar y `severidad` cuán urgente es
+    # (info/warning/critical, vocabulario de Grupo AM). Se conserva `tipo` porque es lo
+    # que pinta el badge del frontend: son ejes distintos, no duplicados.
+    # Las 3 columnas son NULLABLE a propósito: las notificaciones históricas y los 8
+    # llamadores ya existentes de crear_notif() siguen funcionando sin tocarse.
+    # OJO: NO llevan index=True — el ALTER de la migración solo agrega columnas, y un
+    # index=True dejaría la BD fresca (create_all) con un índice que prod no tendría.
+    destinatario_rol = Column(String(50), nullable=True)
+    severidad        = Column(String(20), nullable=True)
+    regla            = Column(String(150), nullable=True)
 
 
 # -- Documentos adjuntos (generico para cualquier entidad) ------------------
@@ -491,17 +540,39 @@ class MonzaRecepcionItem(Base):
 class MonzaDespacho(Base):
     __tablename__ = "monza_despachos"
     id               = Column(Integer, primary_key=True)
-    numero           = Column(String(50), nullable=True)
+    # UNIQUE (índice creado por migrations/monza_despachos_ciclo_vida.py): sostiene el
+    # retry del correlativo DSP ante creación simultánea (espejo de Grupo AM).
+    numero           = Column(String(50), unique=True, nullable=True)
     cotizacion_id    = Column(Integer, nullable=True)
     cliente_nombre   = Column(String(200), nullable=True)
     numero_guia      = Column(String(100), nullable=True)
+    # Fecha de EMISIÓN de la guía ante el SII cuando se emitió FUERA del sistema (portal
+    # del SII / papel) y aquí solo se registra su número. Es el FchRef de la referencia 52
+    # de la factura. NO es `fecha` (creación), ni `fecha_despacho` (cierre), ni la firma.
+    # Con guía ELECTRÓNICA manda el documentDate del propio DTE 52 y esta columna se ignora.
+    # Espejo de despachos.fecha_guia de MachParts — tabla y módulo SEPARADOS por marca.
+    fecha_guia       = Column(Date, nullable=True)
     transportista    = Column(String(150), nullable=True)
     destinatario     = Column(String(200), nullable=True)
     direccion_entrega= Column(String(400), nullable=True)
     observaciones    = Column(Text, nullable=True)
+    # Ciclo de vida (espejo de Grupo AM): en_preparacion (borrador editable/anulable)
+    # → despachado (cerrado: la mercadería salió) → anulado (solo desde borrador).
+    # Los despachos legados nacieron directamente 'despachado' (default histórico).
     estado           = Column(String(20), default="despachado")
     asesor_email     = Column(String(150), nullable=True)
     fecha            = Column(DateTime, default=datetime.utcnow)
+    # Cuándo se CERRÓ el despacho (fecha ≠ fecha de creación). Flujo guía-primero:
+    # el N° de expedición lo entrega el courier DESPUÉS, por el PUT de cabecera.
+    fecha_despacho   = Column(DateTime, nullable=True)
+    numero_expedicion= Column(String(120), nullable=True)
+    # Guía firmada por el cliente (informativo, NO gatea la facturación en Monza).
+    # Las columnas EXISTEN en la tabla desde monza_contabilidad/init_db.py, pero el
+    # modelo no las declaraba: marcar_guia_firmada escribía un atributo Python suelto
+    # y la firma se PERDÍA en silencio (bug visible recién al envolver la suite vieja
+    # en pytest, auditoría de paridad 2026-07-28).
+    guia_firmada     = Column(Integer, default=0)
+    guia_firmada_archivo = Column(String(255), nullable=True)
 
 
 class MonzaDespachoItem(Base):

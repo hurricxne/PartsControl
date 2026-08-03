@@ -7,18 +7,29 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   Wallet, Plus, Search, AlertCircle, CheckCircle2, DollarSign,
-  Loader2, RefreshCw, ChevronDown, ChevronUp, CreditCard, X, Trash2, Ban, Ship,
+  Loader2, RefreshCw, ChevronDown, ChevronUp, CreditCard, X, Trash2, Ban, Ship, Truck,
 } from "lucide-react";
 import toast from "react-hot-toast";
 import { useMonzaTheme } from "./MonzaLayout";
 import { hoyLocal } from "../utils/format";
 import { monzaComprasAPI } from "../services/monzaApi";
+import type { MonzaOcNacional } from "../services/monzaApi";
 
 // ─── Tipos (espejo del JSON del backend monza_compras_contab) ─────────────────
 interface Pago {
   id: number; egreso_id: number; monto_clp: number; fecha: string | null;
   medio: string | null; banco: string | null; numero_operacion: string | null;
   conciliado: boolean; fecha_mov_bancario: string | null; n_compras: number;
+}
+// Línea de costeo por ítem de una compra NACIONAL (monza_cont_compra_item): la
+// factura ES el costo de esos repuestos; costo por ítem = NETO en CLP (el IVA es
+// crédito fiscal, no capitaliza). ADAPTACIÓN Monza: sin oc_proveedor_item_id (el
+// vínculo ítem↔OC es directo, no hay tabla de asignación).
+interface CompraItem {
+  id: number; item_cotizacion_id: number | null;
+  numero_parte: string | null; descripcion: string | null;
+  cantidad: number; precio_unit: number;
+  costo_unit_clp: number; costo_total_clp: number;
 }
 interface Compra {
   id: number; origen: string; tipo_gasto: string; tipo_gasto_label: string;
@@ -32,7 +43,8 @@ interface Compra {
   estado_pago: string; monto_pagado_clp: number; saldo_clp: number; semaforo: string;
   dias_vencimiento: number | null; anulado: boolean; motivo_anulacion: string | null;
   embarque_id: number | null; emb_pricing_gasto_id: number | null;
-  observaciones: string | null; pagos: Pago[];
+  oc_proveedor_id: number | null;
+  observaciones: string | null; pagos: Pago[]; items: CompraItem[];
 }
 interface Antiguedad { "0_30": number; "31_60": number; "61_90": number; "91_mas": number }
 interface Kpis {
@@ -154,12 +166,53 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
   const [pagoFechaBanco, setPagoFechaBanco] = useState(hoy);
   const [saving, setSaving] = useState(false);
 
-  const origen = prefill?.origen || "MANUAL";
-  // Cuenta sugerida según (origen, tipo de gasto).
+  // Compra NACIONAL con detalle de ítems: la factura ES el costo de esos repuestos
+  // (neto CLP por ítem; el IVA es crédito fiscal, no capitaliza). El backend valida
+  // que la cantidad costeada no supere lo recibido en bodega y que Σ ≤ neto.
+  // Con prefill de embarque no aplica (ese flujo es el reflejo de Embarques Pricing).
+  const [origenTipo, setOrigenTipo] = useState<"gasto" | "nacional">("gasto");
+  const [ocNacionales, setOcNacionales] = useState<MonzaOcNacional[]>([]);
+  const [ocpSel, setOcpSel] = useState<number | "">("");
+  const [lineItems, setLineItems] = useState<Record<number, { incluir: boolean; cantidad: string; precio_unit: string }>>({});
+  const esNacional = origenTipo === "nacional" && !prefill;
+  const ocSel = ocNacionales.find(o => o.oc_proveedor_id === ocpSel) || null;
+
+  const origen = prefill?.origen || (esNacional ? "NACIONAL" : "MANUAL");
+  // Cuenta sugerida según (origen, tipo de gasto): nacional → Existencias (1.3.01)
+  // vía la clave NACIONAL|cogs del backend.
   useEffect(() => {
     const def = catalogos?.cuenta_default_por_tipo?.[`${origen}|${tipoGasto}`];
     if (def) setCuentaId(def);
   }, [tipoGasto, catalogos, origen]);
+
+  // Nacional fuerza costo de venta + CLP (el IVA no capitaliza en la compra nacional).
+  useEffect(() => {
+    if (esNacional) { setTipoGasto("cogs"); setMoneda("CLP"); }
+  }, [esNacional]);
+
+  // Cargar el catálogo de OC nacionales al entrar al modo nacional (una sola vez).
+  useEffect(() => {
+    if (esNacional && ocNacionales.length === 0) {
+      monzaComprasAPI.ocNacionales()
+        .then(({ data }) => setOcNacionales(data.ocs))
+        .catch((e: any) => toast.error(e?.response?.data?.detail || "No se pudieron cargar las OC nacionales"));
+    }
+  }, [esNacional]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Al elegir OC nacional: precarga ítems (cantidad = disponible a costear) y el acreedor.
+  useEffect(() => {
+    if (!ocSel) { setLineItems({}); return; }
+    const init: Record<number, { incluir: boolean; cantidad: string; precio_unit: string }> = {};
+    ocSel.items.forEach(it => {
+      init[it.item_cotizacion_id] = {
+        incluir: it.disponible_costear > 0,
+        cantidad: it.disponible_costear > 0 ? String(it.disponible_costear) : "",
+        precio_unit: "",
+      };
+    });
+    setLineItems(init);
+    if (ocSel.proveedor) setAcreedor(ocSel.proveedor);
+  }, [ocpSel, ocNacionales]);  // eslint-disable-line react-hooks/exhaustive-deps
   const cuentasPorClase: Record<string, PlanCuenta[]> = {};
   for (const c of catalogos?.plan_cuentas || []) {
     const k = c.clase || "Otras";
@@ -173,10 +226,25 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
   const tcN = moneda === "CLP" ? 1 : (Number(tc) || 0);
   const totalClp = Math.round(totalN * tcN);
 
+  // Σ de las líneas costeadas incluidas (cantidad × costo unit neto CLP). El backend
+  // permite cobertura PARCIAL (Σ < neto); solo se bloquea Σ > neto (+$1 de redondeo).
+  const sumaLineas = ocSel ? ocSel.items.reduce((acc, it) => {
+    const li = lineItems[it.item_cotizacion_id];
+    if (!li || !li.incluir) return acc;
+    return acc + (Number(li.cantidad) || 0) * (Number(li.precio_unit) || 0);
+  }, 0) : 0;
+  const sumaExcedeNeto = esNacional && netoN > 0 && Math.round(sumaLineas) > netoN + 1;
+
+  // Al elegir un proveedor del catálogo se trae su nombre Y SU MONEDA: sin la moneda, un
+  // proveedor en USD dejaba el formulario en CLP y la compra se contabilizaba a tipo de
+  // cambio 1 (el monto en dólares entraba como si fueran pesos). No aplica en la compra
+  // nacional ni con prefill de embarque, donde la moneda está fija en CLP a propósito.
   const onProveedor = (id: number | "") => {
     setProveedorId(id);
     const p = catalogos?.proveedores.find(x => x.id === id);
-    if (p) setAcreedor(p.nombre);
+    if (!p) return;
+    setAcreedor(p.nombre);
+    if (p.moneda && !prefill && !esNacional) setMoneda(p.moneda);
   };
 
   const submit = async () => {
@@ -185,6 +253,29 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
     // ej. IVA importación): basta que neto+IVA > 0. Manual: neto > 0 obligatorio.
     if (prefill ? (netoN + ivaN) <= 0 : netoN <= 0) { toast.error("El monto debe ser mayor a 0"); return; }
     if (moneda !== "CLP" && tcN <= 0) { toast.error("Indica el tipo de cambio"); return; }
+
+    // Detalle por ítem de la compra NACIONAL (validación espejo del backend).
+    let items: { item_cotizacion_id: number; numero_parte?: string | null; descripcion?: string | null; cantidad: number; precio_unit: number }[] | undefined;
+    if (esNacional) {
+      if (!ocpSel) { toast.error("Selecciona la OC-Proveedor nacional"); return; }
+      const incluidos = (ocSel?.items || []).filter(it => {
+        const li = lineItems[it.item_cotizacion_id];
+        return li && li.incluir && Number(li.cantidad) > 0;
+      });
+      if (incluidos.length === 0) { toast.error("Agrega al menos un ítem con cantidad"); return; }
+      if (sumaExcedeNeto) { toast.error("La suma de líneas costeadas supera el neto de la factura"); return; }
+      items = incluidos.map(it => {
+        const li = lineItems[it.item_cotizacion_id];
+        return {
+          item_cotizacion_id: it.item_cotizacion_id,
+          numero_parte: it.numero_parte,
+          descripcion: it.descripcion,
+          cantidad: Number(li.cantidad),
+          precio_unit: Number(li.precio_unit) || 0,
+        };
+      });
+    }
+
     setSaving(true);
     try {
       await monzaComprasAPI.crear({
@@ -197,6 +288,7 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
         ...(prefill ? { iva: ivaN } : { afecto_iva: afectoIva }),
         condicion_pago: condicion, plazo_dias: condicion === "credito" && plazo ? Number(plazo) : undefined,
         ...(prefill ? { emb_pricing_gasto_id: prefill.emb_pricing_gasto_id, embarque_id: prefill.embarque_id } : {}),
+        ...(esNacional && ocpSel ? { oc_proveedor_id: Number(ocpSel), items } : {}),
         pago: condicion === "contado"
           ? { medio: pagoMedio, banco: pagoBanco || undefined, fecha, fecha_mov_bancario: pagoFechaBanco || fecha }
           : undefined,
@@ -213,12 +305,130 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
           Datos traídos de <b>Embarques Pricing</b> (no se digitan de nuevo). Elige si lo pagas ahora o queda por pagar.
         </p>
       )}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+
+      {/* Tipo de registro: gasto/servicio o compra nacional con detalle por ítem
+          (con prefill de embarque no aplica: ese flujo ya viene armado). */}
+      {!prefill && (
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+          {([["gasto", "Gasto / servicio", Wallet], ["nacional", "Compra nacional (detalle de ítems)", Truck]] as const).map(([val, label, Icon]) => (
+            <button key={val} type="button" onClick={() => setOrigenTipo(val)}
+              style={{
+                display: "flex", alignItems: "center", gap: 6, padding: "7px 14px", borderRadius: 999,
+                fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+                border: origenTipo === val ? "1px solid var(--monza-accent)" : s.cardBd,
+                background: origenTipo === val ? "var(--monza-accent)" : s.sub,
+                color: origenTipo === val ? "white" : s.muted,
+              }}>
+              <Icon size={13} /> {label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {esNacional && (
+        <div style={{ borderRadius: 10, border: s.cardBd, background: s.sub, padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+          <Field label="OC-Proveedor nacional">
+            <select style={inp} value={ocpSel} onChange={e => setOcpSel(e.target.value ? Number(e.target.value) : "")}>
+              <option value="">— Selecciona OC nacional —</option>
+              {ocNacionales.map(o => (
+                <option key={o.oc_proveedor_id} value={o.oc_proveedor_id}>
+                  {(o.numero_oc || o.numero || `OCP #${o.oc_proveedor_id}`)} — {o.proveedor || "Sin proveedor"}
+                </option>
+              ))}
+            </select>
+          </Field>
+          {ocNacionales.length === 0 ? (
+            <p style={{ margin: 0, fontSize: 11, color: s.faint }}>
+              No hay OC nacionales con ítems. Crea una en <b>Abastecimiento</b> (origen Nacional) y
+              registra su entrega en <b>Seguimiento</b> antes de costear.
+            </p>
+          ) : ocSel && (
+            <>
+              <div style={{ borderRadius: 8, border: s.cardBd, overflow: "hidden" }}>
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                    <thead>
+                      <tr style={{ background: s.cardBg, borderBottom: s.cardBd }}>
+                        <th style={{ padding: "7px 8px", width: 28 }}></th>
+                        {["N° Parte", "Descripción", "Recibido", "Disp. costear", "Cantidad", "Costo unit CLP", "Subtotal"].map(h => (
+                          <th key={h} style={{ padding: "7px 8px", textAlign: "left", fontWeight: 700, fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5, color: s.faint, whiteSpace: "nowrap" }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ocSel.items.map(it => {
+                        const li = lineItems[it.item_cotizacion_id] || { incluir: false, cantidad: "", precio_unit: "" };
+                        const sub = (Number(li.cantidad) || 0) * (Number(li.precio_unit) || 0);
+                        const sinDisp = it.disponible_costear <= 0;
+                        return (
+                          <tr key={it.item_cotizacion_id} style={{ borderBottom: s.cardBd, opacity: li.incluir ? 1 : 0.5 }}>
+                            <td style={{ padding: "5px 8px", textAlign: "center" }}>
+                              <input type="checkbox" checked={li.incluir} disabled={sinDisp}
+                                title={sinDisp ? "Registra primero la recepción nacional en Seguimiento" : undefined}
+                                onChange={() => setLineItems(prev => ({ ...prev, [it.item_cotizacion_id]: { ...(prev[it.item_cotizacion_id] || { cantidad: "", precio_unit: "" }), incluir: !prev[it.item_cotizacion_id]?.incluir } }))}
+                                style={{ accentColor: "var(--monza-accent)" }} />
+                            </td>
+                            <td style={{ padding: "5px 8px", fontFamily: "ui-monospace, monospace", fontWeight: 600, color: "var(--monza-accent)", whiteSpace: "nowrap" }}>{it.numero_parte || "—"}</td>
+                            <td style={{ padding: "5px 8px", color: s.text, maxWidth: 150, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={it.descripcion || ""}>{it.descripcion || "—"}</td>
+                            <td style={{ padding: "5px 8px", textAlign: "center", color: s.muted }}>{it.recibido}</td>
+                            <td style={{ padding: "5px 8px", textAlign: "center", fontWeight: 700, color: sinDisp ? s.faint : s.text }}
+                              title={sinDisp ? "Registra primero la recepción nacional en Seguimiento" : undefined}>{it.disponible_costear}</td>
+                            <td style={{ padding: "5px 8px" }}>
+                              <input type="number" min={0} step="any" style={{ ...inp, width: 70, padding: "4px 8px", fontSize: 12 }}
+                                value={li.cantidad} disabled={!li.incluir}
+                                onChange={e => setLineItems(prev => ({ ...prev, [it.item_cotizacion_id]: { ...(prev[it.item_cotizacion_id] || { incluir: true, precio_unit: "" }), cantidad: e.target.value } }))} />
+                            </td>
+                            <td style={{ padding: "5px 8px" }}>
+                              <input type="number" min={0} step="any" style={{ ...inp, width: 90, padding: "4px 8px", fontSize: 12 }}
+                                value={li.precio_unit} disabled={!li.incluir} placeholder="neto CLP"
+                                onChange={e => setLineItems(prev => ({ ...prev, [it.item_cotizacion_id]: { ...(prev[it.item_cotizacion_id] || { incluir: true, cantidad: "" }), precio_unit: e.target.value } }))} />
+                            </td>
+                            <td style={{ padding: "5px 8px", textAlign: "right", fontFamily: "ui-monospace, monospace", whiteSpace: "nowrap", color: s.muted }}>{sub > 0 ? fmtClp(sub) : "—"}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 8, fontSize: 12 }}>
+                <span style={{ color: s.muted }}>
+                  Σ líneas: <b style={{ color: "var(--monza-accent)" }}>{fmtClp(sumaLineas)}</b>
+                  <span style={{ margin: "0 6px" }}>·</span>
+                  Neto factura: <b style={{ color: s.text }}>{fmtClp(netoN)}</b>
+                </span>
+                {sumaExcedeNeto ? (
+                  <span style={{ color: "#B91C1C", fontWeight: 700, display: "flex", alignItems: "center", gap: 4 }}>
+                    <AlertCircle size={13} /> Σ supera el neto de la factura
+                  </span>
+                ) : (
+                  <button type="button" onClick={() => setNeto(String(Math.round(sumaLineas)))}
+                    style={{ fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 8, border: "1px solid var(--monza-accent)", background: "transparent", color: "var(--monza-accent)", cursor: "pointer", fontFamily: "inherit" }}>
+                    Usar Σ como neto
+                  </button>
+                )}
+              </div>
+              <p style={{ margin: 0, fontSize: 11, color: s.faint }}>
+                El costo por ítem es el <b>neto en CLP</b> (el IVA es crédito fiscal, no capitaliza).
+                La cantidad costeada no puede superar lo recibido en bodega.
+              </p>
+            </>
+          )}
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(230px, 1fr))", gap: 12 }}>
+        {esNacional ? (
+          <Field label="Tipo de gasto">
+            <div style={{ ...inp, opacity: 0.7 }}>Costo de venta (nacional)</div>
+          </Field>
+        ) : (
         <Field label="Tipo de gasto">
           <select style={inp} value={tipoGasto} onChange={e => setTipoGasto(e.target.value)}>
             {(catalogos?.tipos_gasto || []).map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
           </select>
         </Field>
+        )}
         <Field label="Categoría">
           <input style={inp} list="mcc-cat" value={categoria} onChange={e => setCategoria(e.target.value)} placeholder="Ej. Flete internacional" />
           <datalist id="mcc-cat">{(catalogos?.categorias_sugeridas || []).map(c => <option key={c} value={c} />)}</datalist>
@@ -239,7 +449,7 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
         <input type="checkbox" checked={esAnticipo} onChange={e => setEsAnticipo(e.target.checked)} style={{ accentColor: "var(--monza-accent)" }} />
         Es anticipo a proveedor extranjero (NIC 21 · no monetario)
       </label>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(230px, 1fr))", gap: 12 }}>
         <Field label="Proveedor (catálogo)">
           <select style={inp} value={proveedorId} onChange={e => onProveedor(e.target.value ? Number(e.target.value) : "")}>
             <option value="">— Sin catálogo —</option>
@@ -262,11 +472,12 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
 
       {/* Montos */}
       <div style={{ borderRadius: 10, border: s.cardBd, background: s.sub, padding: 12 }}>
-        <div style={{ display: "grid", gridTemplateColumns: moneda !== "CLP" ? "1fr 1fr 1fr" : "1fr 1fr", gap: 12 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 12 }}>
           {/* Con prefill de embarque la moneda queda fija en CLP (los gastos locales
-              de Embarques Pricing siempre están en CLP; cambiarla corrompería el registro). */}
+              de Embarques Pricing siempre están en CLP; cambiarla corrompería el
+              registro). La compra NACIONAL también fuerza CLP (factura chilena). */}
           <Field label="Moneda">
-            <select style={inp} value={moneda} disabled={!!prefill} onChange={e => setMoneda(e.target.value)}>
+            <select style={inp} value={moneda} disabled={!!prefill || esNacional} onChange={e => setMoneda(e.target.value)}>
               <option value="CLP">CLP</option><option value="USD">USD</option><option value="EUR">EUR</option>
             </select>
           </Field>
@@ -302,7 +513,7 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
       {condicion === "credito" ? (
         <Field label="Plazo (días)"><input type="number" style={inp} value={plazo} onChange={e => setPlazo(e.target.value)} /></Field>
       ) : (
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12 }}>
           <Field label="Medio de pago">
             <select style={inp} value={pagoMedio} onChange={e => setPagoMedio(e.target.value)}>
               <option value="transferencia">Transferencia</option><option value="cheque">Cheque</option>
@@ -347,7 +558,7 @@ function PagoCompraModal({ compra, onClose, onDone }: { compra: Compra; onClose:
   return (
     <Modal title={`Registrar pago · ${compra.numero_documento || "#" + compra.id}`} onClose={onClose}>
       <p style={{ margin: 0, fontSize: 12, color: s.muted }}>Saldo pendiente: <b style={{ color: "#B45309" }}>{fmtClp(compra.saldo_clp)}</b></p>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(230px, 1fr))", gap: 12 }}>
         <Field label="Monto (CLP)"><input type="number" style={inp} value={monto} onChange={e => setMonto(e.target.value)} /></Field>
         <Field label="Fecha del pago"><input type="date" style={inp} value={fecha} onChange={e => setFecha(e.target.value)} /></Field>
         <Field label="Medio">
@@ -420,7 +631,7 @@ function PagoConsolidadoModal({ onClose, onDone }: { onClose: () => void; onDone
           </label>
         ))}
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(230px, 1fr))", gap: 12 }}>
         <Field label="Fecha"><input type="date" style={inp} value={fecha} onChange={e => setFecha(e.target.value)} /></Field>
         <Field label="Medio">
           <select style={inp} value={medio} onChange={e => setMedio(e.target.value)}>
@@ -469,6 +680,7 @@ function CompraRow({ c, onChanged, onPagar }: { c: Compra; onChanged: () => void
             {open ? <ChevronUp size={12} /> : <ChevronDown size={12} />}{c.numero_documento || `#${c.id}`}
           </span>
           {c.origen === "EMBARQUE" && <span style={{ marginLeft: 4, fontSize: 10, color: "#0E7490" }}>·emb</span>}
+          {c.origen === "NACIONAL" && <span style={{ marginLeft: 4, fontSize: 10, color: "#15803D" }} title="Compra nacional con detalle de ítems">·nac</span>}
         </td>
         <td style={{ ...td, fontWeight: 600, color: s.text, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>{c.acreedor || "—"}</td>
         <td style={td}>
@@ -497,8 +709,10 @@ function CompraRow({ c, onChanged, onPagar }: { c: Compra; onChanged: () => void
       {open && (
         <tr>
           <td colSpan={8} style={{ padding: "0 16px 16px", background: s.sub }}>
-            <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 16, paddingTop: 12 }}>
-              <div>
+            {/* flex-wrap en vez de 2 columnas fijas: en pantalla angosta el detalle y los
+                botones se apilan (equivalente inline del `md:grid-cols-3` de Grupo AM). */}
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 16, paddingTop: 12 }}>
+              <div style={{ flex: "2 1 320px", minWidth: 0 }}>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 20px", fontSize: 12, color: s.muted }}>
                   <span>Neto: <b style={{ color: s.text }}>{c.moneda} {Math.round(c.monto_neto).toLocaleString("es-CL")}</b></span>
                   <span>IVA: <b style={{ color: s.text }}>{c.moneda} {Math.round(c.iva).toLocaleString("es-CL")}</b></span>
@@ -516,6 +730,37 @@ function CompraRow({ c, onChanged, onPagar }: { c: Compra; onChanged: () => void
                   {c.descripcion && <span>Glosa: <b style={{ color: s.muted }}>{c.descripcion}</b></span>}
                   {c.anulado && c.motivo_anulacion && <span style={{ color: "#B91C1C" }}>Anulada: {c.motivo_anulacion}</span>}
                 </div>
+                {/* Líneas costeadas de la compra NACIONAL: la factura ES el costo de
+                    estos repuestos (neto CLP por ítem; el IVA no capitaliza). */}
+                {(c.items?.length || 0) > 0 && (
+                  <div style={{ marginTop: 12 }}>
+                    <p style={{ margin: "0 0 4px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: s.faint }}>
+                      Ítems costeados (neto CLP · el IVA no capitaliza)
+                    </p>
+                    <div style={{ borderRadius: 8, border: s.cardBd, overflow: "hidden" }}>
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                        <thead>
+                          <tr style={{ background: s.cardBg, borderBottom: s.cardBd }}>
+                            {["N° Parte", "Descripción", "Cant.", "Unit CLP", "Total CLP"].map(h => (
+                              <th key={h} style={{ padding: "6px 10px", textAlign: ["Cant.", "Unit CLP", "Total CLP"].includes(h) ? "right" : "left", fontWeight: 700, fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5, color: s.faint, whiteSpace: "nowrap" }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {c.items.map(it => (
+                            <tr key={it.id} style={{ borderBottom: s.cardBd }}>
+                              <td style={{ padding: "5px 10px", fontFamily: "ui-monospace, monospace", fontWeight: 600, color: "var(--monza-accent)", whiteSpace: "nowrap" }}>{it.numero_parte || "—"}</td>
+                              <td style={{ padding: "5px 10px", color: s.text, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={it.descripcion || ""}>{it.descripcion || "—"}</td>
+                              <td style={{ padding: "5px 10px", textAlign: "right", color: s.muted }}>{it.cantidad}</td>
+                              <td style={{ padding: "5px 10px", textAlign: "right", color: s.muted, fontFamily: "ui-monospace, monospace" }}>{fmtClp(it.costo_unit_clp)}</td>
+                              <td style={{ padding: "5px 10px", textAlign: "right", fontWeight: 600, color: s.text, fontFamily: "ui-monospace, monospace" }}>{fmtClp(it.costo_total_clp)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
                 {c.pagos.length > 0 && (
                   <div style={{ marginTop: 12 }}>
                     <p style={{ margin: "0 0 4px", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: s.faint }}>Pagos · la fecha en el banco se cruzará con la cartola</p>
@@ -539,7 +784,7 @@ function CompraRow({ c, onChanged, onPagar }: { c: Compra; onChanged: () => void
                   </div>
                 )}
               </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ flex: "1 1 200px", display: "flex", flexDirection: "column", gap: 8 }}>
                 {!c.anulado && c.saldo_clp > 0 && (
                   <button onClick={e => { e.stopPropagation(); onPagar(c); }} style={btnSecondary(s)}><CreditCard size={14} /> Registrar pago</button>
                 )}
@@ -587,8 +832,10 @@ function CostosEmbarqueTab({ onRegistrar }: { onRegistrar: (p: Prefill) => void 
         <div style={{ borderRadius: 14, border: s.cardBd, background: s.cardBg, overflow: "hidden" }}>
           <div style={{ overflowX: "auto" }}>
             <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              {/* Banco: lo anota Embarques Pricing junto al gasto y es con lo que después se
+                  cuadra el cargo en la cartola — se venía declarando y no se pintaba. */}
               <thead><tr style={{ borderBottom: s.cardBd, background: s.sub }}>
-                {["Embarque", "Gasto", "Proveedor", "N° factura", "Fecha", "Neto", "IVA", "Total", "Estado"].map(h => <th key={h} style={th}>{h}</th>)}
+                {["Embarque", "Gasto", "Proveedor", "N° factura", "Fecha", "Neto", "IVA", "Total", "Banco", "Estado"].map(h => <th key={h} style={th}>{h}</th>)}
               </tr></thead>
               <tbody>
                 {rows.map(r => (
@@ -601,6 +848,7 @@ function CostosEmbarqueTab({ onRegistrar }: { onRegistrar: (p: Prefill) => void 
                     <td style={{ ...td, color: s.text }}>{fmtClp(r.monto_neto)}</td>
                     <td style={{ ...td, color: s.muted }}>{fmtClp(r.iva)}</td>
                     <td style={{ ...td, fontWeight: 600, color: "var(--monza-accent)" }}>{fmtClp(r.monto_total)}</td>
+                    <td style={{ ...td, color: s.muted, maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis" }}>{r.banco || "—"}</td>
                     <td style={td}>
                       {r.compra_id ? (
                         <span style={{ background: "rgba(21,128,61,0.14)", color: "#15803D", fontSize: 11, fontWeight: 600, padding: "3px 9px", borderRadius: 999 }}>En compras ✓</span>

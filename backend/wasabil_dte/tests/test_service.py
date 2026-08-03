@@ -253,6 +253,20 @@ def test_serialize_estados_de_recuperacion():
     # En proceso en el SII → esperar, no reintentar
     s = serialize_dte(_dte(uuid="u1", status_id=2))
     assert s["estado"] == "procesando" and s["puede_reintentar"] is False
+    # EMITIDO manda sobre la ausencia de uuid: un DTE con status 3 y folio pero uuid
+    # NULL (la respuesta trajo el estado y el folio, y el uuid se perdió) se pintaba
+    # "no enviado" CON botón de Reintentar al lado, sobre algo IRREVERSIBLE.
+    s = serialize_dte(_dte(status_id=3, folio="9500"))
+    assert s["estado"] == "emitido" and s["puede_reintentar"] is False, s
+    # ...y también sin folio (el sondeo lo rescata; el botón no se ofrece igual)
+    s = serialize_dte(_dte(status_id=3))
+    assert s["estado"] == "emitido" and s["puede_reintentar"] is False, s
+    # factura_id lo expone el SERIALIZADOR: el modal de facturas sondea por factura, y
+    # sin este campo la respuesta de "emitir" no le dice a quién consultar.
+    s = serialize_dte(_dte(despacho_id=None, factura_id=77, tipo_dte=33))
+    assert s["factura_id"] == 77, s
+    # Un DTE de guía (sin el atributo en la fila) no revienta: getattr con default
+    assert serialize_dte(_dte())["factura_id"] is None
 
 
 # ─── buscar_documentos: paginación defensiva del anti-duplicados (client.py) ────

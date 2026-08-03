@@ -109,7 +109,10 @@ export interface Catalogos {
   cuenta_default_por_tipo: Record<string, number | null>
 }
 
+// Gasto anotado en Embarques Pricing, visto como candidato a Cuenta por Pagar.
 export interface CostoEmbarque {
+  /** id del gasto de pricing (emb_pricing_gasto). Es la llave del prefill al registrarlo
+   *  como compra: viaja en `emb_pricing_gasto_id` y es lo que evita el duplicado. */
   id: number
   origen: string
   embarque_id: number
@@ -124,6 +127,10 @@ export interface CostoEmbarque {
   fecha_factura: string | null
   banco: string | null
   capitaliza: boolean
+  /** id de la compra que YA refleja este gasto como CxP pagable; `null` = todavía no está
+   *  en Compras. Sin esta llave la pestaña no puede distinguir el gasto ya registrado del
+   *  que falta, y el costo del embarque nunca llega a la cola de pagos de Tesorería. */
+  compra_id: number | null
 }
 
 export interface CompraListResponse {

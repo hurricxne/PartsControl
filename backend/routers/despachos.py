@@ -23,7 +23,7 @@ from routers.compras import business_days_remaining, add_business_days
 from wasabil_dte.models import (
     WasabilDte, STATUS_EMITIDO, STATUS_PROCESANDO, STATUS_PENDIENTE,
 )
-from wasabil_dte.service import TIPO_DOC_GUIA, claim_vigente
+from wasabil_dte.service import TIPO_DOC_GUIA, claim_vigente, hoy_chile
 
 # Despachos es data 100% Grupo AM (la tabla no tiene columna empresa): candado
 # 'mineria' a nivel de router, igual que contabilidad y wasabil_dte.
@@ -110,6 +110,10 @@ class DespachoCreate(BaseModel):
 
 class DespachoUpdate(BaseModel):
     numero_guia: Optional[str] = None
+    # Fecha de EMISIÓN de la guía ante el SII (YYYY-MM-DD), sólo para guía EN PAPEL.
+    # Tri-estado gracias a exclude_unset: ausente = no tocar · "2026-07-15" = fijar ·
+    # null/"" = borrar. Ver _parse_fecha_guia y models.Despacho.fecha_guia.
+    fecha_guia: Optional[str] = None
     transportista: Optional[str] = None
     numero_expedicion: Optional[str] = None
     contacto_destinatario: Optional[str] = None
@@ -124,6 +128,77 @@ class FirmarIn(BaseModel):
 
 
 # --- Helpers ---
+# Antigüedad máxima aceptada para la fecha de emisión de una guía tecleada a mano. No es
+# una regla del SII: es una malla ANCHA contra el dedazo grueso (un 2019 en vez de un
+# 2026), y 2 años deja pasar cualquier regularización real.
+# OJO — lo que esta malla NO ataja: el typo de UN año ("2025-07-15" por "2026-07-15") cae
+# muy dentro de los 730 días y pasa limpio. Bajar el tope no es la solución (bloquearía
+# regularizaciones legítimas); el control que sí ataja el error hacia adelante es el cruce
+# `guia_fecha <= fecha de la factura` de armar_referencias_factura (wasabil_dte/service.py),
+# porque una guía fechada el año pasado sigue siendo anterior a su factura y sólo el
+# operador sabe si es correcta.
+_ANTIGUEDAD_MAX_FECHA_GUIA_DIAS = 730
+
+# Formato aceptado: AAAA-MM-DD, opcionalmente con sufijo horario ISO. Cualquier otra cosa
+# pegada a la fecha se RECHAZA en vez de truncarse (ver _parse_fecha_guia).
+_RE_FECHA_GUIA = re.compile(r"^\d{4}-\d{2}-\d{2}([T ].*)?$")
+
+
+def _parse_fecha_guia(valor) -> Optional[date]:
+    """Texto YYYY-MM-DD → date, para la fecha de EMISIÓN de la guía en papel.
+
+    Devuelve None cuando el operador la borra (null o ""), que es un estado legítimo:
+    el despacho vuelve a "sin fecha" y la facturación electrónica se bloquea hasta que
+    se cargue de nuevo.
+
+    Valida ANTES de guardar porque esta fecha termina viajando como FchRef dentro de un
+    DTE 33 REAL: una fecha inventada no se corrige después, sólo se anula el documento.
+    Se rechaza:
+      · lo que no sea una fecha YYYY-MM-DD,
+      · una fecha FUTURA (una guía no se emite mañana; suele ser un tipeo),
+      · una fecha absurdamente vieja (ver _ANTIGUEDAD_MAX_FECHA_GUIA_DIAS).
+    """
+    if valor is None:
+        return None
+    texto = str(valor).strip()
+    if not texto:
+        return None
+    # `_RE_FECHA_GUIA` antes de strptime: con `texto[:10]` a secas, "2026-07-155" se
+    # truncaba a "2026-07-15" y se aceptaba en silencio un dato que el operador escribió
+    # mal. Se admite el sufijo horario ("2026-07-15T10:00:00") porque algunos clientes
+    # mandan datetime ISO, pero nada más pegado a la fecha.
+    if not _RE_FECHA_GUIA.match(texto):
+        raise HTTPException(
+            400,
+            "La fecha de emisión de la guía debe tener el formato AAAA-MM-DD "
+            f"(recibido: '{texto}')",
+        )
+    try:
+        fecha = datetime.strptime(texto[:10], "%Y-%m-%d").date()
+    except ValueError:
+        # Formato correcto pero fecha inexistente: 2026-02-31, 2026-13-01.
+        raise HTTPException(
+            400,
+            f"La fecha de emisión de la guía '{texto[:10]}' no existe en el calendario",
+        )
+    hoy = hoy_chile()
+    if fecha > hoy:
+        raise HTTPException(
+            400,
+            f"La fecha de emisión de la guía ({fecha.isoformat()}) es futura: "
+            "revisa el dato (hoy en Chile es "
+            f"{hoy.isoformat()}). Debe ser la fecha en que el SII emitió la guía.",
+        )
+    if (hoy - fecha).days > _ANTIGUEDAD_MAX_FECHA_GUIA_DIAS:
+        raise HTTPException(
+            400,
+            f"La fecha de emisión de la guía ({fecha.isoformat()}) tiene más de "
+            f"{_ANTIGUEDAD_MAX_FECHA_GUIA_DIAS // 365} años: revisa el año antes de "
+            "guardar (es el error de tipeo más común).",
+        )
+    return fecha
+
+
 def _next_numero_despacho(db: Session) -> str:
     year = datetime.now().year
     prefix = f"DSP-{year}-"
@@ -260,8 +335,8 @@ def _tope_fisico(item: ItemCotizacion, recibidos: dict) -> float:
     return cant
 
 
-def _guia_electronica_activa(db: Session, despacho_id: int,
-                             con_lock: bool = False) -> Optional[WasabilDte]:
+def _guia_electronica_activa(db: Session, despacho_id: int, con_lock: bool = False,
+                             incluir_ambiguo: bool = False) -> Optional[WasabilDte]:
     """Guía electrónica (SII 52) VIVA del despacho: emitida, en vuelo (claim) o en
     proceso en Wasabil. Mientras exista, las operaciones que la dejarían huérfana o
     pisarían su folio (anular el despacho, editar el N° de guía a mano) se rechazan:
@@ -270,7 +345,24 @@ def _guia_electronica_activa(db: Session, despacho_id: int,
 
     `con_lock=True` (anular): lee con FOR UPDATE + populate_existing para ver el
     claim/estado COMMITEADO más reciente aunque la transacción tenga un snapshot
-    anterior — cierra la carrera anular ↔ emitir."""
+    anterior — cierra la carrera anular ↔ emitir.
+
+    `incluir_ambiguo=True` (SOLO anular): además cuenta como viva la emisión
+    AMBIGUA — uuid NULL pero `en_vuelo_desde` puesto — aunque su claim ya haya
+    VENCIDO por TTL. Ahí Wasabil cortó la comunicación sin confirmar nada
+    (timeout/5xx) y `_emitir_en_wasabil` conserva el timestamp a propósito: el
+    documento PUDO nacer con folio real en el SII. Decidir por TTL dejaba anular el
+    despacho, liberaba la mercadería y habilitaba una SEGUNDA guía 52 REAL por lo
+    mismo (irreversible — y Grupo AM es la marca que YA emite de verdad), además de
+    dejar el documento sin recuperación. Es el mismo `ambiguo_sin_resolver` que ya
+    protege el borrado de facturas en routers/contabilidad.py. El fallo CONFIRMADO
+    no queda atrapado: _emitir_en_wasabil limpia `en_vuelo_desde` cuando el error NO
+    es ambiguo, así que un DTE fallido sigue permitiendo anular (el despacho nunca
+    es imborrable).
+    Por defecto False: el PUT de numero_guia (_rechazar_si_pisa_folio) NO es
+    irreversible y ahí el criterio por TTL es el correcto — no se debe endurecer.
+
+    Paridad con MonzaParts (monza_router_despachos.py:_guia_electronica_activa)."""
     q = (
         db.query(WasabilDte)
         .filter(WasabilDte.despacho_id == despacho_id,
@@ -286,6 +378,11 @@ def _guia_electronica_activa(db: Session, despacho_id: int,
     if claim_vigente(dte):
         return dte
     if dte.uuid and dte.status_id in (STATUS_PROCESANDO, STATUS_PENDIENTE):
+        return dte
+    # Emisión AMBIGUA con el claim ya vencido: sin uuid no sabemos si el documento
+    # existe, pero `en_vuelo_desde` dice que el POST salió y nadie confirmó el
+    # resultado. Solo bloquea a quien lo pide (anular).
+    if incluir_ambiguo and dte.uuid is None and dte.en_vuelo_desde is not None:
         return dte
     return None
 
@@ -613,6 +710,7 @@ def oc_cliente_detail(
                 "id": d.id,
                 "numero_despacho": d.numero_despacho,
                 "numero_guia": d.numero_guia,
+                "fecha_guia": d.fecha_guia.isoformat() if d.fecha_guia else None,
                 "transportista": d.transportista,
                 "estado": d.estado,
                 "numero_expedicion": d.numero_expedicion,
@@ -699,6 +797,11 @@ def create_despacho(
     # El correlativo DSP-AAAA-#### se calcula sin lock: si dos despachos simultáneos
     # chocan en el UNIQUE de numero_despacho, se recalcula y se reintenta (máx. 3)
     # en vez de devolver un 500 al usuario.
+    # Y el 1213/1205 se reintenta igual (paridad inversa con monza_router_despachos.py:673-685,
+    # que lo ganó en la Fase 2): crear lockea los ÍTEMS primero y después las filas de
+    # despacho, mientras cerrar/anular lockean el DESPACHO primero → orden inverso, ciclo
+    # InnoDB. `cerrar` ya tiene este retry (ver más abajo); crear se quedó sin él y un deadlock
+    # salía como 500 al usuario en vez de reintentarse solo.
     for _ in range(3):
         try:
             return _crear_despacho(db, payload, current_user)
@@ -706,8 +809,13 @@ def create_despacho(
             db.rollback()
             if "numero_despacho" not in str(getattr(e, "orig", e)):
                 raise
+        except OperationalError as e:
+            db.rollback()
+            code = getattr(getattr(e, "orig", None), "args", [None])[0]
+            if code not in (1213, 1205):
+                raise
     raise HTTPException(
-        409, "No se pudo asignar un N° de despacho único (creación simultánea): reintenta"
+        409, "No se pudo crear el despacho por creación simultánea de la misma OC: reintenta"
     )
 
 
@@ -831,6 +939,7 @@ def get_despacho(
         "numero_oc": oc.numero_oc if oc else None,
         "cliente": cot.cliente if cot else None,
         "numero_guia": d.numero_guia,
+        "fecha_guia": d.fecha_guia.isoformat() if d.fecha_guia else None,
         "transportista": d.transportista,
         "contacto_destinatario": d.contacto_destinatario,
         "direccion_entrega": d.direccion_entrega,
@@ -865,6 +974,11 @@ def update_despacho(
     # Excepción: con guía electrónica viva, numero_guia es el folio del SII y no se pisa a mano.
     if "numero_guia" in data:
         _rechazar_si_pisa_folio(db, d, data["numero_guia"])
+    # fecha_guia llega como texto y la columna es Date: se convierte y valida ANTES del
+    # setattr genérico (si no, SQLAlchemy guardaría el string crudo). Se saca del dict para
+    # que el bucle de abajo no la pise con el valor sin parsear.
+    if "fecha_guia" in data:
+        d.fecha_guia = _parse_fecha_guia(data.pop("fecha_guia"))
     for field, value in data.items():
         setattr(d, field, value)
     db.commit()
@@ -1038,6 +1152,22 @@ def anular_despacho(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # Retry 1213/1205, igual que cerrar y crear (paridad inversa con
+    # monza_router_despachos.py:1113-1121): anular lockea el DESPACHO primero y crear lockea
+    # los ÍTEMS primero, así que un anular concurrente con una creación de la misma OC puede
+    # caer víctima del deadlock. Sin el retry salía como 500.
+    for _ in range(3):
+        try:
+            return _anular_despacho_tx(db, despacho_id, current_user)
+        except OperationalError as e:
+            db.rollback()
+            code = getattr(getattr(e, "orig", None), "args", [None])[0]
+            if code not in (1213, 1205):
+                raise
+    raise HTTPException(409, "Conflicto de concurrencia al anular el despacho: reintenta")
+
+
+def _anular_despacho_tx(db: Session, despacho_id: int, current_user: User):
     # FOR UPDATE: serializa contra la emisión de la guía (que también bloquea el
     # despacho en _reclamar_emision) — sin el lock, anular y emitir simultáneos
     # podían dejar una guía SII viva sobre un despacho anulado.
@@ -1055,13 +1185,29 @@ def anular_despacho(
     # La guía 52 se emite con el despacho aún en preparación: anular acá dejaría un
     # documento tributario legal huérfano y la mercadería libre para emitir OTRA
     # guía por lo mismo (doble emisión ante el SII). Se bloquea mientras la guía viva.
-    dte = _guia_electronica_activa(db, d.id, con_lock=True)
+    # incluir_ambiguo=True: un claim VENCIDO sobre una emisión que Wasabil nunca
+    # confirmó (uuid NULL + en_vuelo_desde puesto) también bloquea; si no, la
+    # mercadería volvía a bodega y salía una SEGUNDA guía 52 REAL al SII. Se pasa SOLO
+    # acá porque anular es irreversible (paridad con MonzaParts,
+    # monza_router_despachos.py:_anular_despacho_tx).
+    dte = _guia_electronica_activa(db, d.id, con_lock=True, incluir_ambiguo=True)
     if dte:
         if dte.folio:
             raise HTTPException(
                 409,
                 f"Este despacho tiene guía electrónica SII emitida (folio {dte.folio}): "
                 "anúlala primero en Wasabil (anulación/nota de crédito) y luego anula el despacho",
+            )
+        if dte.uuid is None and dte.en_vuelo_desde is not None and not claim_vigente(dte):
+            # Ambiguo con el claim vencido: "esperar" ya no resuelve nada, la única
+            # salida es Reintentar (adopta el documento si existe en Wasabil, o
+            # re-emite tras confirmar su ausencia). Mismo texto que el de facturas
+            # (ambiguo_sin_resolver en routers/contabilidad.py).
+            raise HTTPException(
+                409,
+                "No hay confirmación de Wasabil sobre esta emisión (se cortó la comunicación): "
+                "la guía PUEDE existir ya ante el SII. Usa «Reintentar» para que el sistema lo "
+                "verifique; si confirma que no se emitió, podrás anular",
             )
         raise HTTPException(
             409,

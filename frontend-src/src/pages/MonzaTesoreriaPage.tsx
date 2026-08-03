@@ -1,23 +1,29 @@
-// Página "Tesorería" (MonzaParts): el manejo del dinero real del banco en 4 pestañas.
+// Página "Tesorería" (MonzaParts): el manejo del dinero real del banco en 5 pestañas.
 //   1. APROBACIONES — los adelantos 50% informados por Comercial llegan acá; Tesorería
 //      DA LA ORDEN (aprueba con monto/fecha/banco) → Abastecimiento queda destrabado.
 //      Si la cartola ya está cargada, muestra el abono del banco que calza (sugerido).
 //   2. POR PAGAR — cola de compras con saldo (buckets de vencimiento); Tesorería aprueba
 //      el pago (selección múltiple → Comprobante de Egreso vía POST /tesoreria/pagos).
-//   3. CONCILIACIÓN — cuentas bancarias, importar cartolas (CSV/XLSX) y cruzar
-//      cargos ↔ egresos de Compras / abonos ↔ adelantos y cobranzas, con sugerencias.
-//   4. FLUJO DE CAJA — por pagar vs por cobrar por ventana de vencimiento (NIC 7).
+//   3. CONCILIACIÓN — importar cartolas (CSV/XLSX), agregar el movimiento que NO viene en
+//      la cartola (cheque, efectivo, comisión) y cruzar cargos ↔ egresos de Compras /
+//      abonos ↔ adelantos y cobranzas, con sugerencias.
+//   4. FLUJO DE CAJA — por pagar vs por cobrar por ventana de vencimiento (NIC 7), más
+//      los tres bloques que van FUERA de los buckets (retención del factor y adelantos).
+//   5. CUENTAS — alta, edición (banco, alias, N° de cuenta, MONEDA) y activación de las
+//      cuentas bancarias. Una moneda mal tipeada bloquea toda la conciliación automática
+//      (el backend solo concilia cuentas CLP), así que tiene que poder corregirse.
 // Consume monzaTesoreriaAPI.
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   Landmark, Search, Loader2, RefreshCw, CheckCircle2, X, Trash2, Upload,
   Plus, Link2, Unlink, AlertCircle, CreditCard, PiggyBank, CalendarClock, ShieldCheck,
-  Banknote, Receipt,
+  Banknote, Receipt, Building2, Pencil,
 } from "lucide-react";
 import toast from "react-hot-toast";
 import { useMonzaTheme } from "./MonzaLayout";
 import { hoyLocal } from "../utils/format";
 import { monzaTesoreriaAPI } from "../services/monzaApi";
+import type { MonzaFlujoCaja } from "../services/monzaApi";
 
 // ─── Tipos (espejo del JSON del backend monza_tesoreria) ──────────────────────
 interface Aprobacion {
@@ -25,11 +31,21 @@ interface Aprobacion {
   estado_venta: string; fecha_venta: string | null; pct_adelanto: number;
   total_venta_clp: number; estado_adelanto: string;
   monto_sugerido_clp?: number;
+  // Folio de la factura de ANTICIPO (vía B) que respalda esta plata ante el SII. El
+  // backend lo publica DERIVADO de las facturas es_anticipo de la venta; se declara
+  // opcional porque en esta cola llega solo cuando el llamador pasó las facturas.
+  factura_anticipo_folio?: string | null;
   abono_sugerido?: { movimiento_id: number; fecha: string | null; monto: number; glosa: string | null } | null;
   adelanto?: {
     adelanto_id: number; monto: number; monto_aplicado: number; fecha_pago: string | null;
     banco: string | null; numero_operacion: string | null; conciliado_banco: boolean;
   };
+}
+// GET /tesoreria/aprobaciones. Los totales son de la COLA completa (la respuesta viene
+// paginada): con ellos el encabezado dice cuántos hay de verdad, no cuántos se bajaron.
+interface AprobacionesResp {
+  por_aprobar: Aprobacion[]; aprobadas: Aprobacion[];
+  total_por_aprobar?: number; total_aprobadas?: number;
 }
 interface Cuenta { id: number; banco: string; nombre: string | null; numero_cuenta: string | null; moneda: string; activo: boolean; observaciones?: string | null }
 // Resumen del destino conciliado de un movimiento (egreso de Compras, adelanto 50%
@@ -62,13 +78,10 @@ const BANCOS_SUGERIDOS = [
   "Santander", "Banco de Chile", "BCI", "BancoEstado", "Itaú", "Scotiabank",
   "Security", "BICE", "Banco Falabella", "Banco Ripley", "Coopeuch", "Otro",
 ];
-interface FlujoBucket { monto: number; n: number }
-interface FlujoCaja {
-  buckets: string[];
-  por_pagar: Record<string, FlujoBucket>; por_cobrar: Record<string, FlujoBucket>;
-  neto: Record<string, number>;
-  adelantos_por_aprobar: { n: number; monto: number };
-}
+// El flujo de caja usa el tipo de la capa API (MonzaFlujoCaja): ahí están declarados los
+// TRES bloques de fuera de los buckets. La copia local de esta pantalla solo declaraba
+// `adelantos_por_aprobar` y por eso escondía la retención del factor y los adelantos ya
+// recibidos sin aplicar, que el backend devuelve desde siempre.
 interface Resumen {
   aprobaciones_pendientes: number; monto_aprobaciones_clp: number;
   movimientos_total: number; movimientos_conciliados: number;
@@ -76,6 +89,7 @@ interface Resumen {
   egresos_sin_conciliar: number; por_pagar_vencido_clp: number;
   // Nuevos (opcionales: toleran un backend aún sin actualizar)
   cobranzas_sin_conciliar?: number; pagos_por_aprobar?: number; monto_por_pagar_clp?: number;
+  adelantos_sin_conciliar?: number;
 }
 
 // ─── Por pagar (aprobación de pagos de Compras) ───────────────────────────────
@@ -144,6 +158,43 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   return (<label style={{ display: "block" }}><span style={{ display: "block", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4, color: s.muted }}>{label}</span>{children}</label>);
 }
 
+/** Devuelve SOLO el `data` de una llamada, y el `fallback` si esa llamada falla — para
+ *  que un `Promise.all` de búsquedas independientes no se caiga entero por una sola.
+ *  `queSe` nombra lo que no se pudo traer en el aviso al usuario (fallar en silencio
+ *  haría creer que no hay coincidencias). El toast va con `id` fijo: esto corre en un
+ *  typeahead y sin el id se apilaría un aviso por cada tecla. */
+async function soloDatos<T>(p: Promise<{ data: T }>, fallback: T, queSe: string): Promise<T> {
+  try {
+    return (await p).data;
+  } catch {
+    toast.error(`No se pudieron buscar ${queSe} (la otra búsqueda sí se hizo)`, { id: `tes-buscar-${queSe}` });
+    return fallback;
+  }
+}
+
+// Tolerancia en PESOS del monto aplicado (mismo criterio que Grupo AM): un adelanto
+// repartido entre varias facturas puede quedar a $1 por el redondeo del IVA y eso ya es
+// "aplicado del todo", no un remanente por cobrar.
+const TOL_APLICADO = 1;
+
+// Estado de APLICACIÓN del adelanto a las facturas de la venta. El monto aplicado a
+// secas no dice si la plata ya se consumió, va a medias o sigue esperando su factura;
+// sin esa lectura es fácil volver a cobrarle al cliente el mismo depósito.
+function AplicacionAdelanto({ a }: { a: Aprobacion }) {
+  const s = useStyles();
+  const ad = a.adelanto;
+  if (!ad || ad.monto <= 0) return <span style={{ color: s.faint }}>—</span>;
+  if (ad.monto_aplicado >= ad.monto - TOL_APLICADO)
+    return <span style={{ color: "#15803D", fontWeight: 600 }}>Aplicado a factura</span>;
+  if (ad.monto_aplicado > 0)
+    return (
+      <span style={{ color: "#B45309" }}>
+        {fmtClp(ad.monto_aplicado)} · queda {fmtClp(Math.max(ad.monto - ad.monto_aplicado, 0))}
+      </span>
+    );
+  return <span style={{ color: s.faint }}>Esperando factura</span>;
+}
+
 // ═══ PESTAÑA 1: APROBACIONES ═════════════════════════════════════════════════
 function AprobarModal({ apro, onClose, onDone }: { apro: Aprobacion; onClose: () => void; onDone: () => void }) {
   const s = useStyles();
@@ -200,32 +251,45 @@ function AprobacionesTab({ onChanged }: { onChanged: () => void }) {
   const s = useStyles();
   const [porAprobar, setPorAprobar] = useState<Aprobacion[]>([]);
   const [aprobadas, setAprobadas] = useState<Aprobacion[]>([]);
+  const [totales, setTotales] = useState<{ pa?: number; ap?: number }>({});
   const [loading, setLoading] = useState(true);
   const [modal, setModal] = useState<Aprobacion | null>(null);
   const load = useCallback(() => {
     setLoading(true);
     monzaTesoreriaAPI.aprobaciones()
-      .then(({ data }) => { setPorAprobar(data.por_aprobar); setAprobadas(data.aprobadas); })
+      .then(({ data }: { data: AprobacionesResp }) => {
+        setPorAprobar(data.por_aprobar || []);
+        setAprobadas(data.aprobadas || []);
+        setTotales({ pa: data.total_por_aprobar, ap: data.total_aprobadas });
+      })
       .catch((e: any) => toast.error(e?.response?.data?.detail || "No se pudieron cargar las aprobaciones"))
       .finally(() => setLoading(false));
   }, []);
   useEffect(() => { load(); }, [load]);
+  // Refresco a mano: la plata entra al banco mientras la pestaña está abierta y sin esto
+  // el tesorero tiene que salir y volver para ver el abono que acaba de calzar.
+  const refrescar = () => { load(); onChanged(); };
 
   const th: React.CSSProperties = { padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: s.faint, whiteSpace: "nowrap" };
   const td: React.CSSProperties = { padding: "10px 14px", whiteSpace: "nowrap", fontSize: 13 };
   if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: 60 }}><Loader2 size={26} className="animate-spin" color="var(--monza-accent)" /></div>;
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      <div style={{ borderRadius: 12, border: s.cardBd, background: s.cardBg, padding: "12px 16px", fontSize: 13, color: s.muted }}>
-        <ShieldCheck size={15} style={{ verticalAlign: "-3px", marginRight: 6, color: "var(--monza-accent)" }} />
-        Los adelantos que Comercial informa al cerrar una venta llegan acá. <b style={{ color: s.text }}>Tesorería da la orden</b>: al aprobar, Abastecimiento queda autorizado a comprar. Ventas lo ve solo lectura.
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+        <div style={{ flex: 1, borderRadius: 12, border: s.cardBd, background: s.cardBg, padding: "12px 16px", fontSize: 13, color: s.muted }}>
+          <ShieldCheck size={15} style={{ verticalAlign: "-3px", marginRight: 6, color: "var(--monza-accent)" }} />
+          Los adelantos que Comercial informa al cerrar una venta llegan acá. <b style={{ color: s.text }}>Tesorería da la orden</b>: al aprobar, Abastecimiento queda autorizado a comprar. Ventas lo ve solo lectura.
+        </div>
+        <button onClick={refrescar} style={{ ...btnSecondary(s), flexShrink: 0 }} title="Volver a consultar">
+          <RefreshCw size={14} />
+        </button>
       </div>
 
       {/* Por aprobar */}
       <div style={{ borderRadius: 14, border: s.cardBd, background: s.cardBg, overflow: "hidden" }}>
         <div style={{ padding: "12px 16px", borderBottom: s.cardBd, display: "flex", alignItems: "center", gap: 8 }}>
           <AlertCircle size={15} color="#B45309" />
-          <b style={{ fontSize: 13, color: s.text }}>Por aprobar ({porAprobar.length})</b>
+          <b style={{ fontSize: 13, color: s.text }}>Por aprobar ({totales.pa ?? porAprobar.length})</b>
         </div>
         {porAprobar.length === 0 ? (
           <p style={{ padding: 20, margin: 0, fontSize: 13, color: s.muted, textAlign: "center" }}>No hay adelantos pendientes de aprobación.</p>
@@ -270,7 +334,7 @@ function AprobacionesTab({ onChanged }: { onChanged: () => void }) {
       <div style={{ borderRadius: 14, border: s.cardBd, background: s.cardBg, overflow: "hidden" }}>
         <div style={{ padding: "12px 16px", borderBottom: s.cardBd, display: "flex", alignItems: "center", gap: 8 }}>
           <CheckCircle2 size={15} color="#15803D" />
-          <b style={{ fontSize: 13, color: s.text }}>Aprobadas ({aprobadas.length})</b>
+          <b style={{ fontSize: 13, color: s.text }}>Aprobadas ({totales.ap ?? aprobadas.length})</b>
         </div>
         {aprobadas.length === 0 ? (
           <p style={{ padding: 20, margin: 0, fontSize: 13, color: s.muted, textAlign: "center" }}>Aún no hay adelantos aprobados.</p>
@@ -278,18 +342,30 @@ function AprobacionesTab({ onChanged }: { onChanged: () => void }) {
           <div style={{ overflowX: "auto" }}>
             <table style={{ width: "100%", borderCollapse: "collapse" }}>
               <thead><tr style={{ background: s.sub, borderBottom: s.cardBd }}>
-                {["Venta", "Cliente", "Monto aprobado", "Fecha pago", "Banco", "N° operación", "Aplicado a facturas", "Cartola"].map(h => <th key={h} style={th}>{h}</th>)}
+                {["Venta", "Cliente", "Monto aprobado", "Fecha pago", "Banco", "N° operación", "Aplicación a facturas", "Cartola"].map(h => <th key={h} style={th}>{h}</th>)}
               </tr></thead>
               <tbody>
                 {aprobadas.map(a => (
                   <tr key={a.cotizacion_id} style={{ borderBottom: s.cardBd }}>
-                    <td style={{ ...td, fontFamily: "ui-monospace, monospace", fontWeight: 600, color: "var(--monza-accent)" }}>COT {a.numero_cotizacion}</td>
+                    <td style={{ ...td, fontFamily: "ui-monospace, monospace", fontWeight: 600, color: "var(--monza-accent)" }}>
+                      COT {a.numero_cotizacion}
+                      {/* Respaldo tributario del adelanto (factura de anticipo, vía B): sin
+                          verlo acá no se sabe si esa plata tiene documento ante el SII. */}
+                      {a.factura_anticipo_folio && (
+                        <span style={{ display: "block", fontFamily: "inherit", fontWeight: 400, fontSize: 11, color: s.faint }}>
+                          respaldo Factura N° {a.factura_anticipo_folio}
+                        </span>
+                      )}
+                    </td>
                     <td style={{ ...td, color: s.text, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>{a.cliente || "—"}</td>
                     <td style={{ ...td, fontWeight: 700, color: "#15803D" }}>{fmtClp(a.adelanto?.monto)}</td>
                     <td style={{ ...td, color: s.muted }}>{fmtDate(a.adelanto?.fecha_pago)}</td>
                     <td style={{ ...td, color: s.muted }}>{a.adelanto?.banco || "—"}</td>
                     <td style={{ ...td, color: s.muted }}>{a.adelanto?.numero_operacion || "—"}</td>
-                    <td style={{ ...td, color: s.muted }}>{fmtClp(a.adelanto?.monto_aplicado)}</td>
+                    {/* El monto aplicado a secas no dice si el adelanto ya se consumió, va a
+                        medias o sigue esperando su factura — y no saberlo es la fuente
+                        clásica de cobrarle al cliente dos veces la misma plata. */}
+                    <td style={{ ...td, color: s.muted }}><AplicacionAdelanto a={a} /></td>
                     <td style={td}>
                       {a.adelanto?.conciliado_banco
                         ? <span style={{ background: "rgba(21,128,61,0.14)", color: "#15803D", fontSize: 11, fontWeight: 600, padding: "3px 9px", borderRadius: 999 }}>Conciliado ✓</span>
@@ -346,15 +422,18 @@ function SugerenciasModal({ mov, onClose, onDone }: { mov: Movimiento; onClose: 
         const { data } = await monzaTesoreriaAPI.egresosPendientes(v);
         if (my === seqRef.current) setManual(data.egresos || []);
       } else {
+        // Un catch POR LLAMADA: con el catch único de abajo, un hipo del endpoint de
+        // adelantos borraba también las cobranzas que sí calzaban y el tesorero leía
+        // "sin resultados" sobre un cruce que existe.
         const [cobs, adels] = await Promise.all([
-          monzaTesoreriaAPI.cobranzasPendientes(v),
-          monzaTesoreriaAPI.adelantosPendientes(),
+          soloDatos<{ cobranzas?: Sugerencia[] }>(monzaTesoreriaAPI.cobranzasPendientes(v), {}, "cobranzas"),
+          soloDatos<{ adelantos?: Sugerencia[] }>(monzaTesoreriaAPI.adelantosPendientes(), {}, "adelantos"),
         ]);
         if (my === seqRef.current) {
           const needle = v.toLowerCase();
-          const adelantos = ((adels.data.adelantos || []) as Sugerencia[]).filter(a =>
+          const adelantos = (adels.adelantos || []).filter(a =>
             `${a.numero_cotizacion || ""} ${a.cliente || ""} ${a.numero_operacion || ""}`.toLowerCase().includes(needle));
-          setManual([...(cobs.data.cobranzas || []), ...adelantos]);
+          setManual([...(cobs.cobranzas || []), ...adelantos]);
         }
       }
     } catch { if (my === seqRef.current) setManual([]); }
@@ -424,23 +503,30 @@ function SugerenciasModal({ mov, onClose, onDone }: { mov: Movimiento; onClose: 
   );
 }
 
+const MONEDAS_CUENTA = ["CLP", "USD", "EUR"];
+
 function CuentaModal({ cuenta, onClose, onDone }: { cuenta: Cuenta | null; onClose: () => void; onDone: () => void }) {
   const s = useStyles();
   const inp = inputBase(s);
   const [banco, setBanco] = useState(cuenta?.banco || "");
   const [nombre, setNombre] = useState(cuenta?.nombre || "");
   const [numero, setNumero] = useState(cuenta?.numero_cuenta || "");
+  // MONEDA y ACTIVA son editables: la conciliación automática solo corre sobre cuentas
+  // en CLP, así que una moneda mal tipeada la bloquea entera y hay que poder corregirla;
+  // y una cuenta que se cerró en el banco se desactiva (borrarla no se puede si tiene
+  // movimientos — el backend responde 409 y manda a desactivarla).
+  const [moneda, setMoneda] = useState(cuenta?.moneda || "CLP");
+  const [activo, setActivo] = useState(cuenta?.activo ?? true);
   const [saving, setSaving] = useState(false);
   const submit = async () => {
     if (!banco.trim()) { toast.error("Indica el banco"); return; }
     setSaving(true);
     try {
-      // El PUT del backend es de reemplazo total: al editar se conservan moneda,
-      // estado activo y observaciones de la cuenta (si no, se perderían).
+      // El PUT del backend es de reemplazo total: viaja TODO el registro (las
+      // observaciones se conservan porque acá no se editan).
       const data = {
         banco, nombre: nombre || undefined, numero_cuenta: numero || undefined,
-        moneda: cuenta?.moneda || "CLP", activo: cuenta?.activo ?? true,
-        observaciones: cuenta?.observaciones ?? undefined,
+        moneda, activo, observaciones: cuenta?.observaciones ?? undefined,
       };
       if (cuenta) await monzaTesoreriaAPI.actualizarCuenta(cuenta.id, data);
       else await monzaTesoreriaAPI.crearCuenta(data);
@@ -449,27 +535,145 @@ function CuentaModal({ cuenta, onClose, onDone }: { cuenta: Cuenta | null; onClo
   };
   return (
     <Modal title={cuenta ? "Editar cuenta bancaria" : "Nueva cuenta bancaria"} onClose={onClose}>
-      <Field label="Banco"><input style={inp} value={banco} onChange={e => setBanco(e.target.value)} placeholder="Santander, BCI…" /></Field>
+      <Field label="Banco">
+        <input style={inp} list="tes-cuenta-bancos" value={banco} onChange={e => setBanco(e.target.value)} placeholder="Santander, BCI…" />
+        <datalist id="tes-cuenta-bancos">{BANCOS_SUGERIDOS.map(b => <option key={b} value={b} />)}</datalist>
+      </Field>
       <Field label="Alias (opcional)"><input style={inp} value={nombre} onChange={e => setNombre(e.target.value)} placeholder="Cta corriente principal" /></Field>
-      <Field label="N° de cuenta (opcional)"><input style={inp} value={numero} onChange={e => setNumero(e.target.value)} /></Field>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12 }}>
+        <Field label="N° de cuenta (opcional)"><input style={inp} value={numero} onChange={e => setNumero(e.target.value)} /></Field>
+        <Field label="Moneda">
+          <select style={inp} value={moneda} onChange={e => setMoneda(e.target.value)}>
+            {MONEDAS_CUENTA.map(m => <option key={m} value={m}>{m}</option>)}
+          </select>
+        </Field>
+      </div>
+      {moneda !== "CLP" && (
+        <p style={{ margin: 0, fontSize: 11, color: "#B45309" }}>
+          La conciliación automática compara montos en CLP: en una cuenta {moneda} queda bloqueada.
+        </p>
+      )}
+      <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: s.muted, cursor: "pointer" }}>
+        <input type="checkbox" checked={activo} onChange={e => setActivo(e.target.checked)} style={{ accentColor: "var(--monza-accent)" }} />
+        Cuenta activa (las inactivas no aparecen en el selector de conciliación)
+      </label>
       <button onClick={submit} disabled={saving} style={{ ...btnPrimary(), width: "100%", opacity: saving ? 0.6 : 1 }}>
-        {saving ? <Loader2 size={15} className="animate-spin" /> : <CheckCircle2 size={15} />} Guardar
+        {saving ? <Loader2 size={15} className="animate-spin" /> : <Building2 size={15} />} Guardar cuenta
       </button>
     </Modal>
   );
 }
 
-function ConciliacionTab({ onChanged }: { onChanged: () => void }) {
+// ─── Modal: importar cartola (nombre del lote + confirmación explícita) ────────
+// Antes la cartola se subía SOLA al elegir el archivo: no había forma de nombrar el lote
+// (el backend acepta `nombre`) ni de arrepentirse tras un clic equivocado.
+function ImportCartolaModal({ cuentaId, onClose, onDone }: { cuentaId: number; onClose: () => void; onDone: () => void }) {
+  const s = useStyles();
+  const inp = inputBase(s);
+  const [file, setFile] = useState<File | null>(null);
+  const [nombre, setNombre] = useState("");
+  const [saving, setSaving] = useState(false);
+  const submit = async () => {
+    if (!file) { toast.error("Selecciona un archivo CSV o Excel"); return; }
+    setSaving(true);
+    try {
+      const { data } = await monzaTesoreriaAPI.importarCartola(cuentaId, file, nombre || undefined);
+      toast.success(`Cartola importada: ${data.n_importados} movimiento(s)`);
+      // Anti-duplicados del backend: avisa cuántas filas ya existían y por qué
+      if (data.warnings?.length) toast(data.warnings.join("; "));
+      onDone(); onClose();
+    } catch (e: any) { toast.error(e?.response?.data?.detail || "No se pudo importar la cartola"); }
+    finally { setSaving(false); }
+  };
+  return (
+    <Modal title="Importar cartola" onClose={onClose}>
+      <p style={{ margin: 0, fontSize: 12, color: s.muted }}>
+        Sube la cartola del banco en <b>CSV</b> o <b>Excel (.xlsx)</b>. Se detectan las columnas
+        Fecha, Detalle/Glosa, Cargo/Abono (o Monto), Referencia y Saldo. Las filas que ya estén
+        cargadas no se duplican.
+      </p>
+      <Field label="Archivo (CSV / .xlsx)">
+        <input type="file" accept=".csv,.xlsx" style={inp} onChange={e => setFile(e.target.files?.[0] || null)} />
+      </Field>
+      <Field label="Nombre del lote (opcional)">
+        <input style={inp} value={nombre} onChange={e => setNombre(e.target.value)} placeholder="Cartola julio 2026" />
+      </Field>
+      <button onClick={submit} disabled={saving || !file} style={{ ...btnPrimary(), width: "100%", opacity: saving || !file ? 0.6 : 1 }}>
+        {saving ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />} Importar
+      </button>
+    </Modal>
+  );
+}
+
+// ─── Modal: movimiento bancario MANUAL ────────────────────────────────────────
+// El cheque, el efectivo o la comisión que NO viene en la cartola: sin poder darlo de
+// alta a mano ese movimiento no se puede conciliar nunca (endpoint POST
+// /tesoreria/movimientos, que ya existía y ninguna pantalla llamaba).
+function MovManualModal({ cuentaId, onClose, onDone }: { cuentaId: number; onClose: () => void; onDone: () => void }) {
+  const s = useStyles();
+  const inp = inputBase(s);
+  // hoyLocal(): toISOString() es UTC y de noche en Chile daría el día siguiente.
+  const [fecha, setFecha] = useState(hoyLocal());
+  const [glosa, setGlosa] = useState("");
+  const [tipo, setTipo] = useState("cargo");
+  const [monto, setMonto] = useState("");
+  const [referencia, setReferencia] = useState("");
+  const [saving, setSaving] = useState(false);
+  const submit = async () => {
+    if (!monto || Number(monto) <= 0) { toast.error("Monto inválido"); return; }
+    setSaving(true);
+    try {
+      await monzaTesoreriaAPI.crearMovimiento({
+        cuenta_id: cuentaId, fecha, glosa: glosa || undefined, tipo,
+        monto: Number(monto), referencia: referencia || undefined,
+      });
+      toast.success("Movimiento agregado"); onDone(); onClose();
+    } catch (e: any) { toast.error(e?.response?.data?.detail || "No se pudo agregar el movimiento"); }
+    finally { setSaving(false); }
+  };
+  return (
+    <Modal title="Movimiento manual" onClose={onClose}>
+      <p style={{ margin: 0, fontSize: 12, color: s.muted }}>
+        Para lo que <b>no viene en la cartola</b>: un cheque, un pago en efectivo o una comisión del
+        banco. Queda igual que un movimiento importado y se puede conciliar.
+      </p>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12 }}>
+        <Field label="Fecha"><input type="date" style={inp} value={fecha} onChange={e => setFecha(e.target.value)} /></Field>
+        <Field label="Tipo">
+          <select style={inp} value={tipo} onChange={e => setTipo(e.target.value)}>
+            <option value="cargo">Cargo (sale plata)</option>
+            <option value="abono">Abono (entra plata)</option>
+          </select>
+        </Field>
+        <Field label="Monto (CLP)"><input type="number" style={inp} value={monto} onChange={e => setMonto(e.target.value)} /></Field>
+        <Field label="Referencia"><input style={inp} value={referencia} onChange={e => setReferencia(e.target.value)} /></Field>
+      </div>
+      <Field label="Glosa"><input style={inp} value={glosa} onChange={e => setGlosa(e.target.value)} placeholder="Cheque N° 123 · comisión mantención…" /></Field>
+      <button onClick={submit} disabled={saving} style={{ ...btnPrimary(), width: "100%", opacity: saving ? 0.6 : 1 }}>
+        {saving ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />} Agregar movimiento
+      </button>
+    </Modal>
+  );
+}
+
+function ConciliacionTab({ onChanged, onCuenta }: { onChanged: () => void; onCuenta: (id: number | "", etiqueta: string) => void }) {
   const s = useStyles();
   const [cuentas, setCuentas] = useState<Cuenta[]>([]);
   const [cuentaSel, setCuentaSel] = useState<number | "">("");
   const [movs, setMovs] = useState<Movimiento[]>([]);
   const [total, setTotal] = useState(0);
   const [estado, setEstado] = useState("");
+  // Filtro cargo/abono: el backend lo acepta desde siempre (`tipo`). Cuadrar el banco es
+  // mirar una columna a la vez — todos los cargos, después todos los abonos.
+  const [tipo, setTipo] = useState("");
   const [q, setQ] = useState("");
   const [loading, setLoading] = useState(true);
-  const [importing, setImporting] = useState(false);
-  const [modal, setModal] = useState<{ type: "sugerencias"; mov: Movimiento } | { type: "cuenta"; cuenta: Cuenta | null } | null>(null);
+  const [modal, setModal] = useState<
+    | { type: "sugerencias"; mov: Movimiento }
+    | { type: "cuenta"; cuenta: Cuenta | null }
+    | { type: "import"; cuentaId: number }
+    | { type: "manual"; cuentaId: number }
+    | null>(null);
 
   const loadCuentas = useCallback(() => {
     monzaTesoreriaAPI.cuentas().then(({ data }) => {
@@ -480,31 +684,26 @@ function ConciliacionTab({ onChanged }: { onChanged: () => void }) {
       toast.error(e?.response?.data?.detail || "No se pudieron cargar las cuentas bancarias");
     });
   }, []);
-  const loadMovs = useCallback((cId: number | "", est: string, search: string) => {
+  const loadMovs = useCallback((cId: number | "", est: string, tp: string, search: string) => {
     setLoading(true);
     monzaTesoreriaAPI.movimientos({
-      cuenta_id: cId || undefined, estado: est || undefined, q: search || undefined, page_size: 200,
+      cuenta_id: cId || undefined, estado: est || undefined, tipo: tp || undefined,
+      q: search || undefined, page_size: 200,
     }).then(({ data }) => { setMovs(data.movimientos); setTotal(data.total); })
       .catch((e: any) => toast.error(e?.response?.data?.detail || "No se pudieron cargar los movimientos"))
       .finally(() => setLoading(false));
   }, []);
   useEffect(() => { loadCuentas(); }, [loadCuentas]);
-  useEffect(() => { loadMovs(cuentaSel, estado, q); }, [cuentaSel, estado]);  // eslint-disable-line react-hooks/exhaustive-deps
-  const reload = () => { loadMovs(cuentaSel, estado, q); onChanged(); };
+  useEffect(() => { loadMovs(cuentaSel, estado, tipo, q); }, [cuentaSel, estado, tipo]);  // eslint-disable-line react-hooks/exhaustive-deps
+  // Los KPIs del encabezado se acotan a la cuenta que se está cuadrando (sin esto mezclan
+  // todas las cuentas y no dicen nada de esta). Viaja también la etiqueta: un contador
+  // acotado en silencio es peor que uno global — el encabezado dice de qué cuenta habla.
+  useEffect(() => {
+    const c = cuentas.find(x => x.id === cuentaSel);
+    onCuenta(cuentaSel, c ? `${c.banco}${c.nombre ? " · " + c.nombre : ""}` : "");
+  }, [cuentaSel, cuentas]);  // eslint-disable-line react-hooks/exhaustive-deps
+  const reload = () => { loadMovs(cuentaSel, estado, tipo, q); onChanged(); };
 
-  const onImportFile = async (file: File | null) => {
-    if (!file) return;
-    if (!cuentaSel) { toast.error("Crea/selecciona una cuenta bancaria primero"); return; }
-    setImporting(true);
-    try {
-      const { data } = await monzaTesoreriaAPI.importarCartola(Number(cuentaSel), file);
-      toast.success(`Cartola importada: ${data.n_importados} movimiento(s)`);
-      // Anti-duplicados del backend: avisa cuántas filas ya existían y por qué
-      if (data.warnings?.length) toast(data.warnings.join("; "));
-      reload();
-    } catch (e: any) { toast.error(e?.response?.data?.detail || "No se pudo importar la cartola"); }
-    finally { setImporting(false); }
-  };
   const desconciliar = async (m: Movimiento) => {
     if (!confirm("¿Deshacer esta conciliación?")) return;
     try { await monzaTesoreriaAPI.desconciliar(m.id); toast.success("Desconciliado"); reload(); }
@@ -538,11 +737,21 @@ function ConciliacionTab({ onChanged }: { onChanged: () => void }) {
           </Field>
         </div>
         <button onClick={() => setModal({ type: "cuenta", cuenta: null })} style={btnSecondary(s)}><Plus size={14} /> Cuenta</button>
-        <label style={{ ...btnPrimary(), cursor: importing ? "wait" : "pointer", opacity: importing ? 0.6 : 1 }}>
-          {importing ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />} Importar cartola (CSV/XLSX)
-          <input type="file" accept=".csv,.xlsx" style={{ display: "none" }} disabled={importing}
-            onChange={e => { onImportFile(e.target.files?.[0] || null); e.target.value = ""; }} />
-        </label>
+        <button
+          onClick={() => cuentaSel
+            ? setModal({ type: "import", cuentaId: Number(cuentaSel) })
+            : toast.error("Crea/selecciona una cuenta bancaria primero")}
+          style={btnPrimary()}>
+          <Upload size={15} /> Importar cartola (CSV/XLSX)
+        </button>
+        {/* Alta MANUAL: lo que no viene en la cartola (cheque, efectivo, comisión). */}
+        <button
+          onClick={() => cuentaSel
+            ? setModal({ type: "manual", cuentaId: Number(cuentaSel) })
+            : toast.error("Crea/selecciona una cuenta bancaria primero")}
+          style={btnSecondary(s)} title="Agregar un movimiento que no viene en la cartola">
+          <Plus size={14} /> Movimiento manual
+        </button>
         <button onClick={reload} style={btnSecondary(s)}><RefreshCw size={14} /></button>
       </div>
 
@@ -551,10 +760,14 @@ function ConciliacionTab({ onChanged }: { onChanged: () => void }) {
         {[["", "Todos"], ["pendiente", "Pendientes"], ["conciliado", "Conciliados"]].map(([v, l]) => (
           <button key={v} onClick={() => setEstado(v)} style={chip(estado === v)}>{l}</button>
         ))}
+        <span style={{ color: s.faint }}>·</span>
+        {[["", "Cargo y abono"], ["cargo", "Cargos"], ["abono", "Abonos"]].map(([v, l]) => (
+          <button key={v || "ambos"} onClick={() => setTipo(v)} style={chip(tipo === v)}>{l}</button>
+        ))}
         <div style={{ position: "relative", flex: 1, minWidth: 200 }}>
           <Search size={14} color={s.faint} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)" }} />
           <input placeholder="Buscar glosa/referencia…" value={q}
-            onChange={e => { setQ(e.target.value); if (e.target.value.length === 0 || e.target.value.length >= 2) loadMovs(cuentaSel, estado, e.target.value); }}
+            onChange={e => { setQ(e.target.value); if (e.target.value.length === 0 || e.target.value.length >= 2) loadMovs(cuentaSel, estado, tipo, e.target.value); }}
             style={{ ...inputBase(s), padding: "8px 12px 8px 32px", fontSize: 13 }} />
         </div>
         <span style={{ fontSize: 12, color: s.faint }}>{total} movimiento(s)</span>
@@ -633,6 +846,103 @@ function ConciliacionTab({ onChanged }: { onChanged: () => void }) {
 
       {modal?.type === "sugerencias" && <SugerenciasModal mov={modal.mov} onClose={() => setModal(null)} onDone={reload} />}
       {modal?.type === "cuenta" && <CuentaModal cuenta={modal.cuenta} onClose={() => setModal(null)} onDone={loadCuentas} />}
+      {modal?.type === "import" && <ImportCartolaModal cuentaId={modal.cuentaId} onClose={() => setModal(null)} onDone={reload} />}
+      {modal?.type === "manual" && <MovManualModal cuentaId={modal.cuentaId} onClose={() => setModal(null)} onDone={reload} />}
+    </div>
+  );
+}
+
+// ═══ PESTAÑA: CUENTAS (alta, edición y activación de las cuentas del banco) ════
+// Sin esta pestaña el CuentaModal solo se abría en modo "nueva": la moneda o el N° de
+// cuenta mal tipeados no se corregían nunca, y una cuenta en USD/EUR deja la conciliación
+// automática bloqueada (el backend solo compara montos en CLP).
+function CuentasTab() {
+  const s = useStyles();
+  const [cuentas, setCuentas] = useState<Cuenta[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [modal, setModal] = useState<{ cuenta: Cuenta | null } | null>(null);
+  const load = useCallback(() => {
+    setLoading(true);
+    // incluir_inactivas: acá SÍ se ven las desactivadas (es la pantalla donde se reactivan).
+    monzaTesoreriaAPI.cuentas(true)
+      .then(({ data }) => setCuentas(data.cuentas))
+      .catch((e: any) => toast.error(e?.response?.data?.detail || "No se pudieron cargar las cuentas bancarias"))
+      .finally(() => setLoading(false));
+  }, []);
+  useEffect(() => { load(); }, [load]);
+  const borrar = async (c: Cuenta) => {
+    if (!confirm(`¿Borrar la cuenta ${c.banco}${c.nombre ? " · " + c.nombre : ""}?`)) return;
+    try { await monzaTesoreriaAPI.eliminarCuenta(c.id); toast.success("Cuenta borrada"); load(); }
+    // El backend responde 409 si la cuenta tiene movimientos (hay que desactivarla).
+    catch (e: any) { toast.error(e?.response?.data?.detail || "No se pudo borrar la cuenta"); }
+  };
+
+  const th: React.CSSProperties = { padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: s.faint, whiteSpace: "nowrap" };
+  const td: React.CSSProperties = { padding: "10px 14px", whiteSpace: "nowrap", fontSize: 13 };
+  if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: 60 }}><Loader2 size={26} className="animate-spin" color="var(--monza-accent)" /></div>;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+        <p style={{ margin: 0, fontSize: 13, color: s.muted }}>
+          Las cuentas del banco contra las que se concilia. La <b style={{ color: s.text }}>moneda</b> manda:
+          la conciliación automática solo corre en CLP.
+        </p>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={() => setModal({ cuenta: null })} style={btnPrimary()}><Plus size={15} /> Nueva cuenta</button>
+          <button onClick={load} style={btnSecondary(s)}><RefreshCw size={14} /></button>
+        </div>
+      </div>
+      {cuentas.length === 0 ? (
+        <div style={{ borderRadius: 14, border: s.cardBd, background: s.cardBg, padding: 48, textAlign: "center" }}>
+          <Landmark size={40} style={{ margin: "0 auto 12px", opacity: 0.2, color: s.muted }} />
+          <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: s.muted }}>Todavía no hay cuentas bancarias</p>
+          <p style={{ margin: "4px 0 0", fontSize: 12, color: s.faint }}>Crea la primera para poder importar cartolas y conciliar.</p>
+        </div>
+      ) : (
+        <div style={{ borderRadius: 14, border: s.cardBd, background: s.cardBg, overflow: "hidden" }}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead><tr style={{ background: s.sub, borderBottom: s.cardBd }}>
+                {["Banco", "Alias", "N° cuenta", "Moneda", "Estado", ""].map(h => <th key={h} style={th}>{h}</th>)}
+              </tr></thead>
+              <tbody>
+                {cuentas.map(c => (
+                  <tr key={c.id} style={{ borderBottom: s.cardBd }}>
+                    <td style={{ ...td, fontWeight: 600, color: s.text }}>{c.banco}</td>
+                    <td style={{ ...td, color: s.muted }}>{c.nombre || "—"}</td>
+                    <td style={{ ...td, fontFamily: "ui-monospace, monospace", fontSize: 12, color: s.muted }}>{c.numero_cuenta || "—"}</td>
+                    <td style={td}>
+                      <span style={{
+                        background: (c.moneda || "CLP") === "CLP" ? "rgba(21,128,61,0.14)" : "rgba(217,119,6,0.14)",
+                        color: (c.moneda || "CLP") === "CLP" ? "#15803D" : "#B45309",
+                        fontSize: 11, fontWeight: 600, padding: "3px 9px", borderRadius: 999,
+                      }} title={(c.moneda || "CLP") === "CLP" ? undefined : "La conciliación automática solo corre sobre cuentas CLP"}>
+                        {c.moneda || "CLP"}
+                      </span>
+                    </td>
+                    <td style={td}>
+                      {c.activo
+                        ? <span style={{ fontSize: 12, color: "#15803D" }}>Activa</span>
+                        : <span style={{ fontSize: 12, color: s.faint }}>Inactiva</span>}
+                    </td>
+                    <td style={{ ...td, textAlign: "right" }}>
+                      <span style={{ display: "inline-flex", gap: 6 }}>
+                        <button onClick={() => setModal({ cuenta: c })} style={{ ...btnSecondary(s), padding: "5px 10px", fontSize: 11 }}>
+                          <Pencil size={12} /> Editar
+                        </button>
+                        <button onClick={() => borrar(c)} style={{ background: "none", border: "none", color: "#B91C1C", cursor: "pointer", padding: 4 }} title="Borrar cuenta (solo si no tiene movimientos)">
+                          <Trash2 size={13} />
+                        </button>
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+      {modal && <CuentaModal cuenta={modal.cuenta} onClose={() => setModal(null)} onDone={load} />}
     </div>
   );
 }
@@ -839,25 +1149,33 @@ function PorPagarTab({ onChanged }: { onChanged: () => void }) {
 
 function FlujoCajaTab() {
   const s = useStyles();
-  const [fc, setFc] = useState<FlujoCaja | null>(null);
+  const [fc, setFc] = useState<MonzaFlujoCaja | null>(null);
   const [loading, setLoading] = useState(true);
-  useEffect(() => {
+  const load = useCallback(() => {
+    setLoading(true);
     monzaTesoreriaAPI.flujoCaja().then(({ data }) => setFc(data))
       .catch((e: any) => toast.error(e?.response?.data?.detail || "No se pudo cargar el flujo de caja"))
       .finally(() => setLoading(false));
   }, []);
+  useEffect(() => { load(); }, [load]);
   if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: 60 }}><Loader2 size={26} className="animate-spin" color="var(--monza-accent)" /></div>;
   if (!fc) return null;
   const th: React.CSSProperties = { padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: s.faint, whiteSpace: "nowrap" };
   const td: React.CSSProperties = { padding: "10px 14px", whiteSpace: "nowrap", fontSize: 13, textAlign: "right" };
+  // Los TRES bloques de FUERA de los buckets (el backend los devuelve desde siempre; el
+  // fallback es un cinturón: un despliegue a medias no debe tumbar la pestaña entera).
+  const cero = { n: 0, monto: 0 };
+  const factoring = fc.retenciones_factoring ?? cero;
+  const adelPorAprobar = fc.adelantos_por_aprobar ?? cero;
+  const adelSinAplicar = fc.adelantos_recibidos_sin_aplicar ?? cero;
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-      <div style={{ borderRadius: 12, border: s.cardBd, background: s.cardBg, padding: "12px 16px", fontSize: 13, color: s.muted }}>
-        <CalendarClock size={15} style={{ verticalAlign: "-3px", marginRight: 6, color: "var(--monza-accent)" }} />
-        Proyección de caja por ventana de vencimiento: lo que hay que <b style={{ color: "#B91C1C" }}>pagar</b> (Compras) vs lo que va a <b style={{ color: "#15803D" }}>entrar</b> (facturas por cobrar).
-        {fc.adelantos_por_aprobar.n > 0 && (
-          <span> Además hay <b style={{ color: "#B45309" }}>{fc.adelantos_por_aprobar.n} adelanto(s) por aprobar por {fmtClp(fc.adelantos_por_aprobar.monto)}</b> (aún no son caja segura).</span>
-        )}
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+        <div style={{ flex: 1, borderRadius: 12, border: s.cardBd, background: s.cardBg, padding: "12px 16px", fontSize: 13, color: s.muted }}>
+          <CalendarClock size={15} style={{ verticalAlign: "-3px", marginRight: 6, color: "var(--monza-accent)" }} />
+          Proyección de caja por ventana de vencimiento: lo que hay que <b style={{ color: "#B91C1C" }}>pagar</b> (Compras) vs lo que va a <b style={{ color: "#15803D" }}>entrar</b> (facturas por cobrar).
+        </div>
+        <button onClick={load} style={{ ...btnSecondary(s), flexShrink: 0 }} title="Volver a calcular"><RefreshCw size={14} /></button>
       </div>
       <div style={{ borderRadius: 14, border: s.cardBd, background: s.cardBg, overflow: "hidden" }}>
         <div style={{ overflowX: "auto" }}>
@@ -887,6 +1205,33 @@ function FlujoCajaTab() {
           </table>
         </div>
       </div>
+      {/* Los tres bloques que NO son entradas futuras y por eso van FUERA de los buckets.
+          La pantalla los escondía aunque el backend los devuelve: sin la retención del
+          factor, la caja de una factura factorizada desaparecía del tablero (no está en
+          "por cobrar" porque el cliente le paga al factor), y sin los adelantos ya
+          recibidos no se explica por qué las próximas facturas nacen con menos saldo. */}
+      <div style={{ borderRadius: 12, border: s.cardBd, background: s.cardBg, padding: "12px 16px", display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: s.muted }}>
+        <span style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, color: s.faint }}>
+          Fuera de los buckets
+        </span>
+        <span>
+          <Receipt size={12} style={{ verticalAlign: "-2px", marginRight: 6, color: "#6D28D9" }} />
+          Las facturas <b style={{ color: s.text }}>factorizadas</b> no están en "por cobrar" (el cliente le paga al factor):
+          su caja pendiente es la <b style={{ color: "#6D28D9" }}>retención</b> — {factoring.n} operación{factoring.n !== 1 ? "es" : ""} vigente{factoring.n !== 1 ? "s" : ""} por <b style={{ color: "#6D28D9" }}>{fmtClp(factoring.monto)}</b>, que libera el factor al liquidar.
+        </span>
+        {adelPorAprobar.n > 0 && (
+          <span>
+            <ShieldCheck size={12} style={{ verticalAlign: "-2px", marginRight: 6, color: "#B45309" }} />
+            <b style={{ color: "#B45309" }}>{adelPorAprobar.n} adelanto(s) por aprobar</b> por {fmtClp(adelPorAprobar.monto)} — todavía no son caja segura (Tesorería no confirmó la plata).
+          </span>
+        )}
+        {adelSinAplicar.n > 0 && (
+          <span>
+            <PiggyBank size={12} style={{ verticalAlign: "-2px", marginRight: 6, color: "#15803D" }} />
+            <b style={{ color: "#15803D" }}>{adelSinAplicar.n} adelanto(s) recibidos sin aplicar</b> por {fmtClp(adelSinAplicar.monto)} — plata YA en el banco: las próximas facturas de esas ventas nacerán con ese monto descontado.
+          </span>
+        )}
+      </div>
       <p style={{ margin: 0, fontSize: 11, color: s.faint }}>Solo lectura: se calcula en vivo desde Compras y Facturas (NIC 7 · actividades de operación).</p>
     </div>
   );
@@ -895,12 +1240,18 @@ function FlujoCajaTab() {
 // ═══ PÁGINA ══════════════════════════════════════════════════════════════════
 export default function MonzaTesoreriaPage() {
   const s = useStyles();
-  const [tab, setTab] = useState<"aprobaciones" | "porpagar" | "conciliacion" | "flujo">("aprobaciones");
+  const [tab, setTab] = useState<"aprobaciones" | "porpagar" | "conciliacion" | "flujo" | "cuentas">("aprobaciones");
   const [resumen, setResumen] = useState<Resumen | null>(null);
-  const loadResumen = useCallback(() => {
-    monzaTesoreriaAPI.resumen().then(({ data }) => setResumen(data)).catch(() => {});
+  // Cuenta que se está cuadrando en Conciliación: acota los contadores de movimientos de
+  // los KPIs a ESA cuenta (los de Compras/Facturas son globales por naturaleza). Sin esto
+  // los KPIs mezclaban todas las cuentas y no decían nada de la que se está revisando.
+  const [cuentaKpi, setCuentaKpi] = useState<number | "">("");
+  const [cuentaKpiLabel, setCuentaKpiLabel] = useState("");
+  const loadResumen = useCallback((cuentaId: number | "") => {
+    monzaTesoreriaAPI.resumen(cuentaId || undefined).then(({ data }) => setResumen(data)).catch(() => {});
   }, []);
-  useEffect(() => { loadResumen(); }, [loadResumen]);
+  useEffect(() => { loadResumen(cuentaKpi); }, [loadResumen, cuentaKpi]);
+  const refrescarResumen = useCallback(() => loadResumen(cuentaKpi), [loadResumen, cuentaKpi]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -910,7 +1261,12 @@ export default function MonzaTesoreriaPage() {
           <h1 style={{ margin: 0, fontSize: 24, fontWeight: 700, display: "flex", alignItems: "center", gap: 8, color: s.text }}>
             <Landmark size={24} color="var(--monza-accent)" /> Tesorería
           </h1>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: s.muted }}>Aprobación de adelantos y pagos · conciliación bancaria · flujo de caja</p>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: s.muted }}>
+            Aprobación de adelantos y pagos · conciliación bancaria · flujo de caja
+            {/* Los contadores de movimientos/cargos/abonos quedan acotados a la cuenta que
+                se está cuadrando: decirlo evita leer un KPI parcial como si fuera el total. */}
+            {cuentaKpiLabel && <span style={{ color: s.faint }}> · KPIs de conciliación de <b>{cuentaKpiLabel}</b></span>}
+          </p>
         </div>
       </div>
 
@@ -927,6 +1283,8 @@ export default function MonzaTesoreriaPage() {
             { icon: CreditCard, label: "Egresos sin conciliar", value: String(resumen.egresos_sin_conciliar), color: "var(--monza-accent)" },
             ...(resumen.cobranzas_sin_conciliar != null
               ? [{ icon: Receipt, label: "Cobranzas sin conciliar", value: String(resumen.cobranzas_sin_conciliar), color: "#15803D" }] : []),
+            ...(resumen.adelantos_sin_conciliar != null
+              ? [{ icon: ShieldCheck, label: "Adelantos sin conciliar", value: String(resumen.adelantos_sin_conciliar), color: "#B45309" }] : []),
             { icon: AlertCircle, label: "Por pagar vencido", value: fmtClp(resumen.por_pagar_vencido_clp), color: "#B91C1C" },
           ].map(k => (
             <div key={k.label} style={{ background: s.cardBg, border: s.cardBd, borderRadius: 14, padding: 14 }}>
@@ -939,22 +1297,26 @@ export default function MonzaTesoreriaPage() {
       )}
 
       {/* Tabs */}
-      <div style={{ display: "flex", alignItems: "center", gap: 4, borderBottom: s.cardBd }}>
-        {([["aprobaciones", "Aprobaciones"], ["porpagar", "Por pagar"], ["conciliacion", "Conciliación bancaria"], ["flujo", "Flujo de caja"]] as const).map(([k, lbl]) => (
+      <div style={{ display: "flex", alignItems: "center", gap: 4, borderBottom: s.cardBd, overflowX: "auto" }}>
+        {([["aprobaciones", "Aprobaciones"], ["porpagar", "Por pagar"], ["conciliacion", "Conciliación bancaria"], ["flujo", "Flujo de caja"], ["cuentas", "Cuentas"]] as const).map(([k, lbl]) => (
           <button key={k} onClick={() => setTab(k)}
             style={{
               padding: "9px 16px", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
-              background: "none", border: "none", marginBottom: -1,
+              background: "none", border: "none", marginBottom: -1, whiteSpace: "nowrap",
               borderBottom: tab === k ? "2px solid var(--monza-accent)" : "2px solid transparent",
               color: tab === k ? "var(--monza-accent)" : s.muted,
             }}>{lbl}</button>
         ))}
       </div>
 
-      {tab === "aprobaciones" && <AprobacionesTab onChanged={loadResumen} />}
-      {tab === "porpagar" && <PorPagarTab onChanged={loadResumen} />}
-      {tab === "conciliacion" && <ConciliacionTab onChanged={loadResumen} />}
+      {tab === "aprobaciones" && <AprobacionesTab onChanged={refrescarResumen} />}
+      {tab === "porpagar" && <PorPagarTab onChanged={refrescarResumen} />}
+      {tab === "conciliacion" && (
+        <ConciliacionTab onChanged={refrescarResumen}
+          onCuenta={(id, etiqueta) => { setCuentaKpi(id); setCuentaKpiLabel(etiqueta); }} />
+      )}
       {tab === "flujo" && <FlujoCajaTab />}
+      {tab === "cuentas" && <CuentasTab />}
     </div>
   );
 }

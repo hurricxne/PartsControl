@@ -120,6 +120,10 @@ interface DespachoRow {
   id: number
   numero_despacho: string
   numero_guia?: string
+  /** Fecha de EMISIÓN de la guía ante el SII (YYYY-MM-DD). Sólo guía en papel: es la
+   *  fecha que la factura cita en su referencia 52. Distinta de fecha_despacho (cierre)
+   *  y de fecha_firma (recepción del cliente). */
+  fecha_guia?: string | null
   transportista?: string
   estado: string
   numero_expedicion?: string
@@ -611,11 +615,33 @@ function OcRow({
                             <CheckCircle2 className="w-3 h-3" /> Guía firmada
                           </span>
                         )}
+                        {/* Guía EN PAPEL sin fecha de emisión: la factura al SII se va a
+                            bloquear (la referencia 52 la exige). Se avisa acá, en Bodega,
+                            y no recién en Contabilidad cuando ya se quiere facturar.
+                            `dtesListos && !dte` (y no `dte?.estado !== 'emitido'`): al
+                            emitir la guía electrónica el backend copia el folio del SII a
+                            `numero_guia` y deja `fecha_guia` vacía a propósito, así que
+                            sin este filtro el aviso salía en toda guía electrónica —
+                            durante la carga siempre, y PEGADO si la consulta de estados
+                            fallaba (tiene retry:1). Mismo criterio fail-closed que
+                            folioParaModal: mientras no se sepa, no se acusa. */}
+                        {d.numero_guia && !d.fecha_guia && dtesListos && !dte && (
+                          <span
+                            className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 inline-flex items-center gap-1"
+                            title="La factura electrónica cita la guía con su fecha de emisión. Cárgala en Transportista / Editar."
+                          >
+                            <AlertTriangle className="w-3 h-3" /> Falta fecha de la guía
+                          </span>
+                        )}
                       </div>
                       <div className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
                         {d.items_count} ítems
                         {d.transportista && ` · ${d.transportista}`}
                         {d.numero_guia && ` · Guía: ${d.numero_guia}`}
+                        {/* Fecha de EMISIÓN de la guía (la que cita la factura), no la del
+                            cierre del despacho. Se parte el ISO a mano: new Date('2026-07-15')
+                            se interpreta en UTC y en Chile muestra el día anterior. */}
+                        {d.fecha_guia && ` (${d.fecha_guia.slice(0, 10).split('-').reverse().join('-')})`}
                         {d.numero_expedicion && ` · Exp: ${d.numero_expedicion}`}
                         {d.fecha_despacho && ` · ${new Date(d.fecha_despacho).toLocaleDateString('es-CL')}`}
                       </div>
@@ -1500,7 +1526,7 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
   )
 }
 
-function Input({ label, value, onChange, placeholder, disabled, hint }: any) {
+function Input({ label, value, onChange, placeholder, disabled, hint, type = 'text', max }: any) {
   return (
     <div>
       <label
@@ -1510,7 +1536,8 @@ function Input({ label, value, onChange, placeholder, disabled, hint }: any) {
         {label}
       </label>
       <input
-        type="text"
+        type={type}
+        max={max}
         value={value}
         onChange={e => onChange(e.target.value)}
         placeholder={placeholder}
@@ -1663,7 +1690,11 @@ function EditarDespachoModal({
   const [transportista, setTransportista] = useState(despacho.transportista || '')
   const [numeroExpedicion, setNumeroExpedicion] = useState(despacho.numero_expedicion || '')
   const [numeroGuia, setNumeroGuia] = useState(despacho.numero_guia || '')
+  const [fechaGuia, setFechaGuia] = useState((despacho.fecha_guia || '').slice(0, 10))
   const [saving, setSaving] = useState(false)
+  // Tope del selector de fecha: hoy en Chile. Una guía no se emite mañana, y el error de
+  // tipeo clásico es el año. El backend valida lo mismo (no confiar sólo en el navegador).
+  const hoyChile = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Santiago' })
 
   // dteFolio: null = sin guía electrónica · 'verificando' = consulta en curso ·
   // 'en_emision' = guía en proceso en el SII (ver folioParaModal) · otro valor =
@@ -1676,8 +1707,9 @@ function EditarDespachoModal({
       await despachosAPI.update(despacho.id, {
         transportista: transportista || null,
         numero_expedicion: numeroExpedicion || null,
-        // Guía electrónica emitida (o sin verificar): el folio no se edita a mano
-        ...(folioBloqueado ? {} : { numero_guia: numeroGuia || null }),
+        // Guía electrónica emitida (o sin verificar): el folio no se edita a mano, y su
+        // fecha la manda el propio DTE 52 (no este campo).
+        ...(folioBloqueado ? {} : { numero_guia: numeroGuia || null, fecha_guia: fechaGuia || null }),
       })
       toast.success('Datos del despacho actualizados')
       onSaved()
@@ -1713,6 +1745,10 @@ function EditarDespachoModal({
         <div className="p-4 space-y-3">
           <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
             Puedes completar el transportista o el N° de expedición en cualquier momento del despacho.
+            {!folioBloqueado && (
+              <> Si la guía la emitiste <b>directo en el SII</b>, registra aquí su N° <b>y su fecha de emisión</b>:
+              la factura electrónica la cita con esa fecha.</>
+            )}
           </p>
           <Input label="Transportista" value={transportista} onChange={setTransportista} placeholder="Ej: Samex" />
           <Input label="N° Expedición (courier / Samex)" value={numeroExpedicion} onChange={setNumeroExpedicion} />
@@ -1729,6 +1765,19 @@ function EditarDespachoModal({
                   : folioBloqueado
                     ? `Guía electrónica emitida al SII (folio ${dteFolio}): el N° no se edita a mano.`
                     : 'Solo para guía en papel. Si vas a emitir la guía SII, déjalo vacío: el folio lo pone el SII.'
+            }
+          />
+          <Input
+            label="Fecha de emisión de la guía"
+            type="date"
+            max={hoyChile}
+            value={fechaGuia}
+            onChange={setFechaGuia}
+            disabled={folioBloqueado}
+            hint={
+              folioBloqueado
+                ? 'Guía electrónica: la fecha la pone el propio documento del SII.'
+                : 'Fecha en que se EMITIÓ la guía en el SII (no la de la firma del cliente). La factura la cita en su referencia a la guía, así que sin este dato no se puede facturar al SII.'
             }
           />
         </div>

@@ -1,4 +1,11 @@
-"""Schemas Pydantic del módulo Compras / Cuentas por Pagar."""
+"""Schemas Pydantic del módulo Compras / Cuentas por Pagar.
+
+Montos con ge/gt (rechaza negativos en origen) y strings con tope de longitud alineado
+a la columna de `models.py`: con MySQL laxo un string más largo se TRUNCA en silencio,
+y el N° de documento truncado colisiona (o deja de colisionar) en
+`uq_cont_compra_empresa_prov_doc`. Con el tope, la API falla limpio (422) antes de
+tocar la BD, en vez de un 500 o una fila corrupta.
+"""
 from typing import Optional, Literal, List
 from pydantic import BaseModel, Field
 
@@ -11,22 +18,22 @@ Medio = Literal["transferencia", "cheque", "efectivo", "tarjeta"]
 class PagoInline(BaseModel):
     """Pago al momento de registrar la compra (contado o abono inmediato). Genera un
     Comprobante de Egreso con un solo detalle (esta compra)."""
-    fecha: Optional[str] = None
+    fecha: Optional[str] = Field(None, max_length=30)
     monto_clp: Optional[float] = Field(None, gt=0)   # si falta en contado → total
     medio: Medio = "transferencia"
-    banco: Optional[str] = None
+    banco: Optional[str] = Field(None, max_length=100)
     cuenta_origen_id: Optional[int] = None
-    fecha_mov_bancario: Optional[str] = None
-    numero_operacion: Optional[str] = None
-    observaciones: Optional[str] = None
+    fecha_mov_bancario: Optional[str] = Field(None, max_length=30)
+    numero_operacion: Optional[str] = Field(None, max_length=100)
+    observaciones: Optional[str] = Field(None, max_length=500)   # → cont_egreso.glosa
 
 
 class CompraItemIn(BaseModel):
     """Línea de costeo por ítem de una compra NACIONAL (la factura ES el costo)."""
     item_cotizacion_id: int
     oc_proveedor_item_id: Optional[int] = None
-    numero_parte: Optional[str] = None
-    descripcion: Optional[str] = None
+    numero_parte: Optional[str] = Field(None, max_length=100)
+    descripcion: Optional[str] = Field(None, max_length=500)
     cantidad: float = Field(..., gt=0)
     precio_unit: float = Field(..., ge=0)   # NETO unitario en moneda factura (CLP en nacional)
 
@@ -35,18 +42,20 @@ class CompraCreate(BaseModel):
     """Alta de una compra/gasto. Si condicion_pago='contado' y no viene `pago`, se genera
     automáticamente un egreso por el total (sale del banco el mismo día)."""
     tipo_gasto: TipoGasto
-    categoria: Optional[str] = None
+    categoria: Optional[str] = Field(None, max_length=80)
     cuenta_contable_id: Optional[int] = None
     es_anticipo: bool = False
-    origen: str = "MANUAL"
+    # MANUAL | EMBARQUE | NACIONAL — 'NACIONAL' es valor legal explícito: elige la
+    # cuenta default de Existencias (1.3.01, NIC 2) y habilita el detalle por ítem.
+    origen: str = Field("MANUAL", max_length=20)
     proveedor_id: Optional[int] = None
-    acreedor: Optional[str] = None
-    proveedor_rut: Optional[str] = None
-    fecha: Optional[str] = None
-    referencia: Optional[str] = None
-    descripcion: Optional[str] = None
-    numero_documento: Optional[str] = None
-    tipo_doc: str = "factura"
+    acreedor: Optional[str] = Field(None, max_length=255)
+    proveedor_rut: Optional[str] = Field(None, max_length=50)
+    fecha: Optional[str] = Field(None, max_length=30)
+    referencia: Optional[str] = Field(None, max_length=120)
+    descripcion: Optional[str] = Field(None, max_length=500)
+    numero_documento: Optional[str] = Field(None, max_length=100)
+    tipo_doc: str = Field("factura", max_length=20)
     moneda: Moneda = "CLP"
     tc: float = Field(1, gt=0)
     monto_neto: float = Field(0, ge=0)
@@ -54,27 +63,29 @@ class CompraCreate(BaseModel):
     monto_total: Optional[float] = Field(None, ge=0)
     afecto_iva: bool = True
     condicion_pago: Condicion = "credito"
-    plazo_dias: Optional[int] = Field(None, ge=0)
+    # le=3650 (10 años): sin techo, `fecha + timedelta(days=plazo)` revienta con
+    # OverflowError → 500 en vez de un 422 legible.
+    plazo_dias: Optional[int] = Field(None, ge=0, le=3650)
     embarque_id: Optional[int] = None
     emb_pricing_gasto_id: Optional[int] = None
     factura_proveedor_id: Optional[int] = None
     # Compra NACIONAL con detalle de ítems: la factura ES el costo de esos repuestos.
     oc_proveedor_id: Optional[int] = None
     items: Optional[List[CompraItemIn]] = None
-    observaciones: Optional[str] = None
+    observaciones: Optional[str] = Field(None, max_length=65535)   # columna Text
     pago: Optional[PagoInline] = None
 
 
 class PagoIn(BaseModel):
     """Pago posterior de UNA compra (parcial o total). Genera un egreso de 1 detalle."""
-    fecha: Optional[str] = None
+    fecha: Optional[str] = Field(None, max_length=30)
     monto_clp: float = Field(..., gt=0)
     medio: Medio = "transferencia"
-    banco: Optional[str] = None
+    banco: Optional[str] = Field(None, max_length=100)
     cuenta_origen_id: Optional[int] = None
-    fecha_mov_bancario: Optional[str] = None
-    numero_operacion: Optional[str] = None
-    observaciones: Optional[str] = None
+    fecha_mov_bancario: Optional[str] = Field(None, max_length=30)
+    numero_operacion: Optional[str] = Field(None, max_length=100)
+    observaciones: Optional[str] = Field(None, max_length=500)   # → cont_egreso.glosa
 
 
 class EgresoDetalleIn(BaseModel):
@@ -84,25 +95,25 @@ class EgresoDetalleIn(BaseModel):
 
 class EgresoCreate(BaseModel):
     """Comprobante de Egreso CONSOLIDADO: una salida de dinero que paga VARIAS compras."""
-    fecha: Optional[str] = None
+    fecha: Optional[str] = Field(None, max_length=30)
     medio: Medio = "transferencia"
     cuenta_origen_id: Optional[int] = None
-    banco: Optional[str] = None
-    numero_operacion: Optional[str] = None
-    beneficiario: Optional[str] = None
-    beneficiario_rut: Optional[str] = None
-    glosa: Optional[str] = None
+    banco: Optional[str] = Field(None, max_length=100)
+    numero_operacion: Optional[str] = Field(None, max_length=100)
+    beneficiario: Optional[str] = Field(None, max_length=255)
+    beneficiario_rut: Optional[str] = Field(None, max_length=50)
+    glosa: Optional[str] = Field(None, max_length=500)
     moneda: Moneda = "CLP"
     tc: float = Field(1, gt=0)
-    fecha_mov_bancario: Optional[str] = None
+    fecha_mov_bancario: Optional[str] = Field(None, max_length=30)
     detalles: List[EgresoDetalleIn] = Field(..., min_length=1)
 
 
 class EgresoUpdate(BaseModel):
     """Completar/editar datos de conciliación de un egreso (fecha banco / referencia)."""
-    fecha_mov_bancario: Optional[str] = None
-    referencia_bancaria: Optional[str] = None
+    fecha_mov_bancario: Optional[str] = Field(None, max_length=30)
+    referencia_bancaria: Optional[str] = Field(None, max_length=120)
 
 
 class AnularIn(BaseModel):
-    motivo: Optional[str] = None
+    motivo: Optional[str] = Field(None, max_length=255)
