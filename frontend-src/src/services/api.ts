@@ -251,6 +251,25 @@ export const bodegaAPI = {
 }
 
 // --- Contabilidad (Ventas + Facturas/Cobranzas/Factoring) ---
+// KPIs del período (GET /contabilidad/kpis). Se declara completo a propósito: la pantalla
+// pintaba 5 tarjetas y el backend devuelve 6 montos, así que `anticipo_factoring_clp`
+// —lo que YA adelantó el factor, dinero recibido que no viene del cliente— quedaba
+// invisible y "cobrado" no cuadraba con lo que entró por caja. MonzaParts lo pinta.
+export interface ContabKpis {
+  n_facturas: number
+  facturado_clp: number
+  /** Todo lo cobrado: pagos del cliente + anticipos y liquidaciones del factor. */
+  cobrado_clp: number
+  /** Solo lo que pagó el CLIENTE (excluye los medios de factoring). */
+  cobrado_cliente_clp: number
+  /** Lo que puso el FACTOR (adelanto + retención liquidada). cobrado = cliente + factor. */
+  anticipo_factoring_clp: number
+  por_cobrar_clp: number
+  /** Excluye las facturas con factoring vigente: ese riesgo de cobro lo tomó el factor. */
+  vencido_clp: number
+  en_factoring_clp: number
+}
+
 export const contabilidadAPI = {
   // Ventas (agrupado por OC, expandible a ítem — solo venta)
   listVentas: (q?: string, periodo?: string) =>
@@ -274,7 +293,7 @@ export const contabilidadAPI = {
     api.post(`/contabilidad/facturas/${facturaId}/factoring`, data),
   liquidarFactoring: (facturaId: number) =>
     api.post(`/contabilidad/facturas/${facturaId}/factoring/liquidar`),
-  kpis: (periodo?: string) => api.get('/contabilidad/kpis', { params: periodo ? { periodo } : {} }),
+  kpis: (periodo?: string) => api.get<ContabKpis>('/contabilidad/kpis', { params: periodo ? { periodo } : {} }),
   // Adelantos de cliente: Comercial INFORMA (Cierre de Venta / Ventas) y Tesorería
   // APRUEBA (tesoreriaAPI). Acepta oc_cliente_id o cotizacion_id (recién cerrada).
   informarAdelanto: (data: { oc_cliente_id?: number; cotizacion_id?: number; monto_esperado?: number; pct?: number; observaciones?: string }) =>

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { Ship, Plane, Search, RefreshCw, Package, ChevronDown, ChevronRight, X, Boxes } from "lucide-react";
-import { monzaLogisticaAPI } from "../services/monzaApi";
+import { monzaLogisticaAPI, monzaTotalPendiente, monzaErrMsg } from "../services/monzaApi";
+import type { MonzaItemQty } from "../services/monzaApi";
 import { useMonzaTheme } from "./MonzaLayout";
 import MonzaDocs from "./MonzaDocs";
 import toast from "react-hot-toast";
@@ -37,14 +38,40 @@ function CrearEmbarqueModal({ items, onClose, onDone }: { items: PrepItem[]; onC
   const { dark } = useMonzaTheme();
   const [awb, setAwb] = useState(""); const [forwarder, setForwarder] = useState(""); const [tracking, setTracking] = useState("");
   const [fd, setFd] = useState(""); const [fll, setFll] = useState(""); const [notas, setNotas] = useState(""); const [saving, setSaving] = useState(false);
+  // Cantidad a EMBARCAR por ítem (embarque parcial: el proveedor mandó 6 de 10). Por
+  // defecto toda la línea preparada; si se baja, el backend parte la línea y el
+  // remanente vuelve a "Por embarcar" esperando el próximo AWB — así Bodega recibe 6
+  // sobre una línea de 6 (completo) y no se abre el reclamo fantasma por las 4.
+  const [qtys, setQtys] = useState<Record<number, number>>(
+    () => Object.fromEntries(items.map((i) => [i.id, i.cantidad])),
+  );
+  const qtyDe = (it: PrepItem) => qtys[it.id] ?? it.cantidad;
   const bg = dark ? "#131b3e" : "white"; const bd = dark ? "#1e2a4a" : "#E2E8F0"; const txt = dark ? "white" : "#1E293B"; const sub = dark ? "#8899cc" : "#64748B";
   const IS = { width: "100%", padding: "8px 10px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: dark ? "#0d1321" : "#F8FAFC", color: txt };
   const submit = async () => {
+    // Solo los ítems con cantidad REBAJADA viajan con `cantidad`. Si nadie tocó nada,
+    // el body sale con `item_ids` como siempre (vía legada, sin partición).
+    const pedidos: MonzaItemQty[] = items.map((i) =>
+      qtyDe(i) < i.cantidad ? { item_id: i.id, cantidad: qtyDe(i) } : { item_id: i.id });
+    const parcial = pedidos.some((p) => p.cantidad !== undefined);
     setSaving(true);
     try {
-      await monzaLogisticaAPI.crearEmbarque({ item_ids: items.map((i) => i.id), awb: awb || undefined, forwarder: forwarder || undefined, tracking: tracking || undefined, fecha_despacho: fd || undefined, fecha_llegada_est: fll || undefined, notas: notas || undefined });
-      toast.success(`Embarque creado · ${items.length} ítem(s)`); onDone();
-    } catch { toast.error("Error al crear embarque"); } finally { setSaving(false); }
+      const r = await monzaLogisticaAPI.crearEmbarque({
+        ...(parcial ? { items: pedidos } : { item_ids: items.map((i) => i.id) }),
+        awb: awb || undefined, forwarder: forwarder || undefined, tracking: tracking || undefined,
+        fecha_despacho: fd || undefined, fecha_llegada_est: fll || undefined, notas: notas || undefined,
+      });
+      const pend = monzaTotalPendiente(r.data.remanentes);
+      toast.success(
+        `Embarque creado · ${items.length} ítem(s)`
+        + (pend > 0 ? ` · quedan ${pend} unidad(es) en Por embarcar para el próximo AWB` : ""),
+      );
+      onDone();
+    } catch (e: unknown) {
+      // El backend explica el motivo (cantidad inválida, ítem fuera de "preparado", o
+      // la línea ya tiene guía/factura/costo encima): mostrarlo es lo único útil aquí.
+      toast.error(monzaErrMsg(e, "Error al crear embarque"));
+    } finally { setSaving(false); }
   };
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
@@ -55,8 +82,34 @@ function CrearEmbarqueModal({ items, onClose, onDone }: { items: PrepItem[]; onC
         </div>
         <div style={{ padding: "16px 20px", overflowY: "auto" }}>
           <div style={{ background: dark ? "#0d1321" : "#F1F5F9", borderRadius: 8, padding: "10px 14px", marginBottom: 14, fontSize: 12 }}>
-            <div style={{ fontWeight: 700, color: sub, marginBottom: 4, textTransform: "uppercase" }}>{items.length} ítem(s) a embarcar</div>
-            {items.map((it) => <div key={it.id} style={{ color: txt, padding: "1px 0" }}>{it.descripcion} <span style={{ color: sub }}>· {it.cot_numero} ×{it.cantidad}</span></div>)}
+            <div style={{ fontWeight: 700, color: sub, marginBottom: 2, textTransform: "uppercase" }}>{items.length} ítem(s) a embarcar</div>
+            <div style={{ color: sub, marginBottom: 8 }}>ajusta cantidades si el proveedor envió solo una parte</div>
+            {/* Cantidades por ítem (embarque parcial): tope = lo preparado de la línea */}
+            <div style={{ maxHeight: 180, overflowY: "auto" }}>
+              {items.map((it) => (
+                <div key={it.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "3px 0" }}>
+                  <span style={{ color: txt, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {it.descripcion} <span style={{ color: sub }}>· {it.cot_numero}</span>
+                  </span>
+                  <label style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0, fontSize: 11, color: sub }}>
+                    <input
+                      type="number" min={1} max={it.cantidad} step={1}
+                      aria-label={`Cantidad a embarcar de ${it.descripcion} (máximo ${it.cantidad})`}
+                      value={qtyDe(it)}
+                      onChange={(e) => setQtys((p) => ({ ...p, [it.id]: Math.max(1, Math.min(it.cantidad, Math.round(Number(e.target.value) || 0))) }))}
+                      style={{ width: 58, padding: "3px 6px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 12, background: dark ? "#0d1321" : "#F8FAFC", color: txt, textAlign: "right" }}
+                    />
+                    / {it.cantidad}
+                    {qtyDe(it) < it.cantidad && (
+                      <span title="Embarque parcial: el resto queda en Por embarcar esperando el próximo AWB"
+                        style={{ fontSize: 10, fontWeight: 700, background: "#FEF3C7", color: "#B45309", padding: "1px 7px", borderRadius: 999, whiteSpace: "nowrap" }}>
+                        {it.cantidad - qtyDe(it)} pendiente
+                      </span>
+                    )}
+                  </label>
+                </div>
+              ))}
+            </div>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
             <div><label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>AWB (guía aérea)</label><input value={awb} onChange={(e) => setAwb(e.target.value)} style={IS} /></div>

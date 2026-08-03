@@ -2,13 +2,25 @@ import { useState, useEffect, useCallback, useMemo } from 'react'
 import {
   Calculator, Search, Loader2, RefreshCw, ChevronDown, ChevronUp, Ship,
   Lock, Unlock, Save, Info, RotateCcw, Package, Plane, FileText, Hash, CheckCircle2,
+  AlertTriangle,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { embarquesPricingAPI } from './api'
 import { calcularLanded, type LandedInput } from './compute'
 import type {
   EmbarquePricingRow, PricingDetail, GastoLinea, ItemOverride, PricingSavePayload, PesoOrigen,
+  FobOrigen,
 } from './types'
+
+// Etiqueta del origen del FOB. 'default' NO viene del backend: es el estado local
+// "el usuario acaba de resetear el override y todavía no guarda", donde el valor que
+// va a regir es el FOB por defecto (el de la factura del proveedor o, si no hay, el de
+// la cotización — desde el cliente no se puede distinguir cuál de los dos).
+type OrigenFobVista = FobOrigen | 'default'
+const ORIGEN_FOB_LABEL: Record<OrigenFobVista, string> = {
+  factura: 'de factura', cotizacion: 'de cotización', manual: 'manual',
+  default: 'por defecto', auto: 'sin dato',
+}
 
 // Etiquetas de flete según quién paga, por tipo de embarque.
 const FLETE_HINT: Record<string, string> = {
@@ -48,6 +60,10 @@ function PricingEditor({ detail: initial, onSaved }: { detail: PricingDetail; on
   const [pricing, setPricing] = useState(initial.pricing)
   const [gastos, setGastos] = useState<GastoLinea[]>(initial.gastos)
   const [items, setItems] = useState(initial.items)
+  // Avisos NO bloqueantes del backend (hoy: ítems en más de una moneda dentro del mismo
+  // embarque, que se costea con UN solo TC). Se avisan y no bloquean a propósito: el
+  // embarque ya llegó y este es el único lugar donde se registra su costo.
+  const [advertencias, setAdvertencias] = useState<string[]>(initial.advertencias ?? [])
   const [overrides, setOverrides] = useState<Record<number, ItemOverride>>({})
   const [fobInputs, setFobInputs] = useState<Record<number, string>>({})
   const [pesoInputs, setPesoInputs] = useState<Record<number, string>>({})
@@ -162,6 +178,7 @@ function PricingEditor({ detail: initial, onSaved }: { detail: PricingDetail; on
     setPricing(d.pricing)
     setGastos(d.gastos)
     setItems(d.items)        // refrescar FOB/origen confirmados por el server
+    setAdvertencias(d.advertencias ?? [])
     setOverrides({})
     setFobInputs({})
     setPesoInputs({})
@@ -222,6 +239,16 @@ function PricingEditor({ detail: initial, onSaved }: { detail: PricingDetail; on
           <p className="text-xs text-emerald-500">Pricing cerrado — el costo está congelado. Reábralo para editar.</p>
         </div>
       )}
+
+      {/* Avisos del backend que NO bloquean el costeo (hoy: ítems en más de una moneda).
+          Grupo AM es la marca más expuesta: un embarque consolida varias OC de proveedor,
+          cada una con su moneda, y el landed se calcula con un solo TC. */}
+      {advertencias.map((a, i) => (
+        <div key={i} className="flex items-start gap-2 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30">
+          <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+          <p className="text-xs leading-relaxed text-amber-500">{a}</p>
+        </div>
+      ))}
 
       {/* ── Documentos del embarque (los sube Logística; pueden faltar) ── */}
       <div className="rounded-xl border p-3" style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
@@ -415,8 +442,15 @@ function PricingEditor({ detail: initial, onSaved }: { detail: PricingDetail; on
               {items.map((it, idx) => {
                 const p = preview.byId.get(it.embarque_item_id)
                 const ov = overrides[it.embarque_item_id]
-                const isManual = ov?.fob_manual === true || (ov?.fob_manual !== false && it.fob_origen === 'manual')
-                const origen = ov?.fob_manual === true ? 'manual' : ov?.fob_manual === false ? it.fob_origen : it.fob_origen
+                // Origen efectivo del FOB con el MISMO contrato tri-estado que el peso
+                // (manual / vuelto a default / sin tocar). Antes las dos últimas ramas
+                // devolvían it.fob_origen, así que tras apretar "volver al default" la
+                // etiqueta seguía diciendo "manual" hasta guardar — justo cuando el
+                // usuario necesita ver que el override ya no rige.
+                const origen: OrigenFobVista = ov?.fob_manual === true ? 'manual'
+                  : ov?.fob_manual === false ? (it.fob_default > 0 ? 'default' : 'auto')
+                  : it.fob_origen
+                const isManual = origen === 'manual'
                 const pesoOrigen: PesoOrigen = ov?.peso_manual === true ? 'manual'
                   : ov?.peso_manual === false ? 'auto' : it.peso_origen
                 const pesoIsManual = pesoOrigen === 'manual'
@@ -450,13 +484,21 @@ function PricingEditor({ detail: initial, onSaved }: { detail: PricingDetail; on
                           onChange={e => setFob(it.embarque_item_id, e.target.value)}
                           className={inputCls} style={inputStyle} placeholder="0" />
                         {!locked && isManual && (
-                          <button onClick={() => resetFob(it.embarque_item_id)} title="Volver al FOB de la factura" className="shrink-0 text-brand-400 hover:text-brand-300">
+                          <button onClick={() => resetFob(it.embarque_item_id)}
+                            title={it.fob_default > 0
+                              ? 'Volver al FOB por defecto (el de la factura del proveedor o, si no hay, el de la cotización)'
+                              : 'Quitar el FOB cargado (este ítem no tiene FOB por defecto, quedará sin dato)'}
+                            className="shrink-0 text-brand-400 hover:text-brand-300">
                             <RotateCcw className="w-3.5 h-3.5" />
                           </button>
                         )}
                       </div>
-                      <span className="text-[9px] uppercase tracking-wide" style={{ color: origen === 'manual' ? 'var(--text-muted)' : 'var(--text-faint)' }}>
-                        {origen === 'factura' ? 'de factura' : origen === 'cotizacion' ? 'de cotización' : origen === 'manual' ? 'manual' : 'sin dato'}
+                      <span className="text-[9px] uppercase tracking-wide"
+                        style={{ color: origen === 'manual' ? 'var(--text-muted)' : 'var(--text-faint)' }}
+                        title={origen === 'default'
+                          ? 'Al guardar vuelve al FOB por defecto: el de la factura del proveedor y, si no hay, el de la cotización'
+                          : undefined}>
+                        {ORIGEN_FOB_LABEL[origen]}
                       </span>
                     </td>
                     <td className="px-3 py-1.5 text-right font-mono whitespace-nowrap" style={{ color: 'var(--text-primary)' }}>{fmtClp(p?.fob_clp)}</td>

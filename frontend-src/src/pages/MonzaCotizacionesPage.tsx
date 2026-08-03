@@ -1,7 +1,11 @@
 import { useState, useEffect, useCallback } from "react";
 import { Search, Download, RefreshCw, FileText, ChevronDown, ChevronRight, CheckCircle } from "lucide-react";
 import { monzaCotizacionesAPI } from "../services/monzaApi";
-import { PAGO_OPCIONES } from "../constants/adelanto";
+import type { PagoOpcion } from "../constants/adelanto";
+import {
+  PAGO_OPCIONES, PAGO_ADELANTO_LIBRE_ID, ADELANTO_PCT_DEFECTO, formaPagoAdelanto,
+} from "../constants/adelanto";
+import { hoyLocal } from "../utils/format";
 import toast from "react-hot-toast";
 
 interface Cotizacion {
@@ -10,6 +14,20 @@ interface Cotizacion {
   fecha_creacion: string; fecha_venta?: string; oc_cliente?: string; asesor?: string;
   cliente?: { nombre: string; rut?: string };
   lead_numero?: string;
+  // Hallazgos #20 y #14 de la auditoría integral Monza: la API no devolvía estos dos campos,
+  // así que el modal de cierre no podía mostrar la condición vigente ni la fecha real de la OC
+  // y las re-escribía a ciegas (la fecha viaja como referencia 801 al SII). Se leen como
+  // OPCIONALES: si el backend todavía no los serializa, el modal cae al comportamiento anterior.
+  oc_fecha?: string | null;
+  pct_adelanto?: number;
+  // Los tres los sirve el MISMO serializador (_cot_dict) que ya alimenta esta lista; se
+  // declaran para el modal de cierre: `forma_pago` preselecciona la condición vigente,
+  // `total_neto`/`iva_monto` arman el resumen previo a confirmar (M15) y
+  // `fecha_entrega_est` evita pisar una fecha prometida ya acordada al re-cerrar.
+  forma_pago?: string;
+  total_neto?: number;
+  iva_monto?: number;
+  fecha_entrega_est?: string | null;
 }
 interface CotItem {
   id: number; descripcion: string; marca?: string; numero_parte?: string;
@@ -22,6 +40,180 @@ interface CotDetail {
   total_neto?: number; iva_monto?: number; total_bruto?: number;
   items: CotItem[];
   cliente?: { nombre: string; rut?: string };
+}
+
+// ── Días hábiles chilenos ───────────────────────────────────────────────────
+// Copia LITERAL del motor del Cierre de Venta de Grupo AM (CierreVentaPage.tsx): mismos
+// feriados, misma Pascua por Meeus, mismo Jueves/Viernes Santo y mismo Día de los
+// Pueblos Indígenas. No es una aproximación: la fecha prometida de entrega alimenta el
+// semáforo SLA de Ventas, el orden por urgencia de Despachos, las alertas diarias y los
+// avisos de Bodega, y una fecha corrida por un feriado mueve los cuatro.
+
+/** Algoritmo de Meeus para Pascua */
+function easterDate(year: number): Date {
+  const a = year % 19;
+  const b = Math.floor(year / 100);
+  const c = year % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31) - 1;
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  return new Date(year, month, day);
+}
+
+/** Devuelve la fecha del n-ésimo weekday (0=Dom…6=Sáb) del mes/año */
+function nthWeekday(year: number, month: number, weekday: number, n: number): Date {
+  const d = new Date(year, month - 1, 1);
+  let count = 0;
+  while (true) {
+    if (d.getDay() === weekday) { count++; if (count === n) return new Date(d); }
+    d.setDate(d.getDate() + 1);
+  }
+}
+
+/** Feriados legales Chile — incluye Jueves Santo, Viernes Santo y Pueblos Indígenas */
+function isHoliday(date: Date): boolean {
+  const mo = date.getMonth() + 1;
+  const dd = date.getDate();
+  const y = date.getFullYear();
+
+  // Feriados fijos
+  const fixed: [number, number][] = [
+    [1, 1],   // Año Nuevo
+    [5, 1],   // Día del Trabajo
+    [5, 21],  // Glorias Navales
+    [6, 29],  // San Pedro y San Pablo
+    [7, 16],  // Virgen del Carmen
+    [8, 15],  // Asunción
+    [9, 18],  // Fiestas Patrias
+    [9, 19],  // Día del Ejército
+    [10, 12], // Encuentro Dos Mundos
+    [10, 31], // Iglesias Evangélicas
+    [11, 1],  // Todos los Santos
+    [12, 8],  // Inmaculada Concepción
+    [12, 25], // Navidad
+  ];
+  if (fixed.some(([fm, fd]) => fm === mo && fd === dd)) return true;
+
+  // Pascua → Jueves Santo (−3) y Viernes Santo (−2)
+  const easter = easterDate(y);
+  const juevesSanto = new Date(easter); juevesSanto.setDate(easter.getDate() - 3);
+  const viernesSanto = new Date(easter); viernesSanto.setDate(easter.getDate() - 2);
+  if (dd === juevesSanto.getDate() && mo === juevesSanto.getMonth() + 1) return true;
+  if (dd === viernesSanto.getDate() && mo === viernesSanto.getMonth() + 1) return true;
+
+  // Día de los Pueblos Indígenas — 3er lunes de junio (desde 2021)
+  if (y >= 2021) {
+    const pueblos = nthWeekday(y, 6, 1, 3); // lunes=1, 3er ocurrencia, junio
+    if (mo === 6 && dd === pueblos.getDate()) return true;
+  }
+
+  return false;
+}
+
+function addBusinessDays(start: Date, days: number): Date {
+  const result = new Date(start);
+  let count = 0;
+  while (count < days) {
+    result.setDate(result.getDate() + 1);
+    const dow = result.getDay();
+    if (dow !== 0 && dow !== 6 && !isHoliday(result)) count++;
+  }
+  return result;
+}
+
+/** Formatea Date a YYYY-MM-DD usando fecha LOCAL (evita desfase UTC en Chile UTC-3/−4) */
+function toDateInput(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/** Formatea 'YYYY-MM-DD' (fecha pura) a dd/mm/aaaa SIN pasar por UTC. El `fmtDate` de
+ *  esta pantalla sirve para timestamps; con una fecha pura `new Date('YYYY-MM-DD')` la
+ *  interpreta en UTC y en Chile mostraría el día anterior. */
+function fmtFechaIso(iso: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso || "—";
+  const [y, m, d] = iso.split("-");
+  return `${d}/${m}/${y}`;
+}
+
+// Plazo de entrega por defecto (días hábiles) cuando NINGÚN ítem de la cotización lo
+// declara. Mismo número que el fallback del Cierre de Venta de Grupo AM
+// (`data.config?.plazo_max_default ?? 45`); Monza no tiene ese parámetro en Config, así
+// que acá el 45 es la constante. La fecha queda editable en el modal.
+const PLAZO_ENTREGA_DEFECTO_DIAS = 45;
+// Tope de cordura al leer el plazo. En Monza `plazo_entrega` es TEXTO LIBRE por ítem
+// ("30 días", "15-20 días hábiles"), así que un "2026" tecleado por error daría una
+// entrega prometida a 8 años. Grupo AM no lo necesita: allá el plazo es columna numérica.
+const PLAZO_ENTREGA_TOPE_DIAS = 365;
+
+/** Días de plazo que declara un ítem. Mismo criterio que Grupo AM: se toma el MAYOR
+ *  número del texto ("15-20 días hábiles" → 20). undefined si no hay ninguno usable. */
+function parsePlazoDias(s?: string): number | undefined {
+  if (!s) return undefined;
+  const nums = s.replace(/[^0-9]/g, " ").trim().split(/\s+/).map(Number)
+    .filter((n) => n > 0 && n <= PLAZO_ENTREGA_TOPE_DIAS);
+  return nums.length > 0 ? Math.max(...nums) : undefined;
+}
+
+/** Normaliza el error del backend a texto legible. Un 422 de FastAPI trae `detail` como
+ *  ARREGLO de objetos —y con `oc_fecha`/`fecha_entrega_est` como `date` el 422 es un
+ *  escenario real (una fecha mal tecleada)—; sin esto el toast mostraba
+ *  "[object Object]". Molde de CierreVentaPage.tsx, tipado sin `any`. */
+function msgError(e: unknown, fallback: string): string {
+  const d = (e as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+  if (Array.isArray(d)) {
+    const partes = d.map((x) => {
+      const msg = (x as { msg?: unknown })?.msg;
+      return typeof msg === "string" ? msg : JSON.stringify(x);
+    });
+    return partes.length > 0 ? partes.join("; ") : fallback;
+  }
+  if (typeof d === "string" && d.trim()) return d;
+  return fallback;
+}
+
+/** Opción de pago que corresponde a la venta tal como está guardada.
+ *
+ *  Prioriza `forma_pago` (así un crédito a 60 días vuelve a preseleccionarse a 60 y no
+ *  a 30) y cae al `pct_adelanto`, que es el dato que mueve plata. Si el % vigente no
+ *  coincide con ninguna opción fija —el caso nuevo del adelanto libre— devuelve la
+ *  opción de % libre: sin esto, un re-cierre bajaría un 30% pactado a 0 en silencio,
+ *  que es exactamente el hallazgo #14 que ya se corrigió para el 50%. */
+function opcionDeVenta(formaPago: string | undefined, pct: number): PagoOpcion {
+  const porForma = PAGO_OPCIONES.find((o) => !o.pctLibre && o.forma === (formaPago || ""));
+  if (porForma && porForma.pct === pct) return porForma;
+  const porPct = PAGO_OPCIONES.find((o) => !o.pctLibre && o.pct === pct);
+  if (porPct) return porPct;
+  return PAGO_OPCIONES.find((o) => o.pctLibre) ?? PAGO_OPCIONES[0];
+}
+
+// Estados desde los que la fila ofrece el botón de cerrar la venta (hallazgo A5). El
+// botón se pintaba con `estado !== "vendida"`, así que también aparecía en 'propuesta'
+// (nunca se le envió al cliente) y en 'rechazada' (el cliente dijo NO) — y el cierre
+// libera las compras al proveedor. El backend rechaza esos dos con 409
+// (ESTADOS_QUE_CIERRAN_VENTA en monza_router_cotizaciones.py); acá el botón directamente
+// no se ofrece. 'vendida' pasa el guard del backend por idempotencia pero sigue oculto,
+// igual que hoy: la venta ya cerrada se corrige desde Contabilidad → Ventas.
+const ESTADOS_CON_BOTON_CERRAR = new Set(["enviada"]);
+
+/** Lo que el modal entrega al confirmar. Un objeto (y no 5 parámetros posicionales)
+ *  para que agregar un campo no se pueda cablear en el orden equivocado. */
+interface CierreVentaPayload {
+  pct_adelanto: number;
+  forma_pago: string;
+  oc_cliente: string;
+  oc_fecha: string;
+  fecha_entrega_est: string;
 }
 
 const ESTADO_CONFIG: Record<string, { bg: string; color: string; label: string }> = {
@@ -41,37 +233,317 @@ function fmtDate(d?: string) { return d ? new Date(d).toLocaleDateString("es-CL"
 // Condiciones de pago ofrecidas al cerrar una venta (PAGO_OPCIONES, en constants/adelanto).
 // El '% adelanto' dispara la verificación de pago en Contabilidad y "pago no verificado"
 // en Abastecimiento.
-function CerrarVentaModal({ cot, loading, onClose, onConfirm }: {
-  cot: { id: number; numero: string };
+function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
+  cot: Cotizacion;
+  /** Detalle ya cargado (fila expandida). Si no viene, el modal lo pide: de ahí sale el
+   *  plazo de entrega por ítem, que es lo único que la lista no trae. */
+  detalle?: CotDetail;
   loading: boolean;
   onClose: () => void;
-  onConfirm: (pct: number, forma: string) => void;
+  onConfirm: (payload: CierreVentaPayload) => void;
 }) {
-  const [sel, setSel] = useState("contado");
+  // Hallazgo #14: el modal arrancaba SIEMPRE en "contado", así que un re-cierre para corregir
+  // otra cosa mandaba pct_adelanto = 0 y borraba en silencio el 50% vigente (y con él el
+  // cortafuego de "pago no verificado" de Abastecimiento). Ahora preselecciona la condición
+  // que la venta ya tiene; si el backend aún no serializa pct_adelanto, cae en "contado" como antes.
+  const pctVigente = Number(cot.pct_adelanto ?? 0);
+  const vigente = opcionDeVenta(cot.forma_pago, pctVigente);
+  const [sel, setSel] = useState(() => vigente.id);
+  // OC del cliente OBLIGATORIA (Fase 3): la referencia 801 del SII exige N° y fecha,
+  // y sin OC no hay ancla comercial del cobro. El backend también la exige.
+  const [oc, setOc] = useState(cot.oc_cliente || "");
+  // Hallazgo #20: la fecha se inicializaba con new Date().toISOString() = HOY EN UTC, de modo que
+  // (a) re-abrir el modal para corregir el N° de OC pisaba la fecha real de la OC con la de hoy
+  // —y esa fecha viaja como referencia 801 al SII— y (b) de noche en Chile daba el día siguiente.
+  // Se usa la fecha guardada si el backend la devuelve, y hoyLocal() (no UTC) como último recurso.
+  const [ocFecha, setOcFecha] = useState(() => cot.oc_fecha || hoyLocal());
+  // ── Hallazgo A2 · adelanto de % LIBRE o monto exacto en pesos ────────────────
+  // Espejo bidireccional (molde de CierreVentaPage.tsx): con el monto digitado el % se
+  // deriva, y con el % digitado se ven los pesos. Los 3 casos de siempre (contado,
+  // 50%, crédito 30) siguen siendo radios sin nada que teclear.
+  const [adelPct, setAdelPct] = useState(() =>
+    vigente.pctLibre && pctVigente > 0 ? String(pctVigente) : String(ADELANTO_PCT_DEFECTO));
+  const [adelMonto, setAdelMonto] = useState("");
+  // ── Hallazgo A1 · fecha prometida de entrega ─────────────────────────────────
+  // Monza NUNCA escribía esta fecha, así que el semáforo SLA de Ventas decía "Sin
+  // fecha" en el 100% de las ventas y el orden por urgencia de Despachos, las alertas
+  // diarias y los avisos de Bodega no se disparaban jamás. Se precarga con el mayor
+  // plazo de los ítems en días hábiles chilenos, y queda editable.
+  const [det, setDet] = useState<CotDetail | undefined>(detalle);
+  const [cargandoDet, setCargandoDet] = useState(!detalle);
+  const [fechaEntrega, setFechaEntrega] = useState(() => cot.fecha_entrega_est || "");
+  const [fechaTocada, setFechaTocada] = useState(false);
+
+  useEffect(() => {
+    if (detalle) { setDet(detalle); setCargandoDet(false); return; }
+    let vivo = true;
+    setCargandoDet(true);
+    monzaCotizacionesAPI.get(cot.id)
+      .then((r) => { if (vivo) setDet(r.data as CotDetail); })
+      .catch(() => {
+        // Sin el detalle la fecha se precarga con el plazo por defecto: se avisa para que
+        // nadie cierre una venta con una entrega prometida que no revisó.
+        if (vivo) toast.error("No se pudo leer el plazo de los ítems: revisa la fecha prometida de entrega");
+      })
+      .finally(() => { if (vivo) setCargandoDet(false); });
+    return () => { vivo = false; };
+  }, [cot.id, detalle]);
+
+  const plazosItems = (det?.items || [])
+    .map((it) => parsePlazoDias(it.plazo_entrega))
+    .filter((v): v is number => v != null);
+  const hayPlazoDeItems = plazosItems.length > 0;
+  const plazoDias = hayPlazoDeItems ? Math.max(...plazosItems) : PLAZO_ENTREGA_DEFECTO_DIAS;
+
+  useEffect(() => {
+    // Solo precarga: no pisa una fecha ya acordada (re-cierre) ni una tecleada a mano.
+    if (fechaTocada || cot.fecha_entrega_est || cargandoDet) return;
+    setFechaEntrega(toDateInput(addBusinessDays(new Date(), plazoDias)));
+  }, [cargandoDet, plazoDias, fechaTocada, cot.fecha_entrega_est]);
+
   const opt = PAGO_OPCIONES.find((o) => o.id === sel) || PAGO_OPCIONES[0];
+  const esLibre = !!opt.pctLibre;
+  const ocOk = oc.trim().length > 0;
+
+  // Base del adelanto: el total BRUTO de la venta (Monza ya lo guarda con IVA, con la
+  // tasa congelada de la venta — nunca un 1,19 escrito a mano). Es la MISMA base con la
+  // que Tesorería sugiere el monto a aprobar (monza_tesoreria: total_bruto × pct / 100).
+  const totalBruto = Number(cot.total_bruto || 0);
+  const totalNeto = Number(cot.total_neto || 0);
+  const factorNeto = totalBruto > 0 && totalNeto > 0 ? totalNeto / totalBruto : null;
+  const montoAdel = Number(adelMonto) || 0;
+  const montoValido = adelMonto.trim() !== "" && montoAdel > 0;
+  const adelantoExcede = totalBruto > 0 && montoAdel > totalBruto;
+  const pctDigitado = Number(adelPct);
+  const pctDesdeMonto = montoValido && totalBruto > 0 ? (montoAdel / totalBruto) * 100 : null;
+  // Lo que REALMENTE se informa. `pct_adelanto` es entero en la base (0-100), así que un
+  // monto exacto se redondea al entero más cercano: por eso el resumen muestra los pesos
+  // resultantes — lo que se ve es lo que Tesorería va a ver.
+  const pctFinal = esLibre
+    ? Math.round(pctDesdeMonto ?? (Number.isFinite(pctDigitado) ? pctDigitado : 0))
+    : opt.pct;
+  const montoFinal = totalBruto > 0 ? Math.round(totalBruto * pctFinal / 100) : 0;
+  const montoDesdePct = esLibre && !montoValido && totalBruto > 0
+    && pctDigitado > 0 && pctDigitado <= 100
+    ? Math.round(totalBruto * pctDigitado / 100)
+    : null;
+
+  // Se valida ACÁ (y no al recibir el 422) porque un cierre a medias deja la venta
+  // cerrada con la condición equivocada: el PATCH es uno solo.
+  const problemaAdelanto: string | null = (() => {
+    if (!esLibre) return null;
+    if (montoValido) {
+      if (totalBruto <= 0) return "La cotización no tiene total calculado: informa el adelanto en %.";
+      if (adelantoExcede) return "El monto del adelanto supera el total de la venta.";
+      if (pctFinal < 1) return "El monto es menor al 1% del total: informa el adelanto en %.";
+      return null;
+    }
+    if (adelMonto.trim() !== "") return "El monto del adelanto debe ser mayor a 0.";
+    if (!(pctDigitado >= 1 && pctDigitado <= 100)) return "El % de adelanto debe estar entre 1 y 100.";
+    return null;
+  })();
+  const puedeConfirmar = ocOk && !problemaAdelanto && !loading;
+
+  // Aviso explícito cuando el re-cierre BAJA el adelanto ya acordado (hallazgo #14). Con
+  // el adelanto libre a medio teclear el % todavía no significa nada: no se avisa.
+  const bajaAdelanto = pctVigente > 0 && pctFinal < pctVigente && !problemaAdelanto;
+  // La fecha mostrada es la CALCULADA (no una acordada antes ni una tecleada a mano):
+  // solo en ese caso el "— N días hábiles" describe lo que hay en el campo.
+  const fechaEsCalculada = !cot.fecha_entrega_est && !fechaTocada && !cargandoDet;
+
+  const lbl: React.CSSProperties = { fontSize: 12, fontWeight: 600, color: "#64748B", display: "block", marginBottom: 4 };
+  const inp: React.CSSProperties = { width: "100%", padding: "8px 10px", border: "1px solid #E2E8F0", borderRadius: 6, fontSize: 13, boxSizing: "border-box" };
+  const fila: React.CSSProperties = { display: "flex", justifyContent: "space-between", gap: 12, padding: "2px 0" };
+
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.5)", padding: 16 }} onClick={onClose}>
-      <div style={{ width: "100%", maxWidth: 440, background: "white", borderRadius: 14, border: "1px solid #E2E8F0", boxShadow: "0 20px 50px rgba(0,0,0,0.25)" }} onClick={(e) => e.stopPropagation()}>
+      <div style={{ width: "100%", maxWidth: 520, maxHeight: "92vh", display: "flex", flexDirection: "column", background: "white", borderRadius: 14, border: "1px solid #E2E8F0", boxShadow: "0 20px 50px rgba(0,0,0,0.25)" }} onClick={(e) => e.stopPropagation()}>
         <div style={{ padding: "14px 18px", borderBottom: "1px solid #E2E8F0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600, color: "#0f172a" }}>Cerrar venta · {cot.numero}</h3>
           <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "#64748B", fontSize: 20, lineHeight: 1 }}>×</button>
         </div>
-        <div style={{ padding: 18 }}>
-          <p style={{ margin: "0 0 10px", fontSize: 13, color: "#64748B" }}>Condición de pago acordada con el cliente:</p>
-          {PAGO_OPCIONES.map((o) => (
-            <label key={o.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 10, border: `1px solid ${sel === o.id ? "var(--monza-accent)" : "#E2E8F0"}`, marginBottom: 8, cursor: "pointer" }}>
-              <input type="radio" name="pago" checked={sel === o.id} onChange={() => setSel(o.id)} />
-              <span style={{ fontSize: 14, color: "#0f172a", fontWeight: sel === o.id ? 600 : 400 }}>{o.label}</span>
+        <div style={{ padding: 18, overflowY: "auto" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
+            <div>
+              <label style={{ ...lbl, color: ocOk ? "#64748B" : "#B91C1C" }}>N° OC del cliente *</label>
+              <input value={oc} onChange={(e) => setOc(e.target.value)} placeholder="Obligatorio"
+                style={{ ...inp, border: `1px solid ${ocOk ? "#E2E8F0" : "#FCA5A5"}` }} />
+            </div>
+            <div>
+              <label style={lbl}>Fecha OC</label>
+              <input type="date" value={ocFecha} onChange={(e) => setOcFecha(e.target.value)} style={inp} />
+            </div>
+          </div>
+
+          {/* Hallazgo A1: la fecha prometida de entrega. Sin ella el SLA de Ventas, la
+              urgencia de Despachos, las alertas diarias y Bodega quedan apagados. */}
+          <div style={{ marginBottom: 12 }}>
+            <label style={lbl}>
+              Fecha prometida de entrega
+              {fechaEsCalculada && (
+                <span style={{ fontWeight: 400, color: "#94A3B8" }}>
+                  {" "}— {plazoDias} días hábiles
+                </span>
+              )}
             </label>
+            <input type="date" value={fechaEntrega} style={inp}
+              onChange={(e) => { setFechaTocada(true); setFechaEntrega(e.target.value); }} />
+            <p style={{ margin: "4px 0 0", fontSize: 11, color: "#94A3B8" }}>
+              {cargandoDet
+                ? "Leyendo el plazo de los ítems…"
+                : fechaTocada
+                  ? "Fecha fijada a mano."
+                  : cot.fecha_entrega_est
+                    ? "Fecha ya acordada en esta venta. Puedes ajustarla."
+                    : hayPlazoDeItems
+                      ? `Calculada desde el mayor plazo de los ítems (${plazoDias}d hábiles, feriados chilenos incluidos). Puedes ajustarla.`
+                      : `Ningún ítem declara plazo: se usa el plazo por defecto (${plazoDias}d hábiles). Puedes ajustarla.`}
+            </p>
+          </div>
+
+          <p style={{ margin: "0 0 10px", fontSize: 13, color: "#64748B" }}>
+            Condición de pago acordada con el cliente:
+            {/* Hallazgo #14: mostrar la condición VIGENTE para que el re-cierre no se haga a ciegas. */}
+            {pctVigente > 0 && (
+              <span style={{ display: "block", fontSize: 12, color: "#B45309", marginTop: 2 }}>
+                Vigente: <b>{pctVigente}% de adelanto</b>
+              </span>
+            )}
+          </p>
+          {PAGO_OPCIONES.map((o) => (
+            <div key={o.id}>
+              <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 10, border: `1px solid ${sel === o.id ? "var(--monza-accent)" : "#E2E8F0"}`, marginBottom: 8, cursor: "pointer" }}>
+                <input type="radio" name="pago" checked={sel === o.id} onChange={() => setSel(o.id)} />
+                <span style={{ fontSize: 14, color: "#0f172a", fontWeight: sel === o.id ? 600 : 400 }}>{o.label}</span>
+              </label>
+              {/* Los dos campos del adelanto libre viven DENTRO de su opción: solo
+                  aparecen cuando está elegida, así los 3 casos de siempre se ven igual. */}
+              {o.id === PAGO_ADELANTO_LIBRE_ID && sel === o.id && (
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, margin: "0 0 10px", padding: "10px 12px", background: "#F8FAFC", border: "1px solid #E2E8F0", borderRadius: 10 }}>
+                  <div>
+                    <label style={lbl}>% del total</label>
+                    {/* Con monto en pesos digitado el % se DERIVA en vivo (y el campo se
+                        bloquea): el dato que manda es uno solo, nunca los dos a la vez. */}
+                    <input type="number" min={1} max={100} style={inp}
+                      value={montoValido
+                        ? (pctDesdeMonto != null ? pctDesdeMonto.toFixed(1) : "")
+                        : adelPct}
+                      onChange={(e) => setAdelPct(e.target.value)}
+                      disabled={montoValido} />
+                    {montoValido && totalBruto > 0 && (
+                      <p style={{ margin: "4px 0 0", fontSize: 11, color: adelantoExcede ? "#B91C1C" : "#94A3B8" }}>
+                        {adelantoExcede
+                          ? `Supera el total de la venta (${fmt(totalBruto)} c/IVA)`
+                          : `del total c/IVA ${fmt(totalBruto)}`}
+                      </p>
+                    )}
+                  </div>
+                  <div>
+                    <label style={lbl}>o monto exacto (CLP, con IVA)</label>
+                    <input type="number" min={0} style={inp} placeholder="opcional"
+                      value={adelMonto} onChange={(e) => setAdelMonto(e.target.value)} />
+                    {/* Espejo del %: al digitar el porcentaje acá se ven los pesos, con la
+                        MISMA fórmula con que Tesorería sugiere el monto a aprobar. */}
+                    {montoDesdePct !== null && (
+                      <p style={{ margin: "4px 0 0", fontSize: 11, color: "#94A3B8" }}>
+                        ≈ <b style={{ color: "#1E293B" }}>{fmt(montoDesdePct)}</b> c/IVA
+                        {factorNeto != null && ` (${fmt(Math.round(montoDesdePct * factorNeto))} neto)`}
+                      </p>
+                    )}
+                    {/* El % se guarda ENTERO: si el monto exacto no cae justo, acá se ve el
+                        monto que realmente quedará informado antes de confirmar. */}
+                    {montoValido && !adelantoExcede && pctFinal >= 1 && montoFinal !== montoAdel && (
+                      <p style={{ margin: "4px 0 0", fontSize: 11, color: "#B45309" }}>
+                        Se informa como <b>{pctFinal}%</b> = {fmt(montoFinal)} c/IVA
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
           ))}
-          {opt.pct > 0 && (
-            <p style={{ margin: "4px 0 12px", fontSize: 12, color: "#B45309", background: "#FEF3C7", padding: "8px 10px", borderRadius: 8 }}>
-              El cliente paga {opt.pct}% por adelantado. Contabilidad deberá <b>verificar el pago</b>; en Abastecimiento aparecerá <b>"pago no verificado"</b> hasta entonces.
+          {problemaAdelanto && (
+            <p style={{ margin: "4px 0 12px", fontSize: 12, color: "#B91C1C", background: "#FEE2E2", padding: "8px 10px", borderRadius: 8 }}>
+              {problemaAdelanto}
             </p>
           )}
-          <button onClick={() => onConfirm(opt.pct, opt.forma)} disabled={loading}
-            style={{ width: "100%", padding: 10, borderRadius: 8, border: "none", background: "var(--monza-accent)", color: "white", fontWeight: 600, fontSize: 14, cursor: "pointer", opacity: loading ? 0.6 : 1 }}>
-            {loading ? "Guardando…" : "Confirmar venta"}
+          {pctFinal > 0 && !problemaAdelanto && (
+            <p style={{ margin: "4px 0 12px", fontSize: 12, color: "#B45309", background: "#FEF3C7", padding: "8px 10px", borderRadius: 8 }}>
+              El cliente paga {pctFinal}% por adelantado
+              {totalBruto > 0 && <> (<b>{fmt(montoFinal)}</b> c/IVA)</>}. Contabilidad deberá <b>verificar el pago</b>; en Abastecimiento aparecerá <b>"pago no verificado"</b> hasta entonces.
+            </p>
+          )}
+          {/* Hallazgo #14: bajar el adelanto apaga el cortafuego que impide comprar sin anticipo,
+              y antes ocurría en silencio. Si ya hay plata registrada, el backend responde 409. */}
+          {bajaAdelanto && (
+            <p style={{ margin: "4px 0 12px", fontSize: 12, color: "#B91C1C", background: "#FEE2E2", padding: "8px 10px", borderRadius: 8 }}>
+              Estás bajando el adelanto de <b>{pctVigente}%</b> a <b>{pctFinal}%</b>: Abastecimiento podrá comprar sin que se cobre el anticipo.
+              Si el adelanto ya fue verificado o cobrado, el sistema rechazará el cambio (revíertelo antes en Contabilidad/Tesorería).
+            </p>
+          )}
+
+          {/* M15: resumen ANTES de confirmar. El cierre dispara las compras al proveedor,
+              habilita Contabilidad y arranca el reloj de la entrega: el modal era OC,
+              fecha, radios y un botón — sin un solo monto a la vista. */}
+          <div style={{ marginBottom: 14, padding: "10px 12px", background: "#F8FAFC", border: "1px solid #E2E8F0", borderRadius: 10, fontSize: 12, color: "#475569" }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#64748B", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>
+              Resumen de la venta
+            </div>
+            <div style={fila}>
+              <span>Cliente</span>
+              <b style={{ color: "#1E293B", textAlign: "right" }}>{cot.cliente?.nombre || "—"}</b>
+            </div>
+            <div style={fila}>
+              <span>Ítems</span>
+              <b style={{ color: "#1E293B" }}>{det ? det.items.length : cot.items_count}</b>
+            </div>
+            <div style={fila}>
+              <span>Total neto</span>
+              <b style={{ color: "#1E293B" }}>{totalNeto > 0 ? fmt(totalNeto) : "—"}</b>
+            </div>
+            {cot.iva_monto != null && cot.iva_monto > 0 && (
+              <div style={fila}>
+                <span>IVA</span>
+                <b style={{ color: "#1E293B" }}>{fmt(Number(cot.iva_monto))}</b>
+              </div>
+            )}
+            <div style={{ ...fila, borderTop: "1px solid #E2E8F0", marginTop: 4, paddingTop: 6 }}>
+              <span style={{ fontWeight: 600 }}>Total c/IVA</span>
+              <b style={{ color: "var(--monza-accent)", fontSize: 14 }}>{fmt(totalBruto)}</b>
+            </div>
+            <div style={{ ...fila, marginTop: 4 }}>
+              <span>Entrega prometida</span>
+              <b style={{ color: fechaEntrega ? "#1E293B" : "#B91C1C" }}>
+                {fechaEntrega ? fmtFechaIso(fechaEntrega) : "Sin fecha"}
+              </b>
+            </div>
+            <div style={fila}>
+              <span>Adelanto</span>
+              <b style={{ color: "#1E293B" }}>
+                {pctFinal > 0
+                  ? `${pctFinal}%${totalBruto > 0 ? ` · ${fmt(montoFinal)}` : ""}`
+                  : "Sin adelanto"}
+              </b>
+            </div>
+            <div style={fila}>
+              <span>Condición</span>
+              <b style={{ color: "#1E293B", textAlign: "right" }}>
+                {esLibre ? formaPagoAdelanto(pctFinal) : opt.forma}
+              </b>
+            </div>
+          </div>
+
+          <button
+            onClick={() => onConfirm({
+              pct_adelanto: pctFinal,
+              forma_pago: esLibre ? formaPagoAdelanto(pctFinal) : opt.forma,
+              oc_cliente: oc.trim(),
+              oc_fecha: ocFecha,
+              fecha_entrega_est: fechaEntrega,
+            })}
+            disabled={!puedeConfirmar}
+            style={{ width: "100%", padding: 10, borderRadius: 8, border: "none", background: puedeConfirmar ? "var(--monza-accent)" : "#94A3B8", color: "white", fontWeight: 600, fontSize: 14, cursor: puedeConfirmar ? "pointer" : "not-allowed", opacity: loading ? 0.6 : 1 }}>
+            {loading ? "Guardando…" : !ocOk ? "Falta el N° de OC del cliente" : problemaAdelanto ? "Revisa el adelanto" : "Confirmar venta"}
           </button>
         </div>
       </div>
@@ -135,7 +607,11 @@ export default function MonzaCotizacionesPage() {
       await monzaCotizacionesAPI.update(id, { estado: nuevoEstado });
       toast.success("Estado actualizado");
       fetchAll();
-    } catch { toast.error("Error al actualizar estado"); }
+    } catch (e: unknown) {
+      // M14: los 409 del backend (des-cierre con plata colgando, cobertura de despachos,
+      // OC ya referenciada en un DTE) explican QUÉ hacer; el mensaje genérico los tapaba.
+      toast.error(msgError(e, "Error al actualizar estado"), { duration: 8000 });
+    }
     finally { setUpdatingEstado(null); }
   };
 
@@ -160,14 +636,28 @@ export default function MonzaCotizacionesPage() {
 
   // Cierra la venta con la condición de pago elegida (pct_adelanto dispara la
   // verificación en Contabilidad y el estado en Abastecimiento).
-  const confirmarVenta = async (cot: Cotizacion, pctAdelanto: number, formaPago: string) => {
+  const confirmarVenta = async (cot: Cotizacion, p: CierreVentaPayload) => {
     setMarkingVendida(cot.id);
     try {
-      await monzaCotizacionesAPI.update(cot.id, { estado: "vendida", pct_adelanto: pctAdelanto, forma_pago: formaPago });
+      await monzaCotizacionesAPI.update(cot.id, {
+        estado: "vendida",
+        pct_adelanto: p.pct_adelanto,
+        forma_pago: p.forma_pago,
+        oc_cliente: p.oc_cliente,
+        oc_fecha: p.oc_fecha || undefined,
+        // Hallazgo A1: la fecha prometida de entrega. Es la que enciende el semáforo SLA
+        // de Ventas, el orden por urgencia de Despachos, las alertas diarias del
+        // scheduler y los avisos de Bodega — hasta ahora ninguna pantalla la escribía.
+        fecha_entrega_est: p.fecha_entrega_est || undefined,
+      });
       toast.success(`Cotización ${cot.numero} marcada como Vendida`);
       setCerrarVenta(null);
       fetchAll();
-    } catch { toast.error("Error al marcar como vendida"); }
+    } catch (e: unknown) {
+      // M14: con oc_fecha/fecha_entrega_est como `date`, un 422 de FastAPI llega como
+      // ARREGLO y el toast mostraba "[object Object]".
+      toast.error(msgError(e, "Error al marcar como vendida"), { duration: 8000 });
+    }
     finally { setMarkingVendida(null); }
   };
 
@@ -274,7 +764,27 @@ export default function MonzaCotizacionesPage() {
                       <td style={{ padding: "10px 12px" }}>
                         <select
                           value={cot.estado}
-                          onChange={(e) => handleEstado(cot.id, e.target.value)}
+                          onChange={(e) => {
+                            // 'vendida' NO se cierra desde el selector (hallazgo A5): el
+                            // cierre exige N° de OC del cliente —referencia 801 del SII—,
+                            // la condición de pago y la fecha prometida de entrega, así
+                            // que se abre el mismo modal que el botón, que los pide todos.
+                            // Y desde 'propuesta'/'rechazada' no se cierra en absoluto:
+                            // el backend responde 409 (ESTADOS_QUE_CIERRAN_VENTA), acá se
+                            // dice por qué sin gastar el viaje.
+                            if (e.target.value === "vendida") {
+                              if (!ESTADOS_CON_BOTON_CERRAR.has(cot.estado || "propuesta")) {
+                                toast.error(
+                                  "Solo una cotización ENVIADA al cliente se puede cerrar como venta: "
+                                  + "el cierre libera las compras al proveedor. Márcala primero como Enviada.",
+                                  { duration: 8000 });
+                                return;
+                              }
+                              setCerrarVenta(cot);
+                              return;
+                            }
+                            handleEstado(cot.id, e.target.value);
+                          }}
                           disabled={updatingEstado === cot.id}
                           style={{ padding: "4px 8px", border: `1px solid ${ec.color}40`, borderRadius: 8, background: ec.bg, color: ec.color, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
                           {Object.entries(ESTADO_CONFIG).map(([v, c]) => (
@@ -285,11 +795,15 @@ export default function MonzaCotizacionesPage() {
                       <td style={{ padding: "10px 12px", color: "#475569", fontSize: 12 }}>{cot.asesor || "—"}</td>
                       <td style={{ padding: "10px 12px", textAlign: "center" }}>
                         <div style={{ display: "flex", gap: 6, justifyContent: "center", alignItems: "center" }}>
-                          {cot.estado !== "vendida" && (
+                          {/* Hallazgo A5: solo en los estados desde los que SÍ se puede
+                              cerrar. Antes se pintaba con `estado !== "vendida"`, así que
+                              también salía en 'propuesta' y 'rechazada' — y un clic mal
+                              dado en la fila equivocada disparaba las compras al proveedor. */}
+                          {ESTADOS_CON_BOTON_CERRAR.has(cot.estado || "propuesta") && (
                             <button
                               onClick={() => setCerrarVenta(cot)}
                               disabled={markingVendida === cot.id}
-                              title="Marcar como vendida"
+                              title="Cerrar la venta (N° de OC del cliente, condición de pago y fecha de entrega)"
                               style={{ background: "transparent", border: "1px solid #16A34A40", borderRadius: 6, cursor: "pointer", color: "#16A34A", padding: "5px 8px", fontSize: 11, fontWeight: 600, display: "flex", alignItems: "center", gap: 4, opacity: markingVendida === cot.id ? 0.5 : 1 }}>
                               <CheckCircle size={12} /> Vendida
                             </button>
@@ -379,9 +893,12 @@ export default function MonzaCotizacionesPage() {
       {cerrarVenta && (
         <CerrarVentaModal
           cot={cerrarVenta}
+          // Si la fila ya está expandida el detalle está en memoria: se reusa y el modal
+          // no pide de nuevo lo mismo.
+          detalle={details[cerrarVenta.id]}
           loading={markingVendida === cerrarVenta.id}
           onClose={() => setCerrarVenta(null)}
-          onConfirm={(pct, forma) => confirmarVenta(cerrarVenta, pct, forma)}
+          onConfirm={(payload) => confirmarVenta(cerrarVenta, payload)}
         />
       )}
     </div>

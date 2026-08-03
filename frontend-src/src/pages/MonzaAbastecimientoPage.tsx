@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
 import { ShoppingCart, Search, RefreshCw, Package, X, Truck, FileText, ChevronDown, ChevronRight, Plus } from "lucide-react";
-import { monzaAbastecimientoAPI } from "../services/monzaApi";
+// (Truck también marca el badge "Nacional": OC sin embarque, entrega por camión)
+import { monzaAbastecimientoAPI, monzaTotalPendiente, monzaErrMsg } from "../services/monzaApi";
+import type { MonzaItemQty } from "../services/monzaApi";
 import { ADELANTO_PCT_DEFECTO } from "../constants/adelanto";
 import { useMonzaTheme } from "./MonzaLayout";
 import MonzaDocs from "./MonzaDocs";
@@ -25,6 +27,9 @@ interface ItemCompra {
   plazo_entrega?: string;
   estado_linea: string;
   fecha_venta?: string;
+  // Origen de la OC del ítem: 'nacional' → NO pasa por preparar/embarque (su camino
+  // es "Registrar entrega nacional" en Seguimiento). Solo viene en /comprados.
+  tipo_origen?: string;
   // Adelanto (verificado por Contabilidad)
   pct_adelanto?: number;
   requiere_adelanto?: boolean;
@@ -42,6 +47,9 @@ interface OcCompra {
   proveedor_nombre?: string;
   pais?: string;
   moneda?: string;
+  // Camino físico: 'internacional' (embarque+aduana) | 'nacional' (camión + guía,
+  // sin embarque). Coalescido en el backend: histórico sin valor = internacional.
+  tipo_origen?: string;
   estado: string;
   plazo_dias?: number;
   awb?: string;
@@ -99,10 +107,22 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
   const [provId, setProvId] = useState<string>("");
   const [pais, setPais] = useState("");
   const [moneda, setMoneda] = useState("EUR");
+  // Camino físico de la compra: internacional (embarque+aduana+landed) o nacional
+  // (camión + guía de despacho, sin embarque). Gobierna la moneda por defecto en la
+  // UI y el flujo posterior en Seguimiento (nacional salta preparado/embarque).
+  // NO se deriva de país/moneda: es la fuente única del camino físico en el backend.
+  const [tipoOrigen, setTipoOrigen] = useState<"internacional" | "nacional">("internacional");
   const [numeroOc, setNumeroOc] = useState("");
   const [plazo, setPlazo] = useState("");
   const [notas, setNotas] = useState("");
   const [saving, setSaving] = useState(false);
+
+  const onTipoOrigen = (v: "internacional" | "nacional") => {
+    setTipoOrigen(v);
+    // Nacional → Chile/CLP SOLO como default de UI (el usuario puede cambiarlos;
+    // el origen jamás se deriva de la moneda).
+    if (v === "nacional") { setPais("Chile"); setMoneda("CLP"); }
+  };
 
   // Alta inline de proveedor
   const [addProv, setAddProv] = useState(false);
@@ -168,6 +188,7 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
         numero_oc: numeroOc || undefined,
         plazo_dias: plazo ? Number(plazo) : undefined,
         notas: notas || undefined,
+        tipo_origen: tipoOrigen,
       });
       toast.success(`OC creada · ${items.length} ítem(s)`);
       setOcpId(r.data.ocp_id); setOcpNumero(r.data.numero);  // pasar a paso 2 (documentos)
@@ -206,6 +227,34 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
                 <span style={{ color: sub }}>×{it.cantidad}{it.costo ? ` · ${it.moneda} ${it.costo}` : ""}</span>
               </div>
             ))}
+          </div>
+
+          {/* Origen de la compra: internacional (embarque) o nacional (camión + guía) */}
+          <div style={{ marginBottom: 14 }}>
+            <label style={lbl}>Origen de la compra</label>
+            <div style={{ display: "flex", gap: 8 }}>
+              {([
+                ["internacional", "Internacional", "Embarque + aduana"],
+                ["nacional", "Nacional", "Camión + guía, sin embarque"],
+              ] as const).map(([val, label, subT]) => (
+                <button key={val} type="button" onClick={() => onTipoOrigen(val)}
+                  style={{
+                    flex: 1, padding: "8px 10px", borderRadius: 10, textAlign: "left", cursor: "pointer", fontFamily: "inherit",
+                    border: tipoOrigen === val ? "1px solid var(--monza-accent)" : `1px solid ${bd}`,
+                    background: tipoOrigen === val ? (dark ? "#1a2340" : "#FFF5F5") : "transparent",
+                    color: tipoOrigen === val ? "var(--monza-accent)" : sub, fontSize: 12, fontWeight: 700,
+                  }}>
+                  {label}
+                  <span style={{ display: "block", fontSize: 10, fontWeight: 400, marginTop: 2, color: tipoOrigen === val ? "var(--monza-accent)" : sub }}>{subT}</span>
+                </button>
+              ))}
+            </div>
+            {tipoOrigen === "nacional" && (
+              <p style={{ margin: "6px 0 0", fontSize: 11, color: sub }}>
+                Nacional: moneda <b style={{ color: "var(--monza-accent)" }}>CLP</b> por defecto, sin AWB/forwarder.
+                La entrega se registra luego en <b>Seguimiento</b> ("Registrar entrega nacional").
+              </p>
+            )}
           </div>
 
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
@@ -295,6 +344,10 @@ export default function MonzaAbastecimientoPage() {
   const [items, setItems] = useState<ItemCompra[]>([]);
   const [comprados, setComprados] = useState<ItemCompra[]>([]);
   const [selPrep, setSelPrep] = useState<Set<number>>(new Set());
+  // Cantidad a PREPARAR por ítem (envío parcial: el proveedor mandó 6 de 10). Sin
+  // tocar nada vale toda la línea; si se baja, el backend parte la línea y el
+  // remanente vuelve a esta misma pestaña esperando el próximo embarque.
+  const [qtyPrep, setQtyPrep] = useState<Record<number, number>>({});
   const [ocs, setOcs] = useState<OcCompra[]>([]);
   const [proveedores, setProveedores] = useState<Proveedor[]>([]);
   const [kpis, setKpis] = useState<KPIs | null>(null);
@@ -349,9 +402,29 @@ export default function MonzaAbastecimientoPage() {
   };
 
   const togglePrep = (id: number) => setSelPrep((p) => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  // Cantidad efectiva a preparar de un ítem: lo tecleado o toda la línea.
+  const qtyPrepDe = (it: ItemCompra) => qtyPrep[it.id] ?? it.cantidad;
   const preparar = async () => {
-    try { const r = await monzaAbastecimientoAPI.preparar(Array.from(selPrep)); toast.success(`${r.data.preparados} ítem(s) preparado(s) → Logística`); setSelPrep(new Set()); fetchAll(); }
-    catch { toast.error("Error al preparar"); }
+    // Solo los ítems con cantidad REBAJADA viajan con `cantidad`; si nadie tocó nada,
+    // el servicio manda el pedido por la vía legada (línea completa, sin partir).
+    const pedidos: MonzaItemQty[] = Array.from(selPrep).map((id) => {
+      const it = comprados.find((c) => c.id === id);
+      const q = it ? qtyPrepDe(it) : undefined;
+      return it && q !== undefined && q < it.cantidad ? { item_id: id, cantidad: q } : { item_id: id };
+    });
+    try {
+      const r = await monzaAbastecimientoAPI.preparar(pedidos);
+      const pend = monzaTotalPendiente(r.data.remanentes);
+      toast.success(
+        `${r.data.preparados} ítem(s) preparado(s) → Logística`
+        + (pend > 0 ? ` · quedan ${pend} unidad(es) en Comprados esperando el próximo embarque` : ""),
+      );
+      setSelPrep(new Set()); setQtyPrep({}); fetchAll();
+    } catch (e: unknown) {
+      // El backend explica el motivo (cantidad inválida, estado equivocado, o la
+      // línea ya tiene guía/factura encima): mostrarlo es lo único útil aquí.
+      toast.error(monzaErrMsg(e, "Error al preparar"));
+    }
   };
 
   const advanceOc = async (oc: OcCompra, nuevoEstado: string) => {
@@ -364,6 +437,9 @@ export default function MonzaAbastecimientoPage() {
 
   const selItems = items.filter((i) => selected.has(i.id));
   const comprables = items.filter((i) => !itemBloqueado(i));  // ítems sin bloqueo de adelanto
+  // Comprados preparables: los de OC NACIONAL no van a embarque (su camino es
+  // "Registrar entrega nacional" en Seguimiento) — se excluyen del check global.
+  const preparables = comprados.filter((i) => i.tipo_origen !== "nacional");
   // Defensa: ítems seleccionados que igual estén bloqueados (no debería ocurrir: no se pueden marcar).
   const bloqueadosSel = selItems.filter(itemBloqueado);
 
@@ -432,6 +508,14 @@ export default function MonzaAbastecimientoPage() {
         </button>
       </div>
 
+      {/* Envío parcial: la explicación va donde se teclea la cantidad, no en un manual */}
+      {tab === "comprados" && comprados.length > 0 && (
+        <p style={{ margin: "0 0 10px", fontSize: 11, color: sub }}>
+          Si el proveedor envió solo una parte, baja la cantidad en <b style={{ color: txt }}>A preparar</b>:
+          el resto se queda aquí en <b style={{ color: txt }}>Comprados</b> esperando el próximo embarque.
+        </p>
+      )}
+
       {/* Content */}
       <div style={{ background: bg, border: `1px solid ${bd}`, borderRadius: 10, overflow: "hidden" }}>
         {loading ? (
@@ -447,24 +531,66 @@ export default function MonzaAbastecimientoPage() {
               <thead>
                 <tr style={{ background: dark ? "#0d1321" : "#F8FAFC", borderBottom: `1px solid ${bd}` }}>
                   <th style={{ width: 36, padding: "10px 8px", textAlign: "center" }}>
-                    <input type="checkbox" checked={selPrep.size === comprados.length && comprados.length > 0} onChange={() => setSelPrep(selPrep.size === comprados.length ? new Set() : new Set(comprados.map((i) => i.id)))} style={{ accentColor: "var(--monza-accent)" }} />
+                    <input type="checkbox" checked={preparables.length > 0 && selPrep.size === preparables.length} onChange={() => setSelPrep(selPrep.size === preparables.length ? new Set() : new Set(preparables.map((i) => i.id)))} style={{ accentColor: "var(--monza-accent)" }} />
                   </th>
-                  {["N° COT", "Cliente", "Repuesto", "OC Proveedor", "Cant."].map((h) => (
-                    <th key={h} style={{ padding: "10px 12px", textAlign: h === "Cant." ? "right" : "left", fontWeight: 600, fontSize: 11, color: sub, textTransform: "uppercase" as const }}>{h}</th>
+                  {["N° COT", "Cliente", "Repuesto", "OC Proveedor", "Cant.", "A preparar"].map((h) => (
+                    <th key={h} style={{ padding: "10px 12px", textAlign: ["Cant.", "A preparar"].includes(h) ? "right" : "left", fontWeight: 600, fontSize: 11, color: sub, textTransform: "uppercase" as const }}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {comprados.map((it) => {
                   const isSel = selPrep.has(it.id);
+                  // Nacional: NO se prepara/embarca — su camino es "Registrar entrega
+                  // nacional" en Seguimiento (la UI oculta Y el backend rechaza 400).
+                  const esNacional = it.tipo_origen === "nacional";
                   return (
-                    <tr key={it.id} onClick={() => togglePrep(it.id)} style={{ borderBottom: `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}`, background: isSel ? (dark ? "#1a2340" : "#F0FDF4") : "transparent", cursor: "pointer" }}>
-                      <td style={{ textAlign: "center", padding: 8 }}><input type="checkbox" checked={isSel} onChange={() => togglePrep(it.id)} onClick={(e) => e.stopPropagation()} style={{ accentColor: "var(--monza-accent)" }} /></td>
+                    <tr key={it.id} onClick={() => { if (!esNacional) togglePrep(it.id); }} style={{ borderBottom: `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}`, background: isSel ? (dark ? "#1a2340" : "#F0FDF4") : "transparent", cursor: esNacional ? "default" : "pointer" }}>
+                      <td style={{ textAlign: "center", padding: 8 }}>
+                        {esNacional ? (
+                          <Truck size={13} color="#15803D" style={{ verticalAlign: "middle" }} />
+                        ) : (
+                          <input type="checkbox" checked={isSel} onChange={() => togglePrep(it.id)} onClick={(e) => e.stopPropagation()} style={{ accentColor: "var(--monza-accent)" }} />
+                        )}
+                      </td>
                       <td style={{ padding: "9px 12px", fontWeight: 600, color: "var(--monza-accent)", fontSize: 12 }}>{it.cot_numero}</td>
                       <td style={{ padding: "9px 12px", color: txt }}>{it.cliente || "—"}</td>
-                      <td style={{ padding: "9px 12px" }}><div style={{ color: txt, fontWeight: 500 }}>{it.descripcion}</div>{it.numero_parte && <div style={{ fontSize: 10, color: sub }}>{it.numero_parte}</div>}</td>
+                      <td style={{ padding: "9px 12px" }}>
+                        <div style={{ color: txt, fontWeight: 500, display: "flex", alignItems: "center", gap: 6 }}>
+                          {it.descripcion}
+                          {esNacional && (
+                            <span title="OC nacional: la entrega se registra en Seguimiento (no pasa por embarque)"
+                              style={{ fontSize: 10, fontWeight: 700, background: "#DCFCE7", color: "#15803D", padding: "1px 7px", borderRadius: 999 }}>Nacional</span>
+                          )}
+                        </div>
+                        {it.numero_parte && <div style={{ fontSize: 10, color: sub }}>{it.numero_parte}</div>}
+                      </td>
                       <td style={{ padding: "9px 12px", color: sub, fontSize: 12 }}>{(it as ItemCompra & { ocp_numero?: string; ocp_proveedor?: string }).ocp_numero || "—"}{(it as ItemCompra & { ocp_proveedor?: string }).ocp_proveedor ? ` · ${(it as ItemCompra & { ocp_proveedor?: string }).ocp_proveedor}` : ""}</td>
                       <td style={{ padding: "9px 12px", textAlign: "right", color: txt }}>{it.cantidad}</td>
+                      {/* Cantidad a preparar (envío parcial). El <td> corta el click porque
+                          la fila togglea el checkbox: teclear no debe deseleccionar la línea. */}
+                      <td style={{ padding: "9px 12px", textAlign: "right" }} onClick={(e) => e.stopPropagation()}>
+                        {esNacional ? (
+                          <span style={{ color: sub }}>—</span>
+                        ) : (
+                          <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "flex-end", gap: 6 }}>
+                            <input
+                              type="number" min={1} max={it.cantidad} step={1}
+                              aria-label={`Cantidad a preparar de ${it.descripcion} (máximo ${it.cantidad})`}
+                              value={qtyPrepDe(it)}
+                              onChange={(e) => setQtyPrep((p) => ({ ...p, [it.id]: Math.max(1, Math.min(it.cantidad, Math.round(Number(e.target.value) || 0))) }))}
+                              style={{ width: 58, padding: "3px 6px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 12, background: dark ? "#0d1321" : "#F8FAFC", color: txt, textAlign: "right" }}
+                            />
+                            <span style={{ fontSize: 11, color: sub }}>/ {it.cantidad}</span>
+                            {qtyPrepDe(it) < it.cantidad && (
+                              <span title="Preparación parcial: el resto se queda en Comprados esperando el próximo embarque"
+                                style={{ fontSize: 10, fontWeight: 700, background: "#FEF3C7", color: "#B45309", padding: "1px 7px", borderRadius: 999, whiteSpace: "nowrap" }}>
+                                {it.cantidad - qtyPrepDe(it)} pendiente
+                              </span>
+                            )}
+                          </span>
+                        )}
+                      </td>
                     </tr>
                   );
                 })}
@@ -564,7 +690,16 @@ export default function MonzaAbastecimientoPage() {
                         {isExp ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                       </td>
                       <td style={{ padding: "10px 12px" }}>
-                        <div style={{ fontWeight: 700, color: "var(--monza-accent)" }}>{oc.numero_oc || oc.numero}</div>
+                        <div style={{ fontWeight: 700, color: "var(--monza-accent)", display: "flex", alignItems: "center", gap: 6 }}>
+                          {oc.numero_oc || oc.numero}
+                          {/* Badge del camino físico: nacional NO pasa por embarque */}
+                          {oc.tipo_origen === "nacional" && (
+                            <span title="OC nacional: camión + guía del proveedor, sin embarque"
+                              style={{ fontSize: 10, fontWeight: 700, background: "#DCFCE7", color: "#15803D", padding: "1px 7px", borderRadius: 999, display: "inline-flex", alignItems: "center", gap: 3 }}>
+                              <Truck size={9} /> Nacional
+                            </span>
+                          )}
+                        </div>
                         {oc.numero_oc && <div style={{ fontSize: 10, color: "#94A3B8" }}>{oc.numero}</div>}
                       </td>
                       <td style={{ padding: "10px 12px", color: txt }}>{oc.proveedor_nombre || "—"}</td>

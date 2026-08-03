@@ -11,7 +11,9 @@ class FacturaItemIn(BaseModel):
     item_cotizacion_id: int
     despacho_item_id: Optional[int] = None
     cantidad: Optional[float] = Field(None, gt=0)
-    precio_unit_neto: Optional[float] = Field(None, ge=0)
+    # gt=0 (espejo GA contabilidad.py): con ge=0 una línea en $0 generaba una factura
+    # en $0 que nacía 'pagada'. Sin precio explícito (None) se usa el del ítem.
+    precio_unit_neto: Optional[float] = Field(None, gt=0)
 
 
 class FacturaCreate(BaseModel):
@@ -21,7 +23,13 @@ class FacturaCreate(BaseModel):
         SIN requerir despacho (tope por lo VENDIDO − ya facturado). EXCLUYENTE: no se
         combina con despacho_id ni items.
       - `items` explícitos (tope por lo despachado).
-    numero_factura es el folio SII (único)."""
+      - `es_anticipo=True` (vía B): factura de ANTICIPO, la ÚNICA que NO nace de una
+        guía; el tope es el total de la venta aún no facturado.
+    numero_factura es el folio SII (único).
+
+    Este mismo schema lo usa la emisión electrónica (monza_wasabil_dte/router.py lo
+    importa de aquí), así que los campos nuevos quedan disponibles en preview y emisión
+    sin duplicar contrato."""
     cotizacion_id: int
     despacho_id: Optional[int] = None
     sin_guia: bool = False
@@ -32,6 +40,22 @@ class FacturaCreate(BaseModel):
     plazo_dias: Optional[int] = Field(None, ge=0, le=3650)
     items: Optional[List[FacturaItemIn]] = None
     observaciones: Optional[str] = None
+    # Factura de ANTICIPO (Fase 7, vía B): respalda ante el SII un adelanto cobrado antes
+    # de que llegara la mercadería. `monto_neto_anticipo` es el NETO (el IVA lo calcula el
+    # backend con la tasa CONGELADA de la venta, no con un 19% fijo).
+    # A diferencia de Grupo AM aquí NO hay `adelanto_ids`: Monza tiene UN adelanto por
+    # venta (uq_monza_cont_adelanto_cotizacion) y el vínculo adelanto↔factura de anticipo
+    # se DERIVA de las facturas es_anticipo=1 de la venta — cero estado que se desincronice.
+    es_anticipo: bool = False
+    monto_neto_anticipo: Optional[float] = Field(None, gt=0)
+    descripcion_anticipo: Optional[str] = None
+    # Puerta EXPLÍCITA para un segundo anticipo en la misma venta. Por defecto el
+    # constructor lo bloquea (409): emitir un DTE 33 es IRREVERSIBLE y el candado anti
+    # doble emisión del módulo SII solo dura mientras el HTTP está en vuelo, así que sin
+    # este guard dos clics seguidos facturaban DOS anticipos reales por UN adelanto.
+    # No se elimina la posibilidad —hay negocios que pactan dos anticipos parciales—:
+    # se exige decirlo a propósito. Ver _construir_factura_anticipo.
+    confirmar_segundo_anticipo: bool = False
 
 
 class CobranzaIn(BaseModel):
@@ -56,6 +80,17 @@ class FactoringIn(BaseModel):
     retencion: Optional[float] = Field(None, ge=0)
     banco: Optional[str] = None
     observaciones: Optional[str] = None
+
+
+class RevertirFactoringIn(BaseModel):
+    """Reversión de una cesión al factor que quedó contra un documento que el SII nunca
+    conoció. El motivo es OBLIGATORIO y no es burocracia: la operación de factoring
+    DESAPARECE (la fila se borra, ver `revertir_factoring`), así que este texto es lo único
+    que después explica por qué. Queda en `factura.observaciones` y en el log del servidor.
+
+    `min_length` no alcanza: ' ' pasa el validador de Pydantic. El router exige 5
+    caracteres REALES tras `strip()`."""
+    motivo: str = Field(..., min_length=5, max_length=500)
 
 
 class GuiaFirmadaIn(BaseModel):

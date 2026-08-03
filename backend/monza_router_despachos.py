@@ -1,17 +1,100 @@
 from fastapi import APIRouter, Depends, Query, HTTPException
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import or_, func
+import re
 from typing import Optional
-from datetime import datetime
+from datetime import date, datetime
 
 from database import get_db
 from auth import get_current_user
-from monza_models import MonzaCotizacion, MonzaCliente, MonzaCotizacionItem, MonzaDespacho, MonzaDespachoItem
+from monza_models import (
+    MonzaCotizacion, MonzaCliente, MonzaCotizacionItem, MonzaDespacho, MonzaDespachoItem,
+    MonzaRecepcion, MonzaRecepcionItem, MonzaEmbarque, MonzaEmbarqueItem,
+)
+from monza_fechas import business_days_remaining
 from pydantic import BaseModel
 from typing import List
 from monza_notif import crear_notif
+from empresa_guard import require_empresa
+# service.py de Monza es puro (sin imports de router ni de modelos): importar de ahí no
+# arma ciclo. Espejo de lo que hace routers/despachos.py con wasabil_dte.service.
+from monza_wasabil_dte.service import hoy_chile
 
-router = APIRouter(prefix="/api/monza/despachos", tags=["monza-despachos"])
+# Candado de empresa (hallazgo #13 de la auditoría integral): este router quedó sin
+# require_empresa mientras Grupo AM sí candó el suyo (routers/despachos.py), así que
+# un usuario de 'mineria' leía y MUTABA despachos de MonzaParts (crear/cerrar/anular
+# entraban a la lógica de negocio en vez de cortarse en la puerta). Se canda el router
+# COMPLETO, no endpoint por endpoint, para no dejar mitades.
+router = APIRouter(prefix="/api/monza/despachos", tags=["monza-despachos"],
+                   dependencies=[Depends(require_empresa("automotriz"))])
+
+
+# Antigüedad máxima aceptada para la fecha de emisión de una guía tecleada a mano. No es
+# una regla del SII: es una malla ANCHA contra el dedazo grueso (un 2019 en vez de un
+# 2026). NO ataja el typo de UN año, que cae dentro de los 730 días — ver la nota larga en
+# routers/despachos.py y el cruce contra la fecha de la factura en service.py.
+# Espejo del de routers/despachos.py — DUPLICADO A PROPÓSITO: MachParts y MonzaParts no
+# comparten código de negocio, y un import cruzado entre routers de marcas distintas es
+# justo lo que la separación por empresa existe para impedir.
+_ANTIGUEDAD_MAX_FECHA_GUIA_DIAS = 730
+
+# Formato aceptado: AAAA-MM-DD, opcionalmente con sufijo horario ISO. Cualquier otra cosa
+# pegada a la fecha se RECHAZA en vez de truncarse (ver _parse_fecha_guia).
+_RE_FECHA_GUIA = re.compile(r"^\d{4}-\d{2}-\d{2}([T ].*)?$")
+
+
+def _parse_fecha_guia(valor) -> Optional[date]:
+    """Texto YYYY-MM-DD → date, para la fecha de EMISIÓN de la guía en papel.
+
+    Devuelve None cuando el operador la borra (null o ""), que es un estado legítimo:
+    el despacho vuelve a "sin fecha" y la facturación electrónica se bloquea hasta que
+    se cargue de nuevo.
+
+    Valida ANTES de guardar porque esta fecha termina viajando como FchRef dentro de un
+    DTE 33 REAL: una fecha inventada no se corrige después, sólo se anula el documento.
+    Se rechaza: lo que no sea YYYY-MM-DD, una fecha FUTURA, y una fecha absurdamente
+    vieja (ver _ANTIGUEDAD_MAX_FECHA_GUIA_DIAS).
+    """
+    if valor is None:
+        return None
+    texto = str(valor).strip()
+    if not texto:
+        return None
+    # `_RE_FECHA_GUIA` antes de strptime: con `texto[:10]` a secas, "2026-07-155" se
+    # truncaba a "2026-07-15" y se aceptaba en silencio un dato que el operador escribió
+    # mal. Se admite el sufijo horario ("2026-07-15T10:00:00") porque algunos clientes
+    # mandan datetime ISO, pero nada más pegado a la fecha.
+    if not _RE_FECHA_GUIA.match(texto):
+        raise HTTPException(
+            400,
+            "La fecha de emisión de la guía debe tener el formato AAAA-MM-DD "
+            f"(recibido: '{texto}')",
+        )
+    try:
+        fecha = datetime.strptime(texto[:10], "%Y-%m-%d").date()
+    except ValueError:
+        # Formato correcto pero fecha inexistente: 2026-02-31, 2026-13-01.
+        raise HTTPException(
+            400,
+            f"La fecha de emisión de la guía '{texto[:10]}' no existe en el calendario",
+        )
+    hoy = hoy_chile()
+    if fecha > hoy:
+        raise HTTPException(
+            400,
+            f"La fecha de emisión de la guía ({fecha.isoformat()}) es futura: "
+            f"revisa el dato (hoy en Chile es {hoy.isoformat()}). Debe ser la fecha en "
+            "que el SII emitió la guía.",
+        )
+    if (hoy - fecha).days > _ANTIGUEDAD_MAX_FECHA_GUIA_DIAS:
+        raise HTTPException(
+            400,
+            f"La fecha de emisión de la guía ({fecha.isoformat()}) tiene más de "
+            f"{_ANTIGUEDAD_MAX_FECHA_GUIA_DIAS // 365} años: revisa el año antes de "
+            "guardar (es el error de tipeo más común).",
+        )
+    return fecha
 
 
 def _despacho_dict(c: MonzaCotizacion) -> dict:
@@ -137,43 +220,705 @@ def despachos_kpis(db: Session = Depends(get_db), _=Depends(get_current_user)):
 
 
 # ── Despacho como entidad (alineacion MachParts) ──────────────────────────────
+#
+# FASE 2 DEL ESPEJO GRUPO AM (docs/plan-espejo-monza-2026-07-23.md):
+#   · TOPE FÍSICO: nunca se despacha más de lo RECIBIDO en bodega (recepciones
+#     cerradas). La qty_recibida dejó de ser dato muerto.
+#   · Despacho PARCIAL por cantidad, con remanente despachable después.
+#   · Ciclo de vida: en_preparacion (borrador) → cerrar → anulado (reversible solo
+#     en borrador). La línea recién voltea a 'despachado' al CERRAR, y solo cuando
+#     los despachos CERRADOS cubren la cantidad completa.
+#   · Flujo guía-primero: se crea SIN N° de guía; transportista/N° guía/N° de
+#     expedición se completan después con el PUT de cabecera.
+#   · Guía electrónica SII (Fase 5, monza_wasabil_dte/): con guía 52 VIVA no se
+#     anula el despacho ni se pisa su folio a mano (_guia_electronica_activa +
+#     _rechazar_si_pisa_folio, espejo de routers/despachos.py de GA).
+#   · Fase 6 (facturas 33): CERRAR con la guía 52 todavía sin folio SÍ se permite;
+#     el cierre solo registra un hecho físico. Quien bloquea es la EMISIÓN de la
+#     factura 33 (_guia_electronica_en_proceso en monza_wasabil_dte/router.py).
+#     El porqué de esa asimetría está en _cerrar_despacho_tx.
+#   · Concurrencia: FOR UPDATE + populate_existing + retry del correlativo/deadlock
+#     (regla de la casa: docs/regla-lecturas-de-plata.md).
+# Arquitectura espejo de routers/despachos.py (Grupo AM); diferencias de modelo:
+# la cotización ES la venta (no hay OcCliente) y la recepción apunta directo al ítem.
 
 def _gen_num_desp(db):
     anio = datetime.utcnow().year
     last = db.query(MonzaDespacho).filter(MonzaDespacho.numero.like(f"DSP-{anio}-%")).order_by(MonzaDespacho.id.desc()).first()
-    n = int(last.numero.split("-")[-1]) + 1 if last and last.numero else 1
-    return f"DSP-{anio}-{n:04d}"
+    n = 0
+    if last and last.numero:
+        # Espejo GA: un sufijo legado no numérico no debe tumbar la creación con 500;
+        # el fallback colisiona con el UNIQUE y el retry lo convierte en 409 controlado.
+        try:
+            n = int(last.numero.split("-")[-1])
+        except (ValueError, TypeError):
+            n = 0
+    return f"DSP-{anio}-{n + 1:04d}"
+
+
+# Estados de recepción cuyas unidades quedan UTILIZABLES en bodega. 'faltante' está
+# incluido porque su qty_recibida son las unidades que SÍ llegaron buenas (el faltante
+# se reclama aparte); 'no_llego' y 'danado_no_utilizable' aportan 0. Espejo de GA.
+_RECEPCION_UTILIZABLE = ("completo", "danado_utilizable", "sobrante", "faltante")
+
+
+def _qty_recibida_utilizable(db: Session, item_ids):
+    """{item_id: Σ qty_recibida utilizable} desde recepciones CERRADAS.
+
+    Es el TOPE FÍSICO del despacho: no se puede despachar más de lo que Bodega
+    recibió realmente. Solo aparecen los ítems que TIENEN registro de recepción —
+    un ítem sin recepción (flujo antiguo o carga manual) no se acota, para no
+    romper datos históricos.
+
+    Suma DOS fuentes en el MISMO dict por item_cotizacion_id: (1) recepciones de
+    EMBARQUE cerradas utilizables (internacional), (2) recepciones NACIONALES
+    cerradas utilizables. Aditivo y direccionalmente seguro: para un ítem nacional
+    solo puede BAJAR el tope (de 'todo lo vendido' a min(vendido, recibido)); no
+    toca los internacionales (fuente distinta, item_ids disjuntos por construcción
+    — el guard anti-embarque de abastecimiento/logística impide que un ítem
+    nacional entre a un embarque).
+
+    Compatibilidad con datos legados de Monza (solo fuente 1): qty_recibida era
+    Optional y las recepciones viejas pudieron cerrarse sin número. Con
+    qty_recibida NULL se interpreta por el estado: completo/sobrante = la cantidad
+    vendida completa; danado_utilizable = cantidad − qty_danada; faltante = 0 (no
+    se declaró cuánto llegó → conservador: no habilita despacho de mercadería no
+    verificada)."""
+    if not item_ids:
+        return {}
+    cant_por_item = {
+        i.id: (i.cantidad or 0)
+        for i in db.query(MonzaCotizacionItem).filter(MonzaCotizacionItem.id.in_(item_ids)).all()
+    }
+    # ── Fuente 1: embarques internacionales (SIN CAMBIOS) ──
+    rows = (
+        db.query(MonzaRecepcionItem)
+        .join(MonzaRecepcion, MonzaRecepcion.id == MonzaRecepcionItem.recepcion_id)
+        .filter(
+            MonzaRecepcionItem.item_id.in_(item_ids),
+            MonzaRecepcion.estado == "cerrada",
+            MonzaRecepcionItem.estado_recepcion.in_(_RECEPCION_UTILIZABLE),
+        )
+        .all()
+    )
+    result = {}
+    for ri in rows:
+        if ri.qty_recibida is not None:
+            qty = max(ri.qty_recibida, 0)
+        elif ri.estado_recepcion in ("completo", "sobrante"):
+            qty = cant_por_item.get(ri.item_id, 0)
+        elif ri.estado_recepcion == "danado_utilizable":
+            qty = max(cant_por_item.get(ri.item_id, 0) - (ri.qty_danada or 0), 0)
+        else:  # 'faltante' sin número declarado
+            qty = 0
+        result[ri.item_id] = result.get(ri.item_id, 0) + qty
+    # ── Fuente 2: recepciones NACIONALES (UNION aditivo) ──
+    # Import LOCAL (patrón probado bodega→despachos): monza_recepcion_nacional.models
+    # NO importa despachos → sin ciclo. Se reusa la MISMA constante
+    # _RECEPCION_UTILIZABLE (verbatim idéntica a RECEPCION_UTILIZABLE del paquete).
+    from monza_recepcion_nacional.models import MonzaRecepcionNacional, MonzaRecepcionNacionalItem
+    nac = (
+        db.query(MonzaRecepcionNacionalItem.item_cotizacion_id,
+                 MonzaRecepcionNacionalItem.qty_recibida)
+        .join(MonzaRecepcionNacional,
+              MonzaRecepcionNacional.id == MonzaRecepcionNacionalItem.recepcion_id)
+        .filter(
+            MonzaRecepcionNacionalItem.item_cotizacion_id.in_(item_ids),
+            MonzaRecepcionNacional.estado == "cerrada",
+            MonzaRecepcionNacionalItem.estado_recepcion.in_(_RECEPCION_UTILIZABLE),
+        )
+        .all()
+    )
+    for item_id, qty in nac:
+        if item_id is None:
+            continue
+        # float() en ambos operandos: evita mezclar Decimal (fuente nacional,
+        # Numeric(12,4)) con el valor previo (int de la fuente 1, qty_recibida es
+        # Integer en monza_recepcion_items) → nunca TypeError.
+        result[item_id] = float(result.get(item_id, 0)) + max(float(qty or 0), 0.0)
+    return result
+
+
+def _tope_fisico_de(item_id: int, cantidad, recibidos: dict):
+    """Igual que _tope_fisico pero por (id, cantidad) sueltos: lo usan las lecturas
+    en lote que traen tuplas y no objetos ORM (/counts). Misma fórmula, un solo
+    lugar donde vive la regla."""
+    cant = cantidad or 0
+    if item_id in recibidos:
+        return min(cant, recibidos[item_id])
+    return cant
+
+
+def _tope_fisico(item: MonzaCotizacionItem, recibidos: dict):
+    """Cantidad máxima despachable de la línea: lo RECIBIDO en bodega si hay
+    recepción registrada (capado a la cantidad vendida), o la cantidad de la
+    cotización si no la hay (comportamiento histórico)."""
+    return _tope_fisico_de(item.id, item.cantidad, recibidos)
+
+
+def _cupo_disponible(item_id: int, cantidad, recibidos: dict, ya: dict):
+    """Cupo REALMENTE despachable de una línea: tope físico − lo ya reservado o
+    despachado (borradores incluidos). Es la misma cuenta de /listos y del detalle
+    de avance, extraída para que los tableros (hallazgo #17) no la reimplementen."""
+    return max(_tope_fisico_de(item_id, cantidad, recibidos) - ya.get(item_id, 0), 0)
+
+
+def _ya_despachado_lote(db: Session, cot_ids) -> dict:
+    """{item_id: Σ qty} de despachos NO anulados de VARIAS ventas, en UNA query.
+    Versión en lote de _qty_already_dispatched para los tableros de solo lectura
+    (evita el N+1 de llamarlo por venta). Mismo criterio: un borrador reserva."""
+    result: dict = {}
+    if not cot_ids:
+        return result
+    rows = (
+        db.query(MonzaDespachoItem.item_id, MonzaDespachoItem.qty_despachada)
+        .join(MonzaDespacho, MonzaDespacho.id == MonzaDespachoItem.despacho_id)
+        .filter(MonzaDespacho.cotizacion_id.in_(list(cot_ids)),
+                MonzaDespacho.estado != "anulado")
+        .all()
+    )
+    for item_id, qty in rows:
+        result[item_id] = result.get(item_id, 0) + (qty or 0)
+    return result
+
+
+def _qty_already_dispatched(db: Session, cotizacion_id: int, con_lock: bool = False):
+    """{item_id: Σ qty_despachada} de despachos NO anulados de la venta.
+
+    Es el consumo de cupo del tope anti-sobredespacho: borradores y cerrados
+    consumen por igual (un borrador reserva mercadería). `con_lock=True` en la
+    creación: FOR UPDATE + populate_existing para validar contra lo COMMITEADO
+    más reciente y serializar dos despachos simultáneos de la misma venta."""
+    q = (
+        db.query(MonzaDespachoItem.item_id, MonzaDespachoItem.qty_despachada)
+        .join(MonzaDespacho, MonzaDespacho.id == MonzaDespachoItem.despacho_id)
+        .filter(MonzaDespacho.cotizacion_id == cotizacion_id, MonzaDespacho.estado != "anulado")
+    )
+    if con_lock:
+        q = q.populate_existing().with_for_update()
+    result = {}
+    for item_id, qty in q.all():
+        result[item_id] = result.get(item_id, 0) + (qty or 0)
+    return result
+
+
+def _qty_dispatched_closed(db: Session, cotizacion_id: int, con_lock: bool = False):
+    """Σ qty por ítem SOLO de despachos CERRADOS ('despachado').
+
+    Es la cobertura que decide el flip de la línea al cerrar: un despacho abierto
+    (en_preparacion) es un borrador anulable, no mercadería salida — contarlo
+    marcaría 'despachado' prematuro con tandas abiertas (lección G16 de GA)."""
+    q = (
+        db.query(MonzaDespachoItem.item_id, MonzaDespachoItem.qty_despachada)
+        .join(MonzaDespacho, MonzaDespacho.id == MonzaDespachoItem.despacho_id)
+        .filter(MonzaDespacho.cotizacion_id == cotizacion_id, MonzaDespacho.estado == "despachado")
+    )
+    if con_lock:
+        q = q.populate_existing().with_for_update()
+    result = {}
+    for item_id, qty in q.all():
+        result[item_id] = result.get(item_id, 0) + (qty or 0)
+    return result
+
+
+# ── Guard DURO del SPLIT de líneas (Fase 9b: envíos parciales) ─────────────────
+#
+# La partición de una línea de venta (MonzaCotizacionItem) en dos hermanas —
+# "se preparan 6 de 10, las 4 esperan el próximo AWB" — es segura mientras la
+# línea NO haya tocado todavía ningún documento ni cantidad congelada. Después
+# sí ROMPE, y de formas irreversibles:
+#
+#   · Bajar `cantidad` a posteriori hace que un despacho parcial ya existente
+#     CUBRA la línea y la voltee a 'despachado' prematuramente
+#     (_cerrar_despacho_tx: qty_total >= it.cantidad), y descuadra la reversa de
+#     _anular_despacho_tx (misma comparación al revés).
+#   · La guía 52 congela `quantity` y `price` en la respuesta de Wasabil, y el
+#     externalId de cada línea es el MonzaDespachoItem.id
+#     (monza_wasabil_dte/service.py): la factura 33 hace match 1:1 con la guía por
+#     ese id. Partir desincroniza el par guía↔factura y descuadra un documento
+#     tributario IRREVERSIBLE ante el SII.
+#   · Las recepciones (embarque y nacional) y los costos congelados
+#     (monza_emb_pricing_item / monza_cont_compra_item) apuntan al item_id: la
+#     hermana nueva nace sin esas filas, y el ítem original quedaría con una
+#     cantidad que ya no corresponde a lo recibido/costeado.
+#
+# Por eso el candado es un 409 y NO un clamp: no hay forma de "arreglar" un split
+# sobre un documento vivo, solo de no hacerlo. Se llama ANTES de mutar nada, desde
+# monza_router_abastecimiento._guard_duro_del_split — que es también quien decide a
+# QUÉ líneas aplicarlo (solo las que de verdad se parten) y quien re-toma el lock
+# después, porque este helper puede hacer rollback (ver el porqué más abajo).
+#
+# Vive en este módulo porque acá ya están los helpers de despacho y el import
+# local del módulo DTE, y la dirección de dependencia establecida es
+# abastecimiento/logística/bodega → despachos (despachos no importa ninguno).
+
+def _rechazar_split_sobre_documento(db: Session, item_ids) -> None:
+    """409 si alguna de las líneas pedidas ya no se puede PARTIR (7 comprobaciones).
+
+    Los 5 módulos satélite (contabilidad, recepción nacional, embarques pricing,
+    compras contab, DTE) pueden no tener su `init_db` corrido en un deploy: MySQL
+    1146 (tabla inexistente) significa que ese módulo JAMÁS registró nada que
+    proteger, así que la comprobación se apaga sola en vez de tumbar la operación
+    con un 500 (patrón ya escrito en _guia_electronica_activa). Ese rollback SUELTA
+    los locks del llamador: por eso _guard_duro_del_split re-toma el lock y re-valida
+    el estado al volver. En ese punto no se ha mutado nada todavía."""
+    if not item_ids:
+        return
+    ids = sorted({int(i) for i in item_ids})
+
+    # Etiquetas legibles para el mensaje (una query): el dueño necesita saber CUÁL
+    # repuesto bloquea, no un id.
+    etiquetas = {
+        iid: (parte or desc or f"ítem {iid}")
+        for iid, parte, desc in db.query(
+            MonzaCotizacionItem.id, MonzaCotizacionItem.numero_parte,
+            MonzaCotizacionItem.descripcion,
+        ).filter(MonzaCotizacionItem.id.in_(ids)).all()
+    }
+
+    def _nombres(offending) -> str:
+        return ", ".join(sorted(etiquetas.get(i, f"ítem {i}") for i in set(offending)))
+
+    def _opcional(fn):
+        """Comprobación cuyo módulo puede no estar instalado (tabla inexistente)."""
+        from sqlalchemy.exc import ProgrammingError
+        try:
+            return fn()
+        except ProgrammingError as e:
+            if getattr(getattr(e, "orig", None), "args", [None])[0] == 1146:
+                db.rollback()
+                return set()
+            raise
+
+    # 1) Despacho NO anulado (borrador incluido: un borrador reserva mercadería y su
+    #    qty ya se comparará contra la cantidad de la línea al cerrar).
+    con_despacho = {
+        r[0] for r in db.query(MonzaDespachoItem.item_id)
+        .join(MonzaDespacho, MonzaDespacho.id == MonzaDespachoItem.despacho_id)
+        .filter(MonzaDespachoItem.item_id.in_(ids),
+                MonzaDespacho.estado != "anulado").all()
+    }
+    if con_despacho:
+        raise HTTPException(
+            409,
+            f"No se puede partir: {_nombres(con_despacho)} ya tiene un despacho "
+            "registrado (aunque sea borrador). Anula el despacho primero.",
+        )
+
+    # 2) Guía electrónica 52 VIVA de CUALQUIER despacho de la línea, incluidos los
+    #    ANULADOS: el folio del SII sobrevive a la anulación del despacho, y ese
+    #    documento congeló cantidad y precio de esta línea. incluir_ambiguo=True por
+    #    el mismo motivo que anular (una emisión sin confirmar PUDO nacer con folio).
+    despachos_de_linea = {
+        r[0] for r in db.query(MonzaDespachoItem.despacho_id)
+        .filter(MonzaDespachoItem.item_id.in_(ids)).all() if r[0]
+    }
+    for dsp_id in sorted(despachos_de_linea):
+        dte = _opcional(lambda: _guia_electronica_activa(
+            db, dsp_id, incluir_ambiguo=True))
+        if dte:
+            raise HTTPException(
+                409,
+                "No se puede partir: hay una guía electrónica SII asociada a estas "
+                f"líneas (despacho {dsp_id}"
+                + (f", folio {dte.folio}" if getattr(dte, "folio", None) else "")
+                + "). El documento congeló cantidad y precio.",
+            )
+
+    # 3) Factura de cliente con esa línea (el 33 ya declaró cantidad × precio al SII).
+    facturados = _opcional(lambda: _split_ids_facturados(db, ids))
+    if facturados:
+        raise HTTPException(
+            409,
+            f"No se puede partir: {_nombres(facturados)} ya está facturado. "
+            "La factura congeló cantidad y precio de la línea.",
+        )
+
+    # 4) Recepción de EMBARQUE (cualquier estado, abierta incluida: el bodeguero ya
+    #    está contando físicamente contra la cantidad de esta línea).
+    recibidos = {
+        r[0] for r in db.query(MonzaRecepcionItem.item_id)
+        .filter(MonzaRecepcionItem.item_id.in_(ids)).all()
+    }
+    if recibidos:
+        raise HTTPException(
+            409,
+            f"No se puede partir: {_nombres(recibidos)} ya tiene recepción de "
+            "bodega registrada. Se parte ANTES de que la mercadería llegue.",
+        )
+
+    # 5) Recepción NACIONAL (camión + guía del proveedor, sin embarque).
+    nacionales = _opcional(lambda: _split_ids_recepcion_nacional(db, ids))
+    if nacionales:
+        raise HTTPException(
+            409,
+            f"No se puede partir: {_nombres(nacionales)} ya tiene recepción "
+            "nacional registrada.",
+        )
+
+    # 6) Costo INTERNACIONAL congelado (landed cost del embarque).
+    con_pricing = _opcional(lambda: _split_ids_pricing(db, ids))
+    if con_pricing:
+        raise HTTPException(
+            409,
+            f"No se puede partir: {_nombres(con_pricing)} ya tiene costo de "
+            "embarque congelado (Embarques Pricing).",
+        )
+
+    # 7) Costo NACIONAL congelado (línea de factura de compra).
+    con_costo = _opcional(lambda: _split_ids_costo_compra(db, ids))
+    if con_costo:
+        raise HTTPException(
+            409,
+            f"No se puede partir: {_nombres(con_costo)} ya tiene costo de compra "
+            "asignado (Compras y Pagos).",
+        )
+
+
+# Las 4 lecturas de tablas de módulos satélite van en funciones sueltas para que el
+# import LOCAL (anti-ciclo, patrón de la casa) quede al lado de su query y el
+# try/except ProgrammingError de arriba las envuelva a todas por igual.
+
+def _split_ids_facturados(db: Session, ids) -> set:
+    from monza_contabilidad.models import MonzaContFacturaClienteItem
+    return {
+        r[0] for r in db.query(MonzaContFacturaClienteItem.item_cotizacion_id)
+        .filter(MonzaContFacturaClienteItem.item_cotizacion_id.in_(ids)).all() if r[0]
+    }
+
+
+def _split_ids_recepcion_nacional(db: Session, ids) -> set:
+    from monza_recepcion_nacional.models import MonzaRecepcionNacionalItem
+    return {
+        r[0] for r in db.query(MonzaRecepcionNacionalItem.item_cotizacion_id)
+        .filter(MonzaRecepcionNacionalItem.item_cotizacion_id.in_(ids)).all() if r[0]
+    }
+
+
+def _split_ids_pricing(db: Session, ids) -> set:
+    from monza_embarques_pricing.models import MonzaEmbPricingItem
+    return {
+        r[0] for r in db.query(MonzaEmbPricingItem.item_cotizacion_id)
+        .filter(MonzaEmbPricingItem.item_cotizacion_id.in_(ids)).all() if r[0]
+    }
+
+
+def _split_ids_costo_compra(db: Session, ids) -> set:
+    from monza_compras_contab.models import MonzaContCompraItem
+    return {
+        r[0] for r in db.query(MonzaContCompraItem.item_cotizacion_id)
+        .filter(MonzaContCompraItem.item_cotizacion_id.in_(ids)).all() if r[0]
+    }
+
+
+# ── Tableros de avance (Fase 4 del espejo GA: G15b) ───────────────────────────
+# Buckets del pipeline por estado_linea REAL de Monza (espejo de _STATE_BUCKETS de
+# routers/despachos.py:57-74; los estados difieren porque el pipeline Monza es otro).
+_STATE_BUCKETS = {
+    "cotizado": "pendiente",
+    "por_comprar": "pendiente",
+    "comprado": "en_compras",
+    "preparado": "en_transito",
+    "embarcado": "en_transito",
+    "en_bodega": "en_bodega",
+    "despachado": "despachado",
+    "reclamo": "reclamo",
+}
+_BUCKET_ORDER = ["pendiente", "en_compras", "en_transito", "en_bodega", "despachado", "reclamo"]
+
+
+def _bucket_of(estado_linea):
+    return _STATE_BUCKETS.get(estado_linea or "", "pendiente")
+
+
+def _serialize_venta_card(c: MonzaCotizacion, cupos: Optional[dict] = None) -> dict:
+    """Card de avance de una VENTA para el tablero de despachos (espejo de
+    _serialize_oc_card de GA :315-413; aquí la cotización ES la venta).
+    Sin plazo crítico por ítem: MonzaCotizacionItem.plazo_entrega es texto libre
+    (String) y no se parsea — cuando exista un plazo estructurado por ítem, se
+    espeja el worst-case de GA (_item_deadline).
+
+    `cupos` (hallazgo #17): {item_id: qty despachable} precalculado en LOTE por el
+    llamador. Con ese dato la etiqueta distingue 'listo' de 'en_espera_stock' — una
+    línea puede seguir (correctamente) en_bodega porque le falta stock por llegar
+    mientras lo recibido YA se despachó, y ahí no hay nada que despachar aunque la
+    venta se pinte en la pestaña 'Listas'. `None` = comportamiento histórico (el
+    detalle de avance no lo necesita: ya publica qty_disponible por ítem)."""
+    items = c.items or []
+    total = len(items)
+    en_bodega = sum(1 for i in items if i.estado_linea == "en_bodega")
+    con_cupo = None if cupos is None else sum(
+        1 for i in items if i.estado_linea == "en_bodega" and cupos.get(i.id, 0) > 0)
+    despachados = sum(1 for i in items if i.estado_linea == "despachado")
+    progreso_estados = {b: 0 for b in _BUCKET_ORDER}
+    for it in items:
+        progreso_estados[_bucket_of(it.estado_linea)] += 1
+    dias_restantes = None
+    if c.fecha_entrega_est:
+        try:
+            dias_restantes = business_days_remaining(c.fecha_entrega_est)
+        except Exception:
+            dias_restantes = None
+    if total and despachados == total:
+        estado = "completado"
+    elif despachados > 0 and en_bodega > 0:
+        estado = "parcial"
+    elif en_bodega > 0:
+        # Hallazgo #17: en bodega SIN cupo despachable (lo recibido ya salió y el
+        # resto de la línea todavía no llega) no es "listo": el encargado abría la
+        # venta desde la pestaña Listas y no había nada que despachar. No se oculta
+        # la venta — esconder una venta parcialmente en bodega esperando stock sería
+        # peor —, se corrige la ETIQUETA.
+        estado = "listo" if (con_cupo is None or con_cupo > 0) else "en_espera_stock"
+    else:
+        estado = "pendiente"
+    return {
+        "id": c.id,
+        "numero": c.numero,
+        "oc_cliente": c.oc_cliente,
+        "oc_fecha": c.oc_fecha.isoformat() if c.oc_fecha else None,
+        "fecha_venta": c.fecha_venta.isoformat() if c.fecha_venta else None,
+        "fecha_entrega_est": c.fecha_entrega_est.isoformat() if c.fecha_entrega_est else None,
+        "cliente": {"nombre": c.cliente.nombre, "rut": c.cliente.rut} if c.cliente else None,
+        "vehiculo": c.vehiculo,
+        "total_items": total,
+        "items_en_bodega": en_bodega,
+        # Ítems en bodega con cupo REAL despachable (None si el llamador no precargó
+        # los cupos). Hallazgo #17: items_en_bodega solo cuenta estados de línea.
+        "items_con_cupo": con_cupo,
+        "items_despachados": despachados,
+        "items_no_disponibles": total - en_bodega - despachados,
+        "progreso_pct": int(despachados * 100 / total) if total else 0,
+        "progreso_estados": progreso_estados,
+        "estado": estado,
+        "dias_restantes": dias_restantes,
+    }
+
+
+@router.get("/avance")
+def avance_ventas(
+    tab: str = Query("listas"),
+    q: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user),
+):
+    """Tablero de avance por venta: listas | en_curso | historial (espejo de
+    /despachos/oc-clientes de GA :452-533). SOLO lectura, sin locks.
+    'historial' = ventas con ≥1 despacho CERRADO (≠ cot.estado=='despachado': una
+    venta parcialmente despachada aparece en historial aunque siga 'vendida')."""
+    if tab not in ("listas", "en_curso", "historial"):
+        raise HTTPException(400, f"tab inválido: {tab}")
+    cots = (
+        db.query(MonzaCotizacion)
+        .options(joinedload(MonzaCotizacion.cliente), joinedload(MonzaCotizacion.items))
+        .filter(MonzaCotizacion.estado.in_(("vendida", "despachado")))
+        .all()
+    )
+    # Precarga en LOTE (anti N+1): qué ventas tienen despachos abiertos/cerrados.
+    cot_ids = [c.id for c in cots]
+    con_abierto, con_cerrado = set(), set()
+    if cot_ids:
+        for cot_id, estado in (
+            db.query(MonzaDespacho.cotizacion_id, MonzaDespacho.estado)
+            .filter(MonzaDespacho.cotizacion_id.in_(cot_ids),
+                    MonzaDespacho.estado.in_(("en_preparacion", "despachado")))
+            .all()
+        ):
+            (con_abierto if estado == "en_preparacion" else con_cerrado).add(cot_id)
+
+    # Cupo real por ítem en bodega, en LOTE (hallazgo #17: sin esto la venta cuyo
+    # cupo ya se consumió se etiquetaba 'listo'). 2 queries extra para TODO el
+    # tablero, mismo patrón que /listos — nunca por venta.
+    items_en_bod = [i for c in cots for i in (c.items or []) if i.estado_linea == "en_bodega"]
+    recibidos = _qty_recibida_utilizable(db, [i.id for i in items_en_bod])
+    ya = _ya_despachado_lote(db, cot_ids)
+    cupos = {i.id: _cupo_disponible(i.id, i.cantidad, recibidos, ya) for i in items_en_bod}
+
+    result = []
+    for c in cots:
+        card = _serialize_venta_card(c, cupos)
+        if tab == "listas":
+            if card["items_en_bodega"] == 0 or card["estado"] == "completado":
+                continue
+        elif tab == "en_curso":
+            if c.id not in con_abierto:
+                continue
+        else:  # historial
+            if c.id not in con_cerrado:
+                continue
+        if q:
+            ql = q.lower()
+            haystack = " ".join([
+                card.get("numero") or "", (card.get("cliente") or {}).get("nombre") or "",
+                card.get("oc_cliente") or "", card.get("vehiculo") or "",
+            ]).lower()
+            if ql not in haystack:
+                continue
+        result.append(card)
+    # Urgente primero: fecha_entrega_est ascendente, sin fecha al final (espejo GA :532)
+    result.sort(key=lambda card: (card["fecha_entrega_est"] is None, card["fecha_entrega_est"] or ""))
+    return result
+
+
+@router.get("/avance/{cot_id}")
+def avance_venta_detalle(cot_id: int, db: Session = Depends(get_db), _=Depends(get_current_user)):
+    """Detalle de avance de UNA venta: card + ítems (bucket, despachado, disponible)
+    + despachos + embarques que trajeron sus ítems (espejo de oc_cliente_detail GA)."""
+    c = (
+        db.query(MonzaCotizacion)
+        .options(joinedload(MonzaCotizacion.cliente), joinedload(MonzaCotizacion.items))
+        .filter(MonzaCotizacion.id == cot_id)
+        .first()
+    )
+    if not c:
+        raise HTTPException(404, "Venta no encontrada")
+    card = _serialize_venta_card(c)
+
+    item_ids = [i.id for i in (c.items or [])]
+    recibidos = _qty_recibida_utilizable(db, item_ids)
+    ya = _qty_already_dispatched(db, c.id)
+    cerrados = _qty_dispatched_closed(db, c.id)
+    card["items"] = [{
+        "id": i.id, "descripcion": i.descripcion, "numero_parte": i.numero_parte,
+        "cantidad": i.cantidad, "estado_linea": i.estado_linea or "cotizado",
+        "bucket": _bucket_of(i.estado_linea),
+        "qty_despachada": cerrados.get(i.id, 0),
+        "qty_disponible": (
+            max(_tope_fisico(i, recibidos) - ya.get(i.id, 0), 0)
+            if i.estado_linea == "en_bodega" else 0
+        ),
+    } for i in (c.items or [])]
+
+    card["despachos"] = [
+        _despacho_entidad_dict(db, d)
+        for d in db.query(MonzaDespacho).filter(MonzaDespacho.cotizacion_id == c.id)
+        .order_by(MonzaDespacho.id.desc()).all()
+    ]
+
+    embarques = []
+    if item_ids:
+        emb_ids = {
+            r[0] for r in db.query(MonzaEmbarqueItem.embarque_id)
+            .filter(MonzaEmbarqueItem.item_id.in_(item_ids)).all()
+        }
+        if emb_ids:
+            counts = dict(
+                db.query(MonzaEmbarqueItem.embarque_id, func.count(MonzaEmbarqueItem.id))
+                .filter(MonzaEmbarqueItem.embarque_id.in_(emb_ids),
+                        MonzaEmbarqueItem.item_id.in_(item_ids))
+                .group_by(MonzaEmbarqueItem.embarque_id).all()
+            )
+            for e in db.query(MonzaEmbarque).filter(MonzaEmbarque.id.in_(emb_ids)).all():
+                embarques.append({
+                    "id": e.id, "numero": e.numero, "estado": e.estado,
+                    "awb": e.awb, "forwarder": e.forwarder, "tracking": e.tracking,
+                    # String(30) libre en el modelo: se entrega tal cual, sin parseo
+                    "fecha_llegada_est": e.fecha_llegada_est,
+                    "items_de_esta_venta": counts.get(e.id, 0),
+                })
+    card["embarques"] = embarques
+    return card
+
+
+@router.get("/counts")
+def counts_despachos(db: Session = Depends(get_db), _=Depends(get_current_user)):
+    """Contadores del tablero (espejo de /despachos/counts GA :417-449).
+
+    Hallazgo #17: 'listo' es lo que se puede DESPACHAR, no solo el estado de línea.
+    Un ítem en_bodega cuyo cupo ya se consumió (llegó parcial y esas unidades ya
+    salieron) inflaba el contador y mandaba al encargado a una venta vacía. Se
+    descuenta el cupo con la misma precarga en LOTE de /listos (2 queries extra
+    sobre los ítems en bodega, sin N+1). 'despachados' no cambia."""
+    filas = (
+        db.query(MonzaCotizacionItem.cotizacion_id, MonzaCotizacionItem.id,
+                 MonzaCotizacionItem.cantidad, MonzaCotizacionItem.estado_linea)
+        .join(MonzaCotizacion, MonzaCotizacion.id == MonzaCotizacionItem.cotizacion_id)
+        .filter(MonzaCotizacion.estado.in_(("vendida", "despachado")))
+        .all()
+    )
+    en_bod = [f for f in filas if f[3] == "en_bodega"]
+    recibidos = _qty_recibida_utilizable(db, [f[1] for f in en_bod])
+    ya = _ya_despachado_lote(db, {f[0] for f in en_bod})
+    con_cupo = [f for f in en_bod if _cupo_disponible(f[1], f[2], recibidos, ya) > 0]
+    return {
+        "ventas_listas": len({f[0] for f in con_cupo}),
+        "items_listos": len(con_cupo),
+        "items_despachados": sum(1 for f in filas if f[3] == "despachado"),
+    }
 
 
 @router.get("/listos")
 def listos_despacho(db: Session = Depends(get_db), _=Depends(get_current_user)):
-    """Cotizaciones con >=1 item en_bodega (listas para despachar)."""
+    """Cotizaciones con >=1 item en_bodega con cupo DISPONIBLE para despachar.
+
+    disponible = min(vendido, recibido en bodega) − ya reservado/despachado.
+    Un ítem con todo su cupo consumido por borradores o despachos cerrados ya no
+    aparece (antes se ofrecía la cantidad completa siempre)."""
     cots = (
         db.query(MonzaCotizacion)
         .options(joinedload(MonzaCotizacion.cliente), joinedload(MonzaCotizacion.items))
         .filter(MonzaCotizacion.estado == "vendida")
         .all()
     )
+    # Precarga en LOTE (anti N+1, patrón GA): recibidos y reservados de TODOS los
+    # ítems en bodega en 3 queries totales, no 2 por cotización.
+    todos_en_bod = [i for c in cots for i in c.items if i.estado_linea == "en_bodega"]
+    recibidos = _qty_recibida_utilizable(db, [i.id for i in todos_en_bod])
+    cot_ids = list({c.id for c in cots})
+    ya_global: dict = {}
+    if cot_ids:
+        rows = (
+            db.query(MonzaDespachoItem.item_id, MonzaDespachoItem.qty_despachada)
+            .join(MonzaDespacho, MonzaDespacho.id == MonzaDespachoItem.despacho_id)
+            .filter(MonzaDespacho.cotizacion_id.in_(cot_ids), MonzaDespacho.estado != "anulado")
+            .all()
+        )
+        for item_id, qty in rows:
+            ya_global[item_id] = ya_global.get(item_id, 0) + (qty or 0)
     out = []
     for c in cots:
         en_bod = [i for i in c.items if i.estado_linea == "en_bodega"]
         if not en_bod:
             continue
+        ya = ya_global
+        items_disp = []
+        for i in en_bod:
+            disponible = max(_tope_fisico(i, recibidos) - ya.get(i.id, 0), 0)
+            if disponible <= 0:
+                continue
+            items_disp.append({
+                "id": i.id, "descripcion": i.descripcion, "numero_parte": i.numero_parte,
+                "cantidad": i.cantidad, "qty_disponible": disponible,
+            })
+        if not items_disp:
+            continue
         total = len(c.items)
         out.append({
             "id": c.id, "numero": c.numero,
             "cliente": c.cliente.nombre if c.cliente else None,
-            "vehiculo": c.vehiculo, "total_items": total, "en_bodega": len(en_bod),
-            "listo_completo": len(en_bod) == total, "total_bruto": c.total_bruto,
-            "items": [{"id": i.id, "descripcion": i.descripcion, "numero_parte": i.numero_parte, "cantidad": i.cantidad} for i in en_bod],
+            "vehiculo": c.vehiculo, "total_items": total, "en_bodega": len(items_disp),
+            "listo_completo": len(items_disp) == total, "total_bruto": c.total_bruto,
+            "items": items_disp,
         })
     return out
 
 
+class CrearDespachoItem(BaseModel):
+    item_id: int
+    # int (la columna qty_despachada es Integer: un float como 2.5 se redondearía en
+    # silencio en MySQL). None = sentinela de la vía legada (item_ids): "todo el
+    # disponible". En la vía nueva, qty <= 0 se rechaza con 400 (espejo GA).
+    qty: Optional[int] = None
+
+
 class CrearDespachoBody(BaseModel):
     cotizacion_id: int
-    item_ids: List[int]
-    numero_guia: str = ""
+    # Vía nueva (parcial): items con cantidad explícita. Vía legada: item_ids solos
+    # → se despacha el DISPONIBLE completo de cada ítem (no la cantidad vendida:
+    # ese era el bug que permitía despachar más de lo recibido).
+    item_ids: List[int] = []
+    items: Optional[List[CrearDespachoItem]] = None
+    numero_guia: str = ""      # flujo guía-primero: puede (y suele) venir vacío
     transportista: str = ""
     destinatario: str = ""
     direccion_entrega: str = ""
@@ -182,46 +927,547 @@ class CrearDespachoBody(BaseModel):
 
 @router.post("/crear")
 def crear_despacho(body: CrearDespachoBody, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
-    cot = db.query(MonzaCotizacion).options(joinedload(MonzaCotizacion.cliente), joinedload(MonzaCotizacion.items)).filter(MonzaCotizacion.id == body.cotizacion_id).first()
+    # El correlativo DSP-AAAA-#### se calcula sin lock: si dos despachos simultáneos
+    # chocan en el UNIQUE de numero, se recalcula y reintenta (máx. 3) — espejo GA.
+    # También reintenta deadlock 1213/1205: crear lockea ítems y luego filas de
+    # despacho, mientras cerrar/anular lockean el despacho primero (orden inverso).
+    for _ in range(3):
+        try:
+            return _crear_despacho_tx(db, body, current_user)
+        except IntegrityError as e:
+            db.rollback()
+            if "numero" not in str(getattr(e, "orig", e)):
+                raise
+        except OperationalError as e:
+            db.rollback()
+            code = getattr(getattr(e, "orig", None), "args", [None])[0]
+            if code not in (1213, 1205):
+                raise
+    raise HTTPException(409, "No se pudo crear el despacho (creación simultánea): reintenta")
+
+
+def _crear_despacho_tx(db: Session, body: CrearDespachoBody, current_user):
+    cot = db.query(MonzaCotizacion).options(joinedload(MonzaCotizacion.cliente)).filter(MonzaCotizacion.id == body.cotizacion_id).first()
     if not cot:
         raise HTTPException(404, "Cotización no encontrada")
-    items = [i for i in cot.items if i.id in body.item_ids and i.estado_linea == "en_bodega"]
-    if not items:
-        raise HTTPException(400, "Sin ítems en bodega para despachar")
+
+    pedidos = body.items if body.items else [CrearDespachoItem(item_id=i) for i in body.item_ids]
+    if not pedidos:
+        raise HTTPException(400, "Debe incluir al menos 1 ítem")
+    ids_pedidos = [p.item_id for p in pedidos]
+    # Una línea por ítem: dos líneas del mismo ítem burlarían la validación de
+    # disponible (cada una se compararía sola contra el total).
+    if len(set(ids_pedidos)) != len(ids_pedidos):
+        raise HTTPException(400, "Hay ítems repetidos en el despacho: consolida la cantidad en una sola línea")
+
+    # FOR UPDATE sobre los ítems: serializa despachos concurrentes de la misma venta.
+    # populate_existing(): sin él, el identity map devolvería datos del snapshot viejo.
+    # La pertenencia a la cotización se valida en la MISMA query (filtro cotizacion_id).
+    items_db = (
+        db.query(MonzaCotizacionItem)
+        .filter(
+            MonzaCotizacionItem.id.in_(ids_pedidos),
+            MonzaCotizacionItem.cotizacion_id == cot.id,
+        )
+        .order_by(MonzaCotizacionItem.id.asc())
+        .populate_existing()
+        .with_for_update()
+        .all()
+    )
+    if len(items_db) != len(set(ids_pedidos)):
+        raise HTTPException(400, "Hay ítems que no pertenecen a esta cotización")
+    items_by_id = {i.id: i for i in items_db}
+
+    ya = _qty_already_dispatched(db, cot.id, con_lock=True)
+    recibidos = _qty_recibida_utilizable(db, ids_pedidos)
+
+    lineas = []   # (item, qty a despachar)
+    for p in pedidos:
+        it = items_by_id[p.item_id]
+        if it.estado_linea != "en_bodega":
+            raise HTTPException(400, f"Ítem '{it.descripcion}' no está en bodega (estado: {it.estado_linea})")
+        if p.qty is not None and p.qty <= 0:
+            # Espejo GA: una cantidad explícita inválida es error del cliente, no
+            # "todo el disponible" (eso reservaría cupo en silencio).
+            raise HTTPException(400, f"Cantidad inválida para '{it.descripcion}'")
+        tope = _tope_fisico(it, recibidos)
+        disponible = tope - ya.get(it.id, 0)
+        qty = p.qty if p.qty is not None else disponible   # None = vía legada: todo el disponible
+        if qty <= 0:
+            raise HTTPException(400, f"Sin cupo disponible para '{it.descripcion}' (ya reservado/despachado)")
+        if qty > disponible + 0.001:
+            if tope < (it.cantidad or 0):
+                raise HTTPException(
+                    400,
+                    f"Cantidad excede lo RECIBIDO en bodega para '{it.descripcion}' "
+                    f"(recibido: {tope}, disponible: {max(disponible, 0)})",
+                )
+            raise HTTPException(400, f"Cantidad excede disponible para '{it.descripcion}' (disp: {disponible})")
+        lineas.append((it, qty))
+
     dsp = MonzaDespacho(
         numero=_gen_num_desp(db), cotizacion_id=cot.id,
         cliente_nombre=cot.cliente.nombre if cot.cliente else None,
         numero_guia=body.numero_guia or None, transportista=body.transportista or None,
         destinatario=body.destinatario or None, direccion_entrega=body.direccion_entrega or None,
-        observaciones=body.observaciones or None, estado="despachado", asesor_email=current_user.email,
+        observaciones=body.observaciones or None,
+        estado="en_preparacion",   # borrador: la línea NO voltea hasta CERRAR
+        asesor_email=current_user.email,
     )
     db.add(dsp); db.flush()
-    for it in items:
-        it.estado_linea = "despachado"
-        db.add(MonzaDespachoItem(despacho_id=dsp.id, item_id=it.id, qty_despachada=it.cantidad or 1))
-    # Si todos los items quedaron despachados, marcar cotizacion despachada
-    db.flush()
-    if all((i.estado_linea == "despachado") for i in cot.items):
-        cot.estado = "despachado"
-        if not cot.fecha_despacho:
-            cot.fecha_despacho = datetime.utcnow().date()
-    db.commit(); db.refresh(dsp)
+    for it, qty in lineas:
+        db.add(MonzaDespachoItem(despacho_id=dsp.id, item_id=it.id, qty_despachada=qty))
+    # UN solo commit con el log adentro (patrón GA): nada de trabajo después del
+    # commit dentro de una función reintentada — un fallo posterior re-entraría la
+    # tx sobre un estado ya commiteado y devolvería un error falso por un éxito.
     from monza_models import MonzaLog
-    db.add(MonzaLog(user_email=current_user.email, accion="DESPACHADO", entidad="despacho", entidad_id=dsp.id, entidad_ref=dsp.numero, detalle=f"Despacho {dsp.numero} · {len(items)} ítem(s) · {cot.numero}"))
+    db.add(MonzaLog(user_email=current_user.email, accion="CREATE", entidad="despacho", entidad_id=dsp.id, entidad_ref=dsp.numero, detalle=f"Despacho {dsp.numero} creado (en preparación) · {len(lineas)} ítem(s) · {cot.numero}"))
     db.commit()
-    crear_notif(db, f"Despacho realizado · {dsp.numero}", f"{cot.numero} — {len(items)} ítem(s) despachado(s)", "success", "/monzaparts/despachos", "despacho", dsp.id)
-    return {"ok": True, "id": dsp.id, "numero": dsp.numero, "items": len(items)}
+    return {"ok": True, "id": dsp.id, "numero": dsp.numero, "items": len(lineas), "estado": "en_preparacion"}
+
+
+def _despacho_entidad_dict(db: Session, d: MonzaDespacho, con_items: bool = False) -> dict:
+    cot = db.query(MonzaCotizacion).filter(MonzaCotizacion.id == d.cotizacion_id).first() if d.cotizacion_id else None
+    out = {
+        "id": d.id, "numero": d.numero, "cotizacion_id": d.cotizacion_id,
+        "cotizacion_numero": cot.numero if cot else None,
+        "cliente_nombre": d.cliente_nombre, "numero_guia": d.numero_guia,
+        "fecha_guia": d.fecha_guia.isoformat() if d.fecha_guia else None,
+        "transportista": d.transportista, "destinatario": d.destinatario,
+        "direccion_entrega": d.direccion_entrega, "observaciones": d.observaciones,
+        "estado": d.estado, "numero_expedicion": d.numero_expedicion,
+        "fecha": d.fecha.isoformat() if d.fecha else None,
+        "fecha_despacho": d.fecha_despacho.isoformat() if d.fecha_despacho else None,
+    }
+    if con_items:
+        dis = db.query(MonzaDespachoItem).filter(MonzaDespachoItem.despacho_id == d.id).all()
+        its = {
+            i.id: i for i in db.query(MonzaCotizacionItem)
+            .filter(MonzaCotizacionItem.id.in_([x.item_id for x in dis] or [0])).all()
+        }
+        out["items"] = [{
+            "id": di.id, "item_id": di.item_id, "qty_despachada": di.qty_despachada,
+            "descripcion": its[di.item_id].descripcion if di.item_id in its else None,
+            "numero_parte": its[di.item_id].numero_parte if di.item_id in its else None,
+            "cantidad_vendida": its[di.item_id].cantidad if di.item_id in its else None,
+        } for di in dis]
+    else:
+        out["items_count"] = db.query(func.count(MonzaDespachoItem.id)).filter(MonzaDespachoItem.despacho_id == d.id).scalar() or 0
+    return out
 
 
 @router.get("/entidades")
-def list_despachos(db: Session = Depends(get_db), _=Depends(get_current_user)):
+def list_despachos_entidades(db: Session = Depends(get_db), _=Depends(get_current_user)):
+    # Los borradores (en_preparacion) SIEMPRE completos + los últimos 100 del resto:
+    # un borrador antiguo jamás desaparece del panel que permite confirmarlo/anularlo.
+    abiertos = (
+        db.query(MonzaDespacho).filter(MonzaDespacho.estado == "en_preparacion")
+        .order_by(MonzaDespacho.id.desc()).all()
+    )
+    resto = (
+        db.query(MonzaDespacho).filter(MonzaDespacho.estado != "en_preparacion")
+        .order_by(MonzaDespacho.id.desc()).limit(100).all()
+    )
+    ds = abiertos + resto
+    # Precarga en LOTE (anti N+1): números de cotización y conteo de ítems en 2 queries.
+    cot_nums = {}
+    cids = list({d.cotizacion_id for d in ds if d.cotizacion_id})
+    if cids:
+        cot_nums = dict(
+            db.query(MonzaCotizacion.id, MonzaCotizacion.numero)
+            .filter(MonzaCotizacion.id.in_(cids)).all()
+        )
+    counts = {}
+    dids = [d.id for d in ds]
+    if dids:
+        counts = dict(
+            db.query(MonzaDespachoItem.despacho_id, func.count(MonzaDespachoItem.id))
+            .filter(MonzaDespachoItem.despacho_id.in_(dids))
+            .group_by(MonzaDespachoItem.despacho_id).all()
+        )
     out = []
-    for d in db.query(MonzaDespacho).order_by(MonzaDespacho.id.desc()).limit(100).all():
-        n = db.query(func.count(MonzaDespachoItem.id)).filter(MonzaDespachoItem.despacho_id == d.id).scalar() or 0
+    for d in sorted(ds, key=lambda x: x.id, reverse=True):
         out.append({
             "id": d.id, "numero": d.numero, "cotizacion_id": d.cotizacion_id,
+            "cotizacion_numero": cot_nums.get(d.cotizacion_id),
             "cliente_nombre": d.cliente_nombre, "numero_guia": d.numero_guia,
+            "fecha_guia": d.fecha_guia.isoformat() if d.fecha_guia else None,
             "transportista": d.transportista, "destinatario": d.destinatario,
-            "items_count": n, "fecha": d.fecha.isoformat() if d.fecha else None,
+            "direccion_entrega": d.direccion_entrega, "observaciones": d.observaciones,
+            "estado": d.estado, "numero_expedicion": d.numero_expedicion,
+            "fecha": d.fecha.isoformat() if d.fecha else None,
+            "fecha_despacho": d.fecha_despacho.isoformat() if d.fecha_despacho else None,
+            "items_count": counts.get(d.id, 0),
         })
     return out
+
+
+@router.get("/entidades/{despacho_id}")
+def get_despacho_entidad(despacho_id: int, db: Session = Depends(get_db), _=Depends(get_current_user)):
+    d = db.query(MonzaDespacho).filter(MonzaDespacho.id == despacho_id).first()
+    if not d:
+        raise HTTPException(404, "Despacho no encontrado")
+    return _despacho_entidad_dict(db, d, con_items=True)
+
+
+def _guia_electronica_activa(db: Session, despacho_id: int, con_lock: bool = False,
+                             incluir_ambiguo: bool = False):
+    """Guía electrónica (SII 52) VIVA del despacho: emitida, en vuelo (claim) o en
+    proceso en Wasabil. Mientras exista, las operaciones que la dejarían huérfana o
+    pisarían su folio (anular el despacho, editar el N° de guía a mano) se rechazan:
+    el folio es un documento tributario legal y su anulación se gestiona en Wasabil.
+    Un DTE FALLIDO (rechazado por el SII, sin folio) no bloquea nada.
+
+    `con_lock=True` (anular): lee con FOR UPDATE + populate_existing para ver el
+    claim/estado COMMITEADO más reciente aunque la transacción tenga un snapshot
+    anterior — cierra la carrera anular ↔ emitir.
+
+    `incluir_ambiguo=True` (SOLO anular, hallazgos #2/#3 de la auditoría integral):
+    además cuenta como viva la emisión AMBIGUA — uuid NULL pero `en_vuelo_desde`
+    puesto — aunque su claim ya haya VENCIDO por TTL. Ahí Wasabil cortó la
+    comunicación sin confirmar nada: el documento PUDO nacer con folio real en el
+    SII. Decidir por TTL dejaba anular el despacho, liberaba la mercadería y
+    habilitaba una SEGUNDA guía 52 por lo mismo (irreversible), además de dejar el
+    documento sin recuperación. Es el mismo criterio de _bloqueo_dte_factura
+    (monza_contabilidad/router.py). El fallo CONFIRMADO no queda atrapado:
+    _emitir_en_wasabil limpia `en_vuelo_desde` cuando el error NO es ambiguo, así
+    que un DTE fallido sigue permitiendo anular (el despacho nunca es imborrable).
+    Por defecto False: el PUT de numero_guia (_rechazar_si_pisa_folio) y la señal
+    informativa del cierre (_guia_sii_en_proceso) NO son irreversibles y ahí el
+    criterio por TTL es el correcto — no se deben endurecer.
+
+    Espejo de routers/despachos.py:_guia_electronica_activa de GA sobre el modelo
+    Monza. Import LOCAL del paquete monza_wasabil_dte para no crear un ciclo de
+    imports con el módulo DTE (y no cargarlo en los caminos que no lo necesitan)."""
+    from sqlalchemy.exc import ProgrammingError
+    from monza_wasabil_dte.models import (
+        MonzaWasabilDte, STATUS_EMITIDO, STATUS_PROCESANDO, STATUS_PENDIENTE,
+    )
+    from monza_wasabil_dte.service import TIPO_DOC_GUIA, claim_vigente
+    q = (
+        db.query(MonzaWasabilDte)
+        .filter(MonzaWasabilDte.despacho_id == despacho_id,
+                MonzaWasabilDte.tipo_dte == TIPO_DOC_GUIA)
+    )
+    if con_lock:
+        q = q.populate_existing().with_for_update()
+    try:
+        dte = q.first()
+    except ProgrammingError as e:
+        # Tabla monza_wasabil_dte inexistente (MySQL 1146): deploy sin correr el
+        # init_db del módulo. Sin tabla JAMÁS hubo emisión que proteger → el guard
+        # se apaga solo en vez de tumbar anular/editar con 500 (hallazgo del
+        # multienjambre F5). Cualquier otro error de programación sí propaga.
+        # OJO: NO se cortocircuita por MONZA_CONTAB_ENABLED — apagar el gate con
+        # guías ya emitidas dejaría anular una guía SII viva.
+        if getattr(getattr(e, "orig", None), "args", [None])[0] == 1146:
+            db.rollback()
+            return None
+        raise
+    if not dte:
+        return None
+    if dte.status_id == STATUS_EMITIDO:
+        return dte
+    if claim_vigente(dte):
+        return dte
+    if dte.uuid and dte.status_id in (STATUS_PROCESANDO, STATUS_PENDIENTE):
+        return dte
+    # Emisión AMBIGUA con el claim ya vencido (hallazgos #2/#3): sin uuid no sabemos
+    # si el documento existe, pero `en_vuelo_desde` dice que el POST salió y nadie
+    # confirmó el resultado. Solo bloquea a quien lo pide (anular).
+    if incluir_ambiguo and dte.uuid is None and dte.en_vuelo_desde is not None:
+        return dte
+    return None
+
+
+def _guia_sii_en_proceso(db: Session, despacho_id: int, con_lock: bool = False) -> bool:
+    """True si el despacho tiene guía electrónica 52 VIVA pero TODAVÍA SIN FOLIO
+    (pendiente/procesando en Wasabil, o claim de emisión en vuelo).
+
+    Es la ventana peligrosa de la Fase 6: en ella `numero_guia` aún conserva lo que
+    el operador haya tecleado a mano (el módulo Wasabil lo pisa con el folio real
+    recién al confirmarse la emisión, monza_wasabil_dte/router.py), así que una
+    factura 33 emitida en esa ventana referenciaría al SII un folio 52 que el SII
+    NO reconoce — y eso es irreversible.
+
+    Con folio ya asignado (guía emitida) devuelve False: ahí `numero_guia` ES el
+    folio real y la referencia 52 de la factura es legítima. Una guía FALLIDA sin
+    uuid ni claim tampoco está "en proceso" (no hay guía electrónica y el N° manual
+    vuelve a ser la referencia válida): esa direccionalidad la resuelve
+    _guia_electronica_activa y NO se debe invertir.
+
+    Señal INFORMATIVA para el cierre (ver _cerrar_despacho_tx). El guard que
+    BLOQUEA de verdad vive en la emisión de la factura 33
+    (_guia_electronica_en_proceso, monza_wasabil_dte/router.py), que es donde
+    ocurre la acción irreversible. Espejo del espíritu de GA (commit a0d4671)."""
+    dte = _guia_electronica_activa(db, despacho_id, con_lock=con_lock)
+    return bool(dte and not (dte.folio or "").strip())
+
+
+def _rechazar_si_pisa_folio(db: Session, d: MonzaDespacho, numero_guia_nuevo: Optional[str]):
+    """Bloquea el cambio manual de numero_guia cuando el despacho tiene guía
+    electrónica viva (el N° correcto es el folio del SII, lo escribe el módulo
+    Wasabil). Dejar pasar el mismo valor actual es inofensivo (no-op).
+
+    Espejo de routers/despachos.py:_rechazar_si_pisa_folio de GA."""
+    if (numero_guia_nuevo or "") == (d.numero_guia or ""):
+        return
+    dte = _guia_electronica_activa(db, d.id)
+    if not dte:
+        return
+    if dte.folio:
+        raise HTTPException(
+            409,
+            f"Este despacho tiene guía electrónica SII emitida (folio {dte.folio}): "
+            "el N° de guía no se edita a mano",
+        )
+    raise HTTPException(
+        409,
+        "Este despacho tiene una emisión de guía SII en curso: el N° de guía "
+        "quedará fijado por el folio del SII al terminar",
+    )
+
+
+class ActualizarDespachoBody(BaseModel):
+    numero_guia: Optional[str] = None
+    # Fecha de EMISIÓN de la guía ante el SII (YYYY-MM-DD), sólo para guía EN PAPEL.
+    # Tri-estado gracias a exclude_unset: ausente = no tocar · "2026-07-15" = fijar ·
+    # null/"" = borrar. Ver _parse_fecha_guia y monza_models.MonzaDespacho.fecha_guia.
+    fecha_guia: Optional[str] = None
+    transportista: Optional[str] = None
+    numero_expedicion: Optional[str] = None
+    destinatario: Optional[str] = None
+    direccion_entrega: Optional[str] = None
+    observaciones: Optional[str] = None
+
+
+@router.put("/entidades/{despacho_id}")
+def actualizar_despacho(despacho_id: int, body: ActualizarDespachoBody, db: Session = Depends(get_db), _=Depends(get_current_user)):
+    """Cabecera editable incluso cerrado: el transportista y el N° de expedición
+    suelen llegar DESPUÉS del despacho (flujo guía-primero). Con guía electrónica
+    SII viva (Fase 5) el folio queda protegido: _rechazar_si_pisa_folio bloquea
+    solo el cambio manual de numero_guia, el resto de la cabecera sigue editable."""
+    d = db.query(MonzaDespacho).filter(MonzaDespacho.id == despacho_id).first()
+    if not d:
+        raise HTTPException(404, "Despacho no encontrado")
+    if d.estado == "anulado":
+        raise HTTPException(400, "No se puede editar un despacho anulado")
+    cambios = body.dict(exclude_unset=True)
+    if "numero_guia" in cambios:
+        _rechazar_si_pisa_folio(db, d, cambios["numero_guia"])
+    # fecha_guia llega como texto y la columna es Date: se convierte y valida ANTES del
+    # setattr genérico (si no, SQLAlchemy guardaría el string crudo). Se saca del dict para
+    # que el bucle de abajo no la pise con el valor sin parsear.
+    if "fecha_guia" in cambios:
+        d.fecha_guia = _parse_fecha_guia(cambios.pop("fecha_guia"))
+    for field, value in cambios.items():
+        setattr(d, field, value)
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/entidades/{despacho_id}/cerrar")
+def cerrar_despacho(despacho_id: int, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    # Retry 1213/1205 (regla de la casa): cerrar toma locks (despacho + ítems) y puede
+    # caer víctima de un deadlock contra crear/anular concurrentes.
+    for _ in range(3):
+        try:
+            return _cerrar_despacho_tx(db, despacho_id, current_user)
+        except OperationalError as e:
+            db.rollback()
+            code = getattr(getattr(e, "orig", None), "args", [None])[0]
+            if code not in (1213, 1205):
+                raise
+    raise HTTPException(409, "Conflicto de concurrencia al cerrar el despacho: reintenta")
+
+
+def _cerrar_despacho_tx(db: Session, despacho_id: int, current_user):
+    d = (
+        db.query(MonzaDespacho)
+        .filter(MonzaDespacho.id == despacho_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
+    if not d:
+        raise HTTPException(404, "Despacho no encontrado")
+    if d.estado != "en_preparacion":
+        raise HTTPException(400, "Solo se pueden cerrar despachos en preparación")
+
+    # ── DECISIÓN FASE 6 · guía 52 en proceso: el cierre NO se bloquea ──────────
+    # La trampa: cerrar deja el despacho 'despachado', que es el ÚNICO estado
+    # facturable, mientras la guía electrónica sigue sin folio y `numero_guia`
+    # conserva el N° tecleado VIEJO. De ahí saldría una factura 33 REAL con una
+    # referencia 52 a un folio que el SII no reconoce (irreversible).
+    #
+    # Se evaluaron las dos salidas y se eligió la de MENOR RIESGO OPERATIVO:
+    #   (A) BLOQUEAR el cierre mientras la guía no tenga folio — DESCARTADA. El
+    #       cierre registra un HECHO FÍSICO (la mercadería salió) y quedaría
+    #       rehén de un sistema externo: un DTE atascado en pendiente(6) o en un
+    #       fallo ambiguo dejaría el despacho imposible de cerrar, la línea sin
+    #       voltear a 'despachado', la venta sin cerrar y la mercadería trabada,
+    #       sin escape para bodega. Anular tampoco es salida (ya está bloqueado
+    #       con guía viva, y con razón: destruiría un documento tributario).
+    #   (B) PERMITIR el cierre y bloquear la EMISIÓN de la factura 33 mientras la
+    #       guía esté en proceso — ELEGIDA. El guard vive donde ocurre la acción
+    #       irreversible (monza_wasabil_dte/router.py: _guia_electronica_en_proceso,
+    #       en el preview y en el armado del payload), con una salida natural:
+    #       esperar el folio, que llega solo. Nada queda trabado en bodega.
+    #       Es exactamente lo que hizo Grupo AM en el commit a0d4671.
+    #
+    # Desde acá se aporta la SEÑAL, no el candado: se avisa al operador (respuesta,
+    # log y notificación) para que no intente facturar todavía. Si esta señal se
+    # perdiera, el sistema sigue siendo seguro — el candado del 33 es el que manda.
+    #
+    # Lectura BAJO LOCK y ANTES de mutar nada: el orden despacho → dte es el mismo
+    # de _anular_despacho_tx y de _reclamar_emision (anti-deadlock). Si la tabla del
+    # módulo DTE no existiera (deploy sin init_db), el helper hace rollback y
+    # devuelve None: como todavía no se ha mutado nada, basta con re-exigir el
+    # estado para que un lock perdido no permita un doble cierre.
+    guia_en_proceso = _guia_sii_en_proceso(db, d.id, con_lock=True)
+    if d.estado != "en_preparacion":
+        raise HTTPException(400, "Solo se pueden cerrar despachos en preparación")
+    aviso = None
+    if guia_en_proceso:
+        aviso = ("La guía electrónica SII de este despacho aún no tiene folio "
+                 "(emisión en proceso): espera a que quede Emitida antes de facturar.")
+
+    dis = db.query(MonzaDespachoItem).filter(MonzaDespachoItem.despacho_id == d.id).all()
+    item_ids = sorted({di.item_id for di in dis if di.item_id})
+    items_db = []
+    if item_ids:
+        # Orden id ASC = orden canónico de lock de la casa (anti-deadlock).
+        items_db = (
+            db.query(MonzaCotizacionItem)
+            .filter(MonzaCotizacionItem.id.in_(item_ids))
+            .order_by(MonzaCotizacionItem.id.asc())
+            .populate_existing()
+            .with_for_update()
+            .all()
+        )
+
+    # CERRAR PRIMERO y flush: la cobertura de abajo cuenta SOLO despachos cerrados
+    # (incluido este). La línea voltea a 'despachado' únicamente cuando queda
+    # cubierta completa — un cierre parcial deja el remanente en bodega.
+    d.estado = "despachado"
+    d.fecha_despacho = datetime.utcnow()
+    db.flush()
+
+    qty_total = _qty_dispatched_closed(db, d.cotizacion_id, con_lock=True)
+    for it in items_db:
+        if it.estado_linea == "en_bodega" and qty_total.get(it.id, 0) + 0.001 >= (it.cantidad or 0):
+            it.estado_linea = "despachado"
+
+    # La VENTA queda 'despachada' solo cuando TODAS sus líneas lo están (igual que
+    # el flujo histórico, pero ahora la condición se evalúa al cerrar).
+    cot = db.query(MonzaCotizacion).options(joinedload(MonzaCotizacion.items)).filter(MonzaCotizacion.id == d.cotizacion_id).first()
+    if cot:
+        db.flush()
+        if cot.items and all(i.estado_linea == "despachado" for i in cot.items):
+            cot.estado = "despachado"
+            if not cot.fecha_despacho:
+                cot.fecha_despacho = datetime.utcnow().date()
+    # UN solo commit con el log adentro (patrón GA): un fallo después del commit
+    # dentro de la función reintentada re-entraría la tx, vería el despacho ya
+    # cerrado y devolvería un 400 falso por un cierre que SÍ ocurrió.
+    from monza_models import MonzaLog
+    numero_cot = cot.numero if cot else ""
+    db.add(MonzaLog(user_email=current_user.email, accion="DESPACHADO", entidad="despacho", entidad_id=d.id, entidad_ref=d.numero, detalle=f"Despacho {d.numero} confirmado · {len(dis)} ítem(s)" + (f" · {numero_cot}" if numero_cot else "") + (" · guía SII en proceso (sin folio): no facturar aún" if guia_en_proceso else "")))
+    db.commit()
+    crear_notif(db, f"Despacho confirmado · {d.numero}", f"{numero_cot} — {len(dis)} ítem(s) despachado(s)" + (f" · {aviso}" if aviso else ""), "success", "/monzaparts/despachos", "despacho", d.id)
+    return {"ok": True, "numero": d.numero, "guia_sii_en_proceso": guia_en_proceso, "aviso": aviso}
+
+
+@router.delete("/entidades/{despacho_id}")
+def anular_despacho(despacho_id: int, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    # Retry 1213/1205 (regla de la casa): anular toma los mismos locks que cerrar
+    # (despacho + ítems) y puede caer en deadlock contra crear/cerrar concurrentes.
+    for _ in range(3):
+        try:
+            return _anular_despacho_tx(db, despacho_id, current_user)
+        except OperationalError as e:
+            db.rollback()
+            code = getattr(getattr(e, "orig", None), "args", [None])[0]
+            if code not in (1213, 1205):
+                raise
+    raise HTTPException(409, "Conflicto de concurrencia al anular el despacho: reintenta")
+
+
+def _anular_despacho_tx(db: Session, despacho_id: int, current_user):
+    d = (
+        db.query(MonzaDespacho)
+        .filter(MonzaDespacho.id == despacho_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
+    if not d:
+        raise HTTPException(404, "Despacho no encontrado")
+    if d.estado != "en_preparacion":
+        raise HTTPException(400, "Solo se pueden anular despachos en preparación")
+    # La guía 52 se emite con el despacho aún en preparación: anular acá dejaría un
+    # documento tributario legal huérfano y la mercadería libre para emitir OTRA
+    # guía por lo mismo (doble emisión ante el SII). Se bloquea mientras la guía viva.
+    # El FOR UPDATE del despacho de arriba serializa contra _reclamar_emision (que
+    # también lo bloquea); con_lock=True relee el DTE con FOR UPDATE + populate_existing
+    # (espejo de routers/despachos.py:anular_despacho de GA).
+    # incluir_ambiguo=True (hallazgos #2/#3): un claim VENCIDO sobre una emisión que
+    # Wasabil nunca confirmó (uuid NULL + en_vuelo_desde puesto) también bloquea; si
+    # no, la mercadería volvía a bodega y salía una SEGUNDA guía 52 real al SII.
+    dte = _guia_electronica_activa(db, d.id, con_lock=True, incluir_ambiguo=True)
+    if dte:
+        if dte.folio:
+            raise HTTPException(
+                409,
+                f"Este despacho tiene guía electrónica SII emitida (folio {dte.folio}): "
+                "anúlala primero en Wasabil (anulación/nota de crédito) y luego anula el despacho",
+            )
+        # Import LOCAL (mismo motivo que en _guia_electronica_activa: evitar el ciclo
+        # con el módulo DTE). Solo se llega acá con el DTE ya leído, nunca sin tabla.
+        from monza_wasabil_dte.service import claim_vigente
+        if dte.uuid is None and dte.en_vuelo_desde is not None and not claim_vigente(dte):
+            # Ambiguo con claim vencido: "esperar" ya no resuelve nada, la única
+            # salida es Reintentar (adopta el documento si existe, o re-emite tras
+            # confirmar su ausencia). Texto espejo del de facturas.
+            raise HTTPException(
+                409,
+                "No hay confirmación de Wasabil sobre esta emisión (se cortó la comunicación): "
+                "la guía PUEDE existir ya ante el SII. Usa Reintentar para que el sistema lo "
+                "verifique; si confirma que no se emitió, podrás anular",
+            )
+        raise HTTPException(
+            409,
+            "Este despacho tiene una emisión de guía SII en curso: espera el resultado "
+            "(Emitida o Fallida) antes de anular",
+        )
+    d.estado = "anulado"
+    db.flush()
+    # Red de seguridad (espejo GA): si alguna línea quedó 'despachado' sin cobertura
+    # completa de despachos CERRADOS (reversa de este anular o estado atascado
+    # legado), vuelve a bodega; y si la venta estaba 'despachado' pero ya no todas
+    # sus líneas lo están, vuelve a 'vendida'. Se evalúa SIEMPRE (no solo cuando
+    # este anular revierte algo): también repara datos atascados de antes.
+    dis = db.query(MonzaDespachoItem).filter(MonzaDespachoItem.despacho_id == d.id).all()
+    item_ids = sorted({di.item_id for di in dis if di.item_id})
+    if item_ids:
+        qty_total = _qty_dispatched_closed(db, d.cotizacion_id)
+        items_db = (
+            db.query(MonzaCotizacionItem)
+            .filter(MonzaCotizacionItem.id.in_(item_ids))
+            .order_by(MonzaCotizacionItem.id.asc())
+            .populate_existing()
+            .with_for_update()
+            .all()
+        )
+        for it in items_db:
+            if it.estado_linea == "despachado" and qty_total.get(it.id, 0) + 0.001 < (it.cantidad or 0):
+                it.estado_linea = "en_bodega"
+        db.flush()
+        cot = db.query(MonzaCotizacion).options(joinedload(MonzaCotizacion.items)).filter(MonzaCotizacion.id == d.cotizacion_id).first()
+        if cot and cot.estado == "despachado" and any(i.estado_linea != "despachado" for i in cot.items):
+            cot.estado = "vendida"
+    # UN solo commit con el log adentro (patrón GA, igual que crear/cerrar).
+    from monza_models import MonzaLog
+    db.add(MonzaLog(user_email=current_user.email, accion="ANULADO", entidad="despacho", entidad_id=d.id, entidad_ref=d.numero, detalle=f"Despacho {d.numero} anulado (borrador)"))
+    db.commit()
+    return {"ok": True}

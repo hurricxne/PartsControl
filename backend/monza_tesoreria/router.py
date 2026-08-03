@@ -7,7 +7,9 @@ SOLO MonzaParts: candado require_empresa("automotriz") a nivel de router.
   1. APROBACIONES  — cola de adelantos 50% informados por Comercial; Tesorería DA LA
      ORDEN (escribe monza_cont_adelanto + adelanto_verificado=1, misma regla de negocio
      que el endpoint histórico de Ventas-Contab; el cortafuego de Abastecimiento no
-     cambia). Incluye sugerencia de abono en cartola si ya llegó la plata.
+     cambia) y APLICA el adelanto de inmediato a las facturas ya emitidas de la venta
+     (espejo GA; si la factura viene después, la aplica crear_factura de contabilidad).
+     Incluye sugerencia de abono en cartola si ya llegó la plata.
   2. POR PAGAR / APROBAR PAGOS — cola de compras con saldo (registradas en Compras/CxP
      con pago futuro o parcial). Tesorería DA LA ORDEN del pago: crea el Comprobante
      de Egreso con la MISMA regla de negocio que Compras (reusa `_crear_egreso` de
@@ -21,6 +23,7 @@ SOLO MonzaParts: candado require_empresa("automotriz") a nivel de router.
   4. FLUJO DE CAJA — proyección NIC 7 de salidas (Compras por pagar) vs entradas
      (facturas por cobrar + adelantos por aprobar), solo lectura.
 """
+import logging
 from collections import Counter
 from datetime import date, datetime, timezone
 from typing import Optional
@@ -40,7 +43,27 @@ from monza_models import MonzaCotizacion
 # monza_compras_contab. La orden de pago de Tesorería reusa la regla de negocio de
 # Compras (`_crear_egreso`: una sola fuente de verdad).
 from monza_contabilidad.models import MonzaContAdelanto, MonzaContFacturaCliente, MonzaContCobranza, MonzaContFactoring
-from monza_contabilidad.service import estado_adelanto, TOL_PAGO, TOL as TOL_CONTAB, _f as _fc, MEDIO_ADELANTO
+from monza_contabilidad.service import (
+    # TOL_PAGO (holgura del tope) y TOL (tolerancia de plata) ya NO se importan acá: los
+    # dos guards que los usaban se mudaron a validar_venta_para_adelanto /
+    # validar_adelanto_editable, unas líneas más abajo. Dejarlos importados sin usar haría
+    # creer que este módulo todavía decide topes de adelanto por su cuenta.
+    estado_adelanto, _f as _fc, MEDIO_ADELANTO,
+    _recompute_factura,
+    # Estado del adelanto: los predicados y la transición viven en Contabilidad (una sola
+    # fuente de verdad, igual que el resto de la regla del adelanto). Acá se LEE el estado
+    # y se REACTIVA la fila anulada que Tesorería vuelve a aprobar.
+    ADEL_ANULADO, ADEL_APROBADO, adelanto_activo, reactivar_adelanto,
+)
+# Reglas de REGISTRO del adelanto (precondiciones de la venta/monto y los 2 candados de
+# plata de la fila): una sola fuente de verdad compartida con el gemelo de Contabilidad.
+# Aprobar en Tesorería y verificar en Contabilidad son la MISMA regla de negocio sobre la
+# MISMA fila; tenerla dos veces es la deuda M5 y ya costó un arreglo a medias (M2: el 400
+# del adelanto no pactado se quitó allá y quedó vivo acá). Import del ROUTER de otro módulo
+# Monza: mismo patrón que `_crear_egreso` de monza_compras_contab, unas líneas más abajo.
+from monza_contabilidad.router import (
+    validar_venta_para_adelanto, validar_adelanto_editable,
+)
 from monza_compras_contab.models import MonzaContCompra, MonzaContEgreso, MonzaContEgresoDetalle
 from monza_compras_contab.schemas import EgresoCreate
 from monza_compras_contab.router import _crear_egreso
@@ -58,6 +81,8 @@ from .service import (
     _f, _parse_date, bucket_de, parse_cartola,
     serialize_cuenta, serialize_cartola, serialize_movimiento,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/monza/tesoreria",
@@ -100,6 +125,36 @@ def _mov_or_404(db, mov_id, *, lock=False) -> MonzaTesMovimiento:
     if not m:
         raise HTTPException(404, "Movimiento no encontrado")
     return m
+
+
+def _con_retry_deadlock(db: Session, operacion):
+    """Ejecuta `operacion()` reintentando ante deadlock / lock-timeout de InnoDB
+    (1213 / 1205).
+
+    HALLAZGO #1 de la auditoría integral: conciliar una cobranza y registrar/eliminar
+    otra cobranza de la MISMA factura tocan las mismas filas (factura + cobranzas) y
+    MySQL puede elegir una víctima. Sin esta red el operador recibe un 500 en una
+    operación diaria. Mismo patrón (y mismo texto de 409) que
+    monza_recepcion_nacional/router.py: se reintenta la transacción COMPLETA tras
+    db.rollback() y, si a la tercera sigue el conflicto, se responde 409 accionable.
+    Es la CAPA 2 del arreglo: la CAPA 1 (orden de locks factura → cobranza en
+    `_conciliar_tx`) es la que quita la causa raíz; esto es la red de seguridad.
+
+    DEUDA CONOCIDA: este helper ya existe idéntico en monza_recepcion_nacional (y en
+    los módulos que reintentan cierres de despacho). Corresponde consolidarlo en un
+    módulo compartido, pero esa extracción toca varios paquetes a la vez y se deja
+    para el commit de consolidación, no para el arreglo del hallazgo."""
+    from sqlalchemy.exc import OperationalError
+    for _ in range(3):
+        try:
+            return operacion()
+        except OperationalError as e:
+            db.rollback()
+            args = getattr(getattr(e, "orig", None), "args", None) or []
+            if not args or args[0] not in (1213, 1205):
+                raise
+    raise HTTPException(
+        409, "Conflicto momentáneo con otra operación simultánea: reintente")
 
 
 def _egreso_summaries(db, egresos: list) -> dict:
@@ -236,6 +291,18 @@ def _destinos_for_movs(db, movs) -> dict:
     return out
 
 
+def _sin_anulados(q):
+    """Excluye de una query sobre MonzaContAdelanto los adelantos ANULADOS.
+
+    Un adelanto anulado NO es plata recibida: no se sugiere ni se concilia contra un
+    abono, no suma en el flujo de caja ni en los KPIs, y su venta VUELVE a la cola de
+    aprobación (la fila no se borra — el UNIQUE deja un adelanto por venta y se REUSA).
+    Mismo filtro que monza_contabilidad._adelanto_de_cot, incluido el coalesce: una fila
+    legada con la columna en NULL es un adelanto verificado, jamás uno anulado (leerlo al
+    revés apagaría el cortafuego de Abastecimiento de todas las ventas viejas)."""
+    return q.filter(func.coalesce(MonzaContAdelanto.estado, ADEL_APROBADO) != ADEL_ANULADO)
+
+
 def _adelantos_conciliados_ids(db, adelanto_ids) -> set:
     """IDs de adelantos que YA tienen un enlace de conciliación (estado derivado)."""
     if not adelanto_ids:
@@ -254,22 +321,123 @@ def _cobranzas_conciliadas_ids(db, cobranza_ids) -> set:
     return {r[0] for r in rows}
 
 
+def _aplicar_adelanto_a_facturas(db, cot, adel, usuario_id=None, advertencias=None) -> float:
+    """Aplica RETROACTIVAMENTE el adelanto recién aprobado a las facturas YA emitidas
+    de la venta (cobranza medio='adelanto'), espejo de la aplicación inmediata de
+    tesoreria/router.py (GA). Si la factura viene DESPUÉS, la aplica crear_factura de
+    monza_contabilidad — ambas direcciones cubiertas. Devuelve el total aplicado ahora.
+
+    UNA SOLA FUENTE DE VERDAD: la regla de plata por factura NO se reimplementa acá; se
+    delega en `monza_contabilidad._aplicar_adelanto`, igual que Grupo AM delega en
+    `routers.contabilidad._aplicar_adelantos_pendientes` (tesoreria/router.py). Antes
+    Tesorería tenía su propio loop —gemelo línea a línea del de Contabilidad— y los dos
+    ya habían empezado a divergir: el de acá filtraba por la columna `saldo` PERSISTIDA
+    (una factura con el saldo cacheado en 0 salía del reparto y el cliente seguía viendo
+    deuda ya pagada) y su guard SII no miraba `tipo_doc` (una BOLETA sin folio consultaba
+    el módulo DTE sin necesidad y, en un deploy a medias, respondía 503 justo en la
+    aprobación que destraba Abastecimiento). Con la delegación las dos puertas quedan
+    gobernadas por el mismo código y el próximo guard que se agregue allá vale acá.
+
+    Lo que aporta este envoltorio (y por eso sigue existiendo):
+      · el ORDEN de las facturas: las de ANTICIPO (vía B) PRIMERO y recién después el
+        FIFO por id. La factura de anticipo es la que RECIBE la plata del adelanto (la
+        del despacho real lleva la línea de DESCUENTO, no una cobranza), así que al
+        saldarla en esta misma pasada el EXCEDENTE —cuando el adelanto supera el bruto
+        del anticipo— queda libre para las facturas del despacho real dentro de la MISMA
+        transacción. Con el orden por id a secas ese excedente quedaba atrapado y la
+        deuda del cliente quedaba sobrestimada. Mantener en sync con
+        monza_contabilidad.verificar_adelanto (mismo order_by).
+        COALESCE: en DESC MySQL manda los NULL al FINAL, así que una fila legada con
+        es_anticipo NULL perdería contra un 0 y el orden quedaría invertido (la plata
+        entraría a la factura equivocada). La migración deja 0 y el ORM siempre escribe
+        0, pero una tabla nacida de create_all queda sin DEFAULT: cinturón y tirantes.
+      · el recálculo de saldo/estado por factura desde las cobranzas BAJO LOCK.
+      · el TOTAL aplicado ahora, que el endpoint devuelve como `aplicado_ahora_clp`. Se
+        mide como DELTA de `monto_aplicado` (no sumando los aplicados uno por uno): así
+        también refleja el re-encauce de la vía B, que puede DEVOLVER plata de otra
+        factura antes de aplicarla al anticipo.
+
+    Reglas de plata (docs/regla-lecturas-de-plata.md), todas dentro del helper delegado:
+      · Se llama con la COTIZACIÓN y el ADELANTO ya bloqueados por el caller (orden
+        global de locks: cotización → factura → adelanto, el mismo de crear_factura y
+        eliminar_cobranza en monza_contabilidad).
+      · Cada factura se relee populate_existing + with_for_update (serializa contra
+        cobranzas concurrentes) y su saldo se recalcula desde cobranzas BAJO LOCK,
+        no desde el saldo persistido.
+      · Cap por SALDO ACTUAL de la factura (no por monto_bruto): sobre una factura
+        con cobranzas parciales previas, el cap por bruto sobre-aplicaría.
+      · Facturas con factoring VIGENTE se SALTAN, y una FACTURA electrónica sin folio
+        con su DTE 33 sin emitir tampoco recibe plata (guard SII).
+
+    INVARIANTE: adel.monto_aplicado == Σ cobranzas medio='adelanto' de la venta.
+    """
+    # Import LOCAL: evita el ciclo contabilidad ↔ tesorería (monza_contabilidad.router
+    # importa monza_tesoreria.models), mismo patrón que el resto de los cruces del módulo.
+    from monza_contabilidad.router import _aplicar_adelanto, _cobranzas_bloqueadas
+    antes = _fc(adel.monto_aplicado)
+    facturas = (db.query(MonzaContFacturaCliente)
+                .filter(MonzaContFacturaCliente.cotizacion_id == cot.id)
+                .order_by(func.coalesce(MonzaContFacturaCliente.es_anticipo, 0).desc(),
+                          MonzaContFacturaCliente.id.asc())
+                .populate_existing().with_for_update().all())
+    for factura in facturas:
+        _aplicar_adelanto(db, cot, factura, usuario_id, advertencias=advertencias)
+        db.flush()
+        _recompute_factura(factura, cobranzas=_cobranzas_bloqueadas(db, factura.id))
+    return round(_fc(adel.monto_aplicado) - antes, 2)
+
+
 # ═══ 1. APROBACIONES (adelantos 50% → la orden la da Tesorería) ═════════════════
 @router.get("/aprobaciones")
-def listar_aprobaciones(db: Session = Depends(get_db),
+def listar_aprobaciones(page: int = 1, page_size: int = PAGE_SIZE_DEFAULT,
+                        db: Session = Depends(get_db),
                         current_user: User = Depends(get_current_user)):
     """Cola de aprobación de adelantos.
       · por_aprobar: ventas con pct_adelanto>0 aún SIN la orden de Tesorería, con el
         monto sugerido y, si ya llegó la plata, el abono de cartola que calza.
       · aprobadas: historial (adelanto registrado), con su estado de conciliación
-        bancaria derivado del enlace en monza_tes_conciliacion."""
-    cots = (db.query(MonzaCotizacion)
-            .options(joinedload(MonzaCotizacion.cliente))
-            .filter(MonzaCotizacion.estado.in_(ESTADOS_VENTA), MonzaCotizacion.pct_adelanto > 0)
-            .order_by(MonzaCotizacion.id.desc()).all())
+        bancaria derivado del enlace en monza_tes_conciliacion. Incluye los adelantos NO
+        PACTADOS (pct_adelanto = 0): son plata recibida igual, y filtrarlos por % los
+        dejaba registrables pero invisibles en esta pestaña.
+
+    PAGINADO (T14): las dos colas se cortan en SQL con `page`/`page_size` — antes traía
+    TODAS las ventas con adelanto informado de la historia y las serializaba en memoria,
+    así que la pestaña se degradaba sin techo a medida que crece el histórico. Cada lista
+    va con su total (`total_por_aprobar` / `total_aprobadas`), y `n_por_aprobar` sigue
+    siendo el TOTAL de la cola (no el largo de la página): es el badge del encabezado.
+
+    Una venta cuyo adelanto fue ANULADO vuelve a `por_aprobar`: la fila del adelanto
+    sigue existiendo (Monza tiene UN adelanto por venta y anular no la borra), pero un
+    adelanto anulado no es plata recibida — ver `_sin_anulados`."""
+    page = max(1, int(page))
+    page_size = min(max(1, int(page_size)), PAGE_SIZE_MAX)
+    # Ventas con adelanto informado por Comercial, partidas en dos colas EN SQL según
+    # exista o no un adelanto VIGENTE (los anulados no cuentan: la venta vuelve a la cola
+    # de aprobación). Subquery de ids en vez de outerjoin: el UNIQUE por cotización
+    # garantiza a lo más una fila, así que un IN/NOT IN no puede duplicar ni perder filas.
+    con_adelanto = _sin_anulados(db.query(MonzaContAdelanto.cotizacion_id)).scalar_subquery()
+    base_cots = (db.query(MonzaCotizacion)
+                 .options(joinedload(MonzaCotizacion.cliente))
+                 .filter(MonzaCotizacion.estado.in_(ESTADOS_VENTA)))
+    # `por_aprobar` es una EXPECTATIVA (falta la plata), así que sigue pidiendo el % que
+    # informó Comercial: sin pct_adelanto > 0 no hay monto que esperar y toda venta al
+    # contado inundaría la cola.
+    q_pa = base_cots.filter(MonzaCotizacion.pct_adelanto > 0,
+                            ~MonzaCotizacion.id.in_(con_adelanto))
+    # `aprobadas` es un HECHO (la plata ya está registrada) y por eso NO filtra por
+    # pct_adelanto: el adelanto NO PACTADO (M2, pct = 0) es plata recibida de verdad y con
+    # el filtro quedaba fuera de la pestaña — registrable pero invisible en la cola donde
+    # se administra, mientras sí aparecía en /adelantos-pendientes para conciliar.
+    q_ap = base_cots.filter(MonzaCotizacion.id.in_(con_adelanto))
+    total_pa, total_ap = q_pa.count(), q_ap.count()
+    off = (page - 1) * page_size
+    cots_pa = q_pa.order_by(MonzaCotizacion.id.desc()).offset(off).limit(page_size).all()
+    cots_ap = q_ap.order_by(MonzaCotizacion.id.desc()).offset(off).limit(page_size).all()
+    cots = cots_pa + cots_ap
+    ids_pa = {c.id for c in cots_pa}
     adelantos = {a.cotizacion_id: a for a in
-                 db.query(MonzaContAdelanto)
-                 .filter(MonzaContAdelanto.cotizacion_id.in_([c.id for c in cots])).all()} if cots else {}
+                 _sin_anulados(db.query(MonzaContAdelanto)
+                               .filter(MonzaContAdelanto.cotizacion_id.in_([c.id for c in cots]))).all()} if cots else {}
     conciliados = _adelantos_conciliados_ids(db, [a.id for a in adelantos.values()])
 
     # Abonos de cartola NO conciliados (para sugerir el match del adelanto que llega).
@@ -279,7 +447,10 @@ def listar_aprobaciones(db: Session = Depends(get_db),
 
     por_aprobar, aprobadas = [], []
     for cot in cots:
-        adel = adelantos.get(cot.id)
+        # La cola la manda la QUERY, no la existencia del objeto: una venta de `q_pa`
+        # nunca tiene adelanto vigente, y así la fila anulada no se serializa como
+        # "aprobada" ni entrega su monto como si fuera plata en el banco.
+        adel = None if cot.id in ids_pa else adelantos.get(cot.id)
         base = {
             "cotizacion_id": cot.id,
             "numero_cotizacion": cot.numero,
@@ -312,15 +483,22 @@ def listar_aprobaciones(db: Session = Depends(get_db),
             }
             aprobadas.append(base)
     return {"por_aprobar": por_aprobar, "aprobadas": aprobadas,
-            "n_por_aprobar": len(por_aprobar)}
+            # n_por_aprobar = TOTAL de la cola (badge del encabezado), no el largo de la
+            # página: con una sola página coincide con el valor histórico.
+            "n_por_aprobar": int(total_pa),
+            "total_por_aprobar": int(total_pa), "total_aprobadas": int(total_ap),
+            "page": page, "page_size": page_size}
 
 
 @router.post("/aprobaciones/{cot_id}/aprobar")
 def aprobar_adelanto(cot_id: int, payload: AprobarAdelantoIn,
                      db: Session = Depends(get_db),
                      current_user: User = Depends(get_current_user)):
-    """TESORERÍA da la orden: registra el adelanto recibido (monto/fecha/banco/N° op)
-    y marca adelanto_verificado=1 → Abastecimiento queda destrabado (cortafuego).
+    """TESORERÍA da la orden: registra el adelanto recibido (monto/fecha/banco/N° op),
+    marca adelanto_verificado=1 → Abastecimiento queda destrabado (cortafuego) y APLICA
+    el adelanto DE INMEDIATO a las facturas YA emitidas de la venta (cobranza
+    medio='adelanto'; si la factura viene después, la aplica crear_factura — ambas
+    direcciones cubiertas, espejo de tesoreria/router.py de Grupo AM).
 
     MISMA regla de negocio que POST /api/monza/contabilidad/ventas/{id}/adelanto/verificar
     (monza_contabilidad/router.py); mantener ambas en sync. Lock de la cotización:
@@ -331,35 +509,70 @@ def aprobar_adelanto(cot_id: int, payload: AprobarAdelantoIn,
            .first())
     if not cot:
         raise HTTPException(404, "Venta (cotización) no encontrada")
-    if cot.estado not in ESTADOS_VENTA:
-        raise HTTPException(400, "La cotización debe estar vendida para aprobar el adelanto")
-    if int(getattr(cot, "pct_adelanto", 0) or 0) <= 0:
-        raise HTTPException(400, "Esta venta no tiene un adelanto informado por Comercial")
-    if payload.monto > _fc(cot.total_bruto) + TOL_PAGO:
-        raise HTTPException(400, f"El monto del adelanto no puede exceder el total de la venta ({_fc(cot.total_bruto):.0f})")
+    # M2 — ADELANTO NO PACTADO: acá había un 400 «Esta venta no tiene un adelanto informado
+    # por Comercial» cuando pct_adelanto era 0. Se quitó primero en el gemelo de
+    # Contabilidad y esta copia quedó viva: en MonzaParts la ORDEN del adelanto la da
+    # TESORERÍA (Ventas quedó de solo lectura), o sea que el arreglo había quedado en la
+    # puerta que el operador NO usa y el depósito no pactado seguía sin poder registrarse.
+    # Ahora las dos puertas comparten la regla —validar_venta_para_adelanto, en
+    # monza_contabilidad/router.py— así que no pueden volver a divergir: es la deuda M5
+    # (dos copias de una regla de plata) cerrada hacia UNA fuente de verdad.
+    validar_venta_para_adelanto(cot, payload.monto, verbo="aprobar")
+    # Lectura BLOQUEANTE del adelanto (espejo GA tesoreria/router.py): sin el lock,
+    # conciliar (que SÍ bloquea la fila del adelanto) puede colarse entre estos guards
+    # y la escritura (TOCTOU) y los guards decidirían sobre datos viejos.
+    # populate_existing: sin él, el identity map serviría una lectura previa al lock.
+    # Orden de locks cotización → adelanto: conciliar solo toma movimiento → adelanto,
+    # nunca la cotización, así que no introduce deadlocks nuevos.
     adel = (db.query(MonzaContAdelanto)
-            .filter(MonzaContAdelanto.cotizacion_id == cot_id).first())
-    if adel is not None and _fc(adel.monto_aplicado) > TOL_CONTAB:
-        raise HTTPException(409, f"El adelanto ya fue aplicado a una factura (aplicado {_fc(adel.monto_aplicado):.0f}); revierta esa cobranza antes de modificarlo")
-    # GAP DE INTEGRIDAD: si el adelanto ya está conciliado con un abono del banco,
-    # re-aprobarlo (editar el monto) dejaría el cruce bancario apuntando a otro monto.
-    if adel is not None and _adelantos_conciliados_ids(db, [adel.id]):
-        raise HTTPException(409, "El adelanto ya está conciliado con un abono del banco; "
-                                 "desconcilie el abono en Tesorería antes de modificar el adelanto")
+            .filter(MonzaContAdelanto.cotizacion_id == cot_id)
+            .populate_existing().with_for_update().first())
+    # Los 2 candados de plata sobre la fila (ya aplicado a una factura / ya conciliado con
+    # un abono del banco) son la MISMA regla que el gemelo de Contabilidad y viven allá:
+    # validar_adelanto_editable. Idéntico comportamiento observable (mismos 409, mismos
+    # textos, mismo orden) — lo que cambia es que ya no hay dos copias que mantener.
+    validar_adelanto_editable(db, adel)
     if adel is None:
         adel = MonzaContAdelanto(cotizacion_id=cot_id)
         db.add(adel)
+    # ESTADO: aprobar (o RE-aprobar) deja el adelanto VIGENTE. Es el único camino de vuelta
+    # desde 'anulado': Monza tiene UN adelanto por venta (uq_monza_cont_adelanto_cotizacion),
+    # así que anular NO borra la fila y no se puede crear otra — la fila se REUSA. Sin este
+    # paso el adelanto quedaría 'anulado' con plata dentro: invisible para todos los
+    # caminos que filtran anulados y con adelanto_verificado=1 destrabando Abastecimiento.
+    # La transición vive en monza_contabilidad.service (misma llamada que hace su gemelo
+    # verificar_adelanto: los dos deben mantenerse en sync).
+    if reactivar_adelanto(adel):
+        logger.info("Adelanto reactivado por Tesorería (venta %s): anulado → aprobado", cot_id)
     adel.monto = payload.monto
-    adel.fecha_pago = _parse_date(payload.fecha_pago) or date.today()
+    # Fecha estricta: explícita pero no parseable → 400 (antes caía en SILENCIO a hoy,
+    # registrando el adelanto con una fecha que el operador no ingresó; espejo GA).
+    adel.fecha_pago = _fecha(payload.fecha_pago, "fecha_pago") or date.today()
     adel.banco = payload.banco
     adel.numero_operacion = payload.numero_operacion
-    adel.observaciones = payload.observaciones
+    # Solo si vino en el payload: re-aprobar (corregir monto) SIN mandar observaciones
+    # no debe borrar las existentes (espejo GA tesoreria/router.py).
+    if payload.observaciones is not None:
+        adel.observaciones = payload.observaciones
     adel.usuario_id = getattr(current_user, "id", None)
     cot.adelanto_verificado = 1
+    db.flush()
+    # Aplicación RETROACTIVA a las facturas que ya existen (el lock de la cotización ya
+    # está tomado; el helper bloquea factura por factura). Antes de esto, la plata de un
+    # adelanto aprobado DESPUÉS de facturar nunca descontaba el saldo de la factura.
+    # `advertencias`: la aplicación puede tener que RE-ENCAUZAR plata de otra factura a la
+    # de anticipo y quedarse corta (factoring vigente, DTE sin emitir, cobranza ya
+    # conciliada). Ese aviso es la única señal de que la factura de anticipo quedó por
+    # cobrar: se devuelve al operador en vez de descartarse.
+    advertencias: list = []
+    aplicado_ahora = _aplicar_adelanto_a_facturas(
+        db, cot, adel, usuario_id=getattr(current_user, "id", None),
+        advertencias=advertencias)
     db.commit()
     db.refresh(cot)
     db.refresh(adel)
-    return estado_adelanto(cot, adel)
+    return {**estado_adelanto(cot, adel), "aplicado_ahora_clp": round(aplicado_ahora, 2),
+            "advertencias": advertencias}
 
 
 # ═══ 2. POR PAGAR / APROBAR PAGOS (la orden del pago la da Tesorería) ═══════════
@@ -704,8 +917,11 @@ def sugerencias(mov_id: int, db: Session = Depends(get_db),
         return {"movimiento_id": mov.id, "monto": monto,
                 "sugerencias": [{**smap[e.id], "dias_diferencia": _dist_e(e)} for e in top]}
 
-    # abono → adelantos con monto ≈ y sin enlace previo (plus Monza)…
-    adels = (db.query(MonzaContAdelanto)
+    # abono → adelantos VIGENTES con monto ≈ y sin enlace previo (plus Monza). Los
+    # ANULADOS no se sugieren: la plata de un adelanto anulado no está comprometida con
+    # esa venta, y cruzar el abono contra él dejaría el depósito amarrado a un registro
+    # que ya no cuenta para nadie (ni para Abastecimiento ni para el flujo de caja).
+    adels = (_sin_anulados(db.query(MonzaContAdelanto))
              .filter(MonzaContAdelanto.monto >= monto - TOL,
                      MonzaContAdelanto.monto <= monto + TOL).all())
     ya_a = _adelantos_conciliados_ids(db, [a.id for a in adels])
@@ -748,7 +964,15 @@ def conciliar(mov_id: int, payload: ConciliarIn, db: Session = Depends(get_db),
       · abono + adelanto_id → crea el enlace (el 'conciliado' del adelanto se deriva);
         marca el movimiento conciliado.
       · abono + cobranza_id → crea el enlace en monza_tes_conciliacion_ingreso (el
-        'conciliado' de la cobranza se deriva); marca el movimiento conciliado."""
+        'conciliado' de la cobranza se deriva); marca el movimiento conciliado.
+
+    HALLAZGO #1 (CAPA 2): el cuerpo vive en `_conciliar_tx` para poder reintentarlo
+    completo si InnoDB elige esta transacción como víctima de un deadlock (1213) con
+    Facturas y Cobranzas. Mismo patrón que monza_recepcion_nacional/router.py."""
+    return _con_retry_deadlock(db, lambda: _conciliar_tx(mov_id, payload, db, current_user))
+
+
+def _conciliar_tx(mov_id: int, payload: ConciliarIn, db: Session, current_user: User):
     mov = _mov_or_404(db, mov_id, lock=True)
     _solo_cuentas_clp(mov.cuenta)
     if mov.conciliado:
@@ -769,8 +993,14 @@ def conciliar(mov_id: int, payload: ConciliarIn, db: Session = Depends(get_db),
             raise HTTPException(409, "Ese egreso ya está conciliado con otro movimiento")
         if abs(_f(mov.monto) - _f(egreso.monto_total_clp)) > TOL:
             raise HTTPException(400, f"Los montos no coinciden (movimiento {_f(mov.monto):.0f} vs egreso {_f(egreso.monto_total_clp):.0f})")
+        # Snapshot ANTES de enriquecer: mientras el egreso está conciliado la cartola
+        # es la fuente de verdad (fecha/ref del banco pisan lo del egreso), pero
+        # desconciliar debe poder RESTAURAR lo que el operador tenía ingresado
+        # (espejo GA tesoreria/router.py).
         db.add(MonzaTesConciliacion(movimiento_id=mov.id, egreso_id=egreso.id,
-                                    monto_conciliado_clp=_f(mov.monto), usuario_id=uid))
+                                    monto_conciliado_clp=_f(mov.monto), usuario_id=uid,
+                                    fecha_egreso_previa=egreso.fecha_mov_bancario,
+                                    referencia_egreso_previa=egreso.referencia_bancaria))
         egreso.conciliado = True
         egreso.conciliado_at = now
         if mov.fecha:
@@ -781,11 +1011,20 @@ def conciliar(mov_id: int, payload: ConciliarIn, db: Session = Depends(get_db),
     elif payload.adelanto_id:
         if mov.tipo != "abono":
             raise HTTPException(400, "Un adelanto se concilia contra un ABONO del banco")
+        # populate_existing: la decisión de abajo (¿está anulado? ¿coincide el monto?) es
+        # una decisión de PLATA, así que se toma sobre la fila FRESCA bajo el lock — sin
+        # él el identity map podría servir una lectura previa (docs/regla-lecturas-de-plata.md).
         adel = (db.query(MonzaContAdelanto)
                 .filter(MonzaContAdelanto.id == payload.adelanto_id)
-                .with_for_update().first())
+                .populate_existing().with_for_update().first())
         if not adel:
             raise HTTPException(404, "Adelanto no encontrado")
+        # Adelanto ANULADO: su plata dejó de estar comprometida con la venta, así que no
+        # es un destino válido para el abono. Se lee BAJO EL LOCK de arriba, de modo que
+        # una anulación concurrente no se cuela entre el guard y el enlace.
+        if not adelanto_activo(adel):
+            raise HTTPException(409, "Ese adelanto está anulado; vuelva a aprobarlo en la "
+                                     "pestaña Aprobaciones antes de conciliar el abono")
         if _adelantos_conciliados_ids(db, [adel.id]):
             raise HTTPException(409, "Ese adelanto ya está conciliado con otro movimiento")
         if abs(_f(mov.monto) - _f(adel.monto)) > TOL:
@@ -798,13 +1037,43 @@ def conciliar(mov_id: int, payload: ConciliarIn, db: Session = Depends(get_db),
             raise HTTPException(400, "Una cobranza (ingreso de caja) se concilia contra un ABONO del banco")
         # Lock de cobranza Y factura: el recálculo de saldos en Facturas también
         # bloquea la factura, así que esto serializa contra cobranzas concurrentes.
-        par = (db.query(MonzaContCobranza, MonzaContFacturaCliente)
-               .join(MonzaContFacturaCliente, MonzaContFacturaCliente.id == MonzaContCobranza.factura_id)
-               .filter(MonzaContCobranza.id == payload.cobranza_id)
-               .with_for_update().first())
-        if not par:
+        #
+        # HALLAZGO #1 (CAPA 1 — orden de locks). Antes esto era UN JOIN con
+        # with_for_update(): la tabla motriz era la COBRANZA (se busca por su PK) y la
+        # factura se bloqueaba DESPUÉS. Facturas y Cobranzas bloquea al revés —
+        # primero la FACTURA (with_for_update(of=FacturaCliente)) y luego sus
+        # cobranzas — así que las dos operaciones formaban un ciclo InnoDB y el
+        # operador recibía un 500 por deadlock (1213) en una operación diaria.
+        # Ahora se sigue el orden canónico de la casa (cotización → factura →
+        # cobranza) en tres pasos, y como al soltar el JOIN atómico se abre una
+        # ventana entre la lectura sin lock y el lock real, el paso 4 REVALIDA todo
+        # con los datos frescos (no es opcional).
+        #
+        # 1) lectura SIN lock, solo para saber a qué factura pertenece la cobranza.
+        #    Se pide la columna suelta (no la entidad) para no dejar la fila en el
+        #    identity map con valores viejos que la relectura bajo lock no pisaría.
+        factura_id_previa = (db.query(MonzaContCobranza.factura_id)
+                             .filter(MonzaContCobranza.id == payload.cobranza_id).scalar())
+        if factura_id_previa is None:
             raise HTTPException(404, "Cobranza no encontrada")
-        cobranza, _factura = par
+        # 2) PRIMERO la factura (mismo orden que Facturas y Cobranzas).
+        _factura = (db.query(MonzaContFacturaCliente)
+                    .filter(MonzaContFacturaCliente.id == factura_id_previa)
+                    .with_for_update().first())
+        if not _factura:
+            raise HTTPException(404, "Cobranza no encontrada")
+        # 3) DESPUÉS la cobranza.
+        cobranza = (db.query(MonzaContCobranza)
+                    .filter(MonzaContCobranza.id == payload.cobranza_id)
+                    .populate_existing().with_for_update().first())
+        if not cobranza:
+            raise HTTPException(404, "Cobranza no encontrada")
+        # 4) REVALIDACIÓN con los datos ya bloqueados: si la cobranza cambió de factura
+        #    entre el paso 1 y el 3, la factura bloqueada no es la suya → se corta (los
+        #    chequeos de medio / ya-conciliada / monto de abajo también leen la fila
+        #    fresca, así que quedan cubiertos por el mismo lock).
+        if cobranza.factura_id != _factura.id:
+            raise HTTPException(409, "La cobranza cambió de factura mientras se conciliaba: reintente")
         if cobranza.medio == MEDIO_ADELANTO:
             raise HTTPException(400, "Esta cobranza es la aplicación de un adelanto (no un depósito nuevo); el abono del banco se concilia contra el ADELANTO en la pestaña Aprobaciones")
         if _cobranzas_conciliadas_ids(db, [cobranza.id]):
@@ -842,13 +1111,18 @@ def desconciliar(mov_id: int, db: Session = Depends(get_db),
             if eg:
                 eg.conciliado = False
                 eg.conciliado_at = None
-                # Se limpia SOLO lo que vino de ESTE movimiento al conciliar (fecha/ref
-                # idénticas al mov): así no queda data del cruce equivocado, pero se
-                # conserva lo que el operador ingresó a mano en Compras.
-                if mov.fecha and eg.fecha_mov_bancario == mov.fecha:
-                    eg.fecha_mov_bancario = None
-                if mov.referencia and eg.referencia_bancaria == mov.referencia:
-                    eg.referencia_bancaria = None
+                # Se RESTAURA lo que el egreso tenía ANTES del cruce (snapshot guardado
+                # en el enlace al conciliar): así no queda data del cruce equivocado y
+                # se conserva lo que el operador ingresó a mano en Compras, incluso si
+                # coincidía con lo del banco (la igualdad de valores no distingue el
+                # origen del dato). Solo se toca el campo que la conciliación pisó (mov
+                # con fecha/ref); en enlaces previos a la migración el snapshot es NULL
+                # y el resultado es el mismo que la limpieza histórica. Espejo GA
+                # tesoreria/router.py.
+                if mov.fecha:
+                    eg.fecha_mov_bancario = link.fecha_egreso_previa
+                if mov.referencia:
+                    eg.referencia_bancaria = link.referencia_egreso_previa
         # adelanto: su 'conciliado' se deriva del enlace → basta borrar el enlace.
         db.delete(link)
     for link in list(mov.conciliaciones_ingreso):
@@ -885,8 +1159,10 @@ def egresos_pendientes(q: Optional[str] = None, page: int = 1, page_size: int = 
 @router.get("/adelantos-pendientes")
 def adelantos_pendientes(db: Session = Depends(get_db),
                          current_user: User = Depends(get_current_user)):
-    """Adelantos APROBADOS aún sin conciliar con un abono del banco."""
-    adels = db.query(MonzaContAdelanto).order_by(MonzaContAdelanto.id.desc()).all()
+    """Adelantos APROBADOS aún sin conciliar con un abono del banco (los ANULADOS no:
+    esa plata ya no está comprometida con la venta)."""
+    adels = (_sin_anulados(db.query(MonzaContAdelanto))
+             .order_by(MonzaContAdelanto.id.desc()).all())
     ya = _adelantos_conciliados_ids(db, [a.id for a in adels])
     pendientes = [a for a in adels if a.id not in ya]
     amap = _adelanto_summaries(db, pendientes)
@@ -900,7 +1176,12 @@ def cobranzas_pendientes(q: Optional[str] = None, page: int = 1, page_size: int 
     abono del banco. El 'conciliado' se deriva del enlace en monza_tes_conciliacion_ingreso."""
     page = max(1, int(page))
     page_size = min(max(1, int(page_size)), PAGE_SIZE_MAX)
-    ya_conciliadas = db.query(MonzaTesConciliacionIngreso.cobranza_id).scalar_subquery()
+    # isnot(None): defensa espejo de GA — si algún día el enlace admite otro destino con
+    # cobranza_id NULL, un NOT IN contra una lista con NULLs no matchea NADA en SQL
+    # (vaciaría la cola de pendientes en silencio).
+    ya_conciliadas = (db.query(MonzaTesConciliacionIngreso.cobranza_id)
+                      .filter(MonzaTesConciliacionIngreso.cobranza_id.isnot(None))
+                      .scalar_subquery())
     base = (db.query(MonzaContCobranza, MonzaContFacturaCliente)
             .join(MonzaContFacturaCliente, MonzaContFacturaCliente.id == MonzaContCobranza.factura_id)
             # medio='adelanto' se excluye: es la aplicación de un adelanto ya
@@ -961,6 +1242,15 @@ def flujo_caja(db: Session = Depends(get_db),
                         MonzaCotizacion.adelanto_verificado != 1)).all())
     adelantos_por_aprobar = sum(round(_f(t) * int(p or 0) / 100.0, 0) for t, p in cots)
 
+    # Adelantos APROBADOS aún no aplicados a facturas: plata YA recibida (no es entrada
+    # futura, por eso va APARTE de los buckets); se muestra para explicar por qué las
+    # facturas siguientes nacerán con menos saldo (espejo GA tesoreria/router.py).
+    # Los ANULADOS quedan fuera: un adelanto anulado no es plata en la cuenta esperando
+    # su factura, y sumarlo acá inflaba el disponible del flujo de caja.
+    adel_apr = _sin_anulados(db.query(MonzaContAdelanto)).all()
+    apr_pend = [a for a in adel_apr if _f(a.monto) - _f(a.monto_aplicado) > TOL]
+    apr_pend_monto = sum(_f(a.monto) - _f(a.monto_aplicado) for a in apr_pend)
+
     for d in (por_pagar, por_cobrar):
         for b in FLUJO_BUCKETS:
             d[b]["monto"] = round(d[b]["monto"], 0)
@@ -971,6 +1261,7 @@ def flujo_caja(db: Session = Depends(get_db),
         "por_cobrar": por_cobrar,
         "neto": neto,
         "adelantos_por_aprobar": {"n": len(cots), "monto": round(adelantos_por_aprobar, 0)},
+        "adelantos_recibidos_sin_aplicar": {"n": len(apr_pend), "monto": round(apr_pend_monto, 0)},
         "retenciones_factoring": {"n": int(ret_n or 0), "monto": round(_f(ret_monto), 0)},
     }
 
@@ -993,11 +1284,19 @@ def resumen(cuenta_id: Optional[int] = None, db: Session = Depends(get_db),
                              MonzaTesMovimiento.tipo == "abono").count()
     egresos_pend = (db.query(func.count(MonzaContEgreso.id))
                     .filter(MonzaContEgreso.conciliado.is_(False)).scalar())
-    # Cobranzas sin conciliar (el 'conciliado' se deriva del enlace en la tabla nueva)
-    ya_conciliadas = db.query(MonzaTesConciliacionIngreso.cobranza_id).scalar_subquery()
+    # Cobranzas sin conciliar (el 'conciliado' se deriva del enlace en la tabla nueva).
+    # isnot(None): defensa espejo de GA — un NOT IN contra una lista con NULLs no
+    # matchea NADA en SQL (vaciaría el KPI en silencio).
+    ya_conciliadas = (db.query(MonzaTesConciliacionIngreso.cobranza_id)
+                      .filter(MonzaTesConciliacionIngreso.cobranza_id.isnot(None))
+                      .scalar_subquery())
     cobranzas_pend = (db.query(func.count(MonzaContCobranza.id))
                       .filter(MonzaContCobranza.medio != MEDIO_ADELANTO,
                               ~MonzaContCobranza.id.in_(ya_conciliadas)).scalar())
+    # Adelantos aprobados (no anulados) aún SIN conciliar con un abono del banco (espejo
+    # GA resumen, que lista solo los de estado 'aprobado').
+    adel_ids = [r[0] for r in _sin_anulados(db.query(MonzaContAdelanto.id)).all()]
+    adel_sin_conc = len(set(adel_ids) - _adelantos_conciliados_ids(db, adel_ids))
     # Aprobaciones pendientes (n + monto sugerido)
     cots = (db.query(MonzaCotizacion.total_bruto, MonzaCotizacion.pct_adelanto)
             .filter(MonzaCotizacion.estado.in_(ESTADOS_VENTA), MonzaCotizacion.pct_adelanto > 0,
@@ -1024,5 +1323,6 @@ def resumen(cuenta_id: Optional[int] = None, db: Session = Depends(get_db),
         "abonos_pendientes": int(pend_abono),
         "egresos_sin_conciliar": int(egresos_pend or 0),
         "cobranzas_sin_conciliar": int(cobranzas_pend or 0),
+        "adelantos_sin_conciliar": int(adel_sin_conc),
         "por_pagar_vencido_clp": round(_f(vencido), 0),
     }

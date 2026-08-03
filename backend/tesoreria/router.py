@@ -50,6 +50,12 @@ from compras_contab.router import _crear_egreso
 from compras_contab.service import serialize_egreso, parse_date_estricta, _estado_pago as _estado_pago_compra
 # Regla de negocio de adelantos: vive en Contabilidad (una sola fuente de verdad).
 # Sin ciclo: routers.contabilidad solo importa tesoreria.models (no este router).
+# NOTA (guard SII del adelanto): `_aplicar_adelantos_pendientes` consulta el DTE de la
+# factura antes de dejar entrar la plata. Ese guard vive en routers/contabilidad.py y es
+# el que se ejecuta cuando Tesorería aprueba: si el esquema de wasabil_dte no está
+# migrado, el ImportError/ProgrammingError sube como 500 crudo por ESTA ruta. El arreglo
+# (ImportError → False, ProgrammingError/OperationalError → 503 diciendo qué init_db
+# correr; molde monza_contabilidad/router.py) va en routers/contabilidad.py, no acá.
 from routers.contabilidad import (
     MEDIO_ADELANTO, _aplicar_adelantos_pendientes, _serialize_adelanto,
     _adelantos_conciliados_ids, _monto_comprometido_adelanto,
@@ -89,6 +95,9 @@ def _fecha(s, campo: str):
 
 
 def _cuenta_scoped(db, cuenta_id, empresa, *, lock=False) -> CuentaBancaria:
+    # La cuenta no decide plata (es el portón de serialización del catálogo bancario), así
+    # que acá el lock NO necesita populate_existing: no se compara ni se persiste ningún
+    # monto leído de esta fila. Ver `docs/regla-lecturas-de-plata.md`.
     q = db.query(CuentaBancaria).filter(CuentaBancaria.id == cuenta_id, CuentaBancaria.empresa == empresa)
     c = (q.with_for_update().first() if lock else q.first())
     if not c:
@@ -99,10 +108,49 @@ def _cuenta_scoped(db, cuenta_id, empresa, *, lock=False) -> CuentaBancaria:
 def _mov_scoped(db, mov_id, empresa, *, lock=False) -> MovimientoBancario:
     q = db.query(MovimientoBancario).filter(
         MovimientoBancario.id == mov_id, MovimientoBancario.empresa == empresa)
-    m = (q.with_for_update().first() if lock else q.first())
+    # LECTURA DE PLATA bajo lock → populate_existing() obligatorio (regla 3 de
+    # docs/regla-lecturas-de-plata.md, a cualquier nivel de aislamiento: el problema es el
+    # identity map de SQLAlchemy, no el read view de MySQL). `mov.monto` es el lado BANCO
+    # de los tres cruces (se compara ±TOL contra egreso/cobranza/adelanto y se persiste en
+    # conc_conciliacion.monto_conciliado_clp): si cualquier lectura anterior del mismo
+    # request dejó la fila en el identity map, el FOR UPDATE traería la versión fresca de
+    # la BD y SQLAlchemy la DESCARTARÍA, sirviendo el monto viejo.
+    m = (q.populate_existing().with_for_update().first() if lock else q.first())
     if not m:
         raise HTTPException(404, "Movimiento no encontrado")
     return m
+
+
+def _con_retry_deadlock(db: Session, operacion):
+    """Ejecuta `operacion()` reintentando ante deadlock / lock-timeout de InnoDB
+    (1213 / 1205).
+
+    Dos pares de uso diario pueden cruzarse: (1) conciliar una cobranza contra
+    registrar/eliminar otra cobranza de la MISMA factura (factura + cobranzas), y (2)
+    aprobar un pago contra revertir un pago de la MISMA compra en Compras/CxP (egreso +
+    detalles + compra). En ambos MySQL puede elegir una víctima. Sin esta red
+    el operador recibe un 500 en una operación diaria. Mismo patrón (y mismo texto de
+    409) que compras_contab, recepcion_nacional y routers/despachos.py: se reintenta la
+    transacción COMPLETA tras db.rollback() y, si a la tercera sigue el conflicto, se
+    responde 409 accionable. Es la CAPA 2 del arreglo: la CAPA 1 (orden de locks
+    factura → cobranza en `_conciliar_tx`) es la que quita la causa raíz; esto es la red
+    de seguridad. Espejo de monza_tesoreria/router.py.
+
+    DEUDA CONOCIDA: este helper ya existe idéntico en monza_tesoreria y en los módulos
+    que reintentan cierres de despacho. Corresponde consolidarlo en un módulo compartido,
+    pero esa extracción toca varios paquetes a la vez y se deja para el commit de
+    consolidación, no para el arreglo del hallazgo."""
+    from sqlalchemy.exc import OperationalError
+    for _ in range(3):
+        try:
+            return operacion()
+        except OperationalError as e:
+            db.rollback()
+            args = getattr(getattr(e, "orig", None), "args", None) or []
+            if not args or args[0] not in (1213, 1205):
+                raise
+    raise HTTPException(
+        409, "Conflicto momentáneo con otra operación simultánea: reintente")
 
 
 def _egreso_summaries(db, egresos: list) -> dict:
@@ -311,15 +359,56 @@ def por_pagar(q: Optional[str] = None, page: int = 1, page_size: int = PAGE_SIZE
     }
 
 
-@router.post("/pagos")
-def aprobar_pago(payload: EgresoCreate, db: Session = Depends(get_db),
-                 current_user: User = Depends(get_current_user)):
-    """TESORERÍA da la orden: crea el Comprobante de Egreso que paga 1..N compras
-    (parcial o total). MISMA regla de negocio que POST /api/compras-contab/egresos
-    (reusa `_crear_egreso`: locks anti doble-pago, tope por saldo, recálculo)."""
-    empresa = empresa_de(current_user)
-    fecha = _fecha(payload.fecha, "fecha") or date.today()
+def _porton_egresos_de_las_compras(db, compra_ids: list, empresa: str) -> list:
+    """CAPA 1 del orden de locks de la familia PAGOS: bloquea PRIMERO los Comprobantes de
+    Egreso que ya pagan estas compras, en orden de id.
+
+    Por qué existe. Aprobar un pago (esta ruta → `_crear_egreso`) toma los candados en el
+    orden COMPRA → DETALLES, mientras revertir un pago en Compras/CxP los toma AL REVÉS:
+    `eliminar_pago` / `eliminar_egreso` hacen EGRESO → DETALLES (X del DELETE en cascada) →
+    COMPRA. Con las dos operaciones sobre la MISMA compra, InnoDB cierra ciclo: el tesorero
+    aprueba un pago mientras Compras revierte un pago parcial de esa compra y uno de los dos
+    se lleva un 1213 (500 crudo). Tomando primero la fila del EGRESO —el mismo PRIMER
+    recurso que toma el lado que revierte— las dos transacciones se serializan en el portón
+    en vez de cruzarse. Es el mismo patrón con el que el candado de la OC serializa
+    `aprobar_adelanto` contra `crear_factura`.
+
+    La lectura que descubre los ids va SIN lock y pide la columna suelta, para no bloquear
+    `cont_egreso_detalle` antes de la compra (eso invertiría el orden respecto del propio
+    `_crear_egreso` y crearía el ciclo que se quiere evitar). Queda una ventana angosta: un
+    egreso COMMITEADO entre esa lectura y el lock de los detalles no entra al portón; para
+    eso está la CAPA 2 (`_con_retry_deadlock`), que lo degrada a un 409 accionable.
+
+    DEUDA CONOCIDA (fuera de este módulo, no se toca desde acá): los otros dos caminos que
+    crean egresos viven en Compras/CxP —`POST /compras-contab/egresos` y
+    `POST /compras-contab/{id}/pagos`— y siguen entrando por COMPRA → DETALLES sin portón ni
+    reintento, así que ese par (contra `eliminar_pago` / `eliminar_egreso`) sigue pudiendo
+    dar 1213 → 500. El arreglo correcto allá es el mismo portón o invertir el orden de
+    `eliminar_pago`; corresponde al dueño de `compras_contab/router.py`.
+    """
+    ids = [r[0] for r in db.query(ContEgresoDetalle.egreso_id)
+           .join(ContCompra, ContCompra.id == ContEgresoDetalle.compra_id)
+           .filter(ContEgresoDetalle.compra_id.in_(set(compra_ids)),
+                   ContCompra.empresa == empresa)
+           .distinct().all() if r[0]]
+    if not ids:
+        return []
+    # Orden de id también DENTRO del portón: dos aprobaciones simultáneas con conjuntos de
+    # compras que se solapan piden los mismos egresos en el mismo orden.
+    # Sin populate_existing a propósito: es un PORTÓN (igual que la cuenta bancaria y la OC
+    # del adelanto). De estas filas no se lee ni se persiste ningún monto —el resultado se
+    # descarta—, así que la regla 3 de lecturas de plata no aplica.
+    return (db.query(ContEgreso).filter(ContEgreso.id.in_(sorted(ids)))
+            .order_by(ContEgreso.id.asc()).with_for_update().all())
+
+
+def _aprobar_pago_tx(payload: EgresoCreate, empresa: str, fecha, db: Session,
+                     current_user: User) -> ContEgreso:
+    """Cuerpo REINTENTABLE de la aprobación del pago: termina en el commit, así que si
+    InnoDB elige esta transacción como víctima (1213/1205) no quedó nada escrito y el
+    reintento de `_con_retry_deadlock` no puede duplicar el pago al proveedor."""
     try:
+        _porton_egresos_de_las_compras(db, [d.compra_id for d in payload.detalles], empresa)
         egreso = _crear_egreso(
             db, empresa=empresa, usuario_id=getattr(current_user, "id", None),
             detalles=[(d.compra_id, d.monto_clp) for d in payload.detalles],
@@ -333,6 +422,29 @@ def aprobar_pago(payload: EgresoCreate, db: Session = Depends(get_db),
     except HTTPException:
         db.rollback()
         raise
+    return egreso
+
+
+@router.post("/pagos")
+def aprobar_pago(payload: EgresoCreate, db: Session = Depends(get_db),
+                 current_user: User = Depends(get_current_user)):
+    """TESORERÍA da la orden: crea el Comprobante de Egreso que paga 1..N compras
+    (parcial o total). MISMA regla de negocio que POST /api/compras-contab/egresos
+    (reusa `_crear_egreso`: locks anti doble-pago, tope por saldo, recálculo).
+
+    Las DOS capas del arreglo del deadlock de la familia PAGOS:
+      · CAPA 1 — `_porton_egresos_de_las_compras` alinea el orden de candados con el lado
+        que REVIERTE pagos en Compras/CxP (que empieza por la fila del egreso).
+      · CAPA 2 — `_con_retry_deadlock` reintenta la transacción completa y responde 409
+        accionable en vez de 500 si el conflicto igual ocurre (ventana angosta del portón,
+        o un 1205 por lock-timeout).
+    La serialización de la respuesta queda AFUERA del reintento a propósito: un 1213 al
+    serializar no debe reejecutar una transacción ya aplicada. (Deuda conocida: `conciliar`
+    todavía envuelve su serialización dentro del retry.)"""
+    empresa = empresa_de(current_user)
+    fecha = _fecha(payload.fecha, "fecha") or date.today()
+    egreso = _con_retry_deadlock(
+        db, lambda: _aprobar_pago_tx(payload, empresa, fecha, db, current_user))
     db.refresh(egreso)
     return serialize_egreso(egreso)
 
@@ -358,21 +470,30 @@ def _venta_info_adelanto(db, adelantos: list) -> dict:
 
 
 @router.get("/aprobaciones")
-def aprobaciones(db: Session = Depends(get_db),
+def aprobaciones(page: int = 1, page_size: int = PAGE_SIZE_DEFAULT,
+                 db: Session = Depends(get_db),
                  current_user: User = Depends(get_current_user)):
     """Cola de aprobación de adelantos de cliente:
       · por_aprobar: informados por Comercial (con monto esperado y, si calza ±TOL, el
         abono de la cartola sugerido — informativo: aprobar NO exige cartola).
-      · aprobadas: adelantos ya aprobados (con conciliado_banco y aplicado derivados)."""
+      · aprobadas: adelantos ya aprobados (con conciliado_banco y aplicado derivados),
+        PAGINADOS. Antes se truncaban a los 50 más nuevos sin decirlo: un adelanto
+        antiguo aún sin conciliar quedaba INVISIBLE en la pantalla que debe cuadrarlo
+        con el banco. Ahora se informan `aprobadas_total` / `page` / `page_size` para que
+        la UI pueda pedir el resto (los nombres de las dos listas no cambian: aditivo)."""
     empresa = empresa_de(current_user)
+    page = max(1, int(page))
+    page_size = min(max(1, int(page_size)), PAGE_SIZE_MAX)
     informados = (db.query(ContAdelanto)
                   .filter(ContAdelanto.empresa == empresa,
                           ContAdelanto.estado == "informado")
                   .order_by(ContAdelanto.id.asc()).all())
-    aprobados = (db.query(ContAdelanto)
-                 .filter(ContAdelanto.empresa == empresa,
-                         ContAdelanto.estado == "aprobado")
-                 .order_by(ContAdelanto.id.desc()).limit(50).all())
+    base_apr = (db.query(ContAdelanto)
+                .filter(ContAdelanto.empresa == empresa,
+                        ContAdelanto.estado == "aprobado"))
+    aprobadas_total = base_apr.count()
+    aprobados = (base_apr.order_by(ContAdelanto.id.desc())
+                 .offset((page - 1) * page_size).limit(page_size).all())
     info = _venta_info_adelanto(db, informados + aprobados)
     conciliados = _adelantos_conciliados_ids(db, [a.id for a in aprobados])
 
@@ -401,6 +522,9 @@ def aprobaciones(db: Session = Depends(get_db),
             **_serialize_adelanto(a, a.id in conciliados),
             **info.get(a.id, {}),
         } for a in aprobados],
+        "por_aprobar_total": len(informados),
+        "aprobadas_total": int(aprobadas_total),
+        "page": page, "page_size": page_size,
     }
 
 
@@ -426,6 +550,8 @@ def aprobar_adelanto(adelanto_id: int, payload: AprobarAdelantoIn,
            .first())
     if not ref:
         raise HTTPException(404, "Adelanto no encontrado")
+    # La OC es el PORTÓN de serialización del orden global de locks: no se lee ni se
+    # persiste ningún monto de esta fila, así que la regla 3 (populate_existing) no aplica.
     oc = (db.query(OcCliente).filter(OcCliente.id == ref.oc_cliente_id)
           .with_for_update().first())
     if not oc or not oc.cotizacion:
@@ -460,12 +586,27 @@ def aprobar_adelanto(adelanto_id: int, payload: AprobarAdelantoIn,
     # Anticipos PRIMERO: al saldarse liberan el excedente del adelanto ligado para las
     # facturas del despacho real en esta misma pasada (el lock de la OC ya serializa
     # esta transacción, así que el orden de los locks por factura no arriesga deadlock).
+    # COALESCE (paridad con monza_contabilidad/router.py y monza_tesoreria/router.py): en
+    # DESC MySQL manda los NULL al FINAL, así que una fila legada con es_anticipo NULL
+    # (tabla nacida de create_all — el modelo solo tiene default=0 de lado Python, sin
+    # server_default) perdería contra un 0 y el orden quedaría INVERTIDO: la plata del
+    # adelanto entraría a la factura equivocada. El normalizador de tesoreria/init_db.py
+    # deja la columna NOT NULL DEFAULT 0 y el ORM siempre escribe 0: esto es cinturón y
+    # tirantes.
+    # populate_existing (regla de lecturas de plata, la MISMA que ya cumple el lock del
+    # adelanto de más arriba): el FOR UPDATE trae la fila fresca A CUALQUIER NIVEL DE
+    # AISLAMIENTO (el motor está fijado en READ COMMITTED, database.py), pero si el objeto
+    # ya está en el identity map SQLAlchemy DESCARTA esos valores y sirve el snapshot
+    # viejo — el problema es el identity map, no el read view de MySQL. Acá decide plata:
+    # `_aplicar_adelantos_pendientes` mira
+    # saldo/monto_pagado/es_anticipo de estas facturas para repartir el adelanto, así que
+    # con un saldo cacheado el mismo depósito se aplicaría dos veces.
     facturas = (db.query(ContFacturaCliente)
                 .filter(ContFacturaCliente.oc_cliente_id == oc.id,
                         ContFacturaCliente.empresa == empresa)
-                .order_by(ContFacturaCliente.es_anticipo.desc(),
+                .order_by(func.coalesce(ContFacturaCliente.es_anticipo, 0).desc(),
                           ContFacturaCliente.id.asc())
-                .with_for_update().all())
+                .populate_existing().with_for_update().all())
     aplicado_total = 0.0
     for f in facturas:
         aplicado_total += _aplicar_adelantos_pendientes(
@@ -818,7 +959,15 @@ def conciliar(mov_id: int, payload: ConciliarIn, db: Session = Depends(get_db),
       · abono + cobranza_id → crea el enlace (el 'conciliado' de la cobranza se deriva);
         marca el movimiento conciliado. Rechaza cobranzas medio='adelanto' (su plata
         se concilia por la vía abono↔adelanto; conciliarlas duplicaría el depósito).
-      · abono + adelanto_id → enlace con un adelanto de cliente APROBADO (1:1)."""
+      · abono + adelanto_id → enlace con un adelanto de cliente APROBADO (1:1).
+
+    CAPA 2 del arreglo del deadlock: el cuerpo vive en `_conciliar_tx` para poder
+    reintentarlo COMPLETO si InnoDB elige esta transacción como víctima (1213) contra
+    Facturas y Cobranzas. Mismo patrón que monza_tesoreria/router.py."""
+    return _con_retry_deadlock(db, lambda: _conciliar_tx(mov_id, payload, db, current_user))
+
+
+def _conciliar_tx(mov_id: int, payload: ConciliarIn, db: Session, current_user: User):
     empresa = empresa_de(current_user)
     mov = _mov_scoped(db, mov_id, empresa, lock=True)
     _solo_cuentas_clp(mov.cuenta)
@@ -830,9 +979,13 @@ def conciliar(mov_id: int, payload: ConciliarIn, db: Session = Depends(get_db),
     if payload.egreso_id:
         if mov.tipo != "cargo":
             raise HTTPException(400, "Un egreso de Compras se concilia contra un CARGO del banco")
+        # populate_existing: LECTURA DE PLATA bajo lock (regla 3). Abajo se compara
+        # `monto_total_clp` ±TOL contra el movimiento y se lee el guard `conciliado`; con la
+        # fila cacheada por una lectura previa del request, el lock serializa pero los
+        # valores serían viejos (el mismo pago se conciliaría contra dos cargos).
         egreso = (db.query(ContEgreso)
                   .filter(ContEgreso.id == payload.egreso_id, ContEgreso.empresa == empresa)
-                  .with_for_update().first())
+                  .populate_existing().with_for_update().first())
         if not egreso:
             raise HTTPException(404, "Egreso no encontrado")
         if egreso.conciliado:
@@ -856,10 +1009,14 @@ def conciliar(mov_id: int, payload: ConciliarIn, db: Session = Depends(get_db),
     elif payload.adelanto_id:
         if mov.tipo != "abono":
             raise HTTPException(400, "Un adelanto de cliente se concilia contra un ABONO del banco")
+        # populate_existing: LECTURA DE PLATA bajo lock (regla 3). Es la MISMA entidad que
+        # protege el invariante `monto_aplicado == Σ cobranzas medio='adelanto'`: abajo se
+        # leen `estado` y `monto` (±TOL contra el abono). Con la fila cacheada, un adelanto
+        # recién aprobado/corregido por Tesorería se conciliaría contra el monto anterior.
         adel = (db.query(ContAdelanto)
                 .filter(ContAdelanto.id == payload.adelanto_id,
                         ContAdelanto.empresa == empresa)
-                .with_for_update().first())
+                .populate_existing().with_for_update().first())
         if not adel:
             raise HTTPException(404, "Adelanto no encontrado")
         if adel.estado != "aprobado":
@@ -876,14 +1033,51 @@ def conciliar(mov_id: int, payload: ConciliarIn, db: Session = Depends(get_db),
             raise HTTPException(400, "Una cobranza (ingreso de caja) se concilia contra un ABONO del banco")
         # Lock de cobranza Y factura: el recálculo de saldos en Facturas también
         # bloquea la factura, así que esto serializa contra cobranzas concurrentes.
-        par = (db.query(ContCobranza, ContFacturaCliente)
-               .join(ContFacturaCliente, ContFacturaCliente.id == ContCobranza.factura_id)
-               .filter(ContCobranza.id == payload.cobranza_id,
-                       ContFacturaCliente.empresa == empresa)
-               .with_for_update().first())
-        if not par:
+        #
+        # CAPA 1 — ORDEN DE LOCKS. Antes esto era UN JOIN con with_for_update(): la tabla
+        # motriz era la COBRANZA (se busca por su PK) y la factura se bloqueaba DESPUÉS,
+        # o sea AL REVÉS que Facturas y Cobranzas, que bloquea primero la FACTURA y luego
+        # sus cobranzas (routers/contabilidad.py: registrar_cobranza / eliminar_cobranza
+        # con `_cobranzas_bloqueadas`). Las dos operaciones formaban un ciclo InnoDB y el
+        # operador recibía un 500 por deadlock (1213) en una operación diaria — y en todo
+        # este módulo no había un solo reintento.
+        # Ahora se sigue el orden canónico de la casa (OC → factura → cobranza) en tres
+        # pasos y, como al soltar el JOIN atómico se abre una ventana entre la lectura sin
+        # lock y el lock real, el paso 4 REVALIDA con los datos frescos (no es opcional).
+        #
+        # 1) lectura SIN lock, solo para saber a qué factura pertenece la cobranza. Se
+        #    pide la columna suelta (no la entidad) para no dejar la fila en el identity
+        #    map con valores viejos que la relectura bajo lock no pisaría.
+        factura_id_previa = (db.query(ContCobranza.factura_id)
+                             .filter(ContCobranza.id == payload.cobranza_id).scalar())
+        if factura_id_previa is None:
             raise HTTPException(404, "Cobranza no encontrada")
-        cobranza, _factura = par
+        # 2) PRIMERO la factura (mismo orden que Facturas y Cobranzas). El filtro por
+        #    empresa es el mismo candado que traía el JOIN: una cobranza de otra marca
+        #    responde 404, no se concilia. populate_existing por la regla 3 (lecturas de
+        #    plata): esta fila viaja al resumen del destino que ve el tesorero (folio de la
+        #    factura del cruce) y una copia cacheada le mostraría el dato viejo justo
+        #    mientras Facturas y Cobranzas la está corrigiendo.
+        _factura = (db.query(ContFacturaCliente)
+                    .filter(ContFacturaCliente.id == factura_id_previa,
+                            ContFacturaCliente.empresa == empresa)
+                    .populate_existing().with_for_update().first())
+        if not _factura:
+            raise HTTPException(404, "Cobranza no encontrada")
+        # 3) DESPUÉS la cobranza (populate_existing: sin él el identity map devolvería la
+        #    lectura del paso 1 y descartaría los valores frescos que trajo el FOR UPDATE
+        #    — regla de lecturas de plata).
+        cobranza = (db.query(ContCobranza)
+                    .filter(ContCobranza.id == payload.cobranza_id)
+                    .populate_existing().with_for_update().first())
+        if not cobranza:
+            raise HTTPException(404, "Cobranza no encontrada")
+        # 4) REVALIDACIÓN con los datos ya bloqueados: si la cobranza cambió de factura
+        #    entre el paso 1 y el 3, la factura bloqueada no es la suya → se corta (los
+        #    chequeos de medio / ya-conciliada / monto de abajo también leen la fila
+        #    fresca, así que quedan cubiertos por el mismo lock).
+        if cobranza.factura_id != _factura.id:
+            raise HTTPException(409, "La cobranza cambió de factura mientras se conciliaba: reintente")
         if cobranza.medio == MEDIO_ADELANTO:
             raise HTTPException(409, "Esa cobranza es la APLICACIÓN de un adelanto (no un depósito nuevo): "
                                      "concilie el abono contra el ADELANTO correspondiente")
@@ -916,9 +1110,15 @@ def desconciliar(mov_id: int, db: Session = Depends(get_db),
     if not mov.conciliado:
         raise HTTPException(400, "El movimiento no está conciliado")
     for link in list(mov.conciliaciones):
+        # populate_existing (regla 3): acá no basta con que el lock serialice. Si el egreso
+        # ya está en el identity map con la foto ANTERIOR al cruce (conciliado=False,
+        # referencia del operador), SQLAlchemy sirve esa copia y las asignaciones de abajo
+        # no cambian nada → NO emite UPDATE: el pago se queda marcado `conciliado` para
+        # siempre (invisible en /egresos-pendientes) y la referencia del banco no se
+        # revierte. El bug NO es del aislamiento de MySQL, es del identity map.
         eg = (db.query(ContEgreso)
               .filter(ContEgreso.id == link.egreso_id, ContEgreso.empresa == empresa)
-              .with_for_update().first())
+              .populate_existing().with_for_update().first())
         if eg:
             eg.conciliado = False
             eg.conciliado_at = None

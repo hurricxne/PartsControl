@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     # https://app.wasabil.com/api-tokens y va SOLO en backend/.env (nunca en git).
     # Sin token, el módulo wasabil_dte permite previsualizar pero NO emitir.
     WASABIL_API_TOKEN: str = ""
+    # Token de la cuenta Wasabil de MonzaParts (LOPEZ HERNANDEZ INVERSIONES SPA,
+    # RUT 78.121.316-0) — módulo monza_wasabil_dte (Fase 5 del espejo). El valor va
+    # SOLO en backend/.env: jamás leerlo/imprimirlo/commitearlo. OJO: sin este campo
+    # declarado, pydantic rechaza la variable del .env (extra_forbidden) y el backend
+    # COMPLETO no arranca.
+    WASABIL_API_TOKEN_MONZA: str = ""
     WASABIL_API_BASE: str = "https://api.wasabil.com/api"
     # Correo saliente de la app (tickets/avisos). Casilla no-reply@bigcode.cl.
     SMTP_HOST: str = ""

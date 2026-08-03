@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from datetime import datetime
 
@@ -38,7 +38,16 @@ class ConfigIn(BaseModel):
     tc_eur_clp: Optional[float] = None
     tarifa_aerea_por_kg: Optional[float] = None
     moneda_tarifa: Optional[str] = None
-    iva_pct: Optional[float] = None
+    # Hallazgo #5 de la auditoría integral (Fases 1-6): con iva_pct = 0 la venta se
+    # cerraba con IVA 0 pero la FACTURACIÓN usaba el 19 % por defecto (iva_rate_de
+    # no distingue "sin dato" de "0 % explícito"), inventando impuesto en un documento
+    # que se manda al SII y dejando el resto de la mercadería IMPOSIBLE de facturar.
+    # Esta es la ÚNICA puerta de entrada del dato: la cotización no recibe iva_pct del
+    # cliente, lo copia de la config (monza_router_cotizaciones.py:251). Cerrándola
+    # aquí, ninguna venta puede nacer con tasa 0 (ni con una tasa absurda > 100).
+    # NO se implementa un "0 = exento": la tubería DTE no sabe expresar exención
+    # (MntExe); si el negocio la necesita, es un trabajo aparte.
+    iva_pct: Optional[float] = Field(None, gt=0, le=100)
     razon_social: Optional[str] = None
     rut_empresa: Optional[str] = None
     direccion: Optional[str] = None
@@ -48,6 +57,27 @@ class ConfigIn(BaseModel):
     tipo_cuenta: Optional[str] = None
     numero_cuenta: Optional[str] = None
     condiciones_default: Optional[str] = None
+
+    # mode="before" a propósito: corre ANTES de las restricciones gt/le, así el
+    # operador recibe un mensaje en castellano ("la tasa de IVA debe ser mayor a 0")
+    # en vez del "Input should be greater than 0" genérico de pydantic.
+    @field_validator("iva_pct", mode="before")
+    @classmethod
+    def _validar_iva_pct(cls, v):
+        if v is None or v == "":
+            return None
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return v  # tipo inválido: que lo reporte pydantic con su mensaje estándar
+        if n <= 0:
+            raise ValueError(
+                "la tasa de IVA debe ser mayor a 0: una venta con 0 % se facturaría "
+                "igual con el 19 % por defecto e inventaría impuesto ante el SII"
+            )
+        if n > 100:
+            raise ValueError("la tasa de IVA no puede superar el 100 %")
+        return n
 
 
 def _get_or_create_config(db: Session) -> MonzaConfig:

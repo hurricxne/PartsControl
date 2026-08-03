@@ -31,6 +31,22 @@ import routers.contabilidad as cont  # noqa: E402
 from tesoreria.router import router as tes_router  # noqa: E402
 
 MARK = "__TEST_FANT__"
+
+# Los folios de ANTICIPO no pueden llevar el MARK de texto: tienen que ser el correlativo NUMÉRICO
+# del SII, porque la factura de la mercadería los cita en una referencia tipo 33 y un folio con
+# letras hace que el SII rechace el documento **con el folio propio ya consumido** (guard en
+# routers/contabilidad.py). El rango 9992xxxxx es altísimo a propósito: los folios reales van en los
+# cientos, así que nunca colisiona con el unique (empresa, numero_factura). Un folio FIJO es seguro
+# al re-correr porque _limpiar() corre al inicio de run() y borra el residuo por la cadena de la
+# cotización MARCADA, que no depende del número de factura.
+FOLIO_ANT_RS = "999200001"      # razón social digitada al emitir
+FOLIO_ANT_1 = "999200002"       # anticipo ligado a un adelanto
+FOLIO_ANT_2 = "999200003"       # 2° anticipo que excede la venta
+FOLIO_ANT_3 = "999200004"       # anticipo por el total
+FOLIO_ANT_9 = "999200005"       # vía A (adelanto aplicado) + anticipo
+FOLIO_ANT_EXC = "999200006"     # excedente del anticipo
+FOLIO_ANT_EX2 = "999200007"     # excedente, 2ª vuelta
+FOLIO_ANT_DOBLE = "999200008"   # defensa contra el doble descuento
 CURRENT = {"empresa": "mineria", "id": None}
 
 Base.metadata.create_all(bind=engine, checkfirst=True)
@@ -192,7 +208,7 @@ def run():
         # …y al EMITIR se guarda en la venta (queda completa para las siguientes)
         r = client.post("/api/contabilidad/facturas",
                         json={"oc_cliente_id": oc.id, "es_anticipo": True,
-                              "numero_factura": f"{MARK}-ANT-RS",
+                              "numero_factura": FOLIO_ANT_RS,
                               "monto_neto_anticipo": 1000,
                               "razon_social_cliente": "PRUEBA DEMO S.A."})
         check("emitir con razón social digitada 200", r.status_code == 200, r.text)
@@ -228,7 +244,7 @@ def run():
 
         r = client.post("/api/contabilidad/facturas",
                         json={"oc_cliente_id": oc.id, "es_anticipo": True,
-                              "numero_factura": f"{MARK}-ANT1",
+                              "numero_factura": FOLIO_ANT_1,
                               "monto_neto_anticipo": 50000, "adelanto_ids": [adel_id]})
         check("emitir factura de anticipo 200", r.status_code == 200, r.text)
         fant = r.json()
@@ -239,7 +255,7 @@ def run():
         a = r.json()[0]
         check("adelanto ligado a la factura de anticipo (folio)",
               a["factura_anticipo_id"] == fant["id"]
-              and a["factura_anticipo_folio"] == f"{MARK}-ANT1", a)
+              and a["factura_anticipo_folio"] == FOLIO_ANT_1, a)
 
         # factoring sobre la factura de anticipo → 409
         r = client.post(f"/api/contabilidad/facturas/{fant['id']}/factoring",
@@ -249,7 +265,7 @@ def run():
         # tope: un 2° anticipo que excede lo no facturado → 409
         r = client.post("/api/contabilidad/facturas",
                         json={"oc_cliente_id": oc.id, "es_anticipo": True,
-                              "numero_factura": f"{MARK}-ANT2", "monto_neto_anticipo": 60000})
+                              "numero_factura": FOLIO_ANT_2, "monto_neto_anticipo": 60000})
         check("2° anticipo que excede la venta → 409",
               r.status_code == 409 and "excede" in r.json()["detail"].lower(), r.text)
 
@@ -272,7 +288,7 @@ def run():
         dsc = [ln for ln in p["lineas"] if ln["numero_parte"] == "DESCUENTO"]
         check("preview final trae línea de descuento con el folio",
               len(dsc) == 1 and dsc[0]["total_neto"] == -50000
-              and f"{MARK}-ANT1" in dsc[0]["descripcion"], p["lineas"])
+              and FOLIO_ANT_1 in dsc[0]["descripcion"], p["lineas"])
         check("preview final: neto 50.000 / bruto 59.500 (tras descuento)",
               p["totales"] == {"neto": 50000.0, "iva": 9500.0, "bruto": 59500.0}, p["totales"])
 
@@ -324,7 +340,7 @@ def run():
         cot, oc, desp, it = _crear_venta(db)
         r = client.post("/api/contabilidad/facturas",
                         json={"oc_cliente_id": oc.id, "es_anticipo": True,
-                              "numero_factura": f"{MARK}-ANT3", "monto_neto_anticipo": 100000})
+                              "numero_factura": FOLIO_ANT_3, "monto_neto_anticipo": 100000})
         check("anticipo por el total 200", r.status_code == 200, r.text)
         r = client.post("/api/contabilidad/facturas/preview",
                         json={"oc_cliente_id": oc.id, "despacho_id": desp.id})
@@ -352,7 +368,7 @@ def run():
                           "numero_factura": f"{MARK}-F9"})  # vía A: aplica el adelanto
         r = client.post("/api/contabilidad/facturas",
                         json={"oc_cliente_id": oc.id, "es_anticipo": True,
-                              "numero_factura": f"{MARK}-ANT9",
+                              "numero_factura": FOLIO_ANT_9,
                               "monto_neto_anticipo": 10000, "adelanto_ids": [adel_id]})
         check("ligar adelanto ya aplicado → 409",
               r.status_code == 409 and "aplicado" in r.json()["detail"].lower(), r.text)
@@ -369,7 +385,7 @@ def run():
         adel_id = r.json()["id"]
         r = client.post("/api/contabilidad/facturas",
                         json={"oc_cliente_id": oc.id, "es_anticipo": True,
-                              "numero_factura": f"{MARK}-ANT-EXC",
+                              "numero_factura": FOLIO_ANT_EXC,
                               "monto_neto_anticipo": 50000, "adelanto_ids": [adel_id]})
         check("anticipo 59.500 ligado a adelanto de 70.000 emitido 200",
               r.status_code == 200, r.text)
@@ -405,7 +421,7 @@ def run():
         adel_id = r.json()["id"]
         fant2 = client.post("/api/contabilidad/facturas",
                             json={"oc_cliente_id": oc.id, "es_anticipo": True,
-                                  "numero_factura": f"{MARK}-ANT-EX2",
+                                  "numero_factura": FOLIO_ANT_EX2,
                                   "monto_neto_anticipo": 50000,
                                   "adelanto_ids": [adel_id]}).json()
         ffin2 = client.post("/api/contabilidad/facturas",
@@ -421,6 +437,73 @@ def run():
               and por_id[ffin2["id"]]["saldo"] == 49000,
               (por_id[fant2["id"]]["saldo"], por_id[ffin2["id"]]["saldo"]))
         _limpiar(db)
+
+        # ═══ PORT DE MONZA · el mismo depósito NO se puede contar dos veces ═══
+        # Hueco cerrado (paridad con monza_contabilidad/router.py:registrar_cobranza):
+        # registrar_cobranza rechazaba medio='adelanto' y factoring, pero NADA miraba
+        # `es_anticipo`. Alcanzable desde la pantalla normal (FacturasPage ofrecía
+        # «Registrar cobranza» a toda factura con saldo > 0):
+        #   el administrativo salda a mano la factura de ANTICIPO con la transferencia
+        #   del cliente → al aprobar el adelanto, _aplicar_adelantos_pendientes corta en
+        #   `saldo <= TOL_PAGO` y aplica 0, pero cuenta el anticipo como SALDADO → libera
+        #   el adelanto ligado → su plata cae COMPLETA en la factura final.
+        # Verificado: el cliente depositó $59.500 y la venta quedaba facturada 119.000 /
+        # cobrada 119.000 con saldo 0. Ahora son 409 y el saldo real queda a la vista.
+        cot, oc, desp, it = _crear_venta(db)
+        r = client.post("/api/contabilidad/ventas/adelantos",
+                        json={"oc_cliente_id": oc.id, "monto_esperado": 59500, "pct": 50})
+        adel_id = r.json()["id"]
+        fantD = client.post("/api/contabilidad/facturas",
+                            json={"oc_cliente_id": oc.id, "es_anticipo": True,
+                                  "numero_factura": FOLIO_ANT_DOBLE,
+                                  "monto_neto_anticipo": 50000,
+                                  "adelanto_ids": [adel_id]}).json()
+        r = client.post(f"/api/contabilidad/facturas/{fantD['id']}/cobranzas",
+                        json={"monto": 59500, "medio": "transferencia",
+                              "banco": "Santander", "numero_operacion": "DEP-REAL-1"})
+        check("cobranza MANUAL sobre una factura de anticipo → 409",
+              r.status_code == 409 and "anticipo" in r.json()["detail"].lower(), r.text)
+        db.rollback()
+        check("el 409 no dejó cobranza alguna en la factura de anticipo",
+              db.query(ContCobranza).filter(
+                  ContCobranza.factura_id == fantD["id"]).count() == 0)
+        # …y el circuito legítimo sigue funcionando: Tesorería aprueba y la plata entra
+        # UNA vez (al anticipo), dejando la factura final por cobrar de verdad.
+        r = client.post(f"/api/tesoreria/adelantos/{adel_id}/aprobar",
+                        json={"monto": 59500, "fecha_pago": "2026-07-10"})
+        check("Tesorería aplica el adelanto al anticipo (59.500)",
+              r.status_code == 200 and r.json()["aplicado_ahora_clp"] == 59500, r.text)
+        ffinD = client.post("/api/contabilidad/facturas",
+                            json={"oc_cliente_id": oc.id, "despacho_id": desp.id,
+                                  "numero_factura": f"{MARK}-FIN-DOBLE"}).json()
+        db.rollback()
+        fac_ids = [f.id for f in db.query(ContFacturaCliente)
+                   .filter(ContFacturaCliente.oc_cliente_id == oc.id).all()]
+        cobrado = sum(float(c.monto or 0) for c in db.query(ContCobranza)
+                      .filter(ContCobranza.factura_id.in_(fac_ids)).all())
+        check("INVARIANTE: Σ cobranzas de la venta == el depósito REAL (59.500, no 119.000)",
+              round(cobrado, 2) == 59500.0, cobrado)
+        check("la factura final queda POR COBRAR (59.500), no 'pagada' con plata inexistente",
+              ffinD["saldo"] == 59500 and ffinD["estado_pago"] == "por_cobrar",
+              (ffinD["saldo"], ffinD["estado_pago"]))
+        _limpiar(db)
+
+        # Cinturón y tirantes del mismo hallazgo: el ORDER BY que rutea el adelanto va
+        # blindado con COALESCE (en DESC MySQL manda los NULL al FINAL, así que una fila
+        # legada con es_anticipo NULL invertiría el orden y la plata entraría a la factura
+        # equivocada) y el init_db deja la columna NOT NULL DEFAULT 0.
+        import inspect as _inspect
+        from tesoreria import router as _tes_R
+        src = _inspect.getsource(_tes_R.aprobar_adelanto)
+        check("el order_by de aprobar_adelanto va blindado con COALESCE",
+              "coalesce" in src.lower() and "es_anticipo" in src, "")
+        row = db.execute(text(
+            "SELECT is_nullable, column_default FROM information_schema.columns "
+            "WHERE table_schema=DATABASE() AND table_name='cont_factura_cliente' "
+            "AND column_name='es_anticipo'")).first()
+        check("cont_factura_cliente.es_anticipo quedó NOT NULL DEFAULT 0 "
+              "(correr `python -m tesoreria.init_db` si falla)",
+              bool(row) and row[0] == "NO" and str(row[1]) == "0", tuple(row) if row else None)
 
     finally:
         _limpiar(db)

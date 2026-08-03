@@ -151,6 +151,10 @@ interface Kpis {
   facturado_clp: number
   cobrado_clp: number
   cobrado_cliente_clp?: number
+  // Plata que puso el FACTOR (adelanto + retención liquidada), no el cliente. El backend
+  // la devuelve (contabilidad/kpis) y la pantalla la escondía: sin ella "Cobrado" no
+  // cuadra con la cartera. Opcional: tolera respuestas del backend previo.
+  anticipo_factoring_clp?: number
   por_cobrar_clp: number
   vencido_clp: number
   en_factoring_clp: number
@@ -737,10 +741,12 @@ export default function VentasContabPage() {
 
       {/* KPIs */}
       {kpis && (
-        <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           {[
             { icon: <DollarSign className="w-5 h-5" />, label: 'Facturado', value: fmtClp(kpis.facturado_clp), color: 'text-brand-400' },
             { icon: <CheckCircle2 className="w-5 h-5" />, label: 'Cobrado', value: fmtClp(kpis.cobrado_cliente_clp ?? kpis.cobrado_clp), color: 'text-emerald-400' },
+            // Anticipo del factor: lo pone el factor, no el cliente. Mismo KPI que Facturas.
+            { icon: <HandCoins className="w-5 h-5" />, label: 'Anticipo factoring', value: fmtClp(kpis.anticipo_factoring_clp ?? 0), color: 'text-purple-400' },
             { icon: <CreditCard className="w-5 h-5" />, label: 'Por cobrar', value: fmtClp(kpis.por_cobrar_clp), color: 'text-amber-400' },
             { icon: <AlertCircle className="w-5 h-5" />, label: 'Vencido', value: fmtClp(kpis.vencido_clp), color: 'text-red-400' },
             { icon: <Clock className="w-5 h-5" />, label: 'En factoring', value: fmtClp(kpis.en_factoring_clp), color: 'text-purple-400' },

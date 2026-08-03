@@ -92,3 +92,30 @@ Verificado: no hay ningún camino de la casa que dependa de gap locks, y los dea
 
 Los arreglos puntuales ya aplicados protegen los caminos críticos por sí solos: ese es el
 punto de tener las dos capas.
+
+## Tolerancia de 1 CLP (TOL_PAGO) — por qué la identidad Σ cobranzas == bruto − saldo puede desviarse
+
+Auditoría integral MonzaParts 2026-07-29 (hallazgo LOW). **No es un descuadre: está a
+propósito y se documenta para que una auditoría futura no lo vuelva a levantar.**
+
+1. Los topes de plata aceptan hasta **1 CLP por sobre el saldo** para absorber el polvo de
+   redondeo de IVA/factoring (half-up a peso por línea y por tanda):
+   · cobranzas — `backend/monza_contabilidad/router.py` (`payload.monto > saldo_actual + TOL_PAGO`)
+     y su espejo `backend/routers/contabilidad.py`;
+   · factoring — el mismo `TOL_PAGO` en el cupo financiable de ambos módulos;
+   · facturación — el tope Σ brutos ≤ total de la venta.
+2. Por eso, cuando hay un sobrepago DENTRO de la holgura, la identidad
+   `Σ cobranzas == bruto − saldo` puede desviarse **hasta 1 CLP por factura**: el saldo se
+   clampea a 0 (`max(bruto − pagado, 0)`, `monza_contabilidad/service.py::_recompute_factura`)
+   mientras `monto_pagado` conserva lo que el operador registró de verdad.
+3. El desvío **NO es acumulable dentro de una factura** (el invariante duro
+   `Σ cobranzas ≤ bruto + TOL_PAGO` se revalida BAJO LOCK en cada inserción, también por la
+   vía de factoring): un segundo peso ya sale 400. Pero **sí suma 1 CLP por factura
+   sobrepagada** en las lecturas agregadas (`cobrado_clp` de la venta y del KPI), así que
+   una diferencia de N pesos con N facturas es **esperada**.
+
+Si alguna vez se quisiera la identidad exacta al peso: **no** usar `min(payload.monto, saldo_actual)`
+a secas (el `gt=0` de pydantic valida el payload, no el valor capado — habría que usar
+`min(payload.monto, max(saldo_actual, 0.0))` y rechazar con 400 si queda en 0). Igual **no se
+recomienda**: capar en silencio altera lo que registró el operador, y rompería la paridad con
+Grupo AM, que tendría que cambiar en el mismo commit.

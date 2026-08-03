@@ -34,6 +34,15 @@ from tesoreria.models import ConciliacionIngreso  # noqa: E402
 import routers.contabilidad as cont  # noqa: E402
 
 MARK = "__TEST_VDSG__"
+
+# El folio de una factura de ANTICIPO no puede llevar el MARK de texto como las demás: tiene que ser
+# el correlativo NUMÉRICO que asignó el SII, porque la factura de la mercadería lo cita en una
+# referencia tipo 33 y un folio con letras hace que el SII rechace el documento **con el folio propio
+# ya consumido** (guard en routers/contabilidad.py). El rango 9991xxxxx es altísimo a propósito: los
+# folios reales van en los cientos, así que nunca colisiona con el unique (empresa, numero_factura).
+# Un folio FIJO es seguro al re-correr porque _limpiar() corre al inicio de run() y borra el residuo
+# por la cadena de la cotización MARCADA, que no depende del número de factura.
+FOLIO_ANT = "999100001"
 CURRENT = {"empresa": "mineria", "id": None}
 
 Base.metadata.create_all(bind=engine, checkfirst=True)
@@ -181,7 +190,7 @@ def run():
         # ═══ E2 · Solo ANTICIPO cobrado (el caso que confundía a Aldo) ═══
         r = client.post("/api/contabilidad/facturas",
                         json={"oc_cliente_id": oc.id, "es_anticipo": True,
-                              "numero_factura": f"{MARK}-ANT", "monto_neto_anticipo": 50000})
+                              "numero_factura": FOLIO_ANT, "monto_neto_anticipo": 50000})
         check("E2 emitir anticipo 200", r.status_code == 200, r.text)
         fant = r.json()
         # pagar el anticipo (cobranza real; medio='adelanto' manual está prohibido)

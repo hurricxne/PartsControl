@@ -298,6 +298,17 @@ def run():
     check("eliminar con pagos 409", client.delete(f"/api/monza/compras-contab/{r.json()['id']}").status_code == 409)
 
 
+def test_monza_compras_contab_integration():
+    """Wrapper para pytest (espejo de compras_contab/tests/test_integration.py:219 de GA):
+    sin él la suite era INVISIBLE al gate rutinario 'pytest verde'."""
+    seed()
+    try:
+        run()
+    finally:
+        cleanup()
+    assert not _fails, f"fallas: {_fails}"
+
+
 if __name__ == "__main__":
     seed()
     try:

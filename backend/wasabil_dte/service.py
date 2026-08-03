@@ -184,6 +184,18 @@ def armar_guia(*, numero_oc: str, fecha_oc: date, numero_despacho: str,
     """
     if tipo_traslado not in TIPOS_TRASLADO:
         raise ValueError(f"Tipo de traslado inválido: {tipo_traslado}")
+    if not fecha_oc:
+        # Cinturón: el router ya lo reporta como problema bloqueante, pero un DTE 52
+        # sin fecha en la referencia 801 es inválido ante el SII — mejor reventar acá
+        # que emitir chueco si alguna vía nueva se saltara la validación.
+        raise ValueError("La referencia 801 exige la fecha de la OC (fecha_oc es NULL)")
+    folio_oc = str(numero_oc).strip()
+    if len(folio_oc) > FOLIO_REF_MAX:
+        # Mismo cinturón espejo del preview: el SII rechaza folios de referencia de más
+        # de 18 chars y truncarlo cambiaría la referencia legal a la OC del cliente.
+        raise ValueError(
+            f"El N° de OC ('{folio_oc}') tiene {len(folio_oc)} caracteres; "
+            f"el SII permite máximo {FOLIO_REF_MAX} en la referencia 801")
     doc = {
         "siiDocumentTypeCode": TIPO_DOC_GUIA,
         "issue": issue,
@@ -198,7 +210,7 @@ def armar_guia(*, numero_oc: str, fecha_oc: date, numero_despacho: str,
         # SII (RazonRef) y payload_a_rest lo omite si viene vacío.
         "references": [{
             "documentType": TIPO_REF_OC,
-            "folio": str(numero_oc),
+            "folio": folio_oc,
             "date": fecha_oc.isoformat(),
         }],
         # Referencia libre = SOLO el N° de despacho interno (ancla anti doble
@@ -259,16 +271,38 @@ def payload_a_rest(doc: dict) -> dict:
     return rest
 
 
+def _peso(valor) -> float:
+    """Redondeo a PESO con half-up — el criterio del SII, el de _total_linea de
+    routers.contabilidad y el del frontend (Math.round). El round() nativo de Python es
+    banker's (28.5 → 28) y descuadra 1 peso en los .5."""
+    return float(Decimal(str(valor)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def neto_linea_dte(ln: dict) -> float:
+    """Neto que el SII liquidará por UNA línea: (precio × cantidad) menos su `discount`
+    porcentual, half-up a PESO.
+
+    El peso —y no el centavo— es el dominio correcto por DOS razones que apuntan al
+    mismo lado: los montos de un DTE en CLP son ENTEROS (MontoItem por línea), y es
+    EXACTAMENTE el dominio en que Contabilidad calculó el neto local (_total_linea,
+    routers/contabilidad.py). Medir en centavos hacía que el medio peso de una línea
+    terminada en .5 se perdiera y el documento tributario saliera descuadrado contra el
+    libro de ventas."""
+    bruto = _f(ln.get("price")) * _f(ln.get("quantity"))
+    return _peso(bruto * (1 - _f(ln.get("discount")) / 100.0))
+
+
 def total_neto_lineas(lineas: List[dict]) -> float:
-    """Neto del documento = Σ (precio unitario × cantidad) redondeado a peso POR LÍNEA
-    con half-up — mismo criterio que crear_factura en Contabilidad y que lo que el
-    usuario ve en pantalla (Math.round del frontend es half-up; el round() de Python
-    es banker's y descuadraría por 1 peso en los .5)."""
-    total = Decimal("0")
-    for ln in lineas:
-        total += Decimal(str(ln["price"] * ln["quantity"])).quantize(
-            Decimal("1"), rounding=ROUND_HALF_UP)
-    return float(total)
+    """Neto del documento = Σ neto_linea_dte (half-up a peso POR LÍNEA) — mismo criterio
+    que crear_factura en Contabilidad y que lo que el usuario ve en pantalla
+    (Math.round del frontend es half-up; el round() de Python es banker's y
+    descuadraría por 1 peso en los .5).
+
+    DESCUENTA el `discount` de cada línea: ignorarlo reportaba un neto que no era el que
+    iba a liquidar el SII. Para la guía 52 y para cualquier factura sin descuento de
+    anticipo (ninguna línea trae `discount`) el resultado es idéntico al de siempre — el
+    payload de esas facturas no cambia ni un byte."""
+    return float(sum(neto_linea_dte(ln) for ln in lineas))
 
 
 def claim_vigente(dte, ahora: Optional[datetime] = None) -> bool:
@@ -292,9 +326,19 @@ def serialize_dte(dte) -> dict:
       Wasabil o la respuesta se perdió y el claim ya expiró → reintentable).
     `puede_reintentar` es la ÚNICA fuente de verdad del botón Reintentar.
     """
-    from .models import STATUS_LABEL, STATUS_FALLIDO  # import local (módulo puro)
+    from .models import (  # import local (módulo puro)
+        STATUS_LABEL, STATUS_FALLIDO, STATUS_EMITIDO,
+    )
     en_vuelo = claim_vigente(dte)
-    if dte.uuid:
+    if dte.status_id == STATUS_EMITIDO:
+        # El STATUS manda sobre la ausencia de uuid. Reproducido: un DTE con
+        # status_id=3 y folio "9500" pero uuid NULL (la respuesta trajo el estado y el
+        # folio, y el uuid se perdió) se pintaba "no enviado" CON BOTÓN DE REINTENTAR
+        # al lado, sobre un documento que ya existe ante el SII. El reintento lo ataja
+        # con un 409, pero invitar a re-emitir algo irreversible no es aceptable: si el
+        # API lo dio por emitido, el operador tiene que leer "emitido".
+        estado = STATUS_LABEL.get(STATUS_EMITIDO, "emitido")
+    elif dte.uuid:
         estado = STATUS_LABEL.get(dte.status_id, "sin_respuesta")
     elif en_vuelo:
         estado = "enviando"
@@ -307,13 +351,20 @@ def serialize_dte(dte) -> dict:
     # antes dejaba clavado el caso "el server se cayó (o se hizo deploy) entre el claim
     # y la respuesta": nadie alcanzó a escribir el error, el claim expiraba solo y la
     # UI quedaba en "SII en proceso" para siempre, sin botón de reintento.
-    puede_reintentar = (not en_vuelo) and (
+    # ...salvo que el status diga EMITIDO: entonces el documento existe y no se
+    # reintenta nada (mismo motivo que el estado de arriba; el 409 del endpoint deja de
+    # ser la única defensa y el botón ni siquiera se ofrece).
+    puede_reintentar = (not en_vuelo) and dte.status_id != STATUS_EMITIDO and (
         dte.status_id == STATUS_FALLIDO or dte.uuid is None
     )
     return {
         "id": dte.id,
         "tipo_dte": dte.tipo_dte,
         "despacho_id": dte.despacho_id,
+        # factura_id: el modal de facturas sondea POR FACTURA, así que sin este campo la
+        # respuesta de "emitir" no le dice al frontend a quién consultar. Los endpoints
+        # igual lo vuelven a poner como cinturón (mismo valor, sin riesgo de divergencia).
+        "factura_id": getattr(dte, "factura_id", None),
         "uuid": dte.uuid,
         "status_id": dte.status_id,
         "estado": estado,
@@ -337,10 +388,24 @@ def serialize_dte(dte) -> dict:
 # La factura se emite DESDE la factura local persistida (líneas congeladas en
 # cont_factura_cliente_item): preview == emisión == lo que quedó en la BD.
 
+def _folio_dte_valido(folio: str) -> bool:
+    """¿Sirve como FolioRef de una referencia a un DOCUMENTO TRIBUTARIO (52 / 33)?
+
+    El folio de un DTE es un correlativo NUMÉRICO del SII, y lo mismo vale para la guía en
+    papel (su folio viene autorizado por el SII). La referencia 801 de la OC del cliente NO
+    pasa por acá a propósito: ahí el "folio" es el N° de orden de compra del cliente, que
+    es texto libre y legítimo.
+
+    `isascii()` además de `isdigit()`: '٣'.isdigit() es True y no es un folio."""
+    f = (folio or "").strip()
+    return bool(f) and f.isascii() and f.isdigit() and int(f) > 0
+
+
 def armar_referencias_factura(*, numero_oc: str, fecha_oc: Optional[date],
                               guia_folio: Optional[str] = None,
                               guia_fecha: Optional[date] = None,
                               anticipos: Optional[List[dict]] = None,
+                              fecha_documento: Optional[date] = None,
                               ) -> Tuple[List[dict], List[str]]:
     """Referencias del DTE 33 según la matriz de negocio de Grupo AM:
 
@@ -350,6 +415,15 @@ def armar_referencias_factura(*, numero_oc: str, fecha_oc: Optional[date],
 
     `anticipos`: [{"folio": str, "fecha": date|None}]. Devuelve (referencias,
     problemas); cualquier problema es bloqueante (documento inválido ante el SII).
+
+    `fecha_documento` es la fecha de emisión de ESTA factura, y sirve para un solo
+    control: **una referencia no puede estar fechada DESPUÉS del documento que la cita**.
+    Se agregó al hacer editable la fecha de la guía (2026-07-30): `fecha_emision` de la
+    factura es un campo libre sin tope, así que backdatando la factura se llegaba a un
+    DTE 33 REAL que declara haberse emitido ANTES que la guía que dice amparar. Ninguna
+    de las dos fechas es inválida por sí sola — sólo lo es su orden, y nadie las cruzaba.
+    Si viene None el control no corre (se conserva el comportamiento de los llamadores
+    que no la pasan).
     """
     problemas: List[str] = []
     refs: List[dict] = []
@@ -378,6 +452,26 @@ def armar_referencias_factura(*, numero_oc: str, fecha_oc: Optional[date],
             problemas.append(
                 f"El folio de la guía ('{folio_g}') excede {FOLIO_REF_MAX} caracteres "
                 "para la referencia 52 (¿guía manual con N° largo?)")
+        elif not _folio_dte_valido(folio_g):
+            # FolioRef NUMÉRICO, igual que la referencia 33 de los anticipos: la 52 apunta
+            # a un DOCUMENTO TRIBUTARIO (guía electrónica o guía en papel con folio
+            # autorizado por el SII), y el folio de un DTE es un correlativo numérico.
+            # Cuando la guía no es electrónica el folio sale de `despacho.numero_guia`, que
+            # lo TECLEA el operador: se reprodujeron 'G-TECLEADO-A-MANO' y 'G-B' viajando
+            # como FolioRef de una 33 REAL. El SII rechaza ese documento y el rechazo llega
+            # con el folio propio YA CONSUMIDO — hay que bloquear ANTES, no después.
+            # (`isascii` además de `isdigit`: '٣'.isdigit() es True y no es un folio.)
+            problemas.append(
+                f"El N° de guía de despacho ('{folio_g}') no es un folio numérico del SII: "
+                "la referencia 52 apunta a un documento tributario y el SII exige su folio. "
+                "Corrige el N° de guía en Despachos (usa el folio de la guía en papel) o "
+                "emite la guía electrónica antes de facturar")
+        elif guia_fecha and fecha_documento and guia_fecha > fecha_documento:
+            problemas.append(
+                f"La guía de despacho está fechada el {guia_fecha.isoformat()}, DESPUÉS de "
+                f"la fecha de emisión de esta factura ({fecha_documento.isoformat()}): una "
+                "factura no puede referenciar una guía que todavía no existía. Corrige la "
+                "fecha de emisión de la factura o la fecha de la guía en Despachos.")
         else:
             # SIN `reason`: el tipo 52 ya se imprime como "GUIA DE DESPACHO" + folio.
             refs.append({
@@ -396,6 +490,19 @@ def armar_referencias_factura(*, numero_oc: str, fecha_oc: Optional[date],
             continue
         if len(folio_a) > FOLIO_REF_MAX:
             problemas.append(f"El folio del anticipo ('{folio_a}') excede {FOLIO_REF_MAX} caracteres")
+            continue
+        # FolioRef NUMÉRICO: la 33 referencia un DTE, y el folio de un DTE es un número
+        # correlativo del SII. En el modo "registrar una factura de anticipo ya emitida"
+        # el folio lo TECLEA el operador, así que aquí entra cualquier cosa: se
+        # reprodujo un 'N/A-99' viajando en la referencia. El SII rechaza el documento y
+        # el rechazo llega con el folio propio YA CONSUMIDO — hay que bloquear antes.
+        # (`isascii` además de `isdigit`: '٣'.isdigit() es True y no es un folio.)
+        if not _folio_dte_valido(folio_a):
+            problemas.append(
+                f"El folio de la factura de anticipo ('{folio_a}') no es un número "
+                "correlativo del SII: la referencia 33 apunta a un documento tributario y "
+                "el SII exige su folio numérico. Corrige el N° de esa factura en "
+                "Contabilidad → Facturas antes de emitir ésta")
             continue
         fecha_a = a.get("fecha")
         # Este reason SÍ se conserva: explica POR QUÉ se referencia esa factura —
@@ -425,6 +532,10 @@ def armar_lineas_factura(items: list) -> Tuple[List[dict], List[str]]:
     el API real los RECHAZA (price y quantity deben ser > 0 — verificado en
     borrador issue:false el 2026-07-20). Van como `discount` porcentual sobre las
     líneas positivas (aplicar_descuento_lineas), manteniendo el monto exacto.
+
+    Lo que identifica a una línea de descuento es LA FK, no el signo: una línea
+    negativa sin `anticipo_factura_id` es un problema BLOQUEANTE (ver abajo), porque
+    rebajaría el DTE sin ninguna referencia 33 que lo respalde.
     """
     lineas: List[dict] = []
     problemas: List[str] = []
@@ -432,9 +543,25 @@ def armar_lineas_factura(items: list) -> Tuple[List[dict], List[str]]:
     for it in items:
         qty = _f(it.cantidad)
         precio = round(_f(it.precio_unit_neto), 2)
-        if it.anticipo_factura_id is not None or precio < 0:
+        # SOLO la FK alimenta el descuento. El criterio viejo ("FK o precio<0") tragaba
+        # cualquier línea negativa suelta y la convertía en descuento: una línea heredada
+        # sin anticipo detrás —que ANTES de la Fase B BLOQUEABA la emisión— pasaba a
+        # rebajar el DTE sin ninguna referencia 33 que lo respalde ante el SII. El
+        # descuento tiene que poder señalar QUÉ anticipo descuenta; si no puede, no es
+        # un descuento.
+        if getattr(it, "anticipo_factura_id", None) is not None:
             # Línea local de DESCUENTO por anticipo: se acumula y se aplica como %
             descuento_neto += -_f(it.total_neto)
+            continue
+        if precio < 0 or _f(getattr(it, "total_neto", None)) < 0:
+            # Mensaje PROPIO, no el del anticipo: decirle al operador "falta el folio del
+            # anticipo" lo mandaría a buscar un anticipo que no existe.
+            problemas.append(
+                f"{it.numero_parte or 'línea ' + str(it.id)}: la factura tiene una línea "
+                "con monto NEGATIVO que no corresponde al descuento de ninguna factura "
+                "de anticipo. El SII no acepta líneas negativas y sin anticipo detrás no "
+                "hay nada que referenciar: corrige la factura o regístrala por la vía "
+                "manual en Contabilidad → Facturas")
             continue
         if qty <= TOL_QTY:
             continue  # línea vacía
@@ -474,12 +601,36 @@ def aplicar_descuento_lineas(lineas: List[dict], descuento_neto: float) -> List[
     for ln in sorted(lineas, key=lambda x: x["price"] * x["quantity"], reverse=True):
         if restante <= TOL_QTY:
             break
-        total_linea = round(ln["price"] * ln["quantity"], 2)
+        # El total de la línea se mide en PESOS half-up, el MISMO dominio en que
+        # Contabilidad calculó el neto local (_total_linea). Medirlo en centavos
+        # —round(price*qty, 2)— perdía el medio peso de una línea terminada en .5 al
+        # consumirla al 100 % y el DTE salía $1 por debajo del libro de ventas
+        # (verificado: 3 líneas de 8.889,50 con un anticipo de 17.779 → libro 8.891,
+        # DTE 8.890). Además, un tope en centavos podía exigir un `discount` mayor a
+        # 100 % para agotar la línea, y el API rechaza eso.
+        total_linea = neto_linea_dte(ln)
         if total_linea <= 0:
             continue
         d = min(restante, total_linea)
-        ln["discount"] = (d / total_linea) * 100.0
+        objetivo = total_linea - d           # el neto EXACTO que debe quedarle a la línea
+        bruto_linea = _f(ln["price"]) * _f(ln["quantity"])
+        # El porcentaje va contra el bruto SIN REDONDEAR, que es lo que Wasabil
+        # multiplica: así bruto × (1 − %/100) da el objetivo EXACTO y la cuadratura se
+        # sostiene tanto si el receptor redondea por línea como si suma primero. Con
+        # precios enteros —el caso normal— sale el mismo porcentaje de siempre
+        # (30.000 sobre 80.000 → 37,5 %; 33.333 sobre 200.000 → 16,6665), así que el
+        # payload de esas facturas no cambia. Escrito como (bruto − objetivo)/bruto y
+        # no como 1 − objetivo/bruto: misma cuenta, sin arrastrar ruido de float.
+        # Y NO se redondea (ver el docstring: Wasabil calcula con la precisión enviada).
+        pct = (bruto_linea - objetivo) / bruto_linea * 100.0
         restante = round(restante - d, 2)
+        if pct <= 0:
+            # Resto SUB-PESO más chico que lo que la línea ya perdió al redondear (solo
+            # ocurre con un anticipo con centavos): el porcentaje saldría NEGATIVO y el
+            # API lo rechazaría. Se omite el `discount` — la línea redondea al MISMO
+            # entero con o sin él, así que el documento no cambia.
+            continue
+        ln["discount"] = pct
     if restante > TOL_QTY:
         problemas.append(
             f"El descuento por anticipo (${descuento_neto:,.0f}) supera el total de las "
@@ -488,12 +639,17 @@ def aplicar_descuento_lineas(lineas: List[dict], descuento_neto: float) -> List[
     # a 100%): un descuento repartido entre varias líneas puede dejar el total en
     # centavos sin que ninguna sola llegue al 100%. El umbral es UN PESO — el neto del
     # DTE se emite redondeado, así que cualquier cosa bajo $1 llega al SII como $0.
-    # round() de la SUMA: el % de descuento arrastra error de float (un neto de $1,00
-    # exacto daba 0.9999999…) y sin redondear bloqueaba una factura legítima, además de
-    # contradecir al preview, que compara el neto ya redondeado.
-    total_doc = round(sum(round(ln["price"] * ln["quantity"], 2) *
-                          (1 - ln.get("discount", 0) / 100.0) for ln in lineas), 2)
-    if lineas and total_doc < NETO_MINIMO_DTE:
+    # Se miran DOS cifras y basta que una caiga bajo el piso:
+    #   · total_doc  = lo que LIQUIDA el SII (half-up a peso por línea, == neto local).
+    #   · total_fino = el mismo total sin redondear, en centavos. Atrapa el documento que
+    #     en el libro de ventas vale $0,99 y que el redondeo del DTE subiría a $1: el SII
+    #     lo aceptaría, pero saldría por un monto distinto al registrado.
+    # round() de la SUMA en el fino: el % de descuento arrastra error de float (un neto de
+    # $1,00 exacto daba 0.9999999…) y sin redondear bloquearía una factura legítima.
+    total_doc = total_neto_lineas(lineas)
+    total_fino = round(sum(_f(ln["price"]) * _f(ln["quantity"]) *
+                           (1 - _f(ln.get("discount")) / 100.0) for ln in lineas), 2)
+    if lineas and min(total_doc, total_fino) < NETO_MINIMO_DTE:
         problemas.append(
             "El descuento del anticipo deja la factura en $0: el SII no acepta un "
             "DTE en cero — ajusta el descuento o registra la factura por la vía manual")

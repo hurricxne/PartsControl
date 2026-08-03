@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import {
   ShoppingBag, Zap, ArrowRight, Info, CheckCircle2,
   Package, TruckIcon, BookOpen, Loader2, AlertCircle,
-  Search, X, HandCoins,
+  Search, X, HandCoins, Download,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { cotizacionesAPI, cotizadorAPI, authAPI, comprasAPI, contabilidadAPI } from '../services/api'
@@ -126,6 +126,11 @@ interface Cot {
   cliente: string
   fase_comercial: string
   total_items: number
+  // Ya venían en GET /cotizaciones/ y la pantalla no los leía: la referencia es el otro
+  // dato con que Comercial identifica la cotización (obra / solicitud del cliente), y
+  // created_at permite acotar por período en vez de recorrer la lista completa.
+  referencia?: string | null
+  created_at?: string | null
 }
 
 interface Asesor {
@@ -133,6 +138,24 @@ interface Asesor {
   nombre: string
   email: string
 }
+
+// Venta ya registrada para la cotización (GET /contabilidad/ventas). Solo lo que
+// necesita el aviso de "esta venta ya tiene adelanto" al re-cerrar.
+interface VentaConAdelantos {
+  cotizacion_id: number
+  numero_oc: string | null
+  total_con_iva_clp: number
+  adelantos?: { n: number; por_aprobar: number; aprobado_clp: number; pendiente_aplicar_clp: number }
+}
+
+// Ventanas de tiempo del filtro (client-side sobre created_at de la lista).
+const PERIODOS: { key: string; label: string; dias: number | null }[] = [
+  { key: '', label: 'Todo', dias: null },
+  { key: 'semana', label: 'Últimos 7 días', dias: 7 },
+  { key: 'mes', label: 'Últimos 30 días', dias: 30 },
+  { key: 'anio', label: 'Último año', dias: 365 },
+]
+const MS_DIA = 24 * 60 * 60 * 1000
 
 const TRIGGERS = [
   {
@@ -180,6 +203,11 @@ export default function CierreVentaPage() {
   // Search
   const [search, setSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
+  const [periodo, setPeriodo] = useState('')
+  const [descargandoPdf, setDescargandoPdf] = useState(false)
+  // Venta ya cerrada para la cotización elegida (y sus adelantos), para no informar dos
+  // veces el mismo adelanto al re-cerrar. null = sin venta previa / aún no consultado.
+  const [ventaPrevia, setVentaPrevia] = useState<VentaConAdelantos | null>(null)
 
   // Form
   const [oc, setOc] = useState('')
@@ -273,14 +301,44 @@ export default function CierreVentaPage() {
     })
   }
 
+  // Adelanto ya informado/aprobado para esta cotización: se consulta al elegirla, para
+  // que Comercial NO informe un segundo adelanto sobre la misma venta al re-cerrarla
+  // (el backend los suma y topea al total, así que el duplicado se descubre tarde).
+  useEffect(() => {
+    setVentaPrevia(null)
+    if (!selectedCotId) return
+    const numero = cotizaciones.find(c => c.id === selectedCotId)?.numero
+    let vigente = true
+    contabilidadAPI.listVentas(numero || undefined)
+      .then(({ data }) => {
+        if (!vigente) return
+        const rows = (data ?? []) as VentaConAdelantos[]
+        setVentaPrevia(rows.find(r => r.cotizacion_id === selectedCotId) ?? null)
+      })
+      .catch(() => { /* informativo: si no se puede leer, no se bloquea el cierre */ })
+    return () => { vigente = false }
+  }, [selectedCotId, cotizaciones])
+
   const selectedCot = cotizaciones.find(c => c.id === selectedCotId)
 
+  // Filtro de la lista: N° de cotización, cliente o REFERENCIA (obra / solicitud del
+  // cliente), y ventana de tiempo por fecha de creación.
+  const desdeMs = (() => {
+    const dias = PERIODOS.find(p => p.key === periodo)?.dias ?? null
+    return dias == null ? null : Date.now() - dias * MS_DIA
+  })()
   const filteredCots = cotizaciones.filter(c => {
+    if (desdeMs != null && c.created_at) {
+      const t = new Date(c.created_at).getTime()
+      // Sin created_at legible NO se descarta: mejor mostrarla que esconderla.
+      if (Number.isFinite(t) && t < desdeMs) return false
+    }
     if (!search.trim()) return true
     const q = search.toLowerCase()
     return (
       c.numero.toLowerCase().includes(q) ||
-      (c.cliente || '').toLowerCase().includes(q)
+      (c.cliente || '').toLowerCase().includes(q) ||
+      (c.referencia || '').toLowerCase().includes(q)
     )
   })
   const itemsSeleccionados = items.filter(i => selectedItems.has(i.id))
@@ -308,6 +366,28 @@ export default function CierreVentaPage() {
     if (Array.isArray(d)) return d.map((x: any) => x?.msg || JSON.stringify(x)).join('; ')
     if (typeof d === 'string') return d
     return fallback
+  }
+
+  /** Descarga el PDF formal de la cotización (el mismo que se le manda al cliente):
+   *  quien cierra la venta necesita comparar contra el papel que el cliente aprobó,
+   *  sin salir de la pantalla ni volver al Cotizador. */
+  const handleDownloadPdf = async () => {
+    if (!selectedCotId) return
+    setDescargandoPdf(true)
+    try {
+      const resp = await cotizadorAPI.downloadPdf(selectedCotId as number)
+      const blob = new Blob([resp.data], { type: 'application/pdf' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `CotizacionCliente-${selectedCot?.numero ?? selectedCotId}.pdf`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (err) {
+      toast.error(msgError(err, 'No se pudo descargar el PDF de la cotización'))
+    } finally { setDescargandoPdf(false) }
   }
 
   const handleCerrar = async () => {
@@ -416,7 +496,19 @@ export default function CierreVentaPage() {
                     <span className="mx-2 text-xs" style={{ color: 'var(--text-faint)' }}>·</span>
                     <span className="text-sm" style={{ color: 'var(--text-primary)' }}>{selectedCot.cliente || 'Sin cliente'}</span>
                     <span className="ml-2 text-xs" style={{ color: 'var(--text-faint)' }}>{selectedCot.total_items} ítem(s)</span>
+                    {selectedCot.referencia && (
+                      <span className="ml-2 text-xs" style={{ color: 'var(--text-faint)' }}>· ref. {selectedCot.referencia}</span>
+                    )}
                   </div>
+                  {/* PDF de la cotización: el papel que el cliente aprobó, para contrastarlo
+                      antes de cerrar (el mismo documento del Cotizador). */}
+                  <button onClick={handleDownloadPdf} disabled={descargandoPdf}
+                    title="Descargar el PDF de la cotización (el que se le envió al cliente)"
+                    className="text-xs px-2 py-0.5 rounded hover:bg-[var(--surface-300)] transition-colors inline-flex items-center gap-1 disabled:opacity-50"
+                    style={{ color: 'var(--text-muted)' }}>
+                    {descargandoPdf ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+                    PDF
+                  </button>
                   <button onClick={() => setSearchOpen(true)}
                     className="text-xs px-2 py-0.5 rounded hover:bg-[var(--surface-300)] transition-colors"
                     style={{ color: 'var(--text-faint)' }}>
@@ -434,7 +526,7 @@ export default function CierreVentaPage() {
                     <input
                       autoFocus={searchOpen}
                       className="input w-full pl-9 pr-8"
-                      placeholder="Buscar por N° cotización o cliente…"
+                      placeholder="Buscar por N° cotización, cliente o referencia…"
                       value={search}
                       onChange={e => setSearch(e.target.value)}
                     />
@@ -446,12 +538,28 @@ export default function CierreVentaPage() {
                     )}
                   </div>
 
+                  {/* Ventana de tiempo: con historia, la lista de elegibles se vuelve un muro
+                      y hasta ahora solo se podía recorrer a mano. */}
+                  <div className="flex items-center gap-1.5 flex-wrap mt-2">
+                    {PERIODOS.map(p => (
+                      <button key={p.key} onClick={() => setPeriodo(p.key)}
+                        className={`px-2.5 py-1 rounded-full text-[11px] font-medium border transition-all ${periodo === p.key ? 'border-brand-500 bg-brand-500/10 text-brand-400' : 'border-transparent'}`}
+                        style={periodo !== p.key ? { backgroundColor: 'var(--surface-200)', borderColor: 'var(--border)', color: 'var(--text-muted)' } : {}}>
+                        {p.label}
+                      </button>
+                    ))}
+                    <span className="text-[11px] ml-auto" style={{ color: 'var(--text-faint)' }}>
+                      {filteredCots.length} de {cotizaciones.length} elegible(s)
+                    </span>
+                  </div>
+
                   {/* Results list */}
                   <div className="mt-1 rounded-xl border overflow-hidden"
                     style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-100)' }}>
                     {filteredCots.length === 0 ? (
                       <p className="text-xs text-center py-4" style={{ color: 'var(--text-faint)' }}>
-                        Sin resultados para "{search}"
+                        {search ? `Sin resultados para "${search}"` : 'Sin cotizaciones'}
+                        {periodo ? ` en ${(PERIODOS.find(p => p.key === periodo)?.label || '').toLowerCase()}` : ''}
                       </p>
                     ) : (
                       filteredCots.map((c, idx) => (
@@ -468,6 +576,9 @@ export default function CierreVentaPage() {
                           </span>
                           <span className="flex-1 text-sm truncate" style={{ color: 'var(--text-primary)' }}>
                             {c.cliente || <em style={{ color: 'var(--text-faint)' }}>Sin cliente</em>}
+                            {c.referencia && (
+                              <span className="ml-2 text-xs" style={{ color: 'var(--text-faint)' }}>ref. {c.referencia}</span>
+                            )}
                           </span>
                           <span className="text-xs shrink-0" style={{ color: 'var(--text-faint)' }}>
                             {c.total_items} ítem(s)
@@ -649,6 +760,27 @@ export default function CierreVentaPage() {
               {/* Adelanto del cliente (lo aprueba Tesorería después) */}
               <div className="sm:col-span-2 rounded-xl border p-3 space-y-3"
                 style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
+                {/* Adelanto YA vigente en esta venta: al re-cerrar, informar otro lo SUMA
+                    (el backend topea la suma al total de la venta y el duplicado aparece
+                    recién en la cola de Tesorería). */}
+                {ventaPrevia && (ventaPrevia.adelantos?.n ?? 0) > 0 && (
+                  <div className="flex items-start gap-2 px-3 py-2 rounded-lg border"
+                    style={{ backgroundColor: 'rgba(245,158,11,0.08)', borderColor: 'rgba(245,158,11,0.3)' }}>
+                    <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 text-amber-400" />
+                    <p className="text-xs leading-relaxed text-amber-400">
+                      Esta venta ya tiene <b>{ventaPrevia.adelantos!.n} adelanto{ventaPrevia.adelantos!.n !== 1 ? 's' : ''}</b> registrado
+                      {ventaPrevia.numero_oc ? <> en la <b>OC {ventaPrevia.numero_oc}</b></> : null}
+                      {ventaPrevia.adelantos!.aprobado_clp > 0 && <> · aprobado <b>{fmtClp(ventaPrevia.adelantos!.aprobado_clp)}</b></>}
+                      {ventaPrevia.adelantos!.por_aprobar > 0 && <> · {ventaPrevia.adelantos!.por_aprobar} esperando aprobación de Tesorería</>}
+                      . Si informas otro se suma al mismo total de la venta — revísalos en Contabilidad → Ventas.
+                    </p>
+                  </div>
+                )}
+                {ventaPrevia && (ventaPrevia.adelantos?.n ?? 0) === 0 && ventaPrevia.numero_oc && (
+                  <p className="text-xs" style={{ color: 'var(--text-faint)' }}>
+                    Esta cotización ya tiene venta registrada (OC {ventaPrevia.numero_oc} · {fmtClp(ventaPrevia.total_con_iva_clp)} c/IVA), sin adelantos informados.
+                  </p>
+                )}
                 <label className="flex items-center gap-2 text-sm font-medium cursor-pointer" style={{ color: 'var(--text-primary)' }}>
                   <input type="checkbox" checked={conAdelanto} onChange={e => setConAdelanto(e.target.checked)} />
                   <HandCoins className="w-4 h-4 text-emerald-500" />

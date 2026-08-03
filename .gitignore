@@ -82,3 +82,10 @@ backend/static/docs/
 
 # Excel del dueño (Libro diario / Mayor / Clientes) - NO versionar
 Excel grupo am actual/
+
+# Respaldos de la BD - son dumps REALES de producción (clientes, RUTs, precios, facturas).
+# Jamás al repositorio: un "git add -A" descuidado los publicaría.
+respaldos-bd/
+*.sql.gz
+machparts_db-*.sql
+monzaparts_db-*.sql

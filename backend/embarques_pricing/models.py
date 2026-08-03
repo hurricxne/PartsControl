@@ -10,6 +10,7 @@ que a su vez se importa en main.py antes del create_all.
 """
 from sqlalchemy import (
     Column, Integer, String, Numeric, Boolean, Text, DateTime, ForeignKey,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -57,8 +58,29 @@ class EmbarquePricing(Base):
 
 
 class EmbarquePricingGasto(Base):
-    """Línea del bloque GASTOS LOCALES (con desglose tributario)."""
+    """Línea del bloque GASTOS LOCALES (con desglose tributario).
+
+    IDENTIDAD ESTABLE — leer antes de tocar el guardado
+    ---------------------------------------------------
+    La PK de esta fila es una LLAVE DE PLATA: `cont_compra.emb_pricing_gasto_id` la
+    referencia para saber que la factura del forwarder YA está registrada como CxP, y de
+    ella cuelgan el lock y el anti-duplicado de `compras_contab.crear_compra`. Esa FK es
+    `ON DELETE SET NULL`, así que BORRAR una fila de acá **desengancha la CxP en silencio**
+    y el mismo gasto se puede volver a cargar (Σ CxP duplicada, reproducido en
+    `tests/test_llave_gasto_estable.py`).
+
+    Por eso la identidad se define por la LLAVE NATURAL `(pricing_id, tipo)` y el
+    guardado hace UPSERT sobre ella (jamás delete + re-insert). La llave es única de
+    verdad, no por convención: los DOS únicos escritores (`integration.seed_gastos` y el
+    PUT del router) recorren `service.GASTOS_CATALOGO`, que son 6 tipos FIJOS, y el PUT
+    colapsa el payload del cliente por tipo → no puede haber dos líneas "Otros".
+    El UniqueConstraint de abajo lo deja declarado en la BD (migración aditiva en
+    `init_db.py`) para que el invariante no dependa de que nadie lo rompa desde el código.
+    """
     __tablename__ = "emb_pricing_gasto"
+    __table_args__ = (
+        UniqueConstraint("pricing_id", "tipo", name="uq_emb_pricing_gasto_tipo"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     pricing_id = Column(Integer, ForeignKey("emb_pricing.id", ondelete="CASCADE"), index=True)

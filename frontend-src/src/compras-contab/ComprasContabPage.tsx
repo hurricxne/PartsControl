@@ -1,8 +1,10 @@
 // Página "Compras y Cuentas por Pagar": registra compras/gastos del día a día,
 // los clasifica (costo de venta / operacional / no operacional / otros), lleva su
 // condición de pago (contado/crédito) y su estado de pago, y muestra KPIs +
-// antigüedad de cartera por pagar. Pestaña secundaria de SOLO LECTURA con los
-// costos de embarque ya registrados en Embarques Pricing.
+// antigüedad de cartera por pagar. Pestaña secundaria con los costos de embarque
+// anotados en Embarques Pricing: cada uno muestra si YA está en Compras y, si no,
+// se pasa a CxP con un botón (los datos viajan de allá, NO se re-digitan: así la
+// compra nace con emb_pricing_gasto_id y el anti-duplicado del backend funciona).
 import { useState, useEffect, useCallback } from 'react'
 import {
   Wallet, Plus, Search, AlertCircle, CheckCircle2, DollarSign,
@@ -52,24 +54,36 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   return (<label className="block"><span className="block text-[11px] font-semibold uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>{label}</span>{children}</label>)
 }
 
+/** Datos que viajan desde la pestaña de costos de embarque al alta de la compra. La llave
+ *  `emb_pricing_gasto_id` es la que hace alcanzable el anti-duplicado del backend: al
+ *  re-digitar el gasto a mano la compra nacía con esa columna en NULL, y en MySQL los NULL
+ *  no colisionan en el unique → la factura del forwarder se cargaba 2 y 3 veces. */
+interface Prefill {
+  origen: string; tipo_gasto: string; monto_neto: number; iva: number
+  numero_documento: string | null; referencia: string | null; acreedor: string | null
+  emb_pricing_gasto_id: number; embarque_id: number
+}
+
 // ─── Modal: registrar compra ────────────────────────────────────────────────
-function RegistrarCompraModal({ catalogos, onClose, onDone }: { catalogos: Catalogos | null; onClose: () => void; onDone: () => void }) {
-  const [tipoGasto, setTipoGasto] = useState('gasto_operacional')
-  const [categoria, setCategoria] = useState('')
+function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
+  catalogos: Catalogos | null; prefill?: Prefill | null; onClose: () => void; onDone: () => void
+}) {
+  const [tipoGasto, setTipoGasto] = useState(prefill?.tipo_gasto || 'gasto_operacional')
+  const [categoria, setCategoria] = useState(prefill ? 'Gastos de importación' : '')
   const [cuentaId, setCuentaId] = useState<number | ''>('')
   const [esAnticipo, setEsAnticipo] = useState(false)
   const [proveedorId, setProveedorId] = useState<number | ''>('')
-  const [acreedor, setAcreedor] = useState('')
+  const [acreedor, setAcreedor] = useState(prefill?.acreedor || '')
   const [rut, setRut] = useState('')
   const [fecha, setFecha] = useState(hoyLocal())
-  const [numDoc, setNumDoc] = useState('')
+  const [numDoc, setNumDoc] = useState(prefill?.numero_documento || '')
   const [tipoDoc, setTipoDoc] = useState('factura')
   const [descripcion, setDescripcion] = useState('')
-  const [referencia, setReferencia] = useState('')
+  const [referencia, setReferencia] = useState(prefill?.referencia || '')
   const [moneda, setMoneda] = useState('CLP')
   const [tc, setTc] = useState('')
-  const [neto, setNeto] = useState('')
-  const [afectoIva, setAfectoIva] = useState(true)
+  const [neto, setNeto] = useState(prefill ? String(Math.round(prefill.monto_neto)) : '')
+  const [afectoIva, setAfectoIva] = useState(prefill ? prefill.iva > 0 : true)
   const [condicion, setCondicion] = useState<'contado' | 'credito'>('credito')
   const [plazo, setPlazo] = useState('30')
   const [pagoMedio, setPagoMedio] = useState('transferencia')
@@ -84,15 +98,18 @@ function RegistrarCompraModal({ catalogos, onClose, onDone }: { catalogos: Catal
   const [ocNacionales, setOcNacionales] = useState<OcNacional[]>([])
   const [ocpSel, setOcpSel] = useState<number | ''>('')
   const [lineItems, setLineItems] = useState<Record<number, { incluir: boolean; cantidad: string; precio_unit: string }>>({})
-  const esNacional = origenTipo === 'nacional'
+  // Con prefill de embarque el detalle por ítem no aplica: ese flujo ya viene armado.
+  const esNacional = origenTipo === 'nacional' && !prefill
   const ocSel = ocNacionales.find(o => o.oc_proveedor_id === ocpSel) || null
+  const origen = prefill?.origen || (esNacional ? 'NACIONAL' : 'MANUAL')
 
-  // Cuenta sugerida: nacional → Existencias (1.3.01) vía NACIONAL|cogs; si no, MANUAL|tipo.
+  // Cuenta sugerida por (origen, tipo de gasto) con la clave GENÉRICA del backend: así el
+  // costo de embarque cae en Mercadería en tránsito (EMBARQUE|cogs, se capitaliza) en vez
+  // de la cuenta de un gasto suelto. Antes el origen estaba fijo en NACIONAL/MANUAL.
   useEffect(() => {
-    const key = esNacional ? 'NACIONAL|cogs' : `MANUAL|${tipoGasto}`
-    const def = catalogos?.cuenta_default_por_tipo?.[key]
+    const def = catalogos?.cuenta_default_por_tipo?.[`${origen}|${tipoGasto}`]
     if (def) setCuentaId(def)
-  }, [tipoGasto, esNacional, catalogos])
+  }, [tipoGasto, origen, catalogos])
 
   // Nacional fuerza costo de venta + CLP (el IVA no capitaliza en la compra nacional).
   useEffect(() => {
@@ -130,7 +147,9 @@ function RegistrarCompraModal({ catalogos, onClose, onDone }: { catalogos: Catal
   }
 
   const netoN = Number(neto) || 0
-  const ivaN = afectoIva ? Math.round(netoN * 0.19) : 0
+  // Con prefill el IVA es el que ya calculó Embarques Pricing (puede ser IVA de
+  // importación sobre el CIF, que no es el 19% del neto de esta línea): se respeta tal cual.
+  const ivaN = prefill ? Math.round(prefill.iva) : (afectoIva ? Math.round(netoN * 0.19) : 0)
   const totalN = netoN + ivaN
   const tcN = moneda === 'CLP' ? 1 : (Number(tc) || 0)
   const totalClp = Math.round(totalN * tcN)
@@ -151,7 +170,9 @@ function RegistrarCompraModal({ catalogos, onClose, onDone }: { catalogos: Catal
 
   const submit = async () => {
     if (!acreedor.trim()) { toast.error('Indica el proveedor/acreedor'); return }
-    if (netoN <= 0) { toast.error('El monto neto debe ser mayor a 0'); return }
+    // Con prefill de embarque el neto viene bloqueado y puede ser 0 (gasto solo-IVA, p. ej.
+    // IVA de importación): basta que neto+IVA > 0. Manual: neto > 0 obligatorio.
+    if (prefill ? (netoN + ivaN) <= 0 : netoN <= 0) { toast.error('El monto debe ser mayor a 0'); return }
     if (moneda !== 'CLP' && tcN <= 0) { toast.error('Indica el tipo de cambio'); return }
 
     // Detalle por ítem de la compra NACIONAL.
@@ -182,12 +203,15 @@ function RegistrarCompraModal({ catalogos, onClose, onDone }: { catalogos: Catal
       await comprasContabAPI.crear({
         tipo_gasto: tipoGasto, categoria: categoria || undefined,
         cuenta_contable_id: cuentaId || undefined, es_anticipo: esAnticipo,
-        origen: esNacional ? 'NACIONAL' : undefined,
+        origen,
         proveedor_id: proveedorId || undefined, acreedor: acreedor || undefined, proveedor_rut: rut || undefined,
         fecha, referencia: referencia || undefined, descripcion: descripcion || undefined,
         numero_documento: numDoc || undefined, tipo_doc: tipoDoc,
-        moneda, tc: tcN, monto_neto: netoN, afecto_iva: afectoIva,
+        moneda, tc: tcN, monto_neto: netoN,
+        ...(prefill ? { iva: ivaN } : { afecto_iva: afectoIva }),
         condicion_pago: condicion, plazo_dias: condicion === 'credito' && plazo ? Number(plazo) : undefined,
+        // Llave del gasto de pricing: sin ella el dedup del backend es inalcanzable.
+        ...(prefill ? { emb_pricing_gasto_id: prefill.emb_pricing_gasto_id, embarque_id: prefill.embarque_id } : {}),
         oc_proveedor_id: esNacional && ocpSel ? Number(ocpSel) : undefined,
         items,
         pago: condicion === 'contado'
@@ -199,17 +223,27 @@ function RegistrarCompraModal({ catalogos, onClose, onDone }: { catalogos: Catal
   }
 
   return (
-    <Modal title="Registrar compra / gasto" wide onClose={onClose}>
-      {/* Tipo de registro: gasto/servicio o compra nacional con detalle por ítem */}
-      <div className="flex flex-wrap items-center gap-2">
-        {([['gasto', 'Gasto / servicio', Wallet], ['nacional', 'Compra nacional (detalle de ítems)', Truck]] as const).map(([val, label, Icon]) => (
-          <button key={val} type="button" onClick={() => setOrigenTipo(val)}
-            className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-all flex items-center gap-1.5 ${origenTipo === val ? 'border-brand-500 bg-brand-500/10 text-brand-400' : 'border-transparent'}`}
-            style={origenTipo !== val ? { backgroundColor: 'var(--surface-200)', borderColor: 'var(--border)', color: 'var(--text-muted)' } : {}}>
-            <Icon className="w-3.5 h-3.5" /> {label}
-          </button>
-        ))}
-      </div>
+    <Modal title={prefill ? `Registrar costo de embarque${prefill.referencia ? ` · ${prefill.referencia}` : ''}` : 'Registrar compra / gasto'} wide onClose={onClose}>
+      {prefill && (
+        <p className="text-xs rounded-xl px-3 py-2" style={{ color: 'var(--text-muted)', backgroundColor: 'var(--surface-200)' }}>
+          <Ship className="w-3.5 h-3.5 inline mr-1.5 text-cyan-400" />
+          Datos traídos de <b style={{ color: 'var(--text-primary)' }}>Embarques Pricing</b> (no se digitan de nuevo).
+          Elige si lo pagas ahora o queda por pagar.
+        </p>
+      )}
+      {/* Tipo de registro: gasto/servicio o compra nacional con detalle por ítem
+          (con prefill de embarque no aplica: ese flujo ya viene armado). */}
+      {!prefill && (
+        <div className="flex flex-wrap items-center gap-2">
+          {([['gasto', 'Gasto / servicio', Wallet], ['nacional', 'Compra nacional (detalle de ítems)', Truck]] as const).map(([val, label, Icon]) => (
+            <button key={val} type="button" onClick={() => setOrigenTipo(val)}
+              className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-all flex items-center gap-1.5 ${origenTipo === val ? 'border-brand-500 bg-brand-500/10 text-brand-400' : 'border-transparent'}`}
+              style={origenTipo !== val ? { backgroundColor: 'var(--surface-200)', borderColor: 'var(--border)', color: 'var(--text-muted)' } : {}}>
+              <Icon className="w-3.5 h-3.5" /> {label}
+            </button>
+          ))}
+        </div>
+      )}
 
       {esNacional && (
         <div className="rounded-xl border p-3 space-y-3" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
@@ -297,9 +331,11 @@ function RegistrarCompraModal({ catalogos, onClose, onDone }: { catalogos: Catal
       )}
 
       <div className="grid sm:grid-cols-2 gap-3">
-        {esNacional ? (
+        {esNacional || prefill ? (
           <Field label="Tipo de gasto">
-            <div className={inputCls} style={{ ...inputStyle, opacity: 0.7 }}>Costo de venta (nacional)</div>
+            <div className={inputCls} style={{ ...inputStyle, opacity: 0.7 }}>
+              {prefill ? 'Costo de venta (gasto de importación)' : 'Costo de venta (nacional)'}
+            </div>
           </Field>
         ) : (
           <Field label="Tipo de gasto">
@@ -354,16 +390,25 @@ function RegistrarCompraModal({ catalogos, onClose, onDone }: { catalogos: Catal
       <div className="rounded-xl border p-3 mt-1" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
         <div className="grid sm:grid-cols-3 gap-3">
           <Field label="Moneda">
-            <select className={inputCls} style={inputStyle} value={moneda} disabled={esNacional} onChange={e => setMoneda(e.target.value)}>
+            {/* Con prefill la moneda queda fija en CLP: los gastos locales del embarque
+                ya vienen en pesos desde Embarques Pricing. */}
+            <select className={inputCls} style={inputStyle} value={moneda} disabled={esNacional || !!prefill} onChange={e => setMoneda(e.target.value)}>
               <option value="CLP">CLP</option><option value="USD">USD</option><option value="EUR">EUR</option>
             </select>
           </Field>
           {moneda !== 'CLP' && <Field label="Tipo de cambio (a CLP)"><input type="number" className={inputCls} style={inputStyle} value={tc} onChange={e => setTc(e.target.value)} placeholder="950" /></Field>}
-          <Field label={`Monto neto (${moneda})`}><input type="number" className={inputCls} style={inputStyle} value={neto} onChange={e => setNeto(e.target.value)} /></Field>
+          <Field label={`Monto neto (${moneda})`}><input type="number" className={inputCls} style={inputStyle} value={neto} disabled={!!prefill} onChange={e => setNeto(e.target.value)} /></Field>
         </div>
-        <label className="flex items-center gap-2 mt-2 text-xs" style={{ color: 'var(--text-muted)' }}>
-          <input type="checkbox" checked={afectoIva} onChange={e => setAfectoIva(e.target.checked)} /> Afecto a IVA (19%)
-        </label>
+        {prefill ? (
+          <p className="mt-2 text-[11px]" style={{ color: 'var(--text-faint)' }}>
+            Neto e IVA vienen del gasto anotado en Embarques Pricing (el IVA puede ser el de
+            importación sobre el CIF, no el 19% de este neto). Para corregirlos, edítalos allá.
+          </p>
+        ) : (
+          <label className="flex items-center gap-2 mt-2 text-xs" style={{ color: 'var(--text-muted)' }}>
+            <input type="checkbox" checked={afectoIva} onChange={e => setAfectoIva(e.target.checked)} /> Afecto a IVA (19%)
+          </label>
+        )}
         <div className="flex flex-wrap gap-x-5 gap-y-1 mt-2 text-xs" style={{ color: 'var(--text-muted)' }}>
           <span>IVA: <b style={{ color: 'var(--text-primary)' }}>{moneda} {Math.round(ivaN).toLocaleString('es-CL')}</b></span>
           <span>Total: <b style={{ color: 'var(--text-primary)' }}>{moneda} {Math.round(totalN).toLocaleString('es-CL')}</b></span>
@@ -461,7 +506,9 @@ function PagoConsolidadoModal({ onClose, onDone }: { onClose: () => void; onDone
   useEffect(() => {
     comprasContabAPI.list({ page_size: 200 })
       .then(({ data }) => setPendientes(data.compras.filter(c => c.saldo_clp > 0 && !c.anulado)))
-      .catch(() => {})
+      // Sin este aviso, un error del servidor se leía como "no hay gastos pendientes de
+      // pago" — el operador cerraba el modal creyendo que no debía nada.
+      .catch((e: any) => toast.error(e?.response?.data?.detail || 'No se pudieron cargar los gastos pendientes'))
   }, [])
   const toggle = (c: Compra) => setSel(s => {
     const n = { ...s }
@@ -540,6 +587,7 @@ function CompraRow({ c, onChanged, onPagar }: { c: Compra; onChanged: () => void
         <td className="px-4 py-3 font-mono font-semibold text-brand-400 whitespace-nowrap">
           <span className="inline-flex items-center gap-1">{open ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}{c.numero_documento || `#${c.id}`}</span>
           {c.origen === 'EMBARQUE' && <span className="ml-1 text-[10px] text-cyan-400">·emb</span>}
+          {c.origen === 'NACIONAL' && <span className="ml-1 text-[10px] text-emerald-500" title="Compra nacional con detalle de ítems">·nac</span>}
         </td>
         <td className="px-4 py-3 font-medium max-w-[180px] truncate" style={{ color: 'var(--text-primary)' }}>{c.acreedor || '—'}</td>
         <td className="px-4 py-3 whitespace-nowrap"><span className={`text-xs font-medium ${GASTO_TIPO_BADGE[c.tipo_gasto] || ''}`}>{c.tipo_gasto_label}</span>{c.categoria && <span className="block text-[10px]" style={{ color: 'var(--text-faint)' }}>{c.categoria}</span>}</td>
@@ -650,8 +698,12 @@ function CompraRow({ c, onChanged, onPagar }: { c: Compra; onChanged: () => void
   )
 }
 
-// ─── Pestaña: costos de embarque (solo lectura) ─────────────────────────────
-function CostosEmbarqueTab() {
+// ─── Pestaña: costos de embarque (reflejo de Embarques Pricing) ─────────────
+// Cada fila dice si el gasto YA está en Compras (`compra_id`) y, si no, ofrece pasarlo a
+// CxP con los datos de allá: así la compra nace con `emb_pricing_gasto_id` y el gasto no
+// se puede cargar dos veces. Antes la pestaña era solo lectura, el operador re-digitaba
+// cada flete y la factura del forwarder se pagaba dos y tres veces.
+function CostosEmbarqueTab({ onRegistrar }: { onRegistrar: (p: Prefill) => void }) {
   const [rows, setRows] = useState<CostoEmbarque[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
@@ -664,7 +716,9 @@ function CostosEmbarqueTab() {
   return (
     <div className="space-y-3">
       <div className="rounded-xl border px-4 py-3 text-sm" style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
-        <Ship className="w-4 h-4 inline mr-1.5 text-cyan-400" /> Gastos de importación ya registrados en <b style={{ color: 'var(--text-primary)' }}>Embarques Pricing</b> (solo lectura). Total (neto+IVA): <b className="text-brand-400">{fmtClp(total)}</b>
+        <Ship className="w-4 h-4 inline mr-1.5 text-cyan-400" /> Gastos de importación anotados en <b style={{ color: 'var(--text-primary)' }}>Embarques Pricing</b>.
+        Pásalos a <b style={{ color: 'var(--text-primary)' }}>Cuentas por Pagar</b> con el botón de cada fila (los datos viajan de allá, no se digitan de nuevo).
+        Total (neto+IVA): <b className="text-brand-400">{fmtClp(total)}</b>
       </div>
       {rows.length === 0 ? (
         <div className="rounded-2xl border py-12 text-center" style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
@@ -675,7 +729,7 @@ function CostosEmbarqueTab() {
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead><tr className="border-b" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
-                {['Embarque', 'Gasto', 'Proveedor', 'N° factura', 'Fecha', 'Neto', 'IVA', 'Total', 'Banco'].map(h => (
+                {['Embarque', 'Gasto', 'Proveedor', 'N° factura', 'Fecha', 'Neto', 'IVA', 'Total', 'Banco', 'Estado'].map(h => (
                   <th key={h} className="text-left px-4 py-3 text-xs font-semibold uppercase tracking-wider whitespace-nowrap" style={{ color: 'var(--text-faint)' }}>{h}</th>
                 ))}
               </tr></thead>
@@ -691,6 +745,25 @@ function CostosEmbarqueTab() {
                     <td className="px-4 py-2.5 whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{fmtClp(r.iva)}</td>
                     <td className="px-4 py-2.5 whitespace-nowrap font-semibold text-brand-400">{fmtClp(r.monto_total)}</td>
                     <td className="px-4 py-2.5" style={{ color: 'var(--text-muted)' }}>{r.banco || '—'}</td>
+                    <td className="px-4 py-2.5 whitespace-nowrap">
+                      {r.compra_id ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20"
+                          title={`Ya registrado como compra #${r.compra_id}`}>
+                          <CheckCircle2 className="w-3 h-3" /> En compras ✓
+                        </span>
+                      ) : r.monto_total > 0 ? (
+                        <button type="button" onClick={() => onRegistrar({
+                          origen: 'EMBARQUE', tipo_gasto: 'cogs', monto_neto: r.monto_neto, iva: r.iva,
+                          numero_documento: r.nro_factura, referencia: r.embarque_numero,
+                          acreedor: r.acreedor, emb_pricing_gasto_id: r.id, embarque_id: r.embarque_id,
+                        })}
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-brand-400/40 text-brand-400 hover:bg-brand-500/10 transition-colors text-[11px] font-semibold">
+                          <Plus className="w-3 h-3" /> Registrar como compra
+                        </button>
+                      ) : (
+                        <span className="text-[11px]" style={{ color: 'var(--text-faint)' }}>sin monto</span>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -716,7 +789,7 @@ export default function ComprasContabPage() {
   const [error, setError] = useState('')
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
-  const [modal, setModal] = useState<{ type: 'crear' | 'pago' | 'consolidado'; compra?: Compra } | null>(null)
+  const [modal, setModal] = useState<{ type: 'crear' | 'pago' | 'consolidado'; compra?: Compra; prefill?: Prefill } | null>(null)
 
   const PAGE_SIZE = 50
 
@@ -765,7 +838,7 @@ export default function ComprasContabPage() {
         ))}
       </div>
 
-      {tab === 'embarque' ? <CostosEmbarqueTab /> : (
+      {tab === 'embarque' ? <CostosEmbarqueTab onRegistrar={(p) => setModal({ type: 'crear', prefill: p })} /> : (
         <>
           {/* KPIs */}
           {kpis && (
@@ -873,7 +946,13 @@ export default function ComprasContabPage() {
       )}
 
       {/* Modales */}
-      {modal?.type === 'crear' && <RegistrarCompraModal catalogos={catalogos} onClose={() => setModal(null)} onDone={reload} />}
+      {/* Al registrar un costo de embarque se salta a "Compras registradas": la fila nueva
+          está allá, y al volver a la pestaña de embarque el gasto ya sale "En compras ✓". */}
+      {modal?.type === 'crear' && (
+        <RegistrarCompraModal catalogos={catalogos} prefill={modal.prefill || null}
+          onClose={() => setModal(null)}
+          onDone={() => { reload(); if (modal.prefill) setTab('compras') }} />
+      )}
       {modal?.type === 'pago' && modal.compra && <PagoCompraModal compra={modal.compra} onClose={() => setModal(null)} onDone={reload} />}
       {modal?.type === 'consolidado' && <PagoConsolidadoModal onClose={() => setModal(null)} onDone={reload} />}
     </div>

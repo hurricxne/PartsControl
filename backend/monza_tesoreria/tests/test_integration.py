@@ -571,6 +571,17 @@ def run():
     check("candado: mineria APROBAR → 403", r.status_code == 403, r.status_code)
 
 
+def test_monza_tesoreria_integration():
+    """Wrapper para pytest (espejo de tesoreria/tests/test_integration.py:332 de GA):
+    sin él la suite era INVISIBLE al gate rutinario 'pytest verde'."""
+    seed()
+    try:
+        run()
+    finally:
+        cleanup()
+    assert not _fails, f"fallas: {_fails}"
+
+
 if __name__ == "__main__":
     seed()
     try:

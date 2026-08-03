@@ -125,6 +125,18 @@ def run():
     return True
 
 
+def test_monza_cortafuego_adelanto():
+    """Wrapper para pytest (espejo de tesoreria/tests/test_integration.py de GA):
+    sin él la suite era INVISIBLE al gate rutinario 'pytest verde'."""
+    seed()
+    ok = False
+    try:
+        ok = run()
+    finally:
+        cleanup()
+    assert ok, f"fallas: {_fails}"
+
+
 if __name__ == "__main__":
     seed()
     ok = False

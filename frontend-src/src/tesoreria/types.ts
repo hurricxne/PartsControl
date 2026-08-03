@@ -118,6 +118,10 @@ export interface Adelanto {
   factura_anticipo_id: number | null
   factura_anticipo_folio: string | null
   observaciones: string | null
+  // Trazabilidad que el backend ya serializa (_serialize_adelanto) y la pantalla no leía:
+  // cuándo lo informó Comercial y cuándo lo aprobó Tesorería.
+  fecha_aprobacion?: string | null
+  created_at?: string | null
   // info de la venta (cola de aprobaciones)
   numero_oc?: string | null
   numero_cotizacion?: string | null
@@ -128,7 +132,14 @@ export interface Adelanto {
 
 export interface AprobacionesResp {
   por_aprobar: Adelanto[]
+  // PAGINADAS por el backend: `aprobadas` trae solo una página. Sin leer estos contadores
+  // un adelanto antiguo aún sin conciliar queda INVISIBLE en la pantalla que debe
+  // cuadrarlo con el banco (el backend los agregó justamente para poder pedir el resto).
   aprobadas: Adelanto[]
+  por_aprobar_total?: number
+  aprobadas_total?: number
+  page?: number
+  page_size?: number
 }
 
 export interface Cartola {

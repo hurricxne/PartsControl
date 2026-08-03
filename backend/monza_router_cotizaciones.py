@@ -7,10 +7,12 @@ from fastapi import Request, APIRouter, Depends, HTTPException, Query, UploadFil
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import or_
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from database import get_db
 from auth import get_current_user
+from empresa_guard import require_empresa
+from role_guard import require_rol
 from monza_notif import crear_notif
 from monza_models import (
     MonzaCotizacion, MonzaCotizacionItem, MonzaCliente,
@@ -20,6 +22,17 @@ from monza_models import (
 router = APIRouter(prefix="/api/monza/cotizaciones", tags=["monza-cotizaciones"])
 
 RESULTS_DIR = "/var/www/machparts.bigcode.cl/backend/results"
+
+# Estados de cotización desde los que SÍ se puede cerrar la venta (hallazgo A5 de la
+# paridad contable). Espejo conceptual del Cierre de Venta de Grupo AM, que solo lista
+# las OC con fase_comercial 'ingresada' y estado 'completado' (CierreVentaPage.tsx):
+# una cotización RECHAZADA por el cliente, o que nunca se le envió, NO es una venta —
+# y cerrarla dispara las compras al proveedor (el cierre pone las líneas en
+# 'por_comprar' y habilita Abastecimiento). Hoy el botón de la pantalla se pinta con
+# `estado !== "vendida"`, así que un clic mal dado en la fila equivocada compraba.
+# 'vendida' está en la lista porque el cierre es IDEMPOTENTE (re-enviar 'vendida'
+# edita la OC sin repetir efectos); 'despachado' tiene su propio 409 más arriba.
+ESTADOS_QUE_CIERRAN_VENTA = ("enviada", "vendida")
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -55,9 +68,14 @@ class CotCreate(BaseModel):
 class CotUpdate(BaseModel):
     estado: Optional[str] = None
     oc_cliente: Optional[str] = None
+    oc_fecha: Optional[date] = None
     fecha_entrega_est: Optional[date] = None
     fecha_venta: Optional[datetime] = None
     forma_pago: Optional[str] = None
+    # El cierre de venta SIEMPRE lo envía (el modal de la UI): sin este campo en el
+    # schema, Pydantic lo DESCARTABA en silencio y el flujo de adelantos (Contabilidad
+    # verifica → Tesorería ordena → Abastecimiento libera) nunca se disparaba.
+    pct_adelanto: Optional[int] = Field(None, ge=0, le=100)
     numero_factura: Optional[str] = None
     fecha_despacho: Optional[date] = None
     tipo_documento: Optional[str] = None
@@ -85,6 +103,97 @@ def _get_config(db: Session) -> MonzaConfig:
     return cfg
 
 
+def _dte_vivo_de_la_venta(db: Session, cot_id: int):
+    """Documento tributario electrónico VIVO de esta venta → (dte, transaccion_reiniciada).
+
+    Vivo = emitido (folio del SII), en vuelo (claim fresco), en proceso en Wasabil, o
+    AMBIGUO. Devuelve el PRIMERO que encuentre (o None) y una bandera que avisa si la
+    comprobación tuvo que descartar la transacción — ver más abajo.
+
+    POR QUÉ existe (hallazgo W6 de la paridad contable): el N° y la FECHA de la OC del
+    cliente viajan al SII como REFERENCIA 801 de cada documento de la venta —
+    `armar_guia` de la guía 52 y `armar_referencias_factura` de la factura 33
+    (monza_wasabil_dte/service.py). Editarlos con un documento vivo dejaría el papel
+    legal desincronizado del sistema, y en un despacho PARCIAL la 2ª guía saldría con
+    una OC distinta a la 1ª. La anulación de un DTE se gestiona en Wasabil, no
+    reescribiendo el dato local. Espejo del 409 del PUT /oc-cliente de Grupo AM
+    (routers/compras.py) sobre el modelo Monza: acá la guía cuelga del DESPACHO y la
+    factura de la FACTURA DE CLIENTE, y las dos llegan a la venta por su cotizacion_id
+    (en Monza la cotización ES la venta: no hay OcCliente).
+
+    El caso AMBIGUO — uuid NULL con `en_vuelo_desde` puesto y el claim ya VENCIDO por
+    TTL — CUENTA como vivo, igual que el `incluir_ambiguo` de
+    monza_router_despachos.py:_guia_electronica_activa: ahí Wasabil cortó la
+    comunicación sin confirmar nada y el documento PUDO nacer con folio real en el SII.
+    Editar la OC es tan irreversible como una segunda emisión, así que no se decide
+    por TTL.
+
+    Tabla inexistente (MySQL 1146: deploy sin correr el init_db del módulo DTE, o sin
+    el de contabilidad) → esa mitad del guard se apaga sola en vez de tumbar la edición
+    con un 500 (mismo criterio que _guia_electronica_activa: sin tabla JAMÁS hubo
+    emisión que proteger). Las dos mitades van en try/except SEPARADOS para que la
+    ausencia del módulo contable no desarme el candado de las guías. OJO: el rollback
+    que exige ese except SUELTA los locks del llamador (patrón ya documentado en
+    monza_router_despachos.py:_rechazar_split_sobre_documento), y por eso se devuelve
+    `transaccion_reiniciada`: el llamador re-toma el FOR UPDATE antes de seguir.
+    """
+    from sqlalchemy.exc import ProgrammingError
+    from monza_models import MonzaDespacho
+    # monza_contabilidad.models solo importa sqlalchemy + database (no crea ciclo), y
+    # monza_wasabil_dte.models ya lo registra siempre para que configure_mappers() no
+    # reviente: importarlo acá no cambia lo que se carga, solo lo hace explícito.
+    from monza_contabilidad.models import MonzaContFacturaCliente
+    from monza_wasabil_dte.models import (
+        MonzaWasabilDte, STATUS_EMITIDO, STATUS_PROCESANDO, STATUS_PENDIENTE,
+    )
+    from monza_wasabil_dte.service import TIPO_DOC_GUIA, TIPO_DOC_FACTURA, claim_vigente
+
+    reiniciada = False
+
+    def _opcional(fn):
+        """Comprobación cuyo módulo puede no estar instalado (tabla inexistente)."""
+        nonlocal reiniciada
+        try:
+            return fn()
+        except ProgrammingError as e:
+            if getattr(getattr(e, "orig", None), "args", [None])[0] == 1146:
+                db.rollback()
+                reiniciada = True
+                return []
+            raise
+
+    def _vivo(dte) -> bool:
+        if dte.status_id == STATUS_EMITIDO:
+            return True
+        if claim_vigente(dte):
+            return True
+        if dte.uuid and dte.status_id in (STATUS_PROCESANDO, STATUS_PENDIENTE):
+            return True
+        # AMBIGUO con el claim ya vencido: el POST salió y nadie confirmó el resultado.
+        return dte.uuid is None and dte.en_vuelo_desde is not None
+
+    # Guías 52 de la venta (vía despacho). Import LOCAL del paquete DTE: no se acopla
+    # el arranque de Ventas al módulo Wasabil ni se carga en los caminos que no lo usan.
+    candidatos = _opcional(lambda: (
+        db.query(MonzaWasabilDte)
+        .join(MonzaDespacho, MonzaDespacho.id == MonzaWasabilDte.despacho_id)
+        .filter(MonzaDespacho.cotizacion_id == cot_id,
+                MonzaWasabilDte.tipo_dte == TIPO_DOC_GUIA)
+        .all()))
+    # Facturas 33 de la venta (vía factura de cliente): la 801 también viaja en ellas.
+    candidatos = list(candidatos) + list(_opcional(lambda: (
+        db.query(MonzaWasabilDte)
+        .join(MonzaContFacturaCliente,
+              MonzaContFacturaCliente.id == MonzaWasabilDte.factura_id)
+        .filter(MonzaContFacturaCliente.cotizacion_id == cot_id,
+                MonzaWasabilDte.tipo_dte == TIPO_DOC_FACTURA)
+        .all())))
+    # El EMITIDO manda sobre el resto: si hay folio, el mensaje del 409 lo nombra.
+    vivos = [d for d in candidatos if _vivo(d)]
+    vivos.sort(key=lambda d: (0 if d.folio else 1, d.id))
+    return (vivos[0] if vivos else None), reiniciada
+
+
 def _cot_dict(c: MonzaCotizacion) -> dict:
     return {
         "id": c.id,
@@ -102,6 +211,15 @@ def _cot_dict(c: MonzaCotizacion) -> dict:
         "fecha_venta": c.fecha_venta.isoformat() if c.fecha_venta else None,
         "fecha_entrega_est": c.fecha_entrega_est.isoformat() if c.fecha_entrega_est else None,
         "oc_cliente": c.oc_cliente,
+        # Hallazgos #14 y #20 (auditoría integral Fases 1-6): oc_fecha y pct_adelanto
+        # eran WRITE-ONLY — el modal de cierre no podía leerlos, así que inicializaba
+        # la fecha de OC con HOY (pisando la real, que viaja como referencia 801 al SII)
+        # y el % de adelanto con el default fijo (un re-cierre lo bajaba a 0 en silencio
+        # y desarmaba el cortafuego de adelanto de Abastecimiento). Aditivo: lo hereda
+        # _cot_detail y no cambia ningún consumidor existente.
+        "oc_fecha": c.oc_fecha.isoformat() if c.oc_fecha else None,
+        "pct_adelanto": int(c.pct_adelanto or 0),
+        "adelanto_verificado": bool(c.adelanto_verificado),
         "asesor_id": c.asesor_id,
         "fecha_creacion": c.fecha_creacion.isoformat(),
         "cliente": {
@@ -134,6 +252,9 @@ def _cot_detail(c: MonzaCotizacion) -> dict:
             "costo": it.costo,
             "moneda": it.moneda,
             "peso_kg": it.peso_kg,
+            # Foto por ítem (freeze-forward): TC y tarifa con que se calculó la línea.
+            "tc_aplicado": it.tc_aplicado,
+            "tarifa_aerea": it.tarifa_aerea,
             "markup_pct": it.markup_pct,
             "precio_unitario_clp": it.precio_unitario_clp,
             "subtotal_clp": it.subtotal_clp,
@@ -146,6 +267,8 @@ def _cot_detail(c: MonzaCotizacion) -> dict:
     d["config_snapshot"] = {
         "tc_usd_clp": c.tc_usd_clp,
         "tc_eur_clp": c.tc_eur_clp,
+        # Moneda de la tarifa congelada al crear (freeze-forward: NULL en las viejas).
+        "moneda_tarifa": c.moneda_tarifa,
         "tarifa_aerea": c.tarifa_aerea,
         "iva_pct": c.iva_pct,
     }
@@ -232,6 +355,9 @@ def create_cotizacion(body: CotCreate, db: Session = Depends(get_db), current_us
         oc_cliente=body.oc_cliente,
         tc_usd_clp=cfg.tc_usd_clp,
         tc_eur_clp=cfg.tc_eur_clp,
+        # Moneda de la tarifa congelada junto al resto de la foto: sin ella el
+        # cálculo no es reproducible (espejo del pricing_snapshot de GA).
+        moneda_tarifa=cfg.moneda_tarifa,
         tarifa_aerea=cfg.tarifa_aerea_por_kg,
         iva_pct=cfg.iva_pct,
     )
@@ -243,6 +369,16 @@ def create_cotizacion(body: CotCreate, db: Session = Depends(get_db), current_us
         precio_unit = it.precio_unitario_clp or 0
         subtotal = it.subtotal_clp or (precio_unit * it.cantidad)
         total_neto += subtotal
+        # Foto por ítem (freeze-forward, espejo pricing_snapshot GA): el TC y la
+        # tarifa se resuelven SERVER-side desde la config vigente según la moneda
+        # del ítem — JAMÁS del body (la foto sale del servidor, no del cliente).
+        _mon = (it.moneda or "").upper()
+        if _mon == "EUR":
+            tc_item = cfg.tc_eur_clp
+        elif _mon == "USD":
+            tc_item = cfg.tc_usd_clp
+        else:
+            tc_item = 1.0  # CLP u otra moneda sin TC: el costo ya viene en pesos
         db.add(MonzaCotizacionItem(
             cotizacion_id=cot.id,
             descripcion=it.descripcion,
@@ -254,6 +390,8 @@ def create_cotizacion(body: CotCreate, db: Session = Depends(get_db), current_us
             costo=it.costo,
             moneda=it.moneda,
             peso_kg=it.peso_kg,
+            tc_aplicado=tc_item,
+            tarifa_aerea=cfg.tarifa_aerea_por_kg,
             markup_pct=it.markup_pct / 100 if it.markup_pct > 1 else it.markup_pct,
             precio_unitario_clp=precio_unit,
             subtotal_clp=subtotal,
@@ -309,16 +447,205 @@ def get_cotizacion(cot_id: int, db: Session = Depends(get_db), _=Depends(get_cur
 
 # ── Update estado ─────────────────────────────────────────────────────────────
 
-@router.patch("/{cot_id}")
-def update_cotizacion(cot_id: int, body: CotUpdate, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
-    cot = db.query(MonzaCotizacion).filter(MonzaCotizacion.id == cot_id).first()
+# Candado de rol ADEMÁS del de empresa (espejo del PUT /oc-cliente de GA en
+# routers/compras.py): permisivo mientras User.rol no exista — forward-compatible.
+@router.patch(
+    "/{cot_id}",
+    dependencies=[Depends(require_rol("comercial", "contabilidad", "admin"))],
+)
+def update_cotizacion(
+    cot_id: int,
+    body: CotUpdate,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_empresa("automotriz")),
+):
+    """Actualiza la cotización; el CIERRE DE VENTA (estado='vendida') pasa por aquí.
+
+    Endurecimiento Fase 3 (espejo del cierre de GA en routers/compras.py):
+      · N° de OC del cliente OBLIGATORIO para cerrar (la ref 801 del SII exige N° y
+        fecha; sin OC tampoco hay ancla comercial del cobro).
+      · Cierre IDEMPOTENTE: re-enviar 'vendida' sobre una venta ya cerrada edita los
+        campos pero NO repite efectos (fecha_venta, líneas, log VENDIDA, notificación).
+      · Sin retroceso: una venta 'despachado' no vuelve a 'vendida' por este PATCH.
+      · Sin DES-CIERRE: una venta cerrada (vendida/despachado) no retrocede a
+        propuesta/enviada/rechazada si tiene plata o logística colgando (facturas,
+        adelanto, despachos no-anulados) — 409; sin nada colgando se permite
+        (corrige un cierre por error recién hecho).
+      · Despacho idempotente: re-enviar 'despachado' no vuelve a sumar el LTV del
+        cliente ni repite log/notificación (espejo de es_cierre_nuevo).
+      · Candado de empresa: solo usuarios automotriz (es el camino que mueve plata).
+      · Candado de rol (permisivo hasta provisionar User.rol): comercial/contabilidad/admin.
+
+    Endurecimiento de la auditoría integral Fases 1-6:
+      · 'despachado' exige COBERTURA REAL (hallazgo #8): cada línea no-despachada
+        debe estar cubierta por despachos CERRADOS, y la venta debe venir de
+        'vendida'. El estado logístico lo gobierna el cierre de despacho.
+      · pct_adelanto no BAJA si hay plata de adelanto registrada (hallazgo #14) — 409.
+
+    Endurecimiento de la paridad contable Monza ↔ MachParts:
+      · W6: el N° y la FECHA de la OC NO se editan con un DTE vivo de la venta (guía 52
+        o factura 33) — 409 nombrando el folio. Los dos datos son la referencia 801 del
+        documento (_dte_vivo_de_la_venta). Re-enviar el MISMO valor sigue siendo no-op.
+      · A5: solo se cierra como venta una cotización ENVIADA (o ya vendida, por
+        idempotencia) — 409 sobre 'propuesta' y 'rechazada' (ESTADOS_QUE_CIERRAN_VENTA).
+    """
+    # FOR UPDATE + populate_existing (regla de la casa): el cierre muta estados de
+    # línea y dispara el flujo de adelantos — dos cierres/ediciones simultáneos se
+    # serializan aquí en vez de pisarse.
+    cot = (
+        db.query(MonzaCotizacion)
+        .filter(MonzaCotizacion.id == cot_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
     if not cot:
         raise HTTPException(status_code=404, detail="Cotización no encontrada")
+
+    # ── Hallazgo W6 (paridad contable): el N° y la FECHA de la OC son REFERENCIA 801
+    # del DTE. Con un documento tributario vivo no se editan (espejo del PUT
+    # /oc-cliente de GA en routers/compras.py, que responde 409 nombrando el folio).
+    # Se compara contra el valor ACTUAL: re-enviar el mismo N°/fecha —lo que hace el
+    # cierre idempotente cada vez que el modal se reintenta— es un no-op y NO bloquea.
+    # Va primero, antes de cualquier otro guard: acá todavía no se evaluó nada, así que
+    # si la comprobación tiene que descartar la transacción se re-toma el lock limpio.
+    if ((body.oc_cliente is not None and (body.oc_cliente or "") != (cot.oc_cliente or ""))
+            or (body.oc_fecha is not None and body.oc_fecha != cot.oc_fecha)):
+        dte_vivo, _transaccion_reiniciada = _dte_vivo_de_la_venta(db, cot.id)
+        if dte_vivo:
+            from monza_wasabil_dte.service import TIPO_DOC_FACTURA  # local: evita ciclo
+            _doc = ("factura electrónica" if dte_vivo.tipo_dte == TIPO_DOC_FACTURA
+                    else "guía de despacho electrónica")
+            raise HTTPException(
+                409,
+                f"Esta venta ya tiene {_doc} ante el SII"
+                + (f" (folio {dte_vivo.folio})" if dte_vivo.folio else " (en emisión)")
+                + ": el N° y la fecha de la OC del cliente quedaron referenciados en el "
+                "documento (referencia 801) y no se editan. Los demás campos de la venta "
+                "sí se pueden corregir; la anulación del documento se gestiona en Wasabil.",
+            )
+        if _transaccion_reiniciada:
+            # El guard tuvo que descartar la transacción (tabla del módulo DTE
+            # inexistente): el FOR UPDATE de arriba se soltó y se re-toma para que el
+            # resto del PATCH siga serializado.
+            cot = (
+                db.query(MonzaCotizacion)
+                .filter(MonzaCotizacion.id == cot_id)
+                .populate_existing()
+                .with_for_update()
+                .first()
+            )
+            if not cot:
+                raise HTTPException(status_code=404, detail="Cotización no encontrada")
+
+    es_cierre_nuevo = body.estado == "vendida" and cot.estado not in ("vendida", "despachado")
+    # Transición a 'despachado' IDEMPOTENTE (mismo patrón que es_cierre_nuevo): sin
+    # este gate, cada re-PATCH 'despachado' volvía a sumar el total al LTV del
+    # cliente (bug de plata) y repetía la notificación de despacho.
+    es_despacho_nuevo = body.estado == "despachado" and cot.estado != "despachado"
+    if body.estado == "vendida":
+        if cot.estado == "despachado":
+            raise HTTPException(409, "La venta ya está despachada: no puede volver a 'vendida'")
+        # Hallazgo A5 (paridad contable): solo se cierra una cotización ENVIADA al
+        # cliente (o una ya vendida, por idempotencia). 'despachado' ya salió con su
+        # propio 409 justo arriba, así que acá caen 'propuesta' (nunca se envió) y
+        # 'rechazada' — y cerrarlas dispara compras al proveedor.
+        if (cot.estado or "propuesta") not in ESTADOS_QUE_CIERRAN_VENTA:
+            raise HTTPException(
+                409,
+                f"La cotización está en estado '{cot.estado or 'propuesta'}': no se puede "
+                f"cerrar como venta. Una cotización rechazada, o que nunca se le envió al "
+                f"cliente, no es una venta — y el cierre libera las compras al proveedor. "
+                f"Si el cliente la aprobó, márcala primero como 'Enviada' y vuelve a cerrar.",
+            )
+        oc_num = (body.oc_cliente if body.oc_cliente is not None else cot.oc_cliente) or ""
+        if not oc_num.strip():
+            raise HTTPException(400, "El N° de OC del cliente es obligatorio para cerrar la venta")
+
+    # ── Hallazgo #8 (auditoría integral Fases 1-6): el flip a 'despachado' era CIEGO —
+    # marcaba TODAS las líneas como despachadas sin un solo despacho, rompiendo el
+    # invariante de la Fase 2 (SOLO cerrar_despacho voltea la línea) y TRABANDO la
+    # mercadería: con la línea en 'despachado' el POST /despachos/crear responde 400
+    # "Item no está en bodega", así que esas unidades ya no se pueden despachar ni
+    # emitir su guía 52, y los tableros informan despachado algo que nunca salió.
+    # Ahora la ruta administrativa sigue existiendo (es idempotente y la usa el cierre
+    # manual), pero exige COBERTURA REAL de despachos CERRADOS.
+    if body.estado == "despachado":
+        # Agravante 2: propuesta → despachado se saltaba la OC obligatoria, fecha_venta
+        # y el paso por 'vendida' (que es el que suma el LTV con datos completos).
+        if cot.estado not in ("vendida", "despachado"):
+            raise HTTPException(409, "La venta debe estar cerrada antes de marcarse despachada")
+        # Import LOCAL (estilo del repo): monza_router_despachos importa monza_models;
+        # importarlo arriba acoplaría dos routers en el arranque.
+        from monza_router_despachos import _qty_dispatched_closed
+        cerr = _qty_dispatched_closed(db, cot.id)
+        for _it in cot.items:
+            # Las líneas que YA están en 'despachado' no se re-validan: el re-PATCH es
+            # idempotente y su cobertura la fijó el cierre de despacho en su momento.
+            if (_it.estado_linea or "cotizado") == "despachado":
+                continue
+            _cerrado = cerr.get(_it.id, 0)
+            if _cerrado + 0.001 < (_it.cantidad or 0):
+                raise HTTPException(
+                    409,
+                    f"No se puede marcar la venta como despachada: el ítem "
+                    f"'{_it.descripcion}' no está cubierto por despachos CERRADOS "
+                    f"(cerrado: {_cerrado} de {_it.cantidad}). El estado logístico lo "
+                    f"gobierna el cierre de despacho.",
+                )
+
+    # Sin DES-CIERRE silencioso (espejo del espíritu GA: la OcCliente del cierre es
+    # permanente y ancla la plata): una venta cerrada no retrocede a propuesta/enviada/
+    # rechazada por este PATCH. EXCEPCIÓN sensata: si la venta NO tiene plata ni
+    # logística colgando (0 facturas, 0 adelanto, 0 despachos no-anulados) se permite
+    # el retroceso — corrige un cierre por error recién hecho. Corre bajo el FOR UPDATE
+    # de arriba, así que el chequeo + cambio de estado es atómico.
+    if (body.estado
+            and body.estado not in ("vendida", "despachado")
+            and cot.estado in ("vendida", "despachado")):
+        # Imports locales: monza_contabilidad importa monza_models — importarlo arriba
+        # crearía un ciclo de imports entre módulos.
+        from monza_contabilidad.models import MonzaContAdelanto, MonzaContFacturaCliente
+        from monza_models import MonzaDespacho
+        n_fact = db.query(MonzaContFacturaCliente).filter(
+            MonzaContFacturaCliente.cotizacion_id == cot.id).count()
+        n_adel = db.query(MonzaContAdelanto).filter(
+            MonzaContAdelanto.cotizacion_id == cot.id).count()
+        n_desp = db.query(MonzaDespacho).filter(
+            MonzaDespacho.cotizacion_id == cot.id,
+            MonzaDespacho.estado != "anulado").count()
+        if n_fact or n_adel or n_desp:
+            raise HTTPException(
+                409,
+                f"La venta ya está cerrada (estado '{cot.estado}') y tiene plata/logística "
+                f"asociada ({n_fact} factura(s), {n_adel} adelanto(s), {n_desp} despacho(s)): "
+                f"no puede volver a '{body.estado}'. Anula/elimina eso primero.",
+            )
+
+    # Hallazgo #14 (auditoría integral Fases 1-6): como el modal manda opt.pct FIJO,
+    # un re-cierre eligiendo "contado" bajaba pct_adelanto de 50 a 0 en silencio y con
+    # eso el cortafuego de monza_router_abastecimiento.py:203-217 dejaba de frenar la
+    # OC de proveedor (solo frena si pct_adelanto > 0 y adelanto_verificado == 0).
+    # Corre bajo el FOR UPDATE de arriba, así que el chequeo + la asignación son
+    # atómicos. Bajar el % SIN plata registrada se sigue permitiendo: es el caso
+    # legítimo de corregir la condición de pago (implementa monza_contabilidad/README.md:40).
+    if body.pct_adelanto is not None and int(body.pct_adelanto) < int(cot.pct_adelanto or 0):
+        from monza_contabilidad.models import MonzaContAdelanto  # local: evita ciclo
+        tiene_plata = int(cot.adelanto_verificado or 0) or db.query(MonzaContAdelanto).filter(
+            MonzaContAdelanto.cotizacion_id == cot.id).count()
+        if tiene_plata:
+            raise HTTPException(
+                409,
+                f"La venta tiene un adelanto verificado: no se puede bajar la condición "
+                f"de pago de {int(cot.pct_adelanto or 0)}% a {int(body.pct_adelanto)}%. "
+                f"Revierta el adelanto en Contabilidad/Tesorería primero.",
+            )
+
     for field, value in body.model_dump(exclude_none=True).items():
         setattr(cot, field, value)
-    if body.estado == "vendida" and not cot.fecha_venta:
+    if es_cierre_nuevo and not cot.fecha_venta:
         cot.fecha_venta = datetime.utcnow()
-    if body.estado == "vendida":
+    if es_cierre_nuevo:
         for _it in cot.items:
             if (_it.estado_linea or "cotizado") == "cotizado":
                 _it.estado_linea = "por_comprar"
@@ -328,8 +655,9 @@ def update_cotizacion(cot_id: int, body: CotUpdate, db: Session = Depends(get_db
         for _it in cot.items:
             if (_it.estado_linea or "cotizado") != "despachado":
                 _it.estado_linea = "despachado"
-        # Actualizar lead si existe
-        if cot.lead_id:
+        # Actualizar lead SOLO en el despacho NUEVO: el re-PATCH no debe volver a
+        # sumar el LTV (bug de plata) ni re-cerrar el lead.
+        if es_despacho_nuevo and cot.lead_id:
             lead = db.query(MonzaLead).filter(MonzaLead.id == cot.lead_id).first()
             if lead:
                 lead.estado = "cerrado"
@@ -341,14 +669,22 @@ def update_cotizacion(cot_id: int, body: CotUpdate, db: Session = Depends(get_db
                         c.ltv = (c.ltv or 0) + cot.total_bruto
     db.commit()
     db.refresh(cot)
+    # Log/notif de VENTA solo en el cierre NUEVO: re-enviar 'vendida' (edición de la
+    # OC, reintento del modal) no debe duplicar la notificación ni el log del cierre.
     _action = body.estado.upper() if body.estado else "UPDATE"
-    _log(db, current_user.email, _action if _action in ("VENDIDA","DESPACHADO") else "UPDATE",
+    if _action == "VENDIDA" and not es_cierre_nuevo:
+        _action = "UPDATE"
+    # Mismo amortiguador para el despacho: el re-PATCH queda como UPDATE en el log.
+    if _action == "DESPACHADO" and not es_despacho_nuevo:
+        _action = "UPDATE"
+    _log(db, current_user.email, _action if _action in ("VENDIDA", "DESPACHADO") else "UPDATE",
          "cotizacion", cot.id, cot.numero,
          f"Estado → {cot.estado}" if body.estado else "Actualización")
-    if body.estado == "vendida":
+    if es_cierre_nuevo:
         _cli = cot.cliente.nombre if cot.cliente else ""
         crear_notif(db, f"Nueva venta · {cot.numero}", f"{_cli} — ${int(cot.total_bruto or 0):,}".replace(",", "."), "success", "/monzaparts/ventas", "cotizacion", cot.id)
-    elif body.estado == "despachado":
+    elif es_despacho_nuevo:
+        # Solo el despacho NUEVO notifica: el re-PATCH no repite la notificación.
         crear_notif(db, f"Despacho realizado · {cot.numero}", "Cotización despachada al cliente", "info", "/monzaparts/despachos", "cotizacion", cot.id)
     return _cot_dict(cot)
 

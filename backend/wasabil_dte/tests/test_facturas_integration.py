@@ -18,7 +18,7 @@ LIMPIA todo al final. Corre con:
 """
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -42,6 +42,11 @@ from routers.contabilidad import router as cont_router  # noqa: E402
 Base.metadata.create_all(bind=engine, checkfirst=True)
 
 MARK = "__TEST_WFAC__"
+# Fecha de EMISIÓN de la guía EN PAPEL. DISTINTA de la fecha de cierre del despacho a
+# propósito: la referencia 52 de la factura cita ESTA, y si el código volviera a usar
+# `fecha_despacho` el valor delataría cuál está leyendo.
+FECHA_GUIA_PAPEL = date(2026, 6, 18)
+
 CURRENT = {"empresa": "mineria", "id": None}
 
 app = FastAPI()
@@ -145,8 +150,14 @@ def _fake_precios(db, cot_id, cfg_dict, items_db=None):
     return items, pmap, totales
 
 
+# N° de guía en PAPEL tecleado por el operador: NUMÉRICO, porque el folio de una guía
+# manual viene autorizado por el SII y armar_referencias_factura exige folio numérico
+# en la referencia 52 (apunta a un documento tributario). Antes decía "G-MANUAL-9".
+N_GUIA_MANUAL = "900456"
+
+
 def _crear_venta(db, *, cantidad=10, precio=10000.0, sufijo="A", con_guia=True,
-                 guia_manual="G-MANUAL-9"):
+                 guia_manual=N_GUIA_MANUAL):
     """Venta 1 ítem + despacho despachado y FIRMADO (facturable)."""
     cot = Cotizacion(numero=f"{MARK}-COT-{sufijo}", cliente=f"{MARK} HEPI",
                      rut_cliente="78.279.030-7")
@@ -161,7 +172,9 @@ def _crear_venta(db, *, cantidad=10, precio=10000.0, sufijo="A", con_guia=True,
     desp = None
     if con_guia:
         desp = Despacho(numero_despacho=f"{MARK}-DSP-{oc.id}", oc_cliente_id=oc.id,
-                        estado="despachado", guia_firmada=1, numero_guia=guia_manual)
+                        estado="despachado", guia_firmada=1, numero_guia=guia_manual,
+                        # Guía en PAPEL: su fecha de emisión es lo que cita la referencia 52.
+                        fecha_guia=(FECHA_GUIA_PAPEL if guia_manual else None))
         db.add(desp); db.flush()
         db.add(DespachoItem(despacho_id=desp.id, item_cotizacion_id=it.id,
                             qty_despachada=cantidad))
@@ -172,6 +185,15 @@ def _crear_venta(db, *, cantidad=10, precio=10000.0, sufijo="A", con_guia=True,
 
 def _limpiar(db):
     db.rollback()
+    # Anclas CONSERVADAS de este fake: al eliminar una factura con DTE rechazado,
+    # routers/contabilidad.py:_conservar_ancla_dte desliga la fila (factura_id = NULL) en
+    # vez de borrarla, para no perder la única llave hacia el documento de Wasabil. Esa
+    # fila ya no cuelga de ninguna factura ni despacho, así que la limpieza por padre NO
+    # la alcanza y se acumulaba una por corrida. El uuid `uuid-f<N>` lo inventa este fake,
+    # así que identifica exactamente sus propias sobras (ningún documento real lo lleva).
+    db.query(WasabilDte).filter(WasabilDte.despacho_id.is_(None),
+                                WasabilDte.factura_id.is_(None),
+                                WasabilDte.uuid.like("uuid-f%")).delete(synchronize_session=False)
     cots = db.query(Cotizacion).filter(Cotizacion.numero.like(f"{MARK}%")).all()
     cot_ids = [c.id for c in cots]
     oc_ids = [o.id for o in db.query(OcCliente).filter(
@@ -239,7 +261,7 @@ def run():
         refs_env = payload_enviado.get("references") or []
         check("1 payload: referencias 801 y 52 con folio de la guía",
               [x["document_type"] for x in refs_env] == ["801", "52"]
-              and refs_env[1]["folio"] == "G-MANUAL-9", refs_env)
+              and refs_env[1]["folio"] == N_GUIA_MANUAL, refs_env)
 
         r = client.get(f"/api/wasabil/facturas/{fac_id}/estado")
         check("1 sondeo → emitido con folio 777", r.status_code == 200

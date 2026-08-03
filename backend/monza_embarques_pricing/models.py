@@ -58,9 +58,31 @@ class MonzaEmbPricing(Base):
 
 
 class MonzaEmbPricingGasto(Base):
-    """Línea del bloque GASTOS LOCALES (con desglose tributario)."""
+    """Línea del bloque GASTOS LOCALES (con desglose tributario).
+
+    IDENTIDAD ESTABLE — leer antes de tocar el guardado
+    ---------------------------------------------------
+    La PK de esta fila es una LLAVE DE PLATA: `monza_cont_compra.emb_pricing_gasto_id` la
+    referencia para saber que la factura del forwarder YA está registrada como CxP, y de
+    ella cuelgan el lock y el anti-duplicado de `monza_compras_contab.crear_compra`. Esa FK
+    es `ON DELETE SET NULL`, así que BORRAR una fila de acá **desengancha la CxP en
+    silencio** y el mismo gasto se puede volver a cargar (Σ CxP duplicada, reproducido en
+    `tests/test_llave_gasto_estable.py`). En MonzaParts es peor que en Grupo AM porque el
+    botón «Registrar como compra» ya está en pantalla: tras cualquier re-guardado del
+    pricing la píldora "registrado" volvía a ser botón y eran DOS CLICS.
+
+    Por eso la identidad se define por la LLAVE NATURAL `(pricing_id, tipo)` y el guardado
+    hace UPSERT sobre ella (jamás delete + re-insert). La llave es única de verdad, no por
+    convención: los DOS únicos escritores (`integration.seed_gastos` y el PUT del router)
+    recorren `service.GASTOS_CATALOGO`, que son 6 tipos FIJOS, y el PUT colapsa el payload
+    del cliente por tipo → no puede haber dos líneas "Otros". El UniqueConstraint de abajo
+    lo deja declarado en la BD (migración aditiva en `init_db.py`).
+    """
     __tablename__ = "monza_emb_pricing_gasto"
-    __table_args__ = ({"mysql_engine": "InnoDB"},)
+    __table_args__ = (
+        UniqueConstraint("pricing_id", "tipo", name="uq_monza_emb_pricing_gasto_tipo"),
+        {"mysql_engine": "InnoDB"},
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     pricing_id = Column(Integer, ForeignKey("monza_emb_pricing.id", ondelete="CASCADE"), index=True)
@@ -100,6 +122,10 @@ class MonzaEmbPricingItem(Base):
     cantidad = Column(Numeric(14, 4), default=0)
     peso_unit_kg = Column(Numeric(14, 4), default=0)
     peso_total_kg = Column(Numeric(16, 4), default=0)
+    # Origen del peso usado en el prorrateo del flete: cotizacion(auto) | manual.
+    # Espejo de fob_origen: si el peso_kg de la cotización vino mal, Contabilidad lo
+    # corrige a mano y el flete se re-prorratea. 'auto' = se lee de la cotización.
+    peso_origen = Column(String(20), default="auto")
 
     fob_unit = Column(Numeric(16, 4), default=0)
     fob_origen = Column(String(20), default="manual")  # cotizacion|manual|auto

@@ -85,19 +85,19 @@ class ItemCotizacion(Base):
     descripcion = Column(String(500))
     numero_parte = Column(String(100), index=True)
     marca = Column(String(100))
-    cantidad = Column(Float(53))
-    precio_unit_cotizacion = Column(Float(53))
-    total_cotizacion = Column(Float(53))
+    cantidad = Column(Float)
+    precio_unit_cotizacion = Column(Float)
+    total_cotizacion = Column(Float)
     plazo = Column(String(200))
-    peso_unit_lbs = Column(Float(53), nullable=True)
-    margen_pct = Column(Float(53), nullable=True)
-    precio_finning = Column(Float(53), nullable=True)
+    peso_unit_lbs = Column(Float, nullable=True)
+    margen_pct = Column(Float, nullable=True)
+    precio_finning = Column(Float, nullable=True)
     plazo_entrega_min = Column(Integer, nullable=True)
     plazo_entrega_max = Column(Integer, nullable=True)
     estado_item = Column(String(50), default="ingresado")
 
     nombre_cat = Column(String(500))
-    precio_cat = Column(Float(53))
+    precio_cat = Column(Float)
     moneda_cat = Column(String(20))
     retiro_estimado = Column(String(200))
     url_cat = Column(String(500))
@@ -114,14 +114,21 @@ class ConfiguracionCotizador(Base):
     __tablename__ = "configuracion_cotizador"
 
     id = Column(Integer, primary_key=True, default=1)
-    tipo_cambio_usd = Column(Float(53), default=940.0)
-    costo_shipping_usd_kg = Column(Float(53), default=3.8)
-    adicionales_shipping_usd = Column(Float(53), default=440.0)
-    costo_agencia_pct = Column(Float(53), default=0.01)
-    costo_agencia_minimo_clp = Column(Float(53), default=160000.0)
-    desconsolidado_clp = Column(Float(53), default=90000.0)
-    bodegaje_clp = Column(Float(53), default=90000.0)
-    margen_venta_pct = Column(Float(53), default=0.19)
+    tipo_cambio_usd = Column(Float, default=940.0)
+    # TC del EURO: lo usa SOLO el costo landed de los embarques Baukat/Europa
+    # (embarques_pricing), que hasta ahora leía esta columna con getattr y recibía
+    # siempre 0 porque no existía → todo embarque EUR nacía con TC 0 y sin sugerencia.
+    # Espejo de MonzaConfig.tc_eur_clp (mismo default 1100 que usa el dueño en sus
+    # parámetros). El cotizador NO lo usa: sigue trabajando en USD.
+    # Migración aditiva idempotente: `python -m embarques_pricing.init_db`.
+    tipo_cambio_eur = Column(Float, default=1100.0)
+    costo_shipping_usd_kg = Column(Float, default=3.8)
+    adicionales_shipping_usd = Column(Float, default=440.0)
+    costo_agencia_pct = Column(Float, default=0.01)
+    costo_agencia_minimo_clp = Column(Float, default=160000.0)
+    desconsolidado_clp = Column(Float, default=90000.0)
+    bodegaje_clp = Column(Float, default=90000.0)
+    margen_venta_pct = Column(Float, default=0.19)
     plazo_min_default = Column(Integer, default=30)
     plazo_max_default = Column(Integer, default=45)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -133,7 +140,7 @@ class PartsCache(Base):
     id = Column(Integer, primary_key=True, index=True)
     numero_parte = Column(String(100), unique=True, index=True)
     nombre_cat = Column(String(500))
-    precio_cat = Column(Float(53))
+    precio_cat = Column(Float)
     moneda_cat = Column(String(20))
     retiro_estimado = Column(String(200))
     url_cat = Column(String(500))
@@ -468,6 +475,18 @@ class Despacho(Base):
     numero_despacho = Column(String(50), unique=True, index=True)
     oc_cliente_id = Column(Integer, ForeignKey("oc_cliente.id"))
     numero_guia = Column(String(100), nullable=True)
+    # Fecha de EMISIÓN de la guía de despacho ante el SII. La teclea el operador cuando la
+    # guía se emitió FUERA del sistema (portal del SII / talonario en papel) y aquí solo se
+    # registra su número. Es la fecha que viaja como FchRef en la referencia 52 de la
+    # factura, y NO es ninguna de las otras tres fechas del despacho:
+    #   · fecha_creacion  = cuándo se armó el despacho en PartsControl
+    #   · fecha_despacho  = cuándo se CERRÓ el despacho (reloj del servidor)
+    #   · fecha_firma     = cuándo el cliente firmó la guía recibida
+    # Antes la referencia 52 usaba fecha_despacho como sustituto y el DTE 33 salía al SII
+    # con una fecha que no era la del documento referenciado. Ver wasabil_dte/router.py.
+    # Con guía ELECTRÓNICA (Wasabil) esta columna no se usa: ahí manda el documentDate del
+    # propio DTE 52, que es la fecha tributaria real.
+    fecha_guia = Column(Date, nullable=True)
     transportista = Column(String(255), nullable=True)
     numero_expedicion = Column(String(120), nullable=True)   # N° de expedición de la guía (courier, ej. Samex); todos sus ítems lo comparten
     contacto_destinatario = Column(String(255), nullable=True)
@@ -495,7 +514,7 @@ class DespachoItem(Base):
     id = Column(Integer, primary_key=True, index=True)
     despacho_id = Column(Integer, ForeignKey("despachos.id", ondelete="CASCADE"))
     item_cotizacion_id = Column(Integer, ForeignKey("items_cotizacion.id"))
-    qty_despachada = Column(Float(53), default=0)
+    qty_despachada = Column(Float, default=0)
 
     despacho = relationship("Despacho", back_populates="items")
     item_cotizacion = relationship("ItemCotizacion")

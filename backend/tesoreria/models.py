@@ -102,7 +102,8 @@ class MovimientoBancario(Base):
     saldo = Column(Numeric(16, 2), nullable=True)          # saldo contable de la línea (opcional)
 
     # Estado de conciliación (el enlace real es N:M vía conc_conciliacion / _ingreso).
-    conciliado = Column(Boolean, default=False, index=True)
+    # (el índice lo aporta ix_conc_mov_conciliado de __table_args__: sin index=True)
+    conciliado = Column(Boolean, default=False)
     conciliado_at = Column(DateTime(timezone=True), nullable=True)
     conciliado_usuario_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
@@ -122,20 +123,31 @@ class Conciliacion(Base):
     es N:M (preparado para parciales: 1 mov ↔ varios egresos / 1 egreso ↔ varios movs),
     pero HOY el router solo crea enlaces 1:1 exactos (montos iguales). Un egreso ya
     paga varias compras vía cont_egreso_detalle (ese es el caso 'un movimiento paga
-    varios gastos'); los parciales banco↔egreso son fase FUTURA."""
+    varios gastos'); los parciales banco↔egreso son fase FUTURA.
+
+    Invariante reforzada TAMBIÉN a nivel de BD (defensa en profundidad; el router ya la
+    valida con `egreso.conciliado` bajo lock):
+      · UNIQUE egreso_id: un egreso solo puede estar enlazado a UN movimiento (1:1; los
+        NULL no colisionan en MySQL). Espejo de monza_tes_conciliacion. Sin ella el lock
+        del router era la ÚNICA defensa: cualquier camino nuevo —o una reparación en
+        SQL— podía conciliar el mismo pago contra dos cargos del banco. Si algún día se
+        habilitan parciales (N:M), relajarla.
+    Migración aditiva e idempotente en init_db.py."""
     __tablename__ = "conc_conciliacion"
     __table_args__ = (
         # Evita doble-enlace idéntico del mismo par (defensa en profundidad; no bloquea
         # repartos legítimos a egresos/movimientos distintos si se habilita N:M).
         UniqueConstraint("movimiento_id", "egreso_id", name="uq_conc_concil_mov_egreso"),
+        UniqueConstraint("egreso_id", name="uq_conc_concil_egreso"),
         Index("ix_conc_concil_mov", "movimiento_id"),
-        Index("ix_conc_concil_egreso", "egreso_id"),
         {"mysql_engine": "InnoDB"},
     )
     id = Column(Integer, primary_key=True, index=True)
     empresa = Column(String(50), nullable=False, server_default="mineria")
-    movimiento_id = Column(Integer, ForeignKey("conc_movimiento.id", ondelete="CASCADE"), index=True)
-    egreso_id = Column(Integer, ForeignKey("cont_egreso.id", ondelete="CASCADE"), index=True)
+    # (el índice de movimiento_id es el Index explícito de __table_args__ y el de
+    #  egreso_id lo aporta su UNIQUE: sin index=True no se crean índices duplicados)
+    movimiento_id = Column(Integer, ForeignKey("conc_movimiento.id", ondelete="CASCADE"))
+    egreso_id = Column(Integer, ForeignKey("cont_egreso.id", ondelete="CASCADE"))
     monto_conciliado_clp = Column(Numeric(16, 2), default=0)
     usuario_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -179,7 +191,9 @@ class ConciliacionIngreso(Base):
     )
     id = Column(Integer, primary_key=True, index=True)
     empresa = Column(String(50), nullable=False, server_default="mineria")
-    movimiento_id = Column(Integer, ForeignKey("conc_movimiento.id", ondelete="CASCADE"), index=True)
+    # (el índice de movimiento_id es el Index explícito de __table_args__; los de
+    #  cobranza_id/adelanto_id los aportan sus UNIQUE)
+    movimiento_id = Column(Integer, ForeignKey("conc_movimiento.id", ondelete="CASCADE"))
     cobranza_id = Column(Integer, ForeignKey("cont_cobranza.id", ondelete="CASCADE"), nullable=True)
     adelanto_id = Column(Integer, ForeignKey("cont_adelanto.id", ondelete="CASCADE"), nullable=True)
     monto_conciliado_clp = Column(Numeric(16, 2), default=0)

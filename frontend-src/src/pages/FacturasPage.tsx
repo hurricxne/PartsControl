@@ -27,7 +27,13 @@ interface Factura {
   dte_estado?: string | null; dte_folio?: string | null; dte_pdf_url?: string | null
   dte_puede_reintentar?: boolean; dte_en_vuelo?: boolean; dte_error?: string | null
 }
-interface Kpis { facturado_clp: number; cobrado_clp: number; cobrado_cliente_clp?: number; por_cobrar_clp: number; vencido_clp: number; en_factoring_clp: number }
+interface Kpis {
+  facturado_clp: number; cobrado_clp: number; cobrado_cliente_clp?: number
+  /** Lo que puso el FACTOR (adelanto + retención liquidada). cobrado = cliente + factor:
+   *  sin esta tarjeta las cifras de arriba no cuadraban entre sí en pantalla. */
+  anticipo_factoring_clp?: number
+  por_cobrar_clp: number; vencido_clp: number; en_factoring_clp: number
+}
 interface Aging { '0_30': number; '31_60': number; '61_90': number; '91_mas': number }
 
 const PAGO: Record<string, { cls: string; label: string }> = {
@@ -69,6 +75,23 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   return (<label className="block"><span className="block text-[11px] font-semibold uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>{label}</span>{children}</label>)
 }
 
+/** Forma mínima de las respuestas que traen avisos NO bloqueantes junto al 200: el
+ *  registro manual de una factura (POST /contabilidad/facturas) y los tres endpoints SII
+ *  de factura (emitir / estado / reintentar). Campo aditivo: si el backend no lo manda,
+ *  la lista simplemente viene vacía. */
+interface RespuestaConAvisos { advertencias?: string[] }
+
+/** Muestra las `advertencias` que el backend devuelve al REGISTRAR una factura por la vía
+ *  manual: un 200 puede traer avisos que cambian lo que el usuario cree que pasó ("el
+ *  descuento del anticipo deja esta factura en $0", "no se pudo mover el adelanto a esta
+ *  factura"). Antes la respuesta ni se desestructuraba: esos avisos se perdían y en
+ *  pantalla quedaba una factura rara sin ninguna explicación. Duran más que un toast
+ *  normal — hay que alcanzar a leerlas. Molde: MonzaFacturasPage. */
+function avisarAdvertencias(avisos?: string[]): void {
+  (avisos || []).forEach(a =>
+    toast(a, { duration: 9000, icon: <AlertCircle className="w-4 h-4 text-amber-500" /> }))
+}
+
 // ─── Emisión de factura electrónica al SII (DTE 33 vía Wasabil) ───────────────
 // Mismo patrón 2 pasos que la guía de despacho (EmitirGuiaSIIModal): PREVIEW SII
 // (no toca el SII: receptor real de la ficha Wasabil + referencias OC/guía/anticipo
@@ -91,6 +114,16 @@ function EmisionFacturaSII({ payload, facturaId, onDone, onVolver, onCerrar, onB
   const [prev, setPrev] = useState<any>(null)
   const [dte, setDte] = useState<any>(null)
   const [error, setError] = useState('')
+  // Advertencias que llegan CON el folio. El backend las genera UNA sola vez —en el
+  // request que graba el folio, sea el `emitir` o una pasada del sondeo—, así que hay
+  // que quedarse con ellas apenas aparecen: la siguiente respuesta ya viene vacía y se
+  // perderían. Se acumulan sin repetir. Molde: MonzaFacturasPage.
+  const [avisosSii, setAvisosSii] = useState<string[]>([])
+  const recordarAvisos = (data: RespuestaConAvisos) => {
+    const nuevos = data?.advertencias || []
+    if (nuevos.length === 0) return
+    setAvisosSii(prev => [...prev, ...nuevos.filter(a => !prev.includes(a))])
+  }
   // Puerta de una sola dirección: apenas se dispara el POST /emitir, este modal NUNCA
   // vuelve al formulario. El backend PUDO crear la factura (y hasta emitirla) aunque la
   // respuesta se perdiera; re-enviar el formulario crearía un SEGUNDO documento real.
@@ -113,7 +146,7 @@ function EmisionFacturaSII({ payload, facturaId, onDone, onVolver, onCerrar, onB
         .catch((e: any) => { if (vivo) { setError(errMsg(e, 'No se pudo previsualizar la factura')); setFase('error') } })
     } else if (facturaId) {
       wasabilAPI.estadoFacturaSII(facturaId)
-        .then(({ data }) => { if (vivo) { setDte(data); setFase(faseSegunDte(data)); if (data.estado === 'emitido') onDone() } })
+        .then(({ data }) => { if (vivo) { recordarAvisos(data); setDte(data); setFase(faseSegunDte(data)); if (data.estado === 'emitido') onDone() } })
         .catch((e: any) => { if (vivo) { setError(errMsg(e, 'No se pudo consultar el estado SII')); setFase('error') } })
     }
     return () => { vivo = false }
@@ -133,6 +166,9 @@ function EmisionFacturaSII({ payload, facturaId, onDone, onVolver, onCerrar, onB
       try {
         const { data } = await wasabilAPI.estadoFacturaSII(id)
         if (!vivo) return
+        // ANTES de decidir la fase: la pasada que confirma el folio es la que trae el
+        // aviso, y es la misma que corta el sondeo con `return`.
+        recordarAvisos(data)
         setDte(data)
         if (data.estado === 'emitido') { setFase('exito'); onDone(); return }
         if (data.puede_reintentar) { setFase('fallido'); onDone(); return }
@@ -153,6 +189,7 @@ function EmisionFacturaSII({ payload, facturaId, onDone, onVolver, onCerrar, onB
   const cerrar = () => { onDone(); onCerrar() }
 
   const procesarRespuesta = (data: any) => {
+    recordarAvisos(data)
     setDte(data)
     if (data.estado === 'emitido') { setFase('exito'); onDone() }
     else if (data.puede_reintentar) { setFase('fallido'); onDone() }
@@ -203,6 +240,22 @@ function EmisionFacturaSII({ payload, facturaId, onDone, onVolver, onCerrar, onB
           <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
             El folio quedó registrado en la factura y ya aparece en la lista para cobranzas y factoring.
           </p>
+          {/* El documento salió bien, pero la PLATA puede no haber quedado donde
+              corresponde: al confirmarse el folio el backend aplica el adelanto que la
+              emisión había diferido, y si no logra encauzarlo hacia esta factura (la otra
+              está cedida a un factor, su cobranza ya está conciliada con el banco…), la
+              factura nace POR COBRAR. Sin esta caja se leía solo "Factura emitida" y nadie
+              iba nunca a cobrarla. El texto va TAL CUAL viene del backend. */}
+          {avisosSii.length > 0 && (
+            <div className="p-3 rounded-xl border bg-amber-500/10 border-amber-500/30 text-left space-y-1.5">
+              <p className="text-xs font-semibold text-amber-600 dark:text-amber-400 flex items-center gap-1.5">
+                <AlertCircle className="w-4 h-4 shrink-0" /> Ojo con el pago de esta factura
+              </p>
+              {avisosSii.map((a, i) => (
+                <p key={i} className="text-xs leading-relaxed" style={{ color: 'var(--text-muted)' }}>{a}</p>
+              ))}
+            </div>
+          )}
           {dte.pdf_url && (
             <button onClick={() => window.open(dte.pdf_url, '_blank', 'noopener,noreferrer')} className="btn-primary text-sm inline-flex items-center gap-1.5">
               <FileText className="w-4 h-4" /> Ver PDF de la factura
@@ -317,6 +370,38 @@ function EmisionFacturaSII({ payload, facturaId, onDone, onVolver, onCerrar, onB
             </div>
           )}
 
+          {/* Líneas EXACTAS que se van a emitir (lo que imprimirá el DTE). Sin esta tabla
+              el usuario confirmaba un documento tributario real viendo solo el total: un
+              ítem de más, una cantidad mal cortada o el descuento del anticipo aplicado a
+              la línea equivocada solo se descubrían en el PDF ya emitido al SII. */}
+          {(prev.lineas?.length ?? 0) > 0 && (
+            <div className="rounded-xl border overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+              <table className="w-full text-[11px]">
+                <thead>
+                  <tr style={{ backgroundColor: 'var(--surface-200)', color: 'var(--text-faint)' }}>
+                    <th className="p-2 text-left font-semibold uppercase tracking-wider">Ítem</th>
+                    <th className="p-2 text-right font-semibold uppercase tracking-wider">Cant.</th>
+                    <th className="p-2 text-right font-semibold uppercase tracking-wider">P. unit. neto</th>
+                    <th className="p-2 text-right font-semibold uppercase tracking-wider">Total neto</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(prev.lineas as PreviewLinea[]).map((ln, i) => (
+                    <tr key={i} className="border-t" style={{ borderColor: 'var(--border)' }}>
+                      <td className="p-2">
+                        <span className="font-mono font-semibold" style={{ color: 'var(--text-primary)' }}>{ln.numero_parte || '—'}</span>
+                        {ln.descripcion && <span className="block" style={{ color: 'var(--text-faint)' }}>{ln.descripcion}</span>}
+                      </td>
+                      <td className="p-2 text-right" style={{ color: 'var(--text-primary)' }}>{ln.cantidad}</td>
+                      <td className="p-2 text-right" style={{ color: 'var(--text-muted)' }}>{fmtClp(ln.precio_unit_neto)}</td>
+                      <td className="p-2 text-right font-semibold" style={{ color: 'var(--text-primary)' }}>{fmtClp(ln.total_neto)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
           {/* Totales que se enviarán al SII */}
           {prev.totales && (
             <div className="rounded-xl border p-3 text-xs flex gap-5" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)', color: 'var(--text-muted)' }}>
@@ -329,12 +414,22 @@ function EmisionFacturaSII({ payload, facturaId, onDone, onVolver, onCerrar, onB
           <p className="text-[11px]" style={{ color: 'var(--text-faint)' }}>
             El folio lo asigna el SII al emitir. Esta emisión es un documento tributario <b>real</b> — revisa el receptor y los montos antes de confirmar.
           </p>
-          <div className="flex gap-2">
-            {onVolver && <button onClick={onVolver} className="btn-secondary text-sm">← Volver</button>}
-            <button onClick={emitir} disabled={!prev.puede_emitir}
-              className="btn-primary flex-1 text-sm flex items-center justify-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed">
-              <Receipt className="w-4 h-4" /> Emitir al SII ahora
-            </button>
+          {/* Aviso explícito + salida sin emitir: el modal solo ofrecía "Volver" (y solo
+              desde el formulario), así que abierto desde la lista la única salida visible
+              era el botón que emite. Molde: MonzaFacturasPage. */}
+          <div className="pt-3 border-t" style={{ borderColor: 'var(--border)' }}>
+            <p className="text-[11px] flex items-center gap-1.5 mb-2" style={{ color: 'var(--text-muted)' }}>
+              <AlertCircle className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+              Al confirmar, la factura se emite al SII a través de Wasabil. Esta acción es <b>IRREVERSIBLE</b>.
+            </p>
+            <div className="flex gap-2">
+              {onVolver && <button onClick={onVolver} className="btn-secondary text-sm">← Volver</button>}
+              <button onClick={cerrar} className="btn-secondary text-sm">Cancelar</button>
+              <button onClick={emitir} disabled={!prev.puede_emitir}
+                className="btn-primary flex-1 text-sm flex items-center justify-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed">
+                <Receipt className="w-4 h-4" /> Emitir al SII ahora
+              </button>
+            </div>
           </div>
         </>
       )}
@@ -357,12 +452,15 @@ interface PreviewData {
 function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
   const [ocs, setOcs] = useState<OcOpt[]>([])
   const [ocId, setOcId] = useState<number | ''>('')
-  const [despachos, setDespachos] = useState<{ id: number; numero_despacho: string; numero_guia: string | null; numero_expedicion: string | null; guia_firmada_archivo: string | null; items_count: number }[]>([])
+  const [despachos, setDespachos] = useState<{ id: number; numero_despacho: string; numero_guia: string | null; fecha_guia: string | null; numero_expedicion: string | null; guia_firmada_archivo: string | null; items_count: number }[]>([])
   const [despachoId, setDespachoId] = useState<number | ''>('')
   const [folio, setFolio] = useState('')
   const [tipo, setTipo] = useState('factura')
   const [fecha, setFecha] = useState(hoyLocal())
   const [plazo, setPlazo] = useState('30')
+  // Observaciones de la factura: la fila expandida ya las MUESTRA, pero no había dónde
+  // escribirlas (el backend siempre las aceptó en el payload).
+  const [obs, setObs] = useState('')
   const [rut, setRut] = useState('')
   const [rutDebounced, setRutDebounced] = useState('')  // RUT asentado que dispara el preview
   // Razón social: campo por llenar (solo aparece si la venta no la trae); al emitir
@@ -454,6 +552,7 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
     fecha_emision: fecha, plazo_dias: plazo ? Number(plazo) : undefined,
     // Condición real pactada en la OC; si no hay, se deriva del plazo
     condicion_pago: condPagoOc || (plazo ? `${plazo} días` : undefined),
+    observaciones: obs.trim() || undefined,
     rut_cliente: rut || undefined,
     razon_social_cliente: razonSocial.trim() || undefined,
   })
@@ -469,8 +568,12 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
     if (folioFaltante) { toast.error('Ingresa el folio SII de la factura'); return }
     setSaving(true)
     try {
-      await contabilidadAPI.crearFactura({ ...armarPayload(), numero_factura: folio || undefined })
+      const resp: RespuestaConAvisos =
+        (await contabilidadAPI.crearFactura({ ...armarPayload(), numero_factura: folio || undefined })).data
       toast.success('Factura registrada')
+      // Avisos NO bloqueantes del 200 (p. ej. "el descuento del anticipo deja esta
+      // factura en $0"): antes se descartaban y la factura quedaba rara sin explicación.
+      avisarAdvertencias(resp?.advertencias)
       onDone(); onClose()
     } catch (e: any) {
       toast.error(errMsg(e, 'No se pudo registrar la factura'))
@@ -498,7 +601,10 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
       <Field label="Despacho / guía a facturar">
         <select className={inputCls} style={inputStyle} value={despachoId} onChange={e => { setDespachoId(e.target.value ? Number(e.target.value) : ''); setPreview(null) }} disabled={!ocId}>
           <option value="">{ocId ? (despachos.length ? 'Selecciona despacho…' : 'Sin despachos cerrados para facturar') : 'Elige una OC primero'}</option>
-          {despachos.map(d => <option key={d.id} value={d.id}>{d.numero_despacho}{d.numero_guia ? ` · Guía ${d.numero_guia}` : ''} ({d.items_count} ítems)</option>)}
+          {/* «sin fecha» avisa acá que esa guía en papel no se va a poder emitir al SII:
+              la referencia 52 exige la fecha de emisión de la guía. Se carga en
+              Despachos → Editar. Sin este aviso el bloqueo aparecía recién al emitir. */}
+          {despachos.map(d => <option key={d.id} value={d.id}>{d.numero_despacho}{d.numero_guia ? ` · Guía ${d.numero_guia}${d.fecha_guia ? '' : ' (sin fecha)'}` : ''} ({d.items_count} ítems)</option>)}
         </select>
         <p className="text-[11px] mt-1" style={{ color: 'var(--text-faint)' }}>Solo se listan guías de despacho <b>firmadas</b> (entregadas) y aún no facturadas.</p>
         {despachoId !== '' && (() => {
@@ -628,11 +734,22 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
           <Field label={`N° Factura (folio SII)${tipo === 'factura' ? ' *' : ''}`}><input className={inputCls} style={inputStyle} value={folio} onChange={e => setFolio(e.target.value)} placeholder="Ej. 35" /></Field>
         )}
         <Field label="Tipo">
-          <select className={inputCls} style={inputStyle} value={tipo} onChange={e => setTipo(e.target.value)}><option value="factura">Factura</option><option value="boleta">Boleta</option></select>
+          {/* Elegir BOLETA cae automáticamente al registro manual: el DTE 33 es solo
+              factura. Antes el modo SII quedaba activo y el usuario recién se enteraba al
+              apretar "Emitir factura al SII" (toast de rechazo). Volver a "factura" repone
+              el modo SII, que es el default. Molde: MonzaFacturasPage. */}
+          <select className={inputCls} style={inputStyle} value={tipo}
+            onChange={e => { setTipo(e.target.value); setModoSii(e.target.value === 'factura') }}>
+            <option value="factura">Factura</option><option value="boleta">Boleta</option>
+          </select>
         </Field>
         <Field label="Fecha emisión"><input type="date" className={inputCls} style={inputStyle} value={fecha} onChange={e => setFecha(e.target.value)} /></Field>
         <Field label="Plazo (días)"><input type="number" min={0} step={1} className={inputCls} style={inputStyle} value={plazo} onChange={e => setPlazo(e.target.value)} /></Field>
       </div>
+      <Field label="Observaciones (opcional)">
+        <input className={inputCls} style={inputStyle} value={obs} onChange={e => setObs(e.target.value)}
+          placeholder="Notas de la factura (se ven en la fila y en el detalle)" />
+      </Field>
       <button onClick={submit} disabled={saving || !puedeEmitir} className="btn-primary w-full flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
         {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Receipt className="w-4 h-4" />} {modoSii ? 'Emitir factura al SII' : 'Registrar factura emitida'}
       </button>
@@ -651,6 +768,11 @@ interface AdelantoVenta {
   id: number; estado: string; monto_esperado: number; pct: number | null
   monto: number; monto_aplicado: number; factura_anticipo_id: number | null
 }
+/** Factura de anticipo que la venta YA tiene (se lee del detalle de la OC al elegirla,
+ *  ANTES del clic: este botón emite un documento tributario real e irreversible). */
+interface AnticipoPrevio { id: number; numero_factura: string | null; monto_bruto: number }
+/** Forma mínima de las facturas que devuelve GET /contabilidad/ventas/{oc_id}. */
+type FacturaDeVenta = { id: number; numero_factura: string | null; monto_bruto: number; es_anticipo?: boolean }
 
 function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
   const [ocs, setOcs] = useState<OcOpt[]>([])
@@ -660,6 +782,15 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
   const [montoNeto, setMontoNeto] = useState('')
   const [folio, setFolio] = useState('')
   const [fecha, setFecha] = useState(hoyLocal())
+  // Un anticipo se paga AL CONTADO: por defecto 0 días. Este payload NO mandaba plazo ni
+  // condición (el de la factura normal sí), así que el backend dejaba fecha_vencimiento en
+  // NULL: el anticipo nunca vencía, nunca salía en el filtro "Vencidas" y nunca entraba al
+  // KPI "Vencido" — un anticipo impago no avisaba NUNCA. Molde: MonzaFacturasPage.
+  const [plazo, setPlazo] = useState('0')
+  // Facturas de anticipo que la OC YA tiene + la puerta EXPLÍCITA al segundo: emitir un
+  // DTE 33 es irreversible y el backend responde 409 si la casilla no viene marcada.
+  const [anticiposPrevios, setAnticiposPrevios] = useState<AnticipoPrevio[]>([])
+  const [confirmarSegundo, setConfirmarSegundo] = useState(false)
   const [rut, setRut] = useState('')
   const [rutDebounced, setRutDebounced] = useState('')  // RUT asentado que dispara el preview
   // Razón social: campo por llenar (solo aparece si la venta no la trae); al emitir
@@ -715,6 +846,22 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
     return () => { vivo = false }
   }, [ocId])
 
+  // Facturas de anticipo que la venta YA tiene: el aviso va ANTES del clic. El candado
+  // anti doble emisión de wasabil_dte solo dura mientras el HTTP está en vuelo, así que
+  // dos clics tranquilos emitían DOS facturas de anticipo REALES por el mismo adelanto.
+  useEffect(() => {
+    setAnticiposPrevios([]); setConfirmarSegundo(false)
+    if (!ocId) return
+    let vivo = true
+    contabilidadAPI.ventaDetalle(Number(ocId)).then(({ data }) => {
+      if (!vivo) return
+      const facturas: FacturaDeVenta[] = data?.facturas || []
+      setAnticiposPrevios(facturas.filter(f => !!f.es_anticipo)
+        .map(f => ({ id: f.id, numero_factura: f.numero_factura, monto_bruto: f.monto_bruto })))
+    }).catch(() => { /* sin aviso previo: el backend igual bloquea el 2º anticipo con su 409 */ })
+    return () => { vivo = false }
+  }, [ocId])
+
   // Previsualiza con la misma fuente de verdad que la emisión
   useEffect(() => {
     if (!ocId || !montoNeto || Number(montoNeto) <= 0) { setPreview(null); return }
@@ -724,6 +871,9 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
       monto_neto_anticipo: Number(montoNeto), adelanto_ids: [...adelSel],
       rut_cliente: rutDebounced || undefined,
       razon_social_cliente: razonDebounced || undefined,
+      // Sin esto el preview seguiría pintando "Esta venta ya tiene una factura de
+      // anticipo" (y el botón gris) aunque el operador ya marcó la casilla.
+      ...(confirmarSegundo ? { confirmar_segundo_anticipo: true } : {}),
     }).then(({ data }) => {
       if (!vivo) return
       setPreview(data); setPrevError('')
@@ -735,7 +885,7 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
       setPrevError(errMsg(e, 'No se pudo calcular la previsualización'))
     })
     return () => { vivo = false }
-  }, [ocId, montoNeto, adelSel, rutDebounced, razonDebounced])
+  }, [ocId, montoNeto, adelSel, rutDebounced, razonDebounced, confirmarSegundo])
 
   const toggleAdel = (id: number) => setAdelSel(prev => {
     const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s
@@ -747,8 +897,14 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
     oc_cliente_id: Number(ocId), es_anticipo: true,
     monto_neto_anticipo: Number(montoNeto), adelanto_ids: [...adelSel],
     tipo_doc: 'factura', fecha_emision: fecha,
+    // Plazo: 0 = al contado (lo normal en un anticipo). Vacío = sin vencimiento (y sin
+    // alarmas: no entra a "Vencidas" ni al KPI "Vencido").
+    plazo_dias: plazo === '' ? undefined : Number(plazo),
+    condicion_pago: plazo === '' ? undefined : (Number(plazo) === 0 ? 'Contado' : `${plazo} días`),
     rut_cliente: rut || undefined,
     razon_social_cliente: razonSocial.trim() || undefined,
+    // Solo viaja marcado: sin esto el backend bloquea el 2º anticipo de la venta.
+    ...(confirmarSegundo ? { confirmar_segundo_anticipo: true } : {}),
   })
 
   const submit = async () => {
@@ -762,9 +918,15 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
     if (!folio.trim()) { toast.error('Ingresa el folio SII de la factura'); return }
     setSaving(true)
     try {
-      await contabilidadAPI.crearFactura({ ...armarPayload(), numero_factura: folio })
+      const resp: RespuestaConAvisos =
+        (await contabilidadAPI.crearFactura({ ...armarPayload(), numero_factura: folio })).data
       toast.success('Factura de anticipo emitida — al facturar el despacho real se descuenta sola')
+      // Acá salen los avisos que cambian lo que el usuario cree que pasó (p. ej. que el
+      // adelanto NO se pudo mover a esta factura y quedó por cobrar).
+      avisarAdvertencias(resp?.advertencias)
       onDone(); onClose()
+      // El 409 del segundo anticipo llega tal cual desde el backend (nombra el que ya
+      // existe, con folio y monto): errMsg lo muestra sin reescribirlo.
     } catch (e: any) { toast.error(errMsg(e, 'No se pudo emitir la factura de anticipo')) } finally { setSaving(false) }
   }
 
@@ -809,6 +971,25 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
           se registra como cobranza normal (o informa el adelanto primero desde Ventas / Cierre de Venta).
         </p>
       )}
+      {/* Aviso ANTES del clic que emite: esta venta ya tiene factura(s) de anticipo. En
+          Grupo AM un anticipo parcial adicional es legítimo (cada adelanto se liga a SU
+          anticipo), así que no se prohíbe: se exige decirlo a propósito. */}
+      {ocId !== '' && anticiposPrevios.length > 0 && (
+        <div className="rounded-xl border p-3 bg-amber-500/10 border-amber-500/30 space-y-1.5">
+          <p className="text-xs" style={{ color: 'var(--text-primary)' }}>
+            <b>Esta venta ya tiene factura de anticipo:</b>{' '}
+            {anticiposPrevios.map(a => `N° ${a.numero_factura || `#${a.id}`} (${fmtClp(a.monto_bruto)})`).join(' · ')}
+          </p>
+          <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+            Emitir otra crea un <b style={{ color: 'var(--text-primary)' }}>segundo documento tributario real</b> por la
+            misma plata. Si el anticipo pactado es por partes, márcalo; si no es lo que quieres, cierra esta ventana.
+          </p>
+          <label className="flex items-center gap-2 text-xs cursor-pointer" style={{ color: 'var(--text-primary)' }}>
+            <input type="checkbox" checked={confirmarSegundo} onChange={e => setConfirmarSegundo(e.target.checked)} />
+            Sí, necesito un segundo anticipo para esta venta
+          </label>
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-3">
         <Field label="Monto NETO del anticipo (CLP)"><input type="number" className={inputCls} style={inputStyle} value={montoNeto} onChange={e => setMontoNeto(e.target.value)} placeholder="Ej. 50000" /></Field>
         <Field label="RUT del cliente"><input className={inputCls} style={inputStyle} value={rut} onChange={e => setRut(e.target.value)} placeholder="Ej. 78.279.030-7" /></Field>
@@ -819,7 +1000,7 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
           <input className={inputCls} style={inputStyle} value={razonSocial} onChange={e => setRazonSocial(e.target.value)} placeholder="Ej. H-E PARTS INTERNATIONAL CHILE SPA" />
         </Field>
       )}
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
         {modoSii ? (
           <Field label="N° Factura (folio SII)">
             <div className={inputCls} style={{ ...inputStyle, color: 'var(--text-faint)' }}>Lo asigna el SII al emitir</div>
@@ -828,7 +1009,15 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
           <Field label="N° Factura (folio SII) *"><input className={inputCls} style={inputStyle} value={folio} onChange={e => setFolio(e.target.value)} placeholder="Ej. 42" /></Field>
         )}
         <Field label="Fecha emisión"><input type="date" className={inputCls} style={inputStyle} value={fecha} onChange={e => setFecha(e.target.value)} /></Field>
+        <Field label="Plazo (días)">
+          <input type="number" min={0} step={1} className={inputCls} style={inputStyle} value={plazo} onChange={e => setPlazo(e.target.value)} />
+        </Field>
       </div>
+      <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+        Plazo <b style={{ color: 'var(--text-primary)' }}>0 = al contado</b> (lo normal en un anticipo: el cliente ya pagó).
+        Si lo dejas en blanco, la factura queda <b style={{ color: 'var(--text-primary)' }}>sin fecha de vencimiento</b>:
+        nunca se marcará como vencida ni entrará en el KPI "Vencido".
+      </p>
       {prevError && !preview && (
         <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-500">{prevError}</div>
       )}
@@ -1092,7 +1281,13 @@ function FacturaRow({ f, onChanged, onCobrar, onFactoring, onSii }: { f: Factura
                     <RefreshCw className="w-3.5 h-3.5" /> {siiFallida ? 'Reintentar emisión SII' : 'Ver emisión SII en curso'}
                   </button>
                 )}
-                {f.saldo > 0 && (
+                {/* !es_anticipo: una factura de ANTICIPO se salda SOLO con el adelanto que
+                    aprueba Tesorería (el backend responde 409). Si se ofrece el botón, el
+                    administrativo la salda a mano con la transferencia del cliente y ese
+                    MISMO depósito se cuenta DOS VECES: el adelanto ligado se libera y su
+                    plata cae completa en la factura del despacho real. La UI no debe
+                    ofrecer lo que el backend rechaza. Paridad con MonzaParts. */}
+                {f.saldo > 0 && !f.es_anticipo && (
                   <button onClick={(e) => { e.stopPropagation(); onCobrar(f) }} className="btn-secondary w-full flex items-center justify-center gap-2 text-xs">
                     <CreditCard className="w-3.5 h-3.5" /> Registrar cobranza
                   </button>
@@ -1171,10 +1366,13 @@ export default function FacturasPage() {
 
       {/* KPIs */}
       {kpis && (
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           {[
             { icon: DollarSign, label: 'Facturado', value: fmtClp(kpis.facturado_clp), color: 'text-brand-400' },
-            { icon: CheckCircle2, label: 'Cobrado', value: fmtClp(kpis.cobrado_cliente_clp ?? kpis.cobrado_clp), color: 'text-emerald-500' },
+            { icon: CheckCircle2, label: 'Cobrado cliente', value: fmtClp(kpis.cobrado_cliente_clp ?? kpis.cobrado_clp), color: 'text-emerald-500' },
+            // Plata que puso el FACTOR, no el cliente: el backend ya la devolvía y la
+            // pantalla la escondía, así que "Cobrado" no cuadraba con la cartera.
+            { icon: HandCoins, label: 'Anticipo factoring', value: fmtClp(kpis.anticipo_factoring_clp ?? 0), color: 'text-purple-400' },
             { icon: CreditCard, label: 'Por cobrar', value: fmtClp(kpis.por_cobrar_clp), color: 'text-amber-400' },
             { icon: AlertCircle, label: 'Vencido', value: fmtClp(kpis.vencido_clp), color: 'text-red-400' },
             { icon: Landmark, label: 'En factoring', value: fmtClp(kpis.en_factoring_clp), color: 'text-purple-400' },

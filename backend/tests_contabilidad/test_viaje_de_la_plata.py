@@ -29,6 +29,7 @@ Corre con:  ./venv/bin/python -m pytest tests_contabilidad/test_viaje_de_la_plat
 """
 import os
 import sys
+from datetime import date
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -55,6 +56,11 @@ from tesoreria.router import router as tes_router  # noqa: E402
 from wasabil_dte.tests.test_facturas_integration import FakeWasabil  # noqa: E402
 
 MARK = "__TEST_VIAJE__"
+# Fecha de EMISIÓN de la guía EN PAPEL. DISTINTA de la fecha de cierre del despacho a
+# propósito: la referencia 52 de la factura cita ESTA, y si el código volviera a usar
+# `fecha_despacho` el valor delataría cuál está leyendo.
+FECHA_GUIA_PAPEL = date(2026, 6, 18)
+
 CURRENT = {"id": None, "empresa": "mineria"}
 
 Base.metadata.create_all(bind=engine, checkfirst=True)
@@ -146,8 +152,14 @@ def _crear_venta(db, *, cantidad=20, precio=10000.0):
     db.add(it); db.flush()
     oc = OcCliente(cotizacion_id=cot.id, numero_oc=f"{MARK[-8:]}-OC", fecha_oc="2026-07-01")
     db.add(oc); db.flush()
+    # N° de guía NUMÉRICO: la factura 33 lo manda como FolioRef de la referencia 52 y el
+    # SII exige el correlativo (wasabil_dte/service.py lo valida). El seed anterior era
+    # "G{oc.id}" y desde ese guard la emisión de la factura final se rechaza — el dato de
+    # prueba era el irreal, no el guard. Rango altísimo: nunca colisiona con folios reales.
     desp = Despacho(numero_despacho=f"{MARK}-DSP-{oc.id}", oc_cliente_id=oc.id,
-                    estado="despachado", guia_firmada=1, numero_guia=f"G{oc.id}",
+                    estado="despachado", guia_firmada=1, numero_guia=str(99930000 + oc.id),
+                    # Guía en PAPEL: la referencia 52 de la factura exige su fecha de emisión.
+                    fecha_guia=FECHA_GUIA_PAPEL,
                     fecha_despacho=None)
     db.add(desp); db.flush()
     db.add(DespachoItem(despacho_id=desp.id, item_cotizacion_id=it.id, qty_despachada=cantidad))

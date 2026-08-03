@@ -263,6 +263,33 @@ def run():
         check("ítem repetido en items → 400", r.status_code == 400, r.text)
         _limpiar(db)
 
+        # ═══ 8b. Guard E — ítem de OTRA OC-Proveedor → 400 'no pertenece' ═══
+        # (el guard existía sin sonda: costear un ítem ajeno mezclaría trazabilidad y
+        # burlaría el tope, que es por ítem y no por OC)
+        cot, occ, ocp, (a, b) = _setup(db, (10, 10))
+        cot2, occ2, ocp2, (c,) = _setup(db, (5,))
+        r = _crear(f"{MARK}-E", ocp.id, [(c.id, 1, 1000)])
+        check("guard E: ítem de otra OC → 400 'no pertenece'",
+              r.status_code == 400 and "pertenece" in r.json()["detail"].lower(), r.text)
+        _limpiar(db)
+
+        # ═══ 8c. Snapshot del ítem: sin parte/descripción en el payload, cae al ítem ═══
+        # (la línea de costo se congela para auditoría; antes nacía con NULL)
+        cot, occ, ocp, (a, b) = _setup(db, (10, 10))
+        r = client.post("/api/compras-contab", json={
+            "tipo_gasto": "cogs", "origen": "NACIONAL", "moneda": "CLP",
+            "numero_documento": f"{MARK}-SNAP", "oc_proveedor_id": ocp.id,
+            "condicion_pago": "credito", "monto_neto": 5000, "afecto_iva": False,
+            "items": [{"item_cotizacion_id": a.id, "cantidad": 5, "precio_unit": 1000}],
+        })
+        check("snapshot: costear sin numero_parte en el payload → 200", r.status_code == 200, r.text)
+        ln = (r.json().get("items") or [{}])[0]
+        check("snapshot: la línea toma numero_parte del ítem bajo lock",
+              ln.get("numero_parte") == a.numero_parte, ln)
+        check("snapshot: la línea toma descripcion del ítem bajo lock",
+              ln.get("descripcion") == a.descripcion, ln)
+        _limpiar(db)
+
         # ═══ 9. Cobertura PARCIAL: costear 8 de 10 → OK, quedan 2 sin costear ═══
         cot, occ, ocp, (a, b) = _setup(db, (10, 10))
         r = _crear(f"{MARK}-PARC", ocp.id, [(a.id, 8, 1000)], monto_neto=8000)
