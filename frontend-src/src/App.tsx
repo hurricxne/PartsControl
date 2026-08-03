@@ -1,4 +1,4 @@
-import { Routes, Route, Navigate } from 'react-router-dom'
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { useAuthStore } from './stores/authStore'
 import LoginPage from './pages/LoginPage'
 import DashboardLayout from './pages/DashboardLayout'
@@ -39,9 +39,16 @@ import TicketsPage from './pages/TicketsPage'
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated())
   const user = useAuthStore((s) => s.user)
+  const location = useLocation()
 
   if (typeof document !== 'undefined') {
-    document.documentElement.setAttribute('data-empresa', user?.empresa || 'automotriz')
+    // Para cuentas del equipo Bigcode (@bigcode.cl) el tema sigue a la SECCIÓN visitada
+    // (pueden trabajar en ambos sistemas); para el resto, según la empresa de su cuenta.
+    const esBigcode = (user?.email || '').toLowerCase().endsWith('@bigcode.cl')
+    const empresaTema = esBigcode
+      ? (location.pathname.startsWith('/monzaparts') ? 'automotriz' : 'mineria')
+      : (user?.empresa || 'automotriz')
+    document.documentElement.setAttribute('data-empresa', empresaTema)
   }
 
   return isAuthenticated ? <>{children}</> : <Navigate to="/login" replace />

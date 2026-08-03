@@ -65,14 +65,18 @@ export default function LoginPage() {
     try {
       const { data } = await authAPI.login(email, password)
       const userEmpresa = data.user.empresa || 'mineria'
-      if (userEmpresa !== empresa) {
+      // Cuentas del equipo Bigcode (@bigcode.cl, ej. soporte) entran a AMBOS sistemas:
+      // se les respeta la pestaña elegida en vez de exigir que coincida con su empresa.
+      const esBigcode = (data.user.email || '').toLowerCase().endsWith('@bigcode.cl')
+      if (!esBigcode && userEmpresa !== empresa) {
         toast.error(`Tu cuenta pertenece a ${EMPRESAS[userEmpresa as Empresa]?.nombre || userEmpresa}`)
         setLoading(false)
         return
       }
       setAuth(data.access_token, data.user)
       toast.success(`Bienvenido, ${data.user.nombre}`)
-      navigate(userEmpresa === 'automotriz' ? '/monzaparts/leads' : '/', { replace: true })
+      const destino = esBigcode ? empresa : userEmpresa
+      navigate(destino === 'automotriz' ? '/monzaparts/leads' : '/', { replace: true })
     } catch (err: any) {
       toast.error(err.response?.data?.detail || 'Error al iniciar sesión')
     } finally {
