@@ -122,7 +122,9 @@ def _venta(db, key, *, pct=0, lineas=1, qty=1, precio=100000, iva_pct=19):
 
 def _despacho(db, key, cot_key, *, estado="despachado", item_key=None, qty=1):
     d = mm.MonzaDespacho(numero=f"{MARK}-D{key}", cotizacion_id=_S["cots"][cot_key],
-                         estado=estado, numero_guia=f"G-{key}")
+                         estado=estado, numero_guia=f"G-{key}",
+                         # regla 2026-08-06: sin firma no se factura (el gate tiene suite propia)
+                         guia_firmada=1)
     db.add(d); db.flush()
     _S["desps"][key] = d.id
     if item_key is not None:

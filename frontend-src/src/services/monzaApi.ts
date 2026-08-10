@@ -172,12 +172,10 @@ export interface MonzaFactoringPayload {
   banco?: string;
   observaciones?: string;
 }
-// Marca informativa: la guía del despacho volvió firmada por el cliente (espejo de
-// GuiaFirmadaIn). No es requisito para facturar.
-export interface MonzaGuiaFirmadaPayload {
-  firmada?: boolean;
-  archivo?: string;
-}
+// El payload MonzaGuiaFirmadaPayload y monzaContabilidadAPI.marcarGuiaFirmada se
+// ELIMINARON (2026-08-06): la firma dejó de ser un toggle informativo de Contabilidad
+// y ahora GATEA la facturación. Se marca en Despachos — monzaDespachosAPI.firmarEntidad
+// (multipart: foto/PDF + fecha de la firma) — y Contabilidad solo la lee.
 
 // ── Contabilidad (Ventas + Facturas/Cobranzas/Factoring) — SOLO MonzaParts ────
 export const monzaContabilidadAPI = {
@@ -186,8 +184,6 @@ export const monzaContabilidadAPI = {
     api.get("/contabilidad/ventas", { params: { q: q || undefined, periodo: periodo || undefined } }),
   ventaDetalle: (cotId: number) => api.get(`/contabilidad/ventas/${cotId}`),
   despachosFacturables: (cotId: number) => api.get(`/contabilidad/ventas/${cotId}/despachos-facturables`),
-  marcarGuiaFirmada: (despId: number, data: MonzaGuiaFirmadaPayload) =>
-    api.patch(`/contabilidad/ventas/despachos/${despId}/guia-firmada`, data),
   // Adelanto (50%): Contabilidad verifica el pago informado por Comercial
   verificarAdelanto: (cotId: number, data: MonzaAdelantoVerificarPayload) =>
     api.post<MonzaEstadoAdelanto>(`/contabilidad/ventas/${cotId}/adelanto/verificar`, data),
@@ -668,6 +664,26 @@ export const monzaDespachosAPI = {
   // Despacho como entidad (alineación MachParts) — ciclo de vida Fase 2:
   // crear (borrador en_preparacion) → cerrar (confirma la salida) / anular.
   listos: () => api.get("/despachos/listos"),
+  // Marca la guía del despacho como FIRMADA por el cliente (obligatorio para poder
+  // facturar, regla 2026-08-06). Multipart en UN request: foto/PDF + fecha de la firma
+  // (+ N° de guía opcional, rechazado si pisa un folio SII). Solo despachos cerrados.
+  firmarEntidad: (id: number, file: File, fechaFirma: string, numeroGuia?: string) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("fecha_firma", fechaFirma);
+    if (numeroGuia) form.append("numero_guia", numeroGuia);
+    return api.post(`/despachos/entidades/${id}/firmar`, form, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+  },
+  // Abre la guía firmada (u otro doc de uploads/docs) vía el serve de ESTE módulo:
+  // el de GA (services/api.ts:abrirDocumento) está detrás del candado 'mineria' y a
+  // un usuario Monza le respondía 403.
+  abrirGuiaFirmada: async (filename: string) => {
+    const res = await api.get(`/despachos/docs/${filename}`, { responseType: "blob" });
+    const url = URL.createObjectURL(res.data as Blob);
+    window.open(url, "_blank");
+  },
   crear: (data: Record<string, unknown>) => api.post("/despachos/crear", data),
   entidades: () => api.get("/despachos/entidades"),
   getEntidad: (id: number) => api.get(`/despachos/entidades/${id}`),
@@ -864,6 +880,10 @@ export const monzaAbastecimientoAPI = {
   kpis: () => api.get("/abastecimiento/kpis"),
   porComprar: (params?: Record<string, unknown>) => api.get("/abastecimiento/por-comprar", { params }),
   seguimiento: (params?: Record<string, unknown>) => api.get("/abastecimiento/seguimiento", { params }),
+  // `cantidades` opcional en el body: [{item_id, cantidad}] activa la asignación
+  // PARCIAL (la línea se parte y el remanente vuelve al panel, sin OC). Ausente =
+  // body legado, líneas enteras. Contrato de MonzaItemQty: 0 se rechaza, ausente/
+  // None = línea entera.
   comprar: (data: Record<string, unknown>) => api.post("/abastecimiento/comprar", data),
   listOcs: (params?: Record<string, unknown>) => api.get("/abastecimiento/ocs", { params }),
   ocItems: (id: number) => api.get(`/abastecimiento/ocs/${id}/items`),
@@ -884,7 +904,23 @@ export const monzaAbastecimientoAPI = {
       ? api.post<MonzaPrepararResp>("/abastecimiento/items/preparar-parcial", { items: pedidos })
       : api.post<MonzaPrepararResp>("/abastecimiento/preparar", { item_ids: pedidos.map((p) => p.item_id) });
   },
+  // BACK ORDER (caso Baukat): lo que el proveedor no va a mandar vuelve al panel de
+  // compras. `cantidad` ausente = la línea completa; con cantidad, el resto sigue
+  // comprado con su OC (misma partición que preparar-parcial, al revés).
+  // El motivo es obligatorio: es la única transición hacia atrás del pipeline y borra
+  // el vínculo con la OC del proveedor, así que sin él la línea queda sin explicación.
+  devolverACompras: (items: MonzaItemQty[], motivo: string) =>
+    api.post<MonzaDevolverResp>("/abastecimiento/items/devolver-a-compras", { items, motivo }),
 };
+
+/** Respuesta de devolver-a-compras: qué volvió, qué se partió y cómo quedaron las OC. */
+export interface MonzaDevolverResp {
+  ok: boolean;
+  devueltos: number;
+  partidos: number;
+  remanentes: Array<{ item_id: number; devuelto: number; sigue_comprado: number }>;
+  ocs: Array<{ ocp_id: number; numero: string | null; items_vivos: number }>;
+}
 
 // ── Logística (Embarques, alineación MachParts) ───────────────────────────────
 export const monzaLogisticaAPI = {

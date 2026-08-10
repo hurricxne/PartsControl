@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { ShoppingCart, Search, RefreshCw, Package, X, Truck, FileText, ChevronDown, ChevronRight, Plus } from "lucide-react";
+import { ShoppingCart, Search, RefreshCw, Package, X, Truck, FileText, ChevronDown, ChevronRight, Plus, AlertCircle } from "lucide-react";
 // (Truck también marca el badge "Nacional": OC sin embarque, entrega por camión)
 import { monzaAbastecimientoAPI, monzaTotalPendiente, monzaErrMsg } from "../services/monzaApi";
 import type { MonzaItemQty } from "../services/monzaApi";
@@ -26,6 +26,7 @@ interface ItemCompra {
   subtotal_clp?: number;
   plazo_entrega?: string;
   estado_linea: string;
+  oc_proveedor_id?: number | null;
   fecha_venta?: string;
   // Origen de la OC del ítem: 'nacional' → NO pasa por preparar/embarque (su camino
   // es "Registrar entrega nacional" en Seguimiento). Solo viene en /comprados.
@@ -117,6 +118,33 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
   const [notas, setNotas] = useState("");
   const [saving, setSaving] = useState(false);
 
+  // ── Asignación PARCIAL (espejo GA ComprasPage) ──────────────────────────────
+  // El control de cantidad SOLO aparece en líneas partibles: 'por_comprar', sin
+  // vínculo con una OC y cantidad > 1 (una línea con cantidad NULL/0/1 va entera
+  // por el camino legado, que corre cuando el operador no toca nada — no se
+  // ofrece en pantalla lo que el backend va a rechazar).
+  const admiteParcial = (i: ItemCompra) =>
+    i.estado_linea === "por_comprar" && !i.oc_proveedor_id && (i.cantidad ?? 0) > 1;
+
+  // Cantidad a comprar por línea, como texto (el input vive como string y se
+  // valida al guardar). Default = la cantidad COMPLETA → si el operador no toca
+  // nada, el guardado usa el body LEGADO tal cual (cero cambio de comportamiento).
+  const [itemQtys, setItemQtys] = useState<Record<number, string>>(() => {
+    const init: Record<number, string> = {};
+    items.forEach((i) => { init[i.id] = String(i.cantidad ?? ""); });
+    return init;
+  });
+
+  // Rechazos (validación local o 400/404/409/422 del backend) al recuadro DENTRO
+  // del modal: un 409 importante no cabe en un toast de 4 segundos, y el operador
+  // necesita leerlo entero para decidir.
+  const [errorAsignar, setErrorAsignar] = useState<string | null>(null);
+
+  // Cierre bloqueado durante el guardado. A diferencia de GA no hace falta avisar
+  // por una "OC creada sin ítems": acá la OC y la asignación (split incluido) son
+  // UNA sola transacción en el backend — si algo rebota, la OC no nació.
+  const cerrarSeguro = () => { if (saving) return; onClose(); };
+
   const onTipoOrigen = (v: "internacional" | "nacional") => {
     setTipoOrigen(v);
     // Nacional → Chile/CLP SOLO como default de UI (el usuario puede cambiarlos;
@@ -176,7 +204,40 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
   };
 
   const submit = async () => {
+    setErrorAsignar(null);
     const prov = provList.find((x) => String(x.id) === provId);
+
+    // Validación de cantidades ANTES de tocar el backend: entero entre 1 y lo
+    // disponible. El valor por defecto (la cantidad completa) siempre pasa.
+    const problemas: string[] = [];
+    const cantidades: Record<number, number> = {};
+    for (const item of items) {
+      if (!admiteParcial(item)) continue;
+      const total = item.cantidad ?? 0;
+      const parte = item.numero_parte || item.descripcion;
+      const raw = (itemQtys[item.id] ?? "").trim();
+      const qty = Number(raw);
+      if (raw === "" || isNaN(qty)) {
+        problemas.push(`${parte}: indica cuántas unidades asignar (entre 1 y ${total}).`);
+        continue;
+      }
+      if (qty === total) { cantidades[item.id] = qty; continue; }  // completa: siempre válida
+      if (!Number.isInteger(qty) || qty < 1 || qty > total) {
+        problemas.push(`${parte}: la cantidad debe ser un número entero entre 1 y ${total} (pusiste ${raw}).`);
+        continue;
+      }
+      cantidades[item.id] = qty;
+    }
+    if (problemas.length > 0) {
+      setErrorAsignar(problemas.join("\n"));
+      return;
+    }
+    // ¿Alguna línea va parcial? Si NINGUNA → body legado tal cual (el camino de
+    // siempre no cambia ni un byte). El operador no necesita saber que hay dos rutas.
+    const parciales = items.filter(
+      (i) => admiteParcial(i) && cantidades[i.id] !== (i.cantidad ?? 0),
+    );
+
     setSaving(true);
     try {
       const r = await monzaAbastecimientoAPI.comprar({
@@ -189,12 +250,50 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
         plazo_dias: plazo ? Number(plazo) : undefined,
         notas: notas || undefined,
         tipo_origen: tipoOrigen,
+        // `cantidades` SOLO viaja cuando hay una parcial de verdad, y solo con las
+        // líneas partidas (ausente = línea entera, sentinela del contrato; JAMÁS
+        // se manda 0 — el backend lo rechaza a propósito).
+        ...(parciales.length > 0
+          ? { cantidades: parciales.map((i) => ({ item_id: i.id, cantidad: cantidades[i.id] })) }
+          : {}),
       });
-      toast.success(`OC creada · ${items.length} ítem(s)`);
+      if (parciales.length > 0) {
+        // Feedback que cuenta QUÉ pasó, línea por línea partida, con los números
+        // que devolvió el backend (no los que creímos mandar). Dura más que el
+        // toast estándar porque hay que alcanzar a leerlo.
+        const remanentes: any[] = r.data?.remanentes ?? [];
+        const lineas = remanentes.map((p) => {
+          const it = items.find((i) => i.id === p.item_id);
+          const parte = it?.numero_parte || it?.descripcion || `ítem ${p.item_id}`;
+          return `${parte}: asignaste ${p.comprado} de ${p.original} a la OC ${r.data.numero}; quedan ${p.pendiente} en el panel.`;
+        });
+        const enteras = (r.data?.items ?? items.length) - remanentes.length;
+        if (enteras > 0) lineas.push(`Además ${enteras} línea(s) completa(s) asignada(s).`);
+        toast.success(
+          <span style={{ whiteSpace: "pre-line" }}>{lineas.join("\n")}</span>,
+          { duration: 9000 },
+        );
+      } else {
+        toast.success(`OC creada · ${items.length} ítem(s)`);
+      }
       setOcpId(r.data.ocp_id); setOcpNumero(r.data.numero);  // pasar a paso 2 (documentos)
     } catch (e: any) {
-      // Muestra el detalle del backend (p.ej. cortafuego de adelanto no verificado).
-      toast.error(e?.response?.data?.detail || "Error al crear OC");
+      // El detalle del backend viene redactado para humanos (400/404/409/422): se
+      // muestra ENTERO en el recuadro del modal, nunca truncado en un toast. El 422
+      // de validación de Pydantic llega como lista de objetos → se aplanan los msg.
+      const d = e?.response?.data?.detail;
+      const msg = typeof d === "string"
+        ? d
+        : Array.isArray(d)
+          ? d.map((x: any) => {
+              // Con el `loc` el operador sabe QUÉ campo/línea falló:
+              // «cantidades.0.cantidad: Input should be…» en vez del msg suelto.
+              const loc = Array.isArray(x?.loc) ? x.loc.slice(1).join(".") : "";
+              const msg = typeof x?.msg === "string" ? x.msg : JSON.stringify(x);
+              return loc ? `${loc}: ${msg}` : msg;
+            }).join("\n")
+          : "No se pudo asignar. Revisa los datos e inténtalo de nuevo.";
+      setErrorAsignar(msg);
     } finally { setSaving(false); }
   };
 
@@ -206,7 +305,7 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
             <ShoppingCart size={18} className="monza-ic" />
             <span style={{ fontWeight: 700, fontSize: 15, color: txt }}>{ocpId ? `OC ${ocpNumero} · Documentos` : "Crear OC de compra"}</span>
           </div>
-          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: sub, display: "flex" }}><X size={18} /></button>
+          <button onClick={cerrarSeguro} style={{ background: "none", border: "none", cursor: "pointer", color: sub, display: "flex" }}><X size={18} /></button>
         </div>
 
         <div style={{ padding: "16px 20px", overflowY: "auto" }}>
@@ -222,9 +321,44 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
           <div style={{ background: dark ? "#0d1321" : "#F1F5F9", borderRadius: 8, padding: "10px 14px", marginBottom: 16 }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: sub, marginBottom: 6, textTransform: "uppercase" }}>{items.length} ítem(s) a comprar</div>
             {items.map((it) => (
-              <div key={it.id} style={{ fontSize: 12, color: txt, padding: "2px 0", display: "flex", justifyContent: "space-between" }}>
+              <div key={it.id} style={{ fontSize: 12, color: txt, padding: "2px 0", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
                 <span>{it.descripcion} <span style={{ color: sub }}>· {it.cot_numero}</span></span>
-                <span style={{ color: sub }}>×{it.cantidad}{it.costo ? ` · ${it.moneda} ${it.costo}` : ""}</span>
+                {/* Control de cantidad: por defecto la cantidad completa; mínimo 1,
+                    máximo lo disponible, enteros. Solo en líneas partibles
+                    ('por_comprar', sin OC, cantidad > 1) — si la línea no admite
+                    parcial, se muestra la cantidad a secas. */}
+                {admiteParcial(it) ? (() => {
+                  const total = it.cantidad ?? 0;
+                  const q = Number((itemQtys[it.id] ?? "").trim());
+                  const esParcialValida = !isNaN(q) && Number.isInteger(q) && q >= 1 && q < total;
+                  return (
+                    <span style={{ textAlign: "right", flexShrink: 0 }}>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                        <input
+                          type="number"
+                          min={1}
+                          max={total}
+                          step={1}
+                          value={itemQtys[it.id] ?? ""}
+                          onChange={(e) => {
+                            setItemQtys((prev) => ({ ...prev, [it.id]: e.target.value }));
+                            setErrorAsignar(null);
+                          }}
+                          title={`Cuántas unidades asignar a esta OC (entre 1 y ${total}). El resto queda disponible en el panel.`}
+                          style={{ ...IS, width: 56, padding: "3px 6px", fontSize: 12 }}
+                        />
+                        <span style={{ color: sub }}>de {total}</span>
+                      </span>
+                      {esParcialValida && (
+                        <span style={{ display: "block", fontSize: 10, marginTop: 2, fontWeight: 600, color: "#F59E0B" }}>
+                          Asignar {q} de {total} — quedan {total - q} en el panel
+                        </span>
+                      )}
+                    </span>
+                  );
+                })() : (
+                  <span style={{ color: sub }}>×{it.cantidad}{it.costo ? ` · ${it.moneda} ${it.costo}` : ""}</span>
+                )}
               </div>
             ))}
           </div>
@@ -316,6 +450,27 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
             </div>
           </div>
           <div style={{ fontSize: 11, color: sub, marginTop: 8 }}>📎 La AWB (guía aérea) y el tracking se adjuntan como documentos en el siguiente paso.</div>
+
+          {/* Rechazo pintado ACÁ, pegado al botón que el operador acaba de apretar,
+              y se queda hasta que él lo cierre: el detalle del backend viene
+              redactado para humanos y hay que poder leerlo entero (un toast de 4
+              segundos no alcanza para un 409 importante). */}
+          {errorAsignar && (
+            <div style={{ marginTop: 12, border: "1px solid rgba(239,68,68,0.35)", background: "rgba(239,68,68,0.10)", borderRadius: 10, padding: "10px 12px", fontSize: 12 }}>
+              <div style={{ fontWeight: 700, color: "#f87171", display: "flex", alignItems: "flex-start", gap: 6 }}>
+                <AlertCircle size={14} style={{ marginTop: 1, flexShrink: 0 }} />
+                No se pudo asignar
+              </div>
+              <div style={{ color: sub, whiteSpace: "pre-line", marginTop: 6 }}>{errorAsignar}</div>
+              <button
+                type="button"
+                onClick={() => setErrorAsignar(null)}
+                style={{ background: "none", border: "none", cursor: "pointer", padding: 0, marginTop: 6, fontWeight: 600, fontSize: 12, color: sub, textDecoration: "underline" }}
+              >
+                Ocultar este aviso
+              </button>
+            </div>
+          )}
           <datalist id="paises-list">{paises.map((p) => <option key={p} value={p} />)}</datalist>
           </>
           )}
@@ -326,7 +481,7 @@ function CrearOcModal({ items, proveedores, onClose, onDone }: {
             <button onClick={onDone} style={{ padding: "8px 22px", background: "#10B981", border: "none", borderRadius: 8, color: "white", cursor: "pointer", fontWeight: 700, fontSize: 13 }}>Finalizar</button>
           ) : (
             <>
-              <button onClick={onClose} style={{ padding: "8px 18px", border: `1px solid ${bd}`, borderRadius: 8, background: "transparent", color: sub, cursor: "pointer", fontSize: 13 }}>Cancelar</button>
+              <button onClick={cerrarSeguro} disabled={saving} style={{ padding: "8px 18px", border: `1px solid ${bd}`, borderRadius: 8, background: "transparent", color: sub, cursor: saving ? "not-allowed" : "pointer", fontSize: 13, opacity: saving ? 0.5 : 1 }}>Cancelar</button>
               <button onClick={submit} disabled={saving} style={{ padding: "8px 20px", background: "var(--monza-accent)", border: "none", borderRadius: 8, color: "white", cursor: saving ? "wait" : "pointer", fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
                 <ShoppingCart size={14} /> {saving ? "Creando..." : "Crear OC"}
               </button>

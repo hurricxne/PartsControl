@@ -153,6 +153,7 @@ def seed():
         desp = mm.MonzaDespacho(
             numero=f"{MARK}-DSP", cotizacion_id=cot.id, estado="despachado",
             numero_guia="GD-VIEJA", cliente_nombre=cli.nombre,
+            guia_firmada=1,  # regla 2026-08-06: sin firma no se factura (gate con suite propia)
         )
         db.add(desp); db.flush()
         di = mm.MonzaDespachoItem(despacho_id=desp.id, item_id=item.id, qty_despachada=10)
@@ -173,6 +174,7 @@ def seed():
         desp2 = mm.MonzaDespacho(
             numero=f"{MARK}-DSP2", cotizacion_id=cot2.id, estado="despachado",
             numero_guia=None, cliente_nombre=cli.nombre,
+            guia_firmada=1,  # regla 2026-08-06: sin firma no se factura (gate con suite propia)
         )
         db.add(desp2); db.flush()
         di2 = mm.MonzaDespachoItem(despacho_id=desp2.id, item_id=item2.id, qty_despachada=10)

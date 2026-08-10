@@ -217,7 +217,9 @@ def _crear_venta(db, sufijo, *, cantidad=10, precio=10_000.0, pct_adelanto=50, g
     for n, qty in enumerate(guias, start=1):
         d = mm.MonzaDespacho(numero=f"{MARK}-D{sufijo}{n}", cotizacion_id=cot.id,
                              estado="despachado", numero_guia=f"G-{sufijo}-{n}",
-                             cliente_nombre=cli.nombre)
+                             cliente_nombre=cli.nombre,
+                             # regla 2026-08-06: sin firma no se factura (el gate tiene suite propia)
+                             guia_firmada=1)
         db.add(d); db.flush()
         db.add(mm.MonzaDespachoItem(despacho_id=d.id, item_id=it.id, qty_despachada=qty))
         desps.append(d.id)

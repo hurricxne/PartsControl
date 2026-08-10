@@ -96,6 +96,14 @@ class MonzaProveedor(Base):
     id = Column(Integer, primary_key=True)
     code = Column(String(50), nullable=False, unique=True)
     nombre = Column(String(200), nullable=False)
+    # RUT CANÓNICO ('76513680-6': sin puntos, con guión, DV mayúscula — ver
+    # monza_wasabil_compras/rut.py). Es la llave de cruce contra el libro de compras del
+    # SII Monza: sin ella, el informe «existe en el SII y no en el ERP» acusa falsos
+    # faltantes y el operador re-carga facturas que ya están (el doble conteo que se
+    # quiere evitar). NULL en proveedores extranjeros (no tienen RUT) y en los legados
+    # sin backfill. Espejo de models/models.py Proveedor.rut (GA); la columna en BD viva
+    # la crea migrations/monza_proveedor_rut.py (create_all no altera tablas existentes).
+    rut = Column(String(20), nullable=True, index=True)
     pais = Column(String(10), nullable=True)
     formato = Column(String(20), nullable=True)
     linea_default = Column(String(20), nullable=True)
@@ -169,6 +177,15 @@ class MonzaLead(Base):
     linea = Column(String(20), nullable=True)  # autos/maquinaria
     total_estimado = Column(Float, default=0)
     sin_contactar_dias = Column(Integer, default=0)
+    # ── Flete aéreo de ESTA cotización ────────────────────────────────────────────
+    # La moneda de la tarifa vivía SÓLO en monza_config (global, EUR por defecto) y no
+    # había dónde elegirla al cotizar. Ahora se elige por COTIZACIÓN — una sola para
+    # todos los ítems, decisión explícita del dueño — y se guarda acá, que es donde
+    # vive la calculadora. Al cerrar la venta se copia a MonzaCotizacion.moneda_tarifa
+    # y .tarifa_aerea, que ya existían. NULL = usar la configuración global (leads
+    # anteriores a este cambio siguen funcionando igual).
+    moneda_tarifa = Column(String(10), nullable=True)   # EUR | USD
+    tarifa_aerea = Column(Float, nullable=True)         # por kg, en moneda_tarifa
     # Columnas migradas
     origen_crm = Column(String(30), nullable=True)
     vehicle_label = Column(String(200), nullable=True)
@@ -197,6 +214,17 @@ class MonzaLeadItem(Base):
     calidad = Column(String(30), default="sin_calificar")  # sin_calificar/genuine/oem/aftermarket
     cantidad = Column(Integer, default=1)
     precio_clp = Column(Float, nullable=True)  # precio calculado/aplicado (sin IVA, por unidad)
+    # ── Parámetros con que la CALCULADORA obtuvo ese precio ───────────────────────
+    # Sin ellos el precio era irreproducible: `aplicar_precios` guardaba sólo el
+    # precio_clp y al reabrir la calculadora no había nada que restaurar, así que el
+    # frontend metía el PRECIO en el campo del costo y forzaba CLP con markup 0.
+    # La cotización (MonzaCotizacionItem) ya congelaba estos mismos campos; el agujero
+    # estaba una etapa antes, acá en el lead.
+    costo = Column(Float, nullable=True)          # costo unitario en la moneda de origen
+    moneda = Column(String(10), nullable=True)    # EUR | USD | CLP
+    peso_kg = Column(Float, nullable=True)        # peso volumétrico para el flete aéreo
+    markup_pct = Column(Float, nullable=True)     # margen aplicado (entero, ej. 28)
+    tc_aplicado = Column(Float, nullable=True)    # TC con que se convirtió el costo (auditoría)
     supplier_part_pg_id = Column(String(30), nullable=True)
     plazo_entrega = Column(String(100), nullable=True)
 
@@ -262,6 +290,18 @@ class MonzaCotizacion(Base):
     # N° Y fecha de la OC — sin esta columna la guía/factura electrónica (Fase 5/6)
     # no puede armar la referencia. Se pide junto al N° al cerrar la venta.
     oc_fecha = Column(Date, nullable=True)
+    # CLIENTE PARTICULAR (2026-08-08): un consumidor final no emite orden de compra, y
+    # sin OC la venta no se podía cerrar (ni facturar: la referencia 801 del SII exige
+    # N° Y fecha). Con esta marca, el cierre usa la COTIZACIÓN como documento de
+    # respaldo — `oc_cliente` = su N° y `oc_fecha` = la fecha en que se emitió — de modo
+    # que la referencia 801 sigue apuntando a un documento REAL y verificable, solo que
+    # emitido por nosotros en vez del cliente.
+    # Se persiste (no es solo un parámetro del request) por dos razones: deja constancia
+    # de POR QUÉ esa OC coincide con el N° de cotización —si no, parece un error de
+    # digitación— y permite que la pantalla vuelva a abrir el cierre con la casilla ya
+    # marcada. 0/1 en vez de Boolean por consistencia con el resto del módulo
+    # (adelanto_verificado, guia_firmada, es_anticipo).
+    cliente_sin_oc = Column(Integer, default=0)
     vin = Column(String(50), nullable=True)
     asesor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     condiciones_servicio = Column(Text, nullable=True)
@@ -321,6 +361,26 @@ class MonzaConfig(Base):
     id = Column(Integer, primary_key=True)
     tc_usd_clp = Column(Float, default=950)
     tc_eur_clp = Column(Float, default=1100)
+    # ── Tarifa aérea POR MONEDA (2026-08-08) ──────────────────────────────────
+    # El courier cobra un precio por kilo DISTINTO según la moneda del contrato, así
+    # que la tarifa no es un número con una etiqueta de moneda: son DOS precios.
+    # Antes había uno solo (`tarifa_aerea_por_kg`) + `moneda_tarifa`; cuando la
+    # calculadora ganó el selector de moneda (commit 87aec91), elegir USD seguía
+    # usando el MISMO número —p. ej. 4,5 EUR/kg cotizado como 4,5 USD/kg—, o sea un
+    # flete que no era el real, en silencio y dentro del precio de venta.
+    # La tarifa EFECTIVA la resuelve _flete_efectivo (monza_router_cotizador.py),
+    # que es la fuente única: moneda EUR → eur_por_kg, USD → usd_por_kg.
+    # NULL = "no configurada": la calculadora BLOQUEA con un mensaje que manda a
+    # Configuración, en vez de cotizar con 0 (un flete de 0 subvalúa la venta y nadie
+    # se entera). Ver migrations/monza_tarifa_aerea_por_moneda.py.
+    tarifa_aerea_eur_por_kg = Column(Float, nullable=True)
+    tarifa_aerea_usd_por_kg = Column(Float, nullable=True)
+    # LEGADO — se conserva a propósito, no es residuo:
+    #   · `moneda_tarifa` sigue siendo la moneda que viene PRESELECCIONADA en la
+    #     calculadora (el default del negocio), y
+    #   · `tarifa_aerea_por_kg` es el respaldo de ESA moneda mientras su tarifa nueva
+    #     no esté cargada, para que ninguna cotización deje de calcular el día del
+    #     deploy. La migración copia este valor a la columna de su moneda.
     tarifa_aerea_por_kg = Column(Float, default=4.5)
     moneda_tarifa = Column(String(10), default="EUR")  # EUR/USD
     iva_pct = Column(Float, default=19)
@@ -566,12 +626,25 @@ class MonzaDespacho(Base):
     # el N° de expedición lo entrega el courier DESPUÉS, por el PUT de cabecera.
     fecha_despacho   = Column(DateTime, nullable=True)
     numero_expedicion= Column(String(120), nullable=True)
-    # Guía firmada por el cliente (informativo, NO gatea la facturación en Monza).
-    # Las columnas EXISTEN en la tabla desde monza_contabilidad/init_db.py, pero el
-    # modelo no las declaraba: marcar_guia_firmada escribía un atributo Python suelto
-    # y la firma se PERDÍA en silencio (bug visible recién al envolver la suite vieja
-    # en pytest, auditoría de paridad 2026-07-28).
+    # Guía firmada = ENTREGADA y firmada por el cliente. Desde 2026-08-06 es REQUISITO
+    # para facturar este despacho (paridad con MachParts, models.Despacho): la marca la
+    # pone Despachos (POST /entidades/{id}/firmar, con la foto/PDF y la fecha de la
+    # firma) y monza_contabilidad exige guia_firmada==1 al emitir. La única factura que
+    # no nace de una guía es la de ANTICIPO; el retiro en oficina va por sin_guia y
+    # exige que la mercadería NO esté comprometida en ningún despacho.
+    # Historia: guia_firmada/guia_firmada_archivo EXISTEN en la tabla desde
+    # monza_contabilidad/init_db.py, pero el modelo no las declaraba: marcar_guia_firmada
+    # escribía un atributo Python suelto y la firma se PERDÍA en silencio (bug visible
+    # recién al envolver la suite vieja en pytest, auditoría de paridad 2026-07-28).
     guia_firmada     = Column(Integer, default=0)
+    # Cuándo FIRMÓ el cliente. Es la CUARTA fecha del despacho y no es ninguna de las
+    # otras tres: fecha (creación) · fecha_despacho (cierre) · fecha_guia (emisión SII
+    # de la guía en papel, la que viaja como FchRef). Naive (sin tz) a propósito: todo
+    # el módulo usa datetime.utcnow / hoy_chile, no hay tz-aware que mezclar.
+    fecha_firma      = Column(DateTime, nullable=True)
+    # Sin FK (estilo del módulo: cotizacion_id/item_id tampoco la llevan) — es traza de
+    # quién marcó la firma, no una relación que se navegue.
+    usuario_firma_id = Column(Integer, nullable=True)
     guia_firmada_archivo = Column(String(255), nullable=True)
 
 
@@ -626,3 +699,46 @@ class MonzaTicketRespuesta(Base):
     mensaje = Column(Text, nullable=False)
     fecha_creacion = Column(DateTime, default=datetime.utcnow)
     ticket = relationship("MonzaTicket", back_populates="respuestas")
+class MonzaCotizacionCierre(Base):
+    """Historial de CIERRES de venta de una cotización — una fila por VERSIÓN.
+
+    POR QUÉ EXISTE
+    Una cotización cerrada puede revertirse (sólo si no tiene plata ni logística colgando:
+    ver el guard de monza_router_cotizaciones.py) y volver a cerrarse con otros datos. El
+    re-cierre PISABA el N° de OC, la fecha de OC y la fecha prometida sin dejar ninguna
+    huella: en Ventas aparecía como si siempre hubieran sido esos, y nadie podía saber que
+    hubo un cierre anterior ni con qué datos. Esta tabla es esa memoria.
+
+    Cada fila es la FOTO de los datos con que se cerró la venta esa vez. La cotización sigue
+    llevando los datos VIGENTES (la versión más nueva); acá vive el rastro de las anteriores.
+
+    NO es una tabla de plata: no participa de ningún cálculo. Es auditoría, y por eso nunca
+    se borra una fila — revertir MARCA la versión, no la elimina.
+    """
+    __tablename__ = "monza_cotizacion_cierre"
+
+    id = Column(Integer, primary_key=True)
+    cotizacion_id = Column(Integer, ForeignKey("monza_cotizaciones.id", ondelete="CASCADE"),
+                           nullable=False, index=True)
+    # 1, 2, 3… en orden de cierre. Se calcula bajo el mismo lock que el cierre, así que dos
+    # cierres simultáneos no pueden compartir número.
+    version = Column(Integer, nullable=False, default=1)
+
+    # ── Foto de los datos del cierre ──────────────────────────────────────────────
+    oc_cliente = Column(String(100), nullable=True)
+    oc_fecha = Column(Date, nullable=True)
+    fecha_entrega_est = Column(Date, nullable=True)
+    pct_adelanto = Column(Integer, nullable=True)
+    forma_pago = Column(String(100), nullable=True)
+    total_bruto = Column(Float, nullable=True)
+
+    cerrado_at = Column(DateTime, default=datetime.utcnow)
+    cerrado_por_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    cerrado_por_email = Column(String(150), nullable=True)  # copia legible: sobrevive al usuario
+
+    # ── Reversión (NULL mientras la versión esté vigente) ─────────────────────────
+    revertido_at = Column(DateTime, nullable=True)
+    revertido_por_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    revertido_por_email = Column(String(150), nullable=True)
+    revertido_a_estado = Column(String(20), nullable=True)   # a qué estado volvió
+    motivo = Column(String(400), nullable=True)              # lo que escribió el operador

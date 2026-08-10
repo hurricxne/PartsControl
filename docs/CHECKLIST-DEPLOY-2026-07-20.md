@@ -26,6 +26,13 @@ idempotentes: correrlos de nuevo no rompe nada (se probó cada uno dos veces).
 > Y la trampa del `rc=0` —un script que se salta un candado de plata y aun así sale con
 > éxito— quedó documentada para **los 3** scripts a los que les pasa, no solo para
 > tesorería: ver **§1.d-bis** antes de correr §1.e.
+>
+> Actualizado el **2026-08-08**: entraron 3 scripts (`wasabil_compras.init_db`,
+> `monza_wasabil_compras.init_db`, `migrations.monza_cotizacion_cierre`) para las 15 tablas
+> que hasta ahora solo nacían del `create_all` del arranque — es decir, DESPUÉS del §1.e,
+> que por eso salía `rc=1` en todo primer deploy pidiendo migraciones que no existían.
+> **Un paso obligatorio que sale rojo por diseño enseña a ignorar el rojo.** Y §2 estrena
+> dos variables (`SII_MATCHER_NOCTURNO` / `_MONZA`) que nacen apagadas: ver §4.b.
 
 ### 1.a · Núcleo y Grupo AM / MachParts — 🔴 SIEMPRE
 
@@ -40,6 +47,8 @@ python -m migrations.add_despacho_guia_fields      # 🔴 FALTABA EN ESTE CHECKL
 python -m migrations.fix_despacho_parcial_estado   # 🔴 repara líneas 'despachado' de despachos parciales legados (si no se corrió antes). No es de esquema: es de DATOS, y sin ella el remanente de una línea parcial queda bloqueado
 python -m migrations.cotizacion_pricing_snapshot   # 🔴 TC congelado: 2 columnas en cotizaciones (sin backfill; ver docs/tc-congelado-cotizacion.md)
 python -m migrations.despacho_fecha_guia           # 🔴 NUEVO (2026-07-30). fecha_guia DATE en `despachos` Y en `monza_despachos` (un solo script, las DOS marcas: no hay que repetirlo en §1.b). Es la fecha de EMISIÓN de la guía en papel, que la factura cita en su referencia 52. SIN ESTO: los modelos ya declaran la columna → SELECT con 1054 «Unknown column despachos.fecha_guia» y se caen la pantalla de Despachos y la emisión de facturas al SII de AMBAS marcas (Bodega NO: sus consultas no leen la entidad despacho completa). Ver docs/fecha-emision-guia-referencia-52.md
+python -m migrations.proveedor_rut                 # 🔴 NUEVO (2026-08-06). proveedores.rut (RUT canónico, llave de cruce del libro de compras del SII) + índice. Los modelos ya declaran la columna → sin esto, cualquier pantalla que lea la entidad Proveedor completa (Compras, Abastecimiento) responde 1054
+python -m wasabil_compras.init_db                  # 🔴 ⛓️ DESPUÉS de tesoreria.init_db (sus FKs apuntan a conc_movimiento; si falta, el script corta con un mensaje en castellano en vez de un errno 150). NUEVO (2026-08-08). Crea las 7 tablas del libro de compras del SII de Grupo AM: sii_libro_doc / sii_libro_sync_run / sii_libro_regla_rut (el espejo) + sii_libro_match / sii_match_run / sii_match_etiqueta_mov / sii_match_config (el matcher banco↔libro). ⚠️ POR QUÉ ES UN SCRIPT Y NO "lo crea el create_all": lo creaba, sí, pero AL REINICIAR — o sea DESPUÉS del §1.e, que corre antes. En el primer deploy el auditor las veía ausentes, salía rc=1 y ordenaba «correr las migraciones», que no existían: un rojo por diseño que enseña a ignorar el rojo. El barrido nocturno corre en su PROPIO job del scheduler (`run_sii_libro_job`, 05:30 America/Santiago — se separó del job de alertas de las 06:00, que no comparte nada con él) y usa el WASABIL_API_TOKEN que ya existe. El matcher corre al importar una cartola y con el botón de la pantalla; DESATENDIDO de noche solo si se prende `SII_MATCHER_NOCTURNO` (§2), que nace APAGADO — igual que la señal RUT-en-glosa en sii_match_config. Ver docs/plan-libro-compras-sii-2026-08-03.md y docs/spec-matcher-banco-libro-2026-08-06.md
 ```
 
 ### 1.b · MonzaParts — 🔴 SIEMPRE, aunque el gate contable vaya apagado
@@ -48,13 +57,27 @@ python -m migrations.despacho_fecha_guia           # 🔴 NUEVO (2026-07-30). fe
 > `python -m migrations.despacho_fecha_guia` de **§1.a**, que parcha las dos marcas de una
 > vez. Si se salta §1.a, MonzaParts también cae con 1054 en Despachos.
 
+> **`monza_cotizacion_cierre` (historial de versiones del cierre de venta, 2026-08-05)
+> SÍ está ahora, y era el último rojo por diseño del §1.e:** es tabla NUEVA y la creaba
+> sola el `create_all`… pero al REINICIAR, o sea después del auditor de esquema. En el
+> primer deploy salía «TABLA FALTANTE» y mandaba a correr una migración inexistente. Desde
+> el 2026-08-08 tiene su script (`migrations.monza_cotizacion_cierre`, abajo). Los
+> buscadores de Bodega/Despachos de ambas marcas (2026-08-05) no necesitan ningún script:
+> solo consultan columnas que ya existen.
+
 ```bash
 python -m monza_embarques_pricing.init_db          # 🔴 NUEVO (2026-07-30): desconsolidado_clp + bodegaje_clp + costo_agencia_minimo_clp en monza_config (gastos locales por defecto del pricing), más peso_origen en monza_emb_pricing_item y el UNIQUE uq_monza_emb_pricing_gasto_tipo. ⚠️ monza_config es tabla del NÚCLEO Monza: la leen con SELECT de todas las columnas la Configuración, el Cotizador y las Cotizaciones de MonzaParts, y esos 3 routers se montan FUERA del flag → sin esto quedan en 500 CON EL GATE APAGADO. ⚠️ LEER LA ÚLTIMA LÍNEA: si monza_emb_pricing_gasto trae líneas duplicadas legadas, el script SALTA el UNIQUE y sale con éxito (rc=0), y acá el auditor NO lo atrapa con el gate apagado — ver «Los 3 scripts que pueden saltarse un candado», abajo
 python -m migrations.monza_guia_firmada_cotizacion # 🔴 FALTABA EN ESTE CHECKLIST. guia_firmada + guia_firmada_archivo en monza_cotizaciones: el modelo las declara, así que sin ellas cualquier INSERT del ORM de cotizaciones Monza falla con "Unknown column"
 python -m migrations.monza_despachos_ciclo_vida    # 🔴 Monza F2: fecha_despacho + numero_expedicion + índice único DSP (ver docs/monza-flujo-bodega-despachos.md)
+python -m migrations.monza_despachos_fecha_firma   # 🔴 NUEVO (2026-08-06). FALTABA EN ESTE CHECKLIST (hallazgo de la revisión adversarial 2026-08-06 — el patrón exacto del incidente 1054 de julio). fecha_firma + usuario_firma_id en monza_despachos ("Marcar guía firmada", paridad con MachParts). El ORM ya declara las columnas y los routers de Despachos Monza se montan FUERA del gate → sin esto, cualquier lectura/escritura de la entidad despacho Monza responde 1054 y la pantalla cae en 500, CON EL GATE APAGADO. Las hermanas guia_firmada/guia_firmada_archivo las crea monza_contabilidad.init_db; esta migración trae las otras dos
 python -m migrations.monza_oc_fecha_fase3          # 🔴 Monza F3: oc_fecha en monza_cotizaciones (OC obligatoria + RUT validado al facturar). Esa fecha se imprime como referencia 801 del DTE
 python -m migrations.monza_moneda_tarifa           # 🔴 Monza F3: moneda_tarifa en monza_cotizaciones (foto de precios completa; sin backfill)
 python -m migrations.monza_notif_alertas           # 🔴 Monza F9: destinatario_rol + severidad + regla en monza_notificaciones (alertas del barrido diario de las 06:00). La tabla YA existe y create_all NO altera tablas existentes → sin esto MySQL responde "Unknown column 'regla'" y **NINGUNA notificación de MonzaParts se crea**: ni las del barrido (proveedor atrasado, venta lista, plazo crítico) ni las instantáneas que hoy funcionan (venta cerrada, despacho confirmado, embarque en tránsito, reclamos de bodega). El backend arranca igual → la falla es SILENCIOSA: la campana se queda vacía
+python -m migrations.monza_cotizador_parametros    # 🔴 NUEVO (2026-08-05). costo/moneda/peso_kg/markup_pct/tc_aplicado en monza_lead_items + moneda_tarifa/tarifa_aerea en monza_leads: la calculadora de precios GUARDA sus parámetros (antes persistía solo precio_clp y al reabrir mostraba el precio como costo en CLP) y la moneda del flete se elige por cotización. ⚠️ Los modelos YA declaran las columnas y Leads se monta FUERA del gate → sin esto la pantalla de Leads de MonzaParts responde 1054 CON EL GATE APAGADO. Sin backfill deliberado: los ítems viejos quedan NULL y la calculadora cae al comportamiento anterior
+python -m migrations.monza_proveedor_rut               # 🔴 NUEVO (2026-08-06). monza_proveedores.rut (RUT canónico, llave de cruce del libro de compras del SII Monza) + índice. El modelo ya declara la columna → sin esto, cualquier pantalla que lea la entidad MonzaProveedor completa (Compras, Abastecimiento) responde 1054. Las 7 tablas monza_sii_* las crea `monza_wasabil_compras.init_db` de §1.c (es 🟡 porque el Libro SII de Monza obedece al gate contable, igual que su pantalla y su Tesorería). El barrido nocturno corre en el MISMO job propio del scheduler (`run_sii_libro_job`, 05:30 America/Santiago) y usa el WASABIL_API_TOKEN_MONZA que ya existe. El matcher Monza corre al importar una cartola y con el botón de la pantalla; DESATENDIDO de noche solo si se prende `SII_MATCHER_NOCTURNO_MONZA` (§2), que nace APAGADO — igual que la señal RUT-en-glosa en monza_sii_match_config. Ver docs/plan-libro-compras-sii-2026-08-03.md y docs/spec-matcher-banco-libro-2026-08-06.md
+python -m migrations.monza_cotizacion_cierre           # 🔴 NUEVO (2026-08-08). Tabla monza_cotizacion_cierre (historial de versiones del cierre de venta, del 2026-08-05): cada re-cierre guarda la FOTO de con qué datos se cerró — OC, fecha, % de adelanto, forma de pago, total. Es del NÚCLEO Monza (la escribe el cierre de venta, que se monta FUERA del gate), así que va 🔴. No es tabla de plata: es auditoría, y sin ella un re-cierre pisa los datos anteriores sin dejar huella. La creaba el create_all del arranque; tiene script para que el auditor del §1.e no salga rojo por diseño
+python -m migrations.monza_tarifa_aerea_por_moneda     # 🔴 NUEVO (2026-08-08). tarifa_aerea_eur_por_kg + tarifa_aerea_usd_por_kg en monza_config: el courier cobra distinto por moneda y hasta ahora elegir USD cotizaba el número de EUR (flete irreal DENTRO del precio de venta). El modelo ya declara las columnas y Configuración/Cotizador se montan FUERA del gate → sin esto responden 1054 CON EL GATE APAGADO. Hace BACKFILL: copia la tarifa vieja a la columna de SU moneda (la que dice moneda_tarifa); la otra queda NULL y la calculadora BLOQUEA al elegirla hasta que se cargue en Configuración — es a propósito, un flete en 0 subvalúa la venta sin que se note. ⚠️ TAREA POST-DEPLOY: cargar esa segunda tarifa en Configuración
+python -m migrations.monza_cliente_sin_oc              # 🔴 NUEVO (2026-08-08). monza_cotizaciones.cliente_sin_oc: venta a CLIENTE PARTICULAR (no emite OC → se usa el N° y la fecha de la cotización como referencia 801 del SII). El modelo ya declara la columna y Cotizaciones/Ventas se montan FUERA del gate → sin esto responden 1054 CON EL GATE APAGADO. Sin backfill: 0 = "se cerró con OC real del cliente", que es lo que pasó con todas las ventas existentes
 python -m monza_recepcion_nacional.init_db         # 🔴 ⛓️ 1° de 2 (antes de monza_compras_contab). Tablas de recepción nacional + tipo_origen en monza_oc_proveedor. Obligatorio con el gate APAGADO: su router se monta fuera del flag (main.py) y Abastecimiento Monza filtra por tipo_origen
 python -m monza_contabilidad.init_db               # 🔴 ⛓️ ANTES de monza_wasabil_dte (la FK apunta acá). NUEVO (2026-07-30): monza_cont_adelanto.estado — sin él, TODA la Contabilidad y TODA la Tesorería de Monza responden 1054 (lo filtran los lectores de adelantos, sugerencias, aprobaciones, flujo de caja y resumen). Trae además es_anticipo + anticipo_factura_id (factura de ANTICIPO vía B, docs/monza-factura-anticipo.md) y, por eso es 🔴, parchea columnas de tablas del NÚCLEO Monza que se leen con el gate apagado: pct_adelanto / adelanto_verificado / guia_firmada en monza_cotizaciones y guia_firmada en monza_despachos
 python -m monza_wasabil_dte.init_db                # 🔴 ⛓️ DESPUÉS de monza_contabilidad.init_db (FK a monza_cont_factura_cliente). Tabla monza_wasabil_dte (guías 52 Y facturas 33) + factura_id + UNIQUE anti doble emisión. El create_all del arranque NO la crea. Obligatorio con el gate apagado: los guards de anular despacho y de editar la OC la consultan con import local y esos routers se montan siempre (si la tabla falta, el guard se apaga solo y se podría anular un despacho con guía SII viva)
@@ -65,6 +88,7 @@ python -m monza_wasabil_dte.init_db                # 🔴 ⛓️ DESPUÉS de mon
 ```bash
 python -m monza_compras_contab.init_db             # 🟡 ⛓️ 2° de 2 (después de monza_recepcion_nacional). monza_cont_compra_item (costeo por ítem) + monza_cont_compra.oc_proveedor_id + FK (docs/monza-compras-nacionales.md)
 python -m monza_tesoreria.init_db                  # 🟡 snapshot fecha/ref del egreso en monza_tes_conciliacion (desconciliar restaura el dato original)
+python -m monza_wasabil_compras.init_db            # 🟡 ⛓️ DESPUÉS de monza_tesoreria.init_db (sus FKs apuntan a monza_tes_movimiento). NUEVO (2026-08-08). Las 7 tablas monza_sii_* del libro de compras del SII de MonzaParts + su matcher. Espejo exacto de `wasabil_compras.init_db` de §1.a. Con el gate APAGADO el script se abstiene solo y lo dice ("no hay nada que crear — no es un error"): correrlo igual no rompe nada
 ```
 
 > **2026-08-02 · Salidas de emergencia de MonzaParts (registrar folio del SII + revertir
@@ -160,11 +184,21 @@ DTE de ninguna de las dos marcas. `--autoprueba` existe porque «sin problemas»
 idéntico cuando no hay nada malo y cuando no se está mirando: planta defectos falsos en
 memoria (no toca la BD) y exige que el auditor los cante.
 
+> **Este paso tiene que salir VERDE, y desde el 2026-08-08 sale verde de verdad.** Hasta
+> entonces había 15 tablas que solo nacían del `create_all` del arranque —las 14 del libro
+> de compras del SII (7 por marca) y `monza_cotizacion_cierre`—, o sea DESPUÉS de este
+> paso: el auditor las cantaba como «TABLA FALTANTE», salía `rc=1` y cerraba con «CORRER
+> LAS MIGRACIONES ANTES DE REINICIAR», una orden imposible porque esas migraciones no
+> existían. **Un paso obligatorio que sale rojo por diseño le enseña al operador a ignorar
+> el rojo, que es exactamente lo que este auditor existe para impedir.** Se cerró dándoles
+> script propio (§1.a `wasabil_compras.init_db`, §1.c `monza_wasabil_compras.init_db`, §1.b
+> `migrations.monza_cotizacion_cierre`). Si acá sale rojo: falta correr algo de §1, punto.
+
 Nota: la columna `cotizaciones.origen` ya existe en prod (vino de allá).
 
 ## 2. Variables de entorno (`backend/.env` del servidor)
 
-La plantilla completa y comentada es **`backend/.env.example`**: ahí están las 11 variables
+La plantilla completa y comentada es **`backend/.env.example`**: ahí están las 13 variables
 que `config.py` acepta, con qué pasa si falta cada una. `audit_schema.py --pasos` verifica
 que ninguna variable nueva de `config.py` se quede sin documentar ahí (fue el caso del
 token de MonzaParts: `config.py` lo declaraba y la plantilla no, así que un entorno nuevo
@@ -179,6 +213,32 @@ Las dos que hay que completar a mano en el servidor:
   backend al arrancar (pydantic extra_forbidden).
   Sin él la app funciona igual pero el botón "Emitir guía SII" queda bloqueado
   con aviso. **El token NUNCA va al repo.**
+
+⚠️ **El token no es solo para emitir: también LLENA el Libro de Compras del SII.** El
+barrido nocturno de las 05:30 usa el mismo token de cada marca (`WASABIL_API_TOKEN` /
+`WASABIL_API_TOKEN_MONZA`). Sin él, el barrido **se omite** y la pantalla Contabilidad →
+Libro SII queda vacía para siempre con el cartel «Nunca sincronizado» — nadie relaciona
+"el libro está vacío" con "falta un token". Desde el 2026-08-08 el log del servidor lo
+dice a gritos en cada corrida (`[scheduler][libro-sii] SIN WASABIL_API_TOKEN…`).
+
+### Las dos variables NUEVAS del 2026-08-08 — dejarlas COMO ESTÁN en este deploy
+
+- `SII_MATCHER_NOCTURNO` (Grupo AM) y `SII_MATCHER_NOCTURNO_MONZA` (MonzaParts).
+  **Ausentes = `false`, y así tienen que quedar en el deploy.** Gobiernan una sola cosa:
+  si el matcher banco↔libro puede correr **solo, de noche y sin nadie mirando**, dentro
+  del job de las 05:30.
+- Por qué nacen apagadas: el matcher **no tiene ventana de fecha**. La primera noche
+  después del deploy recorrería la cartola histórica COMPLETA de Tesorería y podría dejar
+  movimientos del banco con `conciliado = True` por una decisión automática que nadie
+  revisó nunca. El encargado de Tesorería se encontraría al otro día con plata marcada
+  por un módulo que todavía no conoce (y para soltarla hay que entrar a una pantalla que
+  nadie le mostró). Es el mismo criterio que este proyecto ya aplicó a la señal
+  RUT-en-glosa: **una señal nueva nace apagada hasta validarla con datos reales**.
+- El **barrido del libro corre igual** con esto apagado: llenar el espejo del SII es
+  lectura pura, y es justo lo que hay que mirar en el estreno (§4.b).
+- Cuándo prenderlas: después del estreno de §4.b, **una marca a la vez**, agregando la línea
+  al `backend/.env` y reiniciando. En el arranque el log lo confirma:
+  `[scheduler] … matcher nocturno GA=ON`.
 
 ## 3. Frontend
 
@@ -209,11 +269,47 @@ aislamiento se fija al abrir cada conexión, así que un reload deja workers vie
 nivel anterior. En el log de arranque debe aparecer `[startup] isolation=READ-COMMITTED`
 (si dice otra cosa, algo pisó `backend/database.py`).
 
+En el mismo log de arranque, dos líneas más que hay que LEER:
+
+```text
+[scheduler] APScheduler started — daily checks at 06:00, libro SII at 05:30 (Santiago) · matcher nocturno GA=OFF · Monza=gate apagado
+```
+
+`GA=OFF` es lo esperado en este deploy (ver §2). `Monza=gate apagado` confirma que la
+contabilidad de MonzaParts —incluido su Libro SII— no se montó.
+
 Verificación rápida post-deploy: login → Despachos
 (botones ① Emitir guía SII ② Agregar transportista ③ Confirmar en un despacho
 en preparación) → Contabilidad → Ventas (barra de avance + "Por facturar") →
 Facturas y Cobranzas ("Emitir factura" debe abrir en modo SII con el folio
 "Lo asigna el SII al emitir" y el enlace al registro manual).
+
+### 4.b · ESTRENO del Libro de Compras del SII (módulo nuevo — hacerlo el mismo día)
+
+Es el módulo que este deploy estrena y es el único que empieza a trabajar **solo**. Estos
+tres pasos son a la vez la verificación y el estreno: **en horario de oficina y con el
+dueño del proceso al lado**, no a las 05:30 de la mañana siguiente.
+
+1. **Contabilidad → Libro SII → "Sincronizar ahora".** Debe terminar en verde y decir
+   cuántos documentos trajo. Si falla, el error exacto queda escrito en la pantalla («El
+   último barrido falló: …») y sobrevive al refresco — ahí está la causa (token, red,
+   permisos). Sin este clic, la primera corrida real del módulo sería el job de las 05:30
+   sobre datos vivos y sin nadie mirando.
+2. **Revisar la bandeja de 3 cubetas y la cuadratura** (ESTÁ / NO ESTÁ / EN DUDA). Los
+   RUTs de proveedor que no cruzan se arreglan desde ahí; la señal RUT-en-glosa nace
+   apagada (`sii_match_config` arranca VACÍA: el valor por defecto vive en el código).
+3. **Correr el matcher a mano una vez y mirar lo que propone**, antes de dejarlo suelto de
+   noche. Recién cuando esos cruces convenzan, prender `SII_MATCHER_NOCTURNO` (§2) y
+   reiniciar. **Mientras la variable no esté, el matcher NO escribe nada por su cuenta.**
+
+Si el Libro SII se ve vacío y "Nunca sincronizado", el primer sospechoso es
+`WASABIL_API_TOKEN` (§2), no el módulo.
+
+> **MonzaParts queda fuera de este estreno a propósito.** Con `MONZA_CONTAB_ENABLED=false`
+> su Libro SII no se monta, su barrido no corre y su pantalla no existe — las tres piezas
+> apagadas juntas (hasta el 2026-08-08 el barrido corría igual y construía de noche un
+> espejo que nadie podía mirar). Cuando la marca se encienda, el estreno es el mismo,
+> con `SII_MATCHER_NOCTURNO_MONZA`.
 
 ## Qué trae esta rama (resumen para orientarse)
 
@@ -233,6 +329,8 @@ Facturas y Cobranzas ("Emitir factura" debe abrir en modo SII con el folio
 | Embarques | N° AWB escribible/buscable; peso editable en Embarques Pricing | `docs/awb-numero-embarques-2026-07-17.md`, `docs/peso-editable-embarques-pricing-2026-07-17.md` |
 | **Monza SII (F5 guías 52 + F6 facturas 33)** | Emisión electrónica al SII para MonzaParts (cuenta LOPEZ HERNANDEZ INVERSIONES SPA, RUT 78.121.316-0): botón "Emitir guía SII" en Despachos y modo SII en Facturas (folio "lo asigna el SII"), con el protocolo anti doble emisión de GA, referencias 801+52 con el folio REAL de la guía y **adelantos DIFERIDOS** hasta que el SII confirma. Verificación post-deploy: Despachos → emitir guía (preview) · Facturas → "Nueva factura" abre en modo SII | `docs/monza-guias-sii.md`, `docs/monza-facturas-sii.md` |
 | **Alertas automáticas MonzaParts** | El barrido diario de las 06:00 (America/Santiago) solo consultaba tablas de Grupo AM: **un proveedor de MonzaParts atrasado no avisaba NUNCA**, aunque el plazo estuviera cargado, y "venta lista para despacho" / "plazo crítico ≤3 días hábiles" solo se disparaban en el instante de cerrar una recepción en Bodega. Ahora las 3 reglas se re-evalúan todos los días, con idempotencia de 24 h (sin ella cada corrida repite el mismo aviso y el dueño deja de mirar la campana) y con cada marca aislada en su propio try/except (un error de Monza no puede dejar a Grupo AM sin alertas, ni al revés). Verificación post-deploy: la campana de MonzaParts debe mostrar avisos al día siguiente del deploy si hay OCs de proveedor atrasadas | `backend/scheduler.py`, `backend/monza_notif.py`, suite `backend/monza_tests/test_alertas_diarias.py` |
+| **Libro de Compras del SII (LO NUEVO de este deploy)** | Espejo de los documentos RECIBIDOS desde Wasabil, en las DOS marcas: 14 tablas nuevas (`sii_libro_*` + `sii_match_*` y sus gemelas `monza_sii_*`), pantalla Contabilidad → **Libro SII** con bandeja de 3 cubetas (ESTÁ / NO ESTÁ / EN DUDA), cuadratura, reglas por RUT y conciliación bancaria contra Tesorería. Trae un **job propio del scheduler a las 05:30** (`run_sii_libro_job`, separado del de alertas de las 06:00) y el **matcher banco↔libro**, que corre al importar una cartola, con el botón de la pantalla y —solo si el dueño lo habilita— de noche. Verificación post-deploy y estreno: **§4.b** (no saltárselo: es el único módulo que empieza a trabajar solo). Scripts: §1.a `wasabil_compras.init_db`, §1.c `monza_wasabil_compras.init_db`, más `migrations.proveedor_rut` / `monza_proveedor_rut` | `docs/plan-libro-compras-sii-2026-08-03.md`, `docs/spec-matcher-banco-libro-2026-08-06.md` |
+| **Higiene del deploy (2026-08-08)** | Cuatro arreglos para que el procedimiento **no salga rojo por diseño**: (1) el §1.e ya no reporta 15 «TABLA FALTANTE» inevitables — esas tablas tienen script; (2) el paso 4 de `deploy/README.md` (verificación del gate de Monza) volvió a ser cierto: el Libro SII de Monza se montaba SIEMPRE y su cierre del grafo de FKs metía 25 tablas en la metadata con el gate apagado, así que el `assert` fallaba en toda promoción — ahora el router, el barrido nocturno y la pantalla obedecen al MISMO flag; (3) el matcher nocturno nace apagado (§2) y el estreno tiene su paso (§4.b); (4) sin token de Wasabil, el log del servidor ahora dice que el libro no se va a llenar, en vez de callarse | `backend/scheduler.py`, `backend/main.py`, `deploy/README.md`, suite `backend/tests_infra/test_gate_monza_deploy.py` |
 | **Espejo MonzaParts (F1–F4 + paridad)** | Blindaje del flujo de plata; integridad Despachos/Bodega (tope físico, parcial, guía-primero); datos maestros (OC obligatoria + fecha, RUT validado, `pct_adelanto` que se perdía); avance de la plata por venta (base física) + tableros de despachos; 27 reparaciones de paridad (tope Σ brutos, adelanto retroactivo, locks factoring, folio obligatorio, half-up, snapshot al desconciliar); suites Monza ahora visibles a pytest. Verificación post-deploy Monza: Cotizaciones (cerrar venta pide OC), Despachos (tablero de avance), Bodega (historial), Contab → Ventas (por facturar) | `docs/plan-espejo-monza-2026-07-23.md` + docs `monza-*.md` |
 
 ## El gate de pruebas
@@ -241,13 +339,24 @@ Facturas y Cobranzas ("Emitir factura" debe abrir en modo SII con el folio
 cd backend && python -m pytest -q
 ```
 
-**200 verdes** al corte (107 MonzaParts + 91 Grupo AM + 2 del candado de suites). Necesitan MySQL.
+**200 verdes** al corte (107 MonzaParts + 91 Grupo AM + 2 del candado de suites), **más las
+5 del candado del gate de Monza** que agregó el 2026-08-08 (`tests_infra/`). Necesitan
+MySQL — salvo las de `tests_infra/`, que no tocan ni base ni red.
 
 **Correr SIEMPRE el comando pelado, nunca una lista de carpetas escrita a mano.** No hay
 `pytest.ini`: pytest recorre el árbol solo y encuentra las 30 suites. Una lista a mano es una
 trampa comprobada — escribir `pytest tests_contabilidad wasabil_dte/tests routers/tests` da
 **64 verdes** y parece un gate completo, pero se saltó en silencio `compras_contab`,
 `embarques_pricing`, `recepcion_nacional` y `tesoreria`. Si el número no da 200+, faltan carpetas.
+
+Desde el 2026-08-08 hay una suite más en `tests_infra/`:
+**`test_gate_monza_deploy.py`** automatiza el «paso 4» de `deploy/README.md` (con
+`MONZA_CONTAB_ENABLED=false`: cero rutas contables de MonzaParts montadas y cero de sus 25
+tablas en la metadata) y las puertas del job del libro SII (el matcher no corre
+desatendido sin habilitarlo; el barrido sí). Ese chequeo vivía SOLO como un bloque para
+copiar y pegar en el servidor, y cuando dejó de ser cierto nadie se enteró hasta la
+auditoría — **un chequeo que solo existe en un documento no protege nada entre deploy y
+deploy**. No toca base ni red (subprocesos con `AUTO_CREATE_TABLES=false`).
 
 La suite `backend/tests_infra/test_suites_visibles.py` es el candado contra la **suite
 invisible**: el molde de este repo es `def run()` + un wrapper `def test_x(): run()`, y sin el

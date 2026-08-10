@@ -10,16 +10,13 @@ import {
 import toast from "react-hot-toast";
 import { useMonzaTheme } from "./MonzaLayout";
 import { fmtClp, hoyLocal } from "../utils/format";
-import { monzaContabilidadAPI, monzaWasabilAPI } from "../services/monzaApi";
+import { monzaContabilidadAPI, monzaDespachosAPI, monzaWasabilAPI } from "../services/monzaApi";
 import type {
   MonzaDteFacturaInfo, MonzaDescuentoAnticipo, MonzaFacturaPayload, MonzaFacturaPreview,
 } from "../services/monzaApi";
-// Abre un documento ya subido (la foto/PDF de la guía firmada) autenticado y en una
-// pestaña nueva. Vive en el cliente COMPARTIDO porque el almacén de documentos es uno
-// solo para las dos marcas (GET /api/despachos/docs/{archivo} pide únicamente usuario
-// autenticado). Mismo gesto que MonzaDespachosPage / MonzaBodegaPage, que ya importan
-// ese cliente para las rutas compartidas.
-import { abrirDocumento } from "../services/api";
+// La guía firmada se abre con monzaDespachosAPI.abrirGuiaFirmada (2026-08-06): el
+// abrirDocumento de services/api.ts pega al serve de GA, que exige empresa 'mineria'
+// y a un usuario Monza le respondía 403 al ver su propia guía.
 // Confirmación de folio COMPARTIDA con Despachos (guía 52): una sola implementación de
 // la doble digitación para las dos pantallas donde aparece el callejón "emitido sin folio".
 import MonzaRegistrarFolioModal from "./MonzaRegistrarFolioModal";
@@ -610,7 +607,9 @@ interface DespachoFacturable {
   id: number; numero_despacho: string; numero_guia: string | null;
   /** Fecha de EMISIÓN de la guía ante el SII: sin ella la vía electrónica se bloquea. */
   fecha_guia?: string | null;
-  guia_firmada: boolean; guia_firmada_archivo: string | null; items_count: number;
+  /** Sin firma NO se factura (regla 2026-08-06): el selector deshabilita la opción. */
+  guia_firmada: boolean; fecha_firma?: string | null;
+  guia_firmada_archivo: string | null; items_count: number;
 }
 
 function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
@@ -766,15 +765,28 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
       {!sinGuia ? (
         <Field label="Despacho / guía a facturar">
           <select style={inp} value={despachoId} onChange={e => setDespachoId(e.target.value ? Number(e.target.value) : "")} disabled={!cotId}>
-            <option value="">{cotId ? (despachos.length ? "Selecciona despacho…" : "Sin despachos por facturar") : "Elige una venta primero"}</option>
+            {/* Con TODAS las guías sin firmar, "Selecciona despacho…" mentía (no hay
+                nada seleccionable): el placeholder lo dice y el aviso ámbar de abajo
+                explica cómo destrabarlo. */}
+            <option value="">{cotId ? (despachos.length ? (despachos.every(d => !d.guia_firmada) ? "Todas las guías están SIN FIRMAR (se marca en Despachos)" : "Selecciona despacho…") : "Sin despachos por facturar") : "Elige una venta primero"}</option>
             {/* «sin fecha» avisa acá que esa guía en papel no se va a poder emitir al SII:
-                la referencia 52 exige la fecha de emisión. Se carga en Despachos → Editar. */}
-            {despachos.map(d => <option key={d.id} value={d.id}>{d.numero_despacho}{d.numero_guia ? ` · Guía ${d.numero_guia}${d.fecha_guia ? "" : " (sin fecha)"}` : ""} ({d.items_count} ítems){d.guia_firmada ? " · firmada" : ""}</option>)}
+                la referencia 52 exige la fecha de emisión. Se carga en Despachos → Editar.
+                «SIN FIRMAR» va DESHABILITADA (regla 2026-08-06): el backend igual la
+                rechaza — el disabled evita elegir algo que va a fallar y dice por qué. */}
+            {despachos.map(d => <option key={d.id} value={d.id} disabled={!d.guia_firmada}>{d.numero_despacho}{d.numero_guia ? ` · Guía ${d.numero_guia}${d.fecha_guia ? "" : " (sin fecha)"}` : ""} ({d.items_count} ítems){d.guia_firmada ? ` · firmada${d.fecha_firma ? ` ${d.fecha_firma.slice(0, 10).split("-").reverse().join("-")}` : ""}` : " · SIN FIRMAR — márcala en Despachos"}</option>)}
           </select>
-          {/* A13 · PRUEBA DE RECEPCIÓN de la entrega que se está por facturar. Antes solo
-              había un " · firmada" dentro del <option>: se podía facturar una entrega sin
-              respaldo y sin que nada lo dijera — justo el documento que el cliente
-              discute después. Molde: FacturasPage.tsx (Grupo AM). */}
+          {/* Guías bloqueadas por falta de firma: se dice ACÁ, no solo dentro del
+              <option> deshabilitado (que en gris chico nadie lee). */}
+          {despachos.some(d => !d.guia_firmada) && (
+            <div style={{ marginTop: 6, fontSize: 11, color: "#B45309" }}>
+              ⚠ {despachos.filter(d => !d.guia_firmada).length === 1 ? "Hay 1 guía que no se puede facturar" : `Hay ${despachos.filter(d => !d.guia_firmada).length} guías que no se pueden facturar`} porque
+              el cliente aún no la{despachos.filter(d => !d.guia_firmada).length === 1 ? "" : "s"} firma: súbela{despachos.filter(d => !d.guia_firmada).length === 1 ? "" : "s"} en
+              {" "}<b>Despachos → Marcar guía firmada</b> (foto/PDF + fecha de la firma).
+            </div>
+          )}
+          {/* A13 · PRUEBA DE RECEPCIÓN de la entrega que se está por facturar. Con el
+              gate 2026-08-06 una guía sin firmar ya NO se puede elegir; este bloque
+              muestra el respaldo (foto/PDF) de la elegida. Molde: FacturasPage.tsx (GA). */}
           {despachoId !== "" && (() => {
             const d = despachos.find(x => x.id === Number(despachoId));
             if (!d) return null;
@@ -782,14 +794,14 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
               <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "4px 12px", marginTop: 6, fontSize: 11, color: s.muted }}>
                 {d.guia_firmada_archivo ? (
                   <button type="button"
-                    onClick={() => { abrirDocumento(d.guia_firmada_archivo!).catch(() => toast.error("No se pudo abrir la guía firmada")); }}
+                    onClick={() => { monzaDespachosAPI.abrirGuiaFirmada(d.guia_firmada_archivo!).catch(() => toast.error("No se pudo abrir la guía firmada")); }}
                     style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "3px 10px", borderRadius: 999, border: "1px solid rgba(16,185,129,0.45)", background: "rgba(16,185,129,0.12)", color: "#15803D", fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
-                    <FileText size={11} /> Ver guía firmada
+                    <FileText size={11} /> Ver guía firmada{d.fecha_firma ? ` (${d.fecha_firma.slice(0, 10).split("-").reverse().join("-")})` : ""}
                   </button>
                 ) : d.guia_firmada ? (
-                  <span style={{ color: "#B45309" }}>⚠ Marcada como firmada, pero <b>sin foto de respaldo adjunta</b></span>
+                  <span style={{ color: "#B45309" }}>⚠ Marcada como firmada, pero <b>sin foto de respaldo adjunta</b> (firmas antiguas; re-fírmala en Despachos para adjuntarla)</span>
                 ) : (
-                  <span style={{ color: "#B45309" }}>⚠ Esta guía <b>no está marcada como firmada</b> por el cliente (se puede facturar igual, pero queda sin prueba de recepción)</span>
+                  <span style={{ color: "#B45309" }}>⚠ Esta guía <b>no está firmada</b>: no se puede facturar. Márcala en <b>Despachos → Marcar guía firmada</b>.</span>
                 )}
               </div>
             );
@@ -797,7 +809,8 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
         </Field>
       ) : (
         <p style={{ fontSize: 12, color: s.muted, margin: 0, background: s.sub, padding: "8px 10px", borderRadius: 8 }}>
-          Se facturará el <b>saldo pendiente de la venta</b> (lo vendido aún no facturado), sin requerir guía de despacho.
+          Se facturará el <b>saldo pendiente SIN guía asociada</b> (lo vendido aún no facturado y que no está en
+          ningún despacho): lo que salió o va a salir con guía de despacho se factura <b>desde su guía firmada</b>.
         </p>
       )}
       {sinGuia && modoSii && (

@@ -20,8 +20,9 @@ el de **MonzaParts va apagado**. Se controla por flags — el código es el mism
 
 | Flag | QA | PROD | Efecto |
 |---|---|---|---|
-| `MONZA_CONTAB_ENABLED` (`backend/.env`) | *(ausente = true)* | `false` | Con `false`, `main.py` **ni importa** los 5 módulos Monza-contab (contabilidad, tesorería, compras/CxP, pricing, DTE) → sus modelos no se cargan → `create_all` **no crea** sus 18 tablas (`monza_cont_*`, `monza_tes_*`, `monza_emb_pricing*`) → sus rutas responden 404. **Verificado el 2026-07-30: son 5 módulos y 18 tablas** (acá decía 4 y 17) |
-| `VITE_MONZA_CONTAB` (`frontend-src/.env.local`, build-time) | *(ausente = true)* | `false` | Quita las 4 rutas de `App.tsx` y sus entradas del menú en `MonzaLayout` |
+| `MONZA_CONTAB_ENABLED` (`backend/.env`) | *(ausente = true)* | `false` | Con `false`, `main.py` **ni importa** los 6 módulos Monza-contab (contabilidad, tesorería, compras/CxP, pricing, DTE y Libro de compras del SII) → sus modelos no se cargan → `create_all` **no crea** sus 25 tablas (`monza_cont_*`, `monza_tes_*`, `monza_emb_pricing*`, `monza_sii_*`) → sus rutas responden 404. **Verificado el 2026-08-08: son 6 módulos y 25 tablas** (el 2026-07-30 eran 5 y 18; antes de eso decía 4 y 17) |
+| `VITE_MONZA_CONTAB` (`frontend-src/.env.local`, build-time) | *(ausente = true)* | `false` | Quita las **5** rutas de `App.tsx` (`ventas-contab`, `compras-contab`, `libro-sii`, `tesoreria`, `embarques-pricing`) y sus entradas del menú en `MonzaLayout`. **Verificado el 2026-08-08: son 5** (acá decía 4; la que faltaba era `libro-sii`) |
+| `SII_MATCHER_NOCTURNO` / `SII_MATCHER_NOCTURNO_MONZA` (`backend/.env`) | *(ausente = false)* | *(ausente = false)* | ¿El matcher banco↔libro corre **solo, de noche y sin nadie mirando**, dentro del job de las 05:30? Nace apagado en las dos marcas: el matcher no tiene ventana de fecha, así que la primera noche recorrería la cartola histórica completa y podría dejar movimientos del banco conciliados por una decisión que nadie revisó. Se prende después del estreno — `docs/CHECKLIST-DEPLOY-2026-07-20.md` §4.b |
 | `AUTO_CREATE_TABLES` (`backend/.env`) | *(ausente = true)* | *(ausente = true)* | Gate del `create_all` que corre al importar `main.py` |
 
 Además, `config.py` hace **fail-fast**: si `SECRET_KEY` es la default
@@ -54,9 +55,11 @@ cotizador, la Configuración y las Cotizaciones de MonzaParts quedan en 500 aunq
 vaya apagado.
 
 **La lista completa, en orden, con qué se rompe si se salta cada una, está en
-[`docs/CHECKLIST-DEPLOY-2026-07-20.md`](../docs/CHECKLIST-DEPLOY-2026-07-20.md) §1** — 22
+[`docs/CHECKLIST-DEPLOY-2026-07-20.md`](../docs/CHECKLIST-DEPLOY-2026-07-20.md) §1** — 32
 scripts, marcados 🔴 (obligatorio siempre) / 🟡 (solo con el gate) / ⛓️ (orden obligatorio).
-Ese checklist es la fuente de verdad; este README solo explica el porqué.
+Ese checklist es la fuente de verdad; este README solo explica el porqué. El número sale
+de `deploy/audit_schema.py --pasos`, que compara el árbol de `backend/` contra el
+checklist: si no coinciden, se pone rojo.
 
 > Historia: hasta 2026-07-16 esto se resolvía con `deploy/curar_prod_monza.py`, que
 > recortaba `main.py`/`App.tsx`/`MonzaLayout.tsx` por regex. Se eliminó tras la revisión
@@ -81,7 +84,7 @@ grep MONZA_CONTAB_ENABLED backend/.env          # -> false
 cat frontend-src/.env.local                     # -> VITE_MONZA_CONTAB=false
 
 # 3) Migraciones: create_all NO agrega columnas a tablas existentes.
-#    Son 22 scripts y hay ORDEN obligatorio entre varios. La lista, con qué se rompe si
+#    Son 32 scripts y hay ORDEN obligatorio entre varios. La lista, con qué se rompe si
 #    se salta cada uno, está en docs/CHECKLIST-DEPLOY-2026-07-20.md §1: copiar y correr
 #    ESE bloque completo, desde backend/, con el venv del servidor.
 #    (Hasta 2026-07-30 este README listaba 1 de los 22 y no citaba el checklist. Los
@@ -92,16 +95,35 @@ venv/bin/python deploy/audit_schema.py             # debe decir "sin problemas"
 venv/bin/python deploy/audit_schema.py --autoprueba  # el auditor no está ciego: VERDE
 venv/bin/python deploy/audit_schema.py --pasos      # el checklist quedó completo
 
-# 4) Verificación crítica ANTES de reiniciar (con el flag apagado):
-venv/bin/python -c "
+# 4) Verificación crítica ANTES de reiniciar (con el flag apagado).
+#    AUTO_CREATE_TABLES=false NO es opcional: `import main` ejecuta el create_all, así que
+#    sin esa variable el chequeo CREA las tablas que dice estar verificando.
+MONZA_CONTAB_ENABLED=false AUTO_CREATE_TABLES=false venv/bin/python -c "
 import main
 from models.models import Base
-tm = [t for t in Base.metadata.tables if t.startswith(('monza_cont','monza_tes','monza_emb_'))]
-assert not tm, f'tablas monza-contab en metadata: {tm}'
-print('OK: metadata sin monza-contab ·', len(main.app.routes), 'rutas')"
-# Ojo: esto verifica la METADATA del proceso, no la BD. Si un init_db de Monza ya creó
-# esas 18 tablas, la verificación sigue pasando y no hay nada que arreglar: el flag
-# gobierna las RUTAS (deben dar 404), no la existencia de las tablas.
+PREF_TABLA = ('monza_cont', 'monza_tes', 'monza_emb_', 'monza_sii_')
+PREF_RUTA  = ('/api/monza/contabilidad', '/api/monza/tesoreria',
+              '/api/monza/compras-contab', '/api/monza/embarques-pricing',
+              '/api/monza/sii-libro', '/api/monza/wasabil')
+rutas = [r.path for r in main.app.routes
+         if getattr(r, 'path', '').startswith(PREF_RUTA)]
+tablas = [t for t in Base.metadata.tables if t.startswith(PREF_TABLA)]
+assert not rutas, f'rutas monza-contab montadas con el flag apagado: {rutas[:5]}'
+assert not tablas, f'tablas monza-contab en metadata: {tablas}'
+print('OK: gate cerrado ·', len(main.app.routes), 'rutas · 0 monza-contab')"
+# Lo PRIMERO que se verifica son las RUTAS, porque es lo que el flag gobierna de verdad
+# (deben dar 404). Lo segundo, la metadata: es la comprobación que atrapa un import
+# incondicional colado — y ojo, verifica la METADATA DEL PROCESO, no la BD. Si un init_db
+# de Monza ya creó esas 25 tablas en la base, este chequeo igual pasa y no hay nada que
+# arreglar: tablas vacías con las rutas en 404 no hacen daño.
+#
+# Historia (2026-08-08): entre agosto y esta fecha este paso FALLABA en toda promoción.
+# El Libro de compras del SII de Monza se montaba fuera del gate, y su models.py importa
+# tesorería/contabilidad/compras/pricing de Monza para cerrar el grafo de FKs (sin eso el
+# arranque revienta con NoReferencedTableError y caen las DOS marcas): resultado, 25 tablas
+# en la metadata con el flag apagado y un AssertionError que se leía como "el gate se
+# filtró". Se arregló donde correspondía —el router del libro Monza ahora obedece el mismo
+# flag que su pantalla y su Tesorería—, no bajándole el precio a la verificación.
 
 # 5) Frontend + reinicio
 cd frontend-src && npm run build     # lee .env.local automáticamente
@@ -109,6 +131,9 @@ cp -r dist/assets/* ../assets/ && cp dist/index.html ../index.html
 pm2 restart machparts-api
 
 # 6) Verificar: MachParts 200 · Monza core 200 · monza/compras-contab 404
+#    · monza/sii-libro 404 (desde 2026-08-08 también obedece al gate)
+#    · y el ESTRENO del Libro de Compras del SII de Grupo AM, que es el módulo nuevo y el
+#      único que empieza a trabajar solo: docs/CHECKLIST-DEPLOY-2026-07-20.md §4.b
 ```
 
 ## Lecciones aprendidas (jul 2026)
@@ -129,6 +154,15 @@ pm2 restart machparts-api
   creerle al «sin problemas». Su versión del checklist es `--pasos`: compara el árbol de
   archivos contra `docs/CHECKLIST-DEPLOY-2026-07-20.md` y contra `backend/.env.example`,
   así que un módulo o una variable nuevos sin documentar se cantan solos.
+- **Un paso obligatorio que sale rojo POR DISEÑO es peor que no tenerlo.** Cada tabla nueva
+  que "la crea sola el `create_all` del arranque" nace DESPUÉS del auditor de esquema, que
+  corre antes de reiniciar: el auditor la ve ausente, la cuenta como problema, sale `rc=1`
+  y ordena «CORRER LAS MIGRACIONES», que no existen. Pasó con las 14 tablas del libro de
+  compras del SII y con `monza_cotizacion_cierre`, y la salida del auditor se vuelve ruido
+  que el operador aprende a saltarse — justo lo contrario de para lo que existe. **Regla:
+  toda tabla nueva entra al deploy con un script propio** (un `init_db` acotado o una
+  migración), aunque `create_all` pudiera crearla. Bonus: si una FK falla (errno 150), el
+  error aparece durante las migraciones y no como crash-loop del backend al arrancar.
 - **Una migración puede saltarse sola y salir con éxito.** `tesoreria/init_db.py` no crea
   `UNIQUE(egreso_id)` si encuentra duplicados legados: avisa por pantalla y devuelve rc=0.
   Depende de que alguien lea la salida — por eso el auditor ahora compara también los

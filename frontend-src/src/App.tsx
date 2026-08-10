@@ -35,6 +35,9 @@ import TesoreriaPage from './tesoreria/TesoreriaPage'
 import UsuariosPage from './pages/UsuariosPage'
 import ProveedoresPage from './pages/ProveedoresPage'
 import TicketsPage from './pages/TicketsPage'
+// Libro de Compras del SII (Grupo AM, Fases A1+A2): tablero + bandeja + reglas por RUT.
+// Revertir: quitar este import, la ruta 'libro-sii' y la entrada del menú en DashboardLayout.
+import LibroSiiPage from './pages/LibroSiiPage'
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated())
@@ -80,6 +83,10 @@ const MONZA_CONTAB = import.meta.env.VITE_MONZA_CONTAB !== 'false'
 import MonzaFacturasPage from './pages/MonzaFacturasPage'
 import MonzaEmbarquesPricingPage from './pages/MonzaEmbarquesPricingPage'
 import MonzaComprasPage from './pages/MonzaComprasPage'
+// Libro de Compras del SII MonzaParts (Fases A1+A2, espejo de LibroSiiPage GA): tablero +
+// bandeja + conciliación bancaria + reglas por RUT. Revertir: quitar este import, la ruta
+// 'libro-sii' del layout Monza y la entrada del menú Contabilidad en MonzaLayout.
+import MonzaLibroSiiPage from './pages/MonzaLibroSiiPage'
 import MonzaTesoreriaPage from './pages/MonzaTesoreriaPage'
 
 export default function App() {
@@ -115,6 +122,7 @@ export default function App() {
         <Route path="ventas-contab" element={<VentasContabPage />} />
         <Route path="embarques-pricing" element={<EmbarquesPricingPage />} />
         <Route path="compras-contab" element={<ComprasContabPage />} />
+        <Route path="libro-sii" element={<LibroSiiPage />} />
         <Route path="tesoreria" element={<TesoreriaPage />} />
         {/* ruta antigua del módulo (hoy Tesorería): redirige por memoria muscular */}
         <Route path="conciliacion" element={<Navigate to="/tesoreria" replace />} />
@@ -141,6 +149,7 @@ export default function App() {
         {MONZA_CONTAB && <Route path="ventas-contab" element={<MonzaVentasContabPage />} />}
         <Route path="facturas" element={<MonzaFacturasPage />} />
         {MONZA_CONTAB && <Route path="compras-contab" element={<MonzaComprasPage />} />}
+        {MONZA_CONTAB && <Route path="libro-sii" element={<MonzaLibroSiiPage />} />}
         {MONZA_CONTAB && <Route path="tesoreria" element={<MonzaTesoreriaPage />} />}
         {MONZA_CONTAB && <Route path="embarques-pricing" element={<MonzaEmbarquesPricingPage />} />}
         <Route path="abastecimiento" element={<MonzaAbastecimientoPage />} />

@@ -1069,6 +1069,13 @@ function LeadDetail({ lead, onRefresh }: { lead: Lead; onRefresh: () => void }) 
           clienteNombre={detail.cliente?.nombre || ""}
           vehiculo={detail.vehiculo}
           items={(detail.items || []) as any}
+          // Moneda del flete GUARDADA en el lead (si el operador ya la eligió): el
+          // cotizador parte de ella en vez de la configuración global.
+          monedaTarifaGuardada={(detail as { moneda_tarifa?: string | null }).moneda_tarifa}
+          // La tarifa CONGELADA de este lead: mientras no se cambie de moneda, el modal
+          // usa ésta y no la vigente en Configuración, para que reabrir la calculadora no
+          // mueva un precio ya ofrecido (hallazgo del multienjambre 2026-08-08).
+          tarifaAereaGuardada={(detail as { tarifa_aerea?: number | null }).tarifa_aerea}
           onClose={() => setShowCotizador(false)}
           onApplied={refresh}
         />

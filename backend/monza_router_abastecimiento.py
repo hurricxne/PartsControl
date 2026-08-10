@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
 
@@ -176,6 +176,22 @@ def seguimiento(
     return out
 
 
+class PrepararParcialItem(BaseModel):
+    """Una línea con cantidad opcional — el contrato compartido por los 4 splits
+    (comprar parcial, preparar-parcial, embarque y devolver-a-compras).
+
+    Definida ACÁ (antes de ComprarBody, que la referencia) y no junto al bloque
+    de preparar-parcial donde nació: FastAPI analiza el body de /comprar al
+    decorar el endpoint, así que la clase debe existir antes.
+
+    int (la columna `cantidad` es Integer: un float se redondearía en silencio en
+    MySQL) y None como SENTINELA EXPLÍCITO de "toda la línea". OJO con el vicio de
+    GA (compras.py:1031 usa `if item_data.cantidad`): con ese `if`, cantidad=0 es
+    falsy y cae a "toda la cantidad" — preparar 0 preparaba 10. Acá 0 se RECHAZA."""
+    item_id: int
+    cantidad: Optional[int] = None
+
+
 # Crear OC de proveedor (comprar items)
 class ComprarBody(BaseModel):
     item_ids: List[int]
@@ -191,10 +207,33 @@ class ComprarBody(BaseModel):
     # Origen de la compra: 'internacional' (embarque) o 'nacional' (camión + guía).
     # Gobierna el camino físico y la UI; el default deja el flujo internacional intacto.
     tipo_origen: Optional[str] = "internacional"
+    # Asignación PARCIAL a la OC (espejo del split de asignación de Grupo AM,
+    # commit 1d2a069): extensión ADITIVA — si el campo no viene, el body viejo
+    # sigue byte-igual y corre el camino legado de abajo. Si viene, cada entrada
+    # referencia un id de `item_ids` con su cantidad a comprar (None = línea
+    # entera, mismo contrato que preparar-parcial: 0 se RECHAZA, exceso se
+    # RECHAZA, jamás clamp silencioso). El remanente de una línea partida queda
+    # 'por_comprar' y SIN OC — vuelve al panel, asignable a otro proveedor.
+    cantidades: Optional[List[PrepararParcialItem]] = None
 
 
 @router.post("/comprar")
 def comprar(body: ComprarBody, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    # Vía PARCIAL (cantidades presentes): split + OC en una sola transacción con
+    # locks y retry. `cantidades is None` = camino legado intacto (dos caminos:
+    # el front solo manda el campo cuando el operador redujo alguna cantidad).
+    if body.cantidades is not None:
+        for _ in range(3):
+            try:
+                return _comprar_parcial_tx(db, body, current_user)
+            except OperationalError as e:
+                db.rollback()
+                code = getattr(getattr(e, "orig", None), "args", [None])[0]
+                if code not in (1213, 1205):
+                    raise
+        raise HTTPException(status_code=409,
+                            detail="Conflicto de concurrencia al comprar: reintenta")
+
     if not body.item_ids:
         raise HTTPException(status_code=400, detail="Sin items")
 
@@ -386,21 +425,31 @@ def preparar(body: PrepararBody, db: Session = Depends(get_db), current_user=Dep
 # — tras el split la cantidad embarcada vive en MonzaCotizacionItem.cantidad, igual
 # que en el EmbarqueItem de GA (que tampoco tiene columna de cantidad).
 
-class PrepararParcialItem(BaseModel):
-    item_id: int
-    # int (la columna `cantidad` es Integer: un float se redondearía en silencio en
-    # MySQL) y None como SENTINELA EXPLÍCITO de "toda la línea". OJO con el vicio de
-    # GA (compras.py:1031 usa `if item_data.cantidad`): con ese `if`, cantidad=0 es
-    # falsy y cae a "toda la cantidad" — preparar 0 preparaba 10. Acá 0 se RECHAZA.
-    cantidad: Optional[int] = None
-
+# PrepararParcialItem (el contrato por línea de este split) vive más ARRIBA,
+# antes de ComprarBody: la asignación parcial de /comprar usa el mismo molde y
+# FastAPI necesita la clase definida al decorar ese endpoint.
 
 class PrepararParcialBody(BaseModel):
     items: List[PrepararParcialItem]
 
 
+class DevolverACompras(BaseModel):
+    """Devolver al panel de compras lo que el proveedor dejó en BACK ORDER.
+
+    Mismo contrato que preparar-parcial (`cantidad` None = toda la línea, 0 se rechaza),
+    porque es la MISMA operación de partir una línea vista al revés: acá `cantidad` es lo
+    que VUELVE a comprarse, y el resto sigue su curso con la OC original.
+
+    `motivo` es OBLIGATORIO y no es burocracia: esta es la única transición que va HACIA
+    ATRÁS en el pipeline y borra el vínculo con la OC del proveedor. Sin el motivo, quien
+    revise la línea meses después no tiene forma de saber si fue un back order real, un
+    error de digitación o una cancelación del cliente."""
+    items: List[PrepararParcialItem]
+    motivo: str = Field(..., min_length=3, max_length=300)
+
+
 def _clonar_item_remanente(db: Session, it: MonzaCotizacionItem, remanente: int,
-                           estado: str) -> MonzaCotizacionItem:
+                           estado: str, copiar_oc: bool = True) -> MonzaCotizacionItem:
     """LA REGLA DE ORO DEL SPLIT — el único lugar donde vive, porque es lo único de
     esta fase que puede DUPLICAR PLATA. Lo usan las dos entradas al pipeline físico
     (preparar-parcial en Abastecimiento y crear_embarque en Logística); una sola
@@ -421,10 +470,17 @@ def _clonar_item_remanente(db: Session, it: MonzaCotizacionItem, remanente: int,
       3. Los otros 6 campos de la foto son UNITARIOS y se copian SIN DIVIDIR:
          tc_aplicado, tarifa_aerea, markup_pct, costo, moneda, peso_kg (Embarques
          Pricing los lee como "peso_unit" / costo unitario).
-      4. `oc_proveedor_id` se COPIA: es el análogo funcional del clon de
-         OcProveedorItem que hace GA. Sin él el clon pierde su OC y
+      4. `oc_proveedor_id` se COPIA cuando `copiar_oc=True` (default, los callers
+         históricos llaman posicional y quedan intactos): es el análogo funcional
+         del clon de OcProveedorItem que hace GA. Sin él el clon pierde su OC y
          _rechazar_items_nacionales (JOIN por esa columna) deja de reconocerlo como
          nacional — un ítem nacional se colaría al pipeline de embarque.
+         EXCEPCIÓN (espejo GA 1d2a069): en la ASIGNACIÓN PARCIAL a OC el remanente
+         todavía no es de nadie → `copiar_oc=False` lo deja SIN vínculo, porque si
+         lo heredara nacería "comprado a X" y el panel jamás lo ofrecería a otro
+         proveedor. Es cinturón de segunda capa: el guard del endpoint ya rebota
+         (409) una línea 'por_comprar' con vínculo sucio, pero un caller directo
+         del split no pasa por ese guard.
       5. La CABECERA de la cotización NO SE TOCA. Ni total_neto, ni iva_monto, ni
          total_bruto: Σ(cantidad) y Σ(subtotal_clp) de las hermanas son iguales a los
          de la línea original, así que la cabecera sigue cuadrando por construcción.
@@ -456,14 +512,14 @@ def _clonar_item_remanente(db: Session, it: MonzaCotizacionItem, remanente: int,
                       else int(remanente) * (it.precio_unitario_clp or 0)),
         plazo_entrega=it.plazo_entrega,
         estado_linea=estado,
-        oc_proveedor_id=it.oc_proveedor_id,   # regla 4
+        oc_proveedor_id=(it.oc_proveedor_id if copiar_oc else None),   # regla 4
     )
     db.add(clon)
     db.flush()
     return clon
 
 
-def _validar_pedidos_parciales(pedidos: list) -> list:
+def _validar_pedidos_parciales(pedidos: list, verbo: str = "preparar") -> list:
     """Saneo del body común a las 2 entradas (preparar-parcial y embarque). Devuelve
     la lista de ids. Cada rechazo es un 400 EXPLÍCITO: ninguno de los 4 vicios de GA
     (clamp silencioso, qty=0 → "todo", id inexistente ignorado, id repetido) llega a
@@ -482,8 +538,11 @@ def _validar_pedidos_parciales(pedidos: list) -> list:
         if p.cantidad is not None and p.cantidad <= 0:
             raise HTTPException(
                 status_code=400,
+                # `verbo` nombra el flujo real (revisión del espejo, H4): este helper
+                # lo comparten preparar-parcial, devolver-a-compras y la COMPRA
+                # parcial — decirle «preparar» a quien está asignando confunde.
                 detail=f"Cantidad inválida para el ítem {p.item_id}: debe ser mayor que 0 "
-                       "(omite el campo para preparar la línea completa)",
+                       f"(omite el campo para {verbo} la línea completa)",
             )
     return ids
 
@@ -566,7 +625,8 @@ def _guard_duro_del_split(db: Session, pedidos: list, items_by_id: dict, ids: li
 
 
 def _partir_linea(db: Session, it: MonzaCotizacionItem, qty: Optional[int],
-                  estado_remanente: str) -> Optional[MonzaCotizacionItem]:
+                  estado_remanente: str,
+                  copiar_oc: bool = True) -> Optional[MonzaCotizacionItem]:
     """Aplica la regla de oro a UNA línea: deja `qty` unidades en la línea original
     y devuelve la hermana con el remanente (o None si no hubo partición).
 
@@ -613,11 +673,246 @@ def _partir_linea(db: Session, it: MonzaCotizacionItem, qty: Optional[int],
         )
 
     remanente = cant_total - int(qty)
-    clon = _clonar_item_remanente(db, it, remanente, estado_remanente)
+    clon = _clonar_item_remanente(db, it, remanente, estado_remanente, copiar_oc)
     it.cantidad = int(qty)
     if sub_actual is not None:   # None se preserva (ver _clonar_item_remanente)
         it.subtotal_clp = int(qty) * (precio or 0)
     return clon
+
+
+# ── Asignación PARCIAL a OC de proveedor (espejo GA commit 1d2a069) ───────────
+#
+# El encargo del dueño: de una línea 'por_comprar' de 3 unidades, comprar 1 o 2 a
+# un proveedor y que el remanente quede en el panel, asignable a otro. Es el MISMO
+# split de preparar-parcial con una diferencia deliberada: el remanente NO hereda
+# `oc_proveedor_id` (`copiar_oc=False`) — acá todavía no es de nadie.
+#
+# Adaptaciones al modelo Monza (documentadas para el espejo inverso):
+# · Sin tabla de vínculo (OcProveedorItem no existe): la FK vive en la línea, así
+#   que "asignar" es escribir `oc_proveedor_id` + 'comprado' sobre el trozo, y el
+#   clon nace sin ninguna de las dos cosas. No hay LOCK 2 sobre vínculos como en
+#   GA: el vínculo ES una columna de la fila ya lockeada.
+# · El guard de restaurar_version de GA NO aplica: `_registrar_reversion`
+#   (monza_router_cotizaciones.py) marca la versión REVERTIDA y ajusta el LTV,
+#   pero JAMÁS repone cantidades por id — y el re-cierre recorre `cot.items`
+#   VIVOS (las hermanas del split incluidas) moviendo solo estado_linea, así que
+#   Σ de las hermanas cuadra por construcción. Verificado empíricamente
+#   2026-08-10 sobre _registrar_reversion/_registrar_cierre y el PATCH de cierre.
+# · El guard del editor de GA NO tiene equivalente: los únicos update/delete de
+#   ítems en Monza (monza_router_leads.py) operan sobre MonzaLeadItem
+#   (pre-cotización, sin estado de pipeline); no existe endpoint que edite o
+#   borre una MonzaCotizacionItem post-venta. Verificado 2026-08-10 (grep de
+#   endpoints en cotizaciones/cotizador/ventas/leads).
+
+
+def _lockear_items_para_comprar(db: Session, ids: list) -> dict:
+    """Relectura BAJO LOCK de las líneas a asignar, orden id ASC (ancla canónica
+    de la casa, la misma de _lockear_items_para_split). Variante para el punto de
+    COMPRA porque el contrato de rechazo difiere del split genérico:
+
+    · id inexistente → 404 EXPLÍCITO (espejo GA: es un error del cliente y se le
+      dice cuál; jamás el `continue` mudo ni crear la OC con menos ítems).
+    · 'comprado' → 409 (espejo GA: la reasignación parcial es decisión v1 del
+      panel de diseño de GA y acá tampoco existe).
+    · 'por_comprar' con `oc_proveedor_id` sucio → 409 fail-closed (espejo del
+      LOCK 2 de GA sobre vínculos previos): dato inconsistente no debe poder
+      duplicar plata ni colar el remanente a otra OC.
+    · cualquier otro estado → 400 con el mismo texto que el split genérico.
+
+    El lock sigue siendo OBLIGATORIO: sin él dos asignaciones parciales
+    simultáneas leen cantidad=3 las dos, cada una clona su remanente y SE
+    INVENTAN UNIDADES (reproducido en GA por la sonda al quitar el lock).
+    populate_existing(): sin él el identity map devolvería el snapshot viejo
+    aunque el lock haya esperado."""
+    items = (
+        db.query(MonzaCotizacionItem)
+        .filter(MonzaCotizacionItem.id.in_(ids))
+        .order_by(MonzaCotizacionItem.id.asc())
+        .populate_existing()
+        .with_for_update()
+        .all()
+    )
+    if len(items) != len(set(ids)):
+        faltan = sorted(set(ids) - {i.id for i in items})
+        raise HTTPException(
+            status_code=404,
+            detail=f"Ítem(s) inexistente(s): {', '.join(str(i) for i in faltan)}")
+    comprados = [i for i in items if (i.estado_linea or "") == "comprado"]
+    if comprados:
+        det = ", ".join(i.numero_parte or i.descripcion or str(i.id) for i in comprados)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ítem(s) ya comprados ({det}): la reasignación parcial no existe "
+                   "todavía — mueva la línea entera o use el panel.")
+    otros = [i for i in items if (i.estado_linea or "") != "por_comprar"]
+    if otros:
+        detalle = ", ".join(
+            f"{i.numero_parte or i.descripcion} (estado: {i.estado_linea or 'sin estado'})"
+            for i in otros)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ítem(s) que no están en estado 'por_comprar': {detalle}")
+    con_vinculo = [i for i in items if i.oc_proveedor_id]
+    if con_vinculo:
+        det = ", ".join(str(i.id) for i in con_vinculo)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ítem(s) {det} ya tienen vínculo con un proveedor: la reasignación "
+                   "parcial no existe todavía — mueva la línea entera o use el panel.")
+    return {i.id: i for i in items}
+
+
+def _comprar_parcial_tx(db: Session, body: ComprarBody, current_user) -> dict:
+    """Transacción de la compra con cantidades parciales. UN solo commit al final
+    (log incluido); cualquier rechazo intermedio deja la base intacta."""
+    if not body.item_ids:
+        raise HTTPException(status_code=400, detail="Sin items")
+    ids_sel = list(body.item_ids)
+    if len(set(ids_sel)) != len(ids_sel):
+        raise HTTPException(
+            status_code=400,
+            detail="Hay ítems repetidos en el pedido: consolida la cantidad en una sola línea")
+    # `cantidades` referencia ids de la selección; una entrada fuera de ella es un
+    # error del cliente y se le dice cuál (jamás se ignora en silencio).
+    mapa_qty = {}
+    for c in body.cantidades:
+        if c.item_id in mapa_qty:
+            raise HTTPException(
+                status_code=400,
+                detail="Hay ítems repetidos en el pedido: consolida la cantidad en una sola línea")
+        mapa_qty[c.item_id] = c.cantidad
+    fuera = sorted(set(mapa_qty) - set(ids_sel))
+    if fuera:
+        raise HTTPException(
+            status_code=400,
+            detail=f"cantidades trae ítem(s) fuera de la selección: "
+                   f"{', '.join(str(i) for i in fuera)}")
+    # Ítem sin entrada en `cantidades` = línea entera (mismo sentinela que None).
+    pedidos = [PrepararParcialItem(item_id=i, cantidad=mapa_qty.get(i)) for i in ids_sel]
+    ids = _validar_pedidos_parciales(pedidos, verbo="asignar")   # 0/negativo → 400 explícito
+
+    # Saneo del origen: idéntico al camino legado (backend autoridad).
+    tipo_origen = body.tipo_origen or "internacional"
+    if tipo_origen not in ("nacional", "internacional"):
+        raise HTTPException(
+            status_code=400,
+            detail="tipo_origen inválido: use 'nacional' o 'internacional'",
+        )
+
+    # LOCK + contrato de estados (404/409/400, ver _lockear_items_para_comprar).
+    items_by_id = _lockear_items_para_comprar(db, ids)
+
+    # ── Cortafuego de ADELANTO (idéntico al camino legado, pero BAJO LOCK) ─────
+    sin_verificar = [
+        it.cotizacion for it in items_by_id.values()
+        if it.cotizacion is not None
+        and int(it.cotizacion.pct_adelanto or 0) > 0
+        and not int(it.cotizacion.adelanto_verificado or 0)
+    ]
+    if sin_verificar:
+        vistos, unicas = set(), []
+        for cot in sin_verificar:
+            if cot.id not in vistos:
+                vistos.add(cot.id); unicas.append(cot)
+        nums = ", ".join(f"{cot.numero} (adelanto {int(cot.pct_adelanto or 0)}%)" for cot in unicas)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Adelanto no verificado por Contabilidad en: {nums}. "
+                   f"No se puede generar la OC de proveedor hasta confirmar el pago del adelanto.",
+        )
+
+    # Guard DURO de documentos SOLO sobre lo que realmente se parte (mismo criterio
+    # que _guard_duro_del_split; inline porque el RELOCK debe re-validar el contrato
+    # de COMPRA — 409 para 'comprado' — y no el 400 genérico del split). El guard
+    # puede hacer rollback si falta la tabla de un módulo satélite (MySQL 1146), y
+    # ese rollback SUELTA los locks: por eso se re-toman después.
+    a_partir = [
+        p.item_id for p in pedidos
+        if p.cantidad is not None
+        and int(p.cantidad) < int(items_by_id[p.item_id].cantidad or 0)
+    ]
+    if a_partir:
+        from monza_router_despachos import _rechazar_split_sobre_documento
+        _rechazar_split_sobre_documento(db, a_partir)
+        items_by_id = _lockear_items_para_comprar(db, ids)
+
+    # Proveedor + OC: idéntico al camino legado.
+    nombre = body.proveedor_nombre
+    pais = body.pais
+    moneda = body.moneda or "EUR"
+    if body.proveedor_id:
+        prov = db.query(MonzaProvAbast).filter(MonzaProvAbast.id == body.proveedor_id).first()
+        if prov:
+            nombre = prov.nombre
+            pais = pais or prov.pais
+            moneda = prov.moneda or moneda
+
+    ocp = MonzaOcProveedor(
+        numero=_gen_numero_ocp(db),
+        proveedor_id=body.proveedor_id,
+        proveedor_nombre=nombre,
+        pais=pais,
+        moneda=moneda,
+        tipo_origen=tipo_origen,
+        estado="emitida",
+        plazo_dias=body.plazo_dias,
+        numero_oc=body.numero_oc,
+        awb=body.awb,
+        tracking=body.tracking,
+        notas=body.notas,
+        asesor_email=current_user.email,
+    )
+    db.add(ocp)
+    db.flush()
+
+    partidos = []
+    for p in pedidos:
+        it = items_by_id[p.item_id]
+        original = int(it.cantidad or 0)
+        # El remanente queda 'por_comprar' y SIN OC (copiar_oc=False): vuelve al
+        # panel, asignable a otro proveedor. El split corre ANTES de escribir el
+        # vínculo en la línea original, y la regla de oro protege la plata.
+        clon = _partir_linea(db, it, p.cantidad, "por_comprar", copiar_oc=False)
+        it.estado_linea = "comprado"
+        it.oc_proveedor_id = ocp.id
+        if clon is not None:
+            partidos.append({
+                "item_id": it.id,
+                "remanente_item_id": clon.id,
+                "comprado": it.cantidad,
+                "pendiente": clon.cantidad,
+                "original": original,
+            })
+
+    # UN solo commit con el log adentro (patrón de la casa: nada de trabajo después
+    # del commit dentro de una función reintentada). Bitácora con los números del
+    # split: «asignadas 1 de 3, remanente 2».
+    from monza_models import MonzaLog
+    det = f"OC {ocp.numero} a {nombre or 'proveedor'} - {len(pedidos)} item(s)"
+    if partidos:
+        det += " · " + ", ".join(
+            f"asignadas {p['comprado']} de {p['original']}, remanente {p['pendiente']} "
+            f"(ítem {p['item_id']} → remanente {p['remanente_item_id']})"
+            for p in partidos)
+    db.add(MonzaLog(user_email=current_user.email, accion="CREATE",
+                    entidad="oc_proveedor", entidad_id=ocp.id, entidad_ref=ocp.numero,
+                    detalle=det))
+    db.commit()
+    # Notificación POST-commit del split (paridad con GA — revisión del espejo, H3):
+    # la bitácora MonzaLog queda dentro de la transacción; el aviso a la campana va
+    # después y en try aislado, porque un fallo del aviso jamás puede deshacer una
+    # compra ya commiteada (mismo criterio que devolver-a-compras).
+    if partidos:
+        try:
+            det_notif = "; ".join(
+                f"asignadas {p['comprado']} de {p['original']}, quedan {p['pendiente']}"
+                for p in partidos)
+            crear_notif(db, f"Asignación parcial · OC {ocp.numero}", det_notif,
+                        "info", "/monzaparts/abastecimiento", "oc_proveedor", ocp.id)
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] notificacion asignacion parcial monza: {e}")
+    return {"ok": True, "ocp_id": ocp.id, "numero": ocp.numero,
+            "items": len(pedidos), "partidos": len(partidos), "remanentes": partidos}
 
 
 @router.post("/items/preparar-parcial")
@@ -679,6 +974,227 @@ def _preparar_parcial_tx(db: Session, body: PrepararParcialBody, current_user):
     db.commit()
     return {"ok": True, "preparados": len(pedidos), "partidos": len(partidos),
             "remanentes": partidos}
+
+
+def _guard_plata_devolucion(db: Session, ids: list, items_by_id: dict) -> None:
+    """Bloquea (409) devolver un ítem que YA está costeado en una compra viva.
+
+    El caso: se registró la factura del proveedor en Cuentas por Pagar y su costo se
+    repartió por ítem (monza_cont_compra_item). Si esa línea vuelve a 'por_comprar' y se
+    recompra, el costo queda colgado de una unidad que ya no existe en esa OC: la compra
+    seguiría diciendo que pagamos por algo que volvimos a pedir. Primero se corrige la
+    compra, después se devuelve.
+
+    Mismo criterio y mismo tono que el guard de anular recepción
+    (monza_recepcion_nacional/router.py): la plata manda sobre el estado logístico.
+
+    Fail-open SOLO si el módulo de compras no está instalado (tabla inexistente): ahí no
+    hay ninguna compra que proteger. Cualquier otro error propaga."""
+    from sqlalchemy.exc import ProgrammingError
+    try:
+        from monza_compras_contab.models import MonzaContCompra, MonzaContCompraItem
+        filas = (
+            db.query(MonzaContCompraItem.item_cotizacion_id, MonzaContCompra.numero_documento)
+            .join(MonzaContCompra, MonzaContCompra.id == MonzaContCompraItem.compra_id)
+            .filter(
+                MonzaContCompraItem.item_cotizacion_id.in_(ids),
+                # 'anulada' no cuenta: esa compra ya no reclama nada.
+                func.coalesce(MonzaContCompra.estado_pago, "") != "anulado",
+            )
+            .all()
+        )
+    except ProgrammingError as e:
+        if getattr(getattr(e, "orig", None), "args", [None])[0] == 1146:
+            db.rollback()
+            return
+        raise
+    if filas:
+        detalle = ", ".join(
+            f"{(items_by_id[iid].numero_parte or items_by_id[iid].descripcion)}"
+            + (f" (documento {doc})" if doc else "")
+            for iid, doc in filas if iid in items_by_id
+        )
+        raise HTTPException(
+            409,
+            f"No se puede devolver a compras: ya hay una compra registrada con el costo "
+            f"de {detalle}. Corrige o anula esa compra en Compras y Pagos antes de "
+            "devolver el ítem al panel de compras.",
+        )
+
+
+def _guard_recepcion_devolucion(db: Session, ids: list, items_by_id: dict) -> None:
+    """Bloquea (409) devolver un ítem comprometido en una entrega nacional EN CURSO.
+
+    Un ítem en 'comprado' no debería tener recepción cerrada —cerrarla con unidades
+    utilizables lo mueve a 'en_bodega', y de ahí el guard de estado ya no deja
+    devolver—, pero una entrega ABIERTA sí tiene líneas apuntando a él: devolverlo
+    dejaría esa recepción a medio registrar sobre una línea que volvió a estar sin
+    comprar.
+
+    Solo cuentan las ABIERTAS (hallazgo HIGH del multienjambre 2026-08-08). Mirar
+    TODAS dejaba ATRAPADO el back order nacional legítimo: una entrega ya cerrada en la
+    que el proveedor no mandó nada ('no_llego') deja la línea en 'comprado' con su fila
+    de recepción, que es EXACTAMENTE el caso que hay que poder devolver a compras. El
+    docstring prometía "abierta" y el código bloqueaba por cualquiera.
+
+    Fail-open solo con la tabla ausente, igual que el guard de la plata."""
+    from sqlalchemy.exc import ProgrammingError
+    try:
+        from monza_recepcion_nacional.models import (
+            MonzaRecepcionNacional, MonzaRecepcionNacionalItem,
+        )
+        filas = (
+            db.query(MonzaRecepcionNacionalItem.item_cotizacion_id)
+            .join(MonzaRecepcionNacional,
+                  MonzaRecepcionNacional.id == MonzaRecepcionNacionalItem.recepcion_id)
+            .filter(
+                MonzaRecepcionNacionalItem.item_cotizacion_id.in_(ids),
+                func.coalesce(MonzaRecepcionNacional.estado, "abierta") != "cerrada",
+            )
+            .all()
+        )
+    except ProgrammingError as e:
+        if getattr(getattr(e, "orig", None), "args", [None])[0] == 1146:
+            db.rollback()
+            return
+        raise
+    except ImportError:
+        return
+    con_recepcion = {r[0] for r in filas if r[0] in items_by_id}
+    if con_recepcion:
+        detalle = ", ".join(
+            (items_by_id[i].numero_parte or items_by_id[i].descripcion) for i in sorted(con_recepcion))
+        raise HTTPException(
+            409,
+            f"No se puede devolver a compras: hay una entrega nacional EN CURSO que "
+            f"incluye {detalle}. Ciérrala o anúlala en Bodega y vuelve a intentarlo.",
+        )
+
+
+@router.post("/items/devolver-a-compras")
+def devolver_items_a_compras(body: DevolverACompras, db: Session = Depends(get_db),
+                             current_user=Depends(get_current_user)):
+    """comprado → por_comprar: lo que el proveedor dejó en BACK ORDER vuelve al panel
+    de compras, entero o por cantidad parcial.
+
+    El caso real (Baukat, proveedor de Alemania): se emite la OC, la línea queda
+    'comprado' y en seguimiento, y días después el proveedor avisa que parte de lo
+    pedido está en back order. Hasta ahora el pipeline era de una sola vía y esa
+    mercadería quedaba trabada en Seguimiento, esperando algo que no iba a llegar.
+
+    Devolver DESLIGA la línea de su OC de proveedor (`oc_proveedor_id = None`): vuelve a
+    estar sin comprar, que es la verdad. La traza de qué OC venía queda en el log — si se
+    conservara el vínculo, la línea aparecería en el panel de compras colgando de una OC
+    vieja y `_rechazar_items_nacionales` (que hace JOIN por esa columna) la seguiría
+    tratando como nacional.
+
+    En una devolución PARCIAL el resto de la línea sigue 'comprado' con su OC intacta:
+    es la misma partición de preparar-parcial vista al revés, con la REGLA DE ORO del
+    split (_clonar_item_remanente) protegiendo la plata de la venta.
+
+    Lo que NO hace, a propósito: no cancela la OC del proveedor aunque se quede sin
+    líneas vivas. Nada en el módulo cancela OCs hoy, y una OC es un documento enviado al
+    proveedor — cerrarla es una decisión comercial, no una consecuencia automática. La
+    respuesta informa cuántas líneas le quedan para que el operador decida.
+
+    Retry 1213/1205 (regla de la casa): toma locks sobre MonzaCotizacionItem, las mismas
+    filas que lockean despachos, preparar-parcial y el costeo de compras."""
+    for _ in range(3):
+        try:
+            return _devolver_a_compras_tx(db, body, current_user)
+        except OperationalError as e:
+            db.rollback()
+            code = getattr(getattr(e, "orig", None), "args", [None])[0]
+            if code not in (1213, 1205):
+                raise
+    raise HTTPException(409, "Conflicto de concurrencia al devolver a compras: reintenta")
+
+
+def _devolver_a_compras_tx(db: Session, body: DevolverACompras, current_user):
+    pedidos = list(body.items or [])
+    ids = _validar_pedidos_parciales(pedidos)
+    motivo = (body.motivo or "").strip()
+    if len(motivo) < 3:
+        # min_length de pydantic no alcanza: '   ' lo pasa.
+        raise HTTPException(400, "Escribe el motivo de la devolución (por ejemplo: back order del proveedor)")
+
+    # Lock + guard de estado: SOLO desde 'comprado'. Una línea ya preparada o embarcada
+    # salió del proveedor y no se "devuelve a comprar" — se gestiona por reclamo.
+    items_by_id = _lockear_items_para_split(db, ids, "comprado")
+
+    # Guards de PLATA y de mercadería recibida ANTES de mutar nada (mismo orden que
+    # anular recepción: primero se comprueba que nada dependa de esto, después se toca).
+    _guard_plata_devolucion(db, ids, items_by_id)
+    _guard_recepcion_devolucion(db, ids, items_by_id)
+
+    # Guard de DOCUMENTOS sobre TODAS las líneas, no solo las que se parten (hallazgo
+    # HIGH del multienjambre 2026-08-08). `_guard_duro_del_split` solo lo aplica a lo que
+    # se parte —una devolución TOTAL no parte nada—, así que por esa vía un ítem con
+    # factura 33 o guía 52 VIVA volvía a 'por_comprar' sin que nadie lo frenara: el
+    # documento congeló cantidad y precio de esa línea, y desligarla de su OC deja el
+    # papel legal apuntando a mercadería que el sistema dice no haber comprado.
+    # Devolver es tan destructivo como partir: merece el mismo candado.
+    # incluir_recepciones=False: las recepciones las evalúa el guard de arriba, que SÍ
+    # distingue entregas en curso de cerradas. El del split bloquea por cualquiera —
+    # correcto para partir, pero acá dejaría atrapado el back order nacional legítimo.
+    # Import LOCAL: dirección de dependencia de la casa (abastecimiento → despachos).
+    from monza_router_despachos import _rechazar_split_sobre_documento
+    _rechazar_split_sobre_documento(db, ids, incluir_recepciones=False)
+    # El guard puede haber hecho rollback (tabla de un módulo satélite ausente), que
+    # SUELTA los locks: se re-toman y se re-valida el estado antes de tocar nada.
+    items_by_id = _lockear_items_para_split(db, ids, "comprado")
+
+    # Guard DURO del split, sobre las líneas que además se parten.
+    items_by_id = _guard_duro_del_split(db, pedidos, items_by_id, ids, "comprado")
+
+    devueltos, partidos, ocs_tocadas = [], [], set()
+    for p in pedidos:
+        it = items_by_id[p.item_id]
+        ocp_id_previa = it.oc_proveedor_id
+        if ocp_id_previa:
+            ocs_tocadas.add(ocp_id_previa)
+        # El REMANENTE sigue 'comprado' con su OC: esas unidades no están en back order.
+        clon = _partir_linea(db, it, p.cantidad, "comprado")
+        it.estado_linea = "por_comprar"
+        it.oc_proveedor_id = None      # vuelve a estar sin comprar (ver docstring)
+        devueltos.append({"item_id": it.id, "cantidad": it.cantidad,
+                          "oc_proveedor_id_previa": ocp_id_previa})
+        if clon is not None:
+            partidos.append({"item_id": it.id, "devuelto": it.cantidad,
+                             "sigue_comprado_item_id": clon.id, "sigue_comprado": clon.cantidad})
+    db.flush()
+
+    # Cuántas líneas VIVAS le quedan a cada OC tocada (informativo: la decisión de
+    # cancelarla es comercial, ver docstring).
+    ocs_resumen = []
+    for ocp_id in sorted(ocs_tocadas):
+        vivas = db.query(func.count(MonzaCotizacionItem.id)).filter(
+            MonzaCotizacionItem.oc_proveedor_id == ocp_id).scalar() or 0
+        ocp = db.query(MonzaOcProveedor).filter(MonzaOcProveedor.id == ocp_id).first()
+        ocs_resumen.append({"ocp_id": ocp_id, "numero": ocp.numero if ocp else None,
+                            "items_vivos": int(vivas)})
+
+    # UN solo commit con el log adentro (patrón de la casa): nada de trabajo después del
+    # commit dentro de una función reintentada.
+    from monza_models import MonzaLog
+    etiquetas = ", ".join(
+        (items_by_id[p.item_id].numero_parte or items_by_id[p.item_id].descripcion)
+        for p in pedidos)
+    ocs_txt = ", ".join(f"{o['numero'] or o['ocp_id']} (quedan {o['items_vivos']})"
+                        for o in ocs_resumen)
+    detalle = (f"{len(pedidos)} ítem(s) devuelto(s) a compras: {etiquetas}"
+               + (f" · desde OC {ocs_txt}" if ocs_txt else "")
+               + (f" · parcial en {len(partidos)}" if partidos else "")
+               + f" · motivo: {motivo}")
+    db.add(MonzaLog(user_email=current_user.email, accion="DEVUELTO_A_COMPRAS",
+                    entidad="item", entidad_id=None, entidad_ref=None, detalle=detalle))
+    db.commit()
+
+    crear_notif(db, f"Ítems devueltos a compras · {len(pedidos)}",
+                f"{etiquetas} — {motivo}", "warning",
+                "/monzaparts/abastecimiento", "item", None)
+    return {"ok": True, "devueltos": len(pedidos), "partidos": len(partidos),
+            "detalle": devueltos, "remanentes": partidos, "ocs": ocs_resumen}
 
 
 # Listar OCs de proveedor

@@ -135,6 +135,14 @@ export const comprasAPI = {
   actualizarOcProveedor: (id: number, data: Record<string, any>) => api.put(`/compras/oc-proveedor/${id}`, data),
   asignarItems: (ocpId: number, data: Record<string, any>) =>
     api.post(`/compras/oc-proveedor/${ocpId}/items`, data),
+  // Asignación PARCIAL a OC-Proveedor: el backend PARTE la línea (lo asignado queda
+  // 'comprado' con su vínculo; el remanente vuelve al panel como línea hermana
+  // 'cerrado'). Contrato: { oc_cliente_id, items: [{ item_id, cantidad?, plazo_dias_prov? }] }
+  // — `cantidad` AUSENTE = línea entera (sentinela del backend, jamás mandar 0).
+  // Respuesta: { ok, asignados, particiones: [{ item_id, qty_asignada, qty_original,
+  // qty_remanente, item_id_remanente }] }.
+  asignarItemsParcial: (ocpId: number, data: Record<string, any>) =>
+    api.post(`/compras/oc-proveedor/${ocpId}/items-parcial`, data),
   listProveedores: () => api.get('/compras/proveedores'),
   createProveedor: (data: Record<string, any>) => api.post('/compras/proveedores', data),
   updateProveedor: (id: number, data: Record<string, any>) => api.put(`/compras/proveedores/${id}`, data),

@@ -6,6 +6,7 @@ import {
   PAGO_OPCIONES, PAGO_ADELANTO_LIBRE_ID, ADELANTO_PCT_DEFECTO, formaPagoAdelanto,
 } from "../constants/adelanto";
 import { hoyLocal } from "../utils/format";
+import { useMonzaTheme } from "./MonzaLayout";
 import toast from "react-hot-toast";
 
 interface Cotizacion {
@@ -19,6 +20,10 @@ interface Cotizacion {
   // y las re-escribía a ciegas (la fecha viaja como referencia 801 al SII). Se leen como
   // OPCIONALES: si el backend todavía no los serializa, el modal cae al comportamiento anterior.
   oc_fecha?: string | null;
+  /** Venta a cliente PARTICULAR: la "OC" es el N° de esta cotización (el cliente no
+   *  emite orden de compra). Opcional por la misma razón que los de arriba: contra un
+   *  backend viejo el modal cae al comportamiento anterior en vez de romperse. */
+  cliente_sin_oc?: boolean;
   pct_adelanto?: number;
   // Los tres los sirve el MISMO serializador (_cot_dict) que ya alimenta esta lista; se
   // declaran para el modal de cierre: `forma_pago` preselecciona la condición vigente,
@@ -40,6 +45,36 @@ interface CotDetail {
   total_neto?: number; iva_monto?: number; total_bruto?: number;
   items: CotItem[];
   cliente?: { nombre: string; rut?: string };
+  // Historial de cierres (lo sirve el detalle; el listado no, para no pagar N+1).
+  // Con él, el modal de cierre avisa que hubo una versión anterior y qué OC tenía.
+  cierres?: {
+    version: number; oc_cliente?: string | null; oc_fecha?: string | null;
+    cerrado_at?: string | null; revertido_at?: string | null; motivo?: string | null;
+  }[];
+  veces_cerrada?: number;
+}
+
+// ── Paleta según el tema de Monza ───────────────────────────────────────────
+// Esta pantalla estaba cableada en modo claro: los inputs no fijaban `color`, así que en
+// modo oscuro el navegador pintaba texto claro sobre el fondo blanco del modal y los
+// campos del cierre de venta (N° OC, fecha OC, fecha prometida) quedaban invisibles.
+// Los colores SEMÁNTICOS (rojo error, verde éxito, ámbar aviso, azul info) NO pasan por
+// acá a propósito: tienen que verse igual en claro y en oscuro.
+function useStyles() {
+  const { dark } = useMonzaTheme();
+  return {
+    dark,
+    text:    dark ? "#E2E8F0" : "#0f172a",   // texto principal
+    text2:   dark ? "#CBD5E1" : "#475569",   // texto secundario
+    muted:   dark ? "#94A3B8" : "#64748B",   // atenuado
+    faint:   dark ? "#6B7A99" : "#94A3B8",   // muy tenue
+    cardBg:  dark ? "#131b3e" : "white",     // fondo de tarjeta/modal
+    cardBd:  `1px solid ${dark ? "#1e2a4a" : "#E2E8F0"}`,
+    bd:      dark ? "#1e2a4a" : "#E2E8F0",   // color de borde suelto
+    bdSoft:  dark ? "#243350" : "#CBD5E1",
+    sub:     dark ? "#0d1430" : "#F8FAFC",   // fondo sutil
+    inputBg: dark ? "#0d1430" : "white",
+  };
 }
 
 // ── Días hábiles chilenos ───────────────────────────────────────────────────
@@ -214,14 +249,21 @@ interface CierreVentaPayload {
   oc_cliente: string;
   oc_fecha: string;
   fecha_entrega_est: string;
+  /** Cliente PARTICULAR: no emite OC, el respaldo es esta cotización (el backend graba
+   *  su N° y su fecha de emisión, que son la referencia 801 del SII). */
+  cliente_sin_oc: boolean;
 }
 
-const ESTADO_CONFIG: Record<string, { bg: string; color: string; label: string }> = {
-  propuesta: { bg: "#F1F5F9", color: "#475569", label: "Propuesta" },
-  enviada: { bg: "#DBEAFE", color: "#1D4ED8", label: "Enviada" },
-  vendida: { bg: "#DCFCE7", color: "#15803D", label: "Vendida" },
-  rechazada: { bg: "#FEE2E2", color: "#B91C1C", label: "Rechazada" },
-};
+// Enviada/Vendida/Rechazada llevan color SEMÁNTICO (azul/verde/rojo) y se ven igual en
+// claro y oscuro; 'Propuesta' es el único chip neutro, así que sigue el tema.
+function estadoConfig(s: ReturnType<typeof useStyles>): Record<string, { bg: string; color: string; label: string }> {
+  return {
+    propuesta: { bg: s.sub, color: s.text2, label: "Propuesta" },
+    enviada: { bg: "#DBEAFE", color: "#1D4ED8", label: "Enviada" },
+    vendida: { bg: "#DCFCE7", color: "#15803D", label: "Vendida" },
+    rechazada: { bg: "#FEE2E2", color: "#B91C1C", label: "Rechazada" },
+  };
+}
 const LINEA_CONFIG: Record<string, { bg: string; color: string }> = {
   autos: { bg: "#DBEAFE", color: "#1D4ED8" },
   maquinaria: { bg: "#FEF3C7", color: "#D97706" },
@@ -246,6 +288,7 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
   // otra cosa mandaba pct_adelanto = 0 y borraba en silencio el 50% vigente (y con él el
   // cortafuego de "pago no verificado" de Abastecimiento). Ahora preselecciona la condición
   // que la venta ya tiene; si el backend aún no serializa pct_adelanto, cae en "contado" como antes.
+  const s = useStyles();
   const pctVigente = Number(cot.pct_adelanto ?? 0);
   const vigente = opcionDeVenta(cot.forma_pago, pctVigente);
   const [sel, setSel] = useState(() => vigente.id);
@@ -257,6 +300,9 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
   // —y esa fecha viaja como referencia 801 al SII— y (b) de noche en Chile daba el día siguiente.
   // Se usa la fecha guardada si el backend la devuelve, y hoyLocal() (no UTC) como último recurso.
   const [ocFecha, setOcFecha] = useState(() => cot.oc_fecha || hoyLocal());
+  // Arranca de lo ya guardado: al reabrir un cierre hecho a un particular, la casilla
+  // vuelve marcada (si no, la OC igual al N° de cotización parece un error de tipeo).
+  const [sinOc, setSinOc] = useState(!!cot.cliente_sin_oc);
   // ── Hallazgo A2 · adelanto de % LIBRE o monto exacto en pesos ────────────────
   // Espejo bidireccional (molde de CierreVentaPage.tsx): con el monto digitado el % se
   // deriva, y con el % digitado se ven los pesos. Los 3 casos de siempre (contado,
@@ -303,7 +349,11 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
 
   const opt = PAGO_OPCIONES.find((o) => o.id === sel) || PAGO_OPCIONES[0];
   const esLibre = !!opt.pctLibre;
-  const ocOk = oc.trim().length > 0;
+  // Cliente PARTICULAR: no emite orden de compra, así que el documento de respaldo pasa
+  // a ser esta cotización. Con la casilla marcada el N° de OC deja de ser obligatorio en
+  // pantalla; el backend graba el N° y la fecha de la cotización (la referencia 801 del
+  // SII necesita ambos, y sin ellos la venta cerraría pero no se podría facturar).
+  const ocOk = sinOc || oc.trim().length > 0;
 
   // Base del adelanto: el total BRUTO de la venta (Monza ya lo guarda con IVA, con la
   // tasa congelada de la venta — nunca un 1,19 escrito a mano). Es la MISMA base con la
@@ -351,29 +401,70 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
   // solo en ese caso el "— N días hábiles" describe lo que hay en el campo.
   const fechaEsCalculada = !cot.fecha_entrega_est && !fechaTocada && !cargandoDet;
 
-  const lbl: React.CSSProperties = { fontSize: 12, fontWeight: 600, color: "#64748B", display: "block", marginBottom: 4 };
-  const inp: React.CSSProperties = { width: "100%", padding: "8px 10px", border: "1px solid #E2E8F0", borderRadius: 6, fontSize: 13, boxSizing: "border-box" };
+  const lbl: React.CSSProperties = { fontSize: 12, fontWeight: 600, color: s.muted, display: "block", marginBottom: 4 };
+  // `background` y `color` EXPLÍCITOS: sin ellos, en modo oscuro el navegador pintaba el
+  // texto claro del sistema sobre el fondo blanco del modal y los tres campos del cierre
+  // (N° OC, fecha OC y fecha prometida de entrega) quedaban ilegibles.
+  const inp: React.CSSProperties = { width: "100%", padding: "8px 10px", border: `1px solid ${s.bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box", background: s.inputBg, color: s.text };
   const fila: React.CSSProperties = { display: "flex", justifyContent: "space-between", gap: 12, padding: "2px 0" };
 
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.5)", padding: 16 }} onClick={onClose}>
-      <div style={{ width: "100%", maxWidth: 520, maxHeight: "92vh", display: "flex", flexDirection: "column", background: "white", borderRadius: 14, border: "1px solid #E2E8F0", boxShadow: "0 20px 50px rgba(0,0,0,0.25)" }} onClick={(e) => e.stopPropagation()}>
-        <div style={{ padding: "14px 18px", borderBottom: "1px solid #E2E8F0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600, color: "#0f172a" }}>Cerrar venta · {cot.numero}</h3>
-          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "#64748B", fontSize: 20, lineHeight: 1 }}>×</button>
+      <div style={{ width: "100%", maxWidth: 520, maxHeight: "92vh", display: "flex", flexDirection: "column", background: s.cardBg, borderRadius: 14, border: s.cardBd, boxShadow: "0 20px 50px rgba(0,0,0,0.25)" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ padding: "14px 18px", borderBottom: `1px solid ${s.bd}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600, color: s.text }}>Cerrar venta · {cot.numero}</h3>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: s.muted, fontSize: 20, lineHeight: 1 }}>×</button>
         </div>
         <div style={{ padding: 18, overflowY: "auto" }}>
+          {/* RE-CIERRE: si esta venta ya estuvo cerrada antes (hubo una reversión), se
+              avisa con los datos de la versión anterior a la vista. Lo que se guarde ahora
+              será una VERSIÓN NUEVA — la anterior queda en el historial, no se pierde —
+              pero el operador tiene que saber qué está reemplazando. */}
+          {(() => {
+            const previa = (detalle?.cierres || []).find((x) => x.revertido_at);
+            if (!previa) return null;
+            return (
+              <div style={{ marginBottom: 12, padding: "10px 12px", borderRadius: 10, background: s.dark ? "#3f2d0a" : "#FFFBEB", border: `1px solid ${s.dark ? "#78530f" : "#FDE68A"}`, fontSize: 12, lineHeight: 1.55, color: s.dark ? "#FDE68A" : "#92400E" }}>
+                <b>Esta venta ya estuvo cerrada</b> (versión {previa.version}
+                {previa.oc_cliente ? <> · OC <b>{previa.oc_cliente}</b></> : null}
+                {previa.cerrado_at ? <> · {new Date(previa.cerrado_at).toLocaleDateString("es-CL")}</> : null}
+                {previa.motivo ? <> · revertida: “{previa.motivo}”</> : <> · fue revertida</>})
+                . Lo que guardes ahora queda como versión nueva; la anterior se conserva en el historial.
+              </div>
+            );
+          })()}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
             <div>
-              <label style={{ ...lbl, color: ocOk ? "#64748B" : "#B91C1C" }}>N° OC del cliente *</label>
-              <input value={oc} onChange={(e) => setOc(e.target.value)} placeholder="Obligatorio"
-                style={{ ...inp, border: `1px solid ${ocOk ? "#E2E8F0" : "#FCA5A5"}` }} />
+              <label style={{ ...lbl, color: ocOk ? s.muted : "#B91C1C" }}>
+                N° OC del cliente {sinOc ? "" : "*"}
+              </label>
+              <input value={sinOc ? cot.numero : oc} onChange={(e) => setOc(e.target.value)}
+                disabled={sinOc}
+                placeholder={sinOc ? "" : "Obligatorio"}
+                title={sinOc ? "Cliente particular: se usa el N° de esta cotización" : undefined}
+                style={{ ...inp, border: `1px solid ${ocOk ? s.bd : "#FCA5A5"}`, opacity: sinOc ? 0.65 : 1 }} />
             </div>
             <div>
               <label style={lbl}>Fecha OC</label>
-              <input type="date" value={ocFecha} onChange={(e) => setOcFecha(e.target.value)} style={inp} />
+              <input type="date" value={sinOc ? (cot.fecha_creacion || "").slice(0, 10) : ocFecha}
+                onChange={(e) => setOcFecha(e.target.value)} disabled={sinOc}
+                title={sinOc ? "Cliente particular: se usa la fecha de emisión de la cotización" : undefined}
+                style={{ ...inp, opacity: sinOc ? 0.65 : 1 }} />
             </div>
           </div>
+
+          {/* CLIENTE PARTICULAR: un consumidor final no emite orden de compra. Marcarlo
+              usa esta cotización como documento de respaldo — su N° y su fecha son la
+              referencia 801 que el SII exige en la guía y en la factura. */}
+          <label style={{ display: "flex", alignItems: "flex-start", gap: 8, marginBottom: 12, cursor: "pointer" }}>
+            <input type="checkbox" checked={sinOc} onChange={(e) => setSinOc(e.target.checked)}
+              style={{ marginTop: 2, accentColor: "var(--monza-accent)", cursor: "pointer" }} />
+            <span style={{ fontSize: 12, color: s.muted, lineHeight: 1.45 }}>
+              <b style={{ color: s.text }}>Cliente particular (sin OC)</b> — no emite orden de compra.
+              Se usará el N° de esta cotización (<b>{cot.numero}</b>) y su fecha de emisión como
+              respaldo de la venta ante el SII.
+            </span>
+          </label>
 
           {/* Hallazgo A1: la fecha prometida de entrega. Sin ella el SLA de Ventas, la
               urgencia de Despachos, las alertas diarias y Bodega quedan apagados. */}
@@ -381,14 +472,14 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
             <label style={lbl}>
               Fecha prometida de entrega
               {fechaEsCalculada && (
-                <span style={{ fontWeight: 400, color: "#94A3B8" }}>
+                <span style={{ fontWeight: 400, color: s.faint }}>
                   {" "}— {plazoDias} días hábiles
                 </span>
               )}
             </label>
             <input type="date" value={fechaEntrega} style={inp}
               onChange={(e) => { setFechaTocada(true); setFechaEntrega(e.target.value); }} />
-            <p style={{ margin: "4px 0 0", fontSize: 11, color: "#94A3B8" }}>
+            <p style={{ margin: "4px 0 0", fontSize: 11, color: s.faint }}>
               {cargandoDet
                 ? "Leyendo el plazo de los ítems…"
                 : fechaTocada
@@ -401,7 +492,7 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
             </p>
           </div>
 
-          <p style={{ margin: "0 0 10px", fontSize: 13, color: "#64748B" }}>
+          <p style={{ margin: "0 0 10px", fontSize: 13, color: s.muted }}>
             Condición de pago acordada con el cliente:
             {/* Hallazgo #14: mostrar la condición VIGENTE para que el re-cierre no se haga a ciegas. */}
             {pctVigente > 0 && (
@@ -412,14 +503,15 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
           </p>
           {PAGO_OPCIONES.map((o) => (
             <div key={o.id}>
-              <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 10, border: `1px solid ${sel === o.id ? "var(--monza-accent)" : "#E2E8F0"}`, marginBottom: 8, cursor: "pointer" }}>
-                <input type="radio" name="pago" checked={sel === o.id} onChange={() => setSel(o.id)} />
-                <span style={{ fontSize: 14, color: "#0f172a", fontWeight: sel === o.id ? 600 : 400 }}>{o.label}</span>
+              <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 10, border: `1px solid ${sel === o.id ? "var(--monza-accent)" : s.bd}`, marginBottom: 8, cursor: "pointer" }}>
+                <input type="radio" name="pago" checked={sel === o.id} onChange={() => setSel(o.id)}
+                  style={{ background: s.inputBg, color: s.text }} />
+                <span style={{ fontSize: 14, color: s.text, fontWeight: sel === o.id ? 600 : 400 }}>{o.label}</span>
               </label>
               {/* Los dos campos del adelanto libre viven DENTRO de su opción: solo
                   aparecen cuando está elegida, así los 3 casos de siempre se ven igual. */}
               {o.id === PAGO_ADELANTO_LIBRE_ID && sel === o.id && (
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, margin: "0 0 10px", padding: "10px 12px", background: "#F8FAFC", border: "1px solid #E2E8F0", borderRadius: 10 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, margin: "0 0 10px", padding: "10px 12px", background: s.sub, border: s.cardBd, borderRadius: 10 }}>
                   <div>
                     <label style={lbl}>% del total</label>
                     {/* Con monto en pesos digitado el % se DERIVA en vivo (y el campo se
@@ -431,7 +523,7 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
                       onChange={(e) => setAdelPct(e.target.value)}
                       disabled={montoValido} />
                     {montoValido && totalBruto > 0 && (
-                      <p style={{ margin: "4px 0 0", fontSize: 11, color: adelantoExcede ? "#B91C1C" : "#94A3B8" }}>
+                      <p style={{ margin: "4px 0 0", fontSize: 11, color: adelantoExcede ? "#B91C1C" : s.faint }}>
                         {adelantoExcede
                           ? `Supera el total de la venta (${fmt(totalBruto)} c/IVA)`
                           : `del total c/IVA ${fmt(totalBruto)}`}
@@ -445,8 +537,8 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
                     {/* Espejo del %: al digitar el porcentaje acá se ven los pesos, con la
                         MISMA fórmula con que Tesorería sugiere el monto a aprobar. */}
                     {montoDesdePct !== null && (
-                      <p style={{ margin: "4px 0 0", fontSize: 11, color: "#94A3B8" }}>
-                        ≈ <b style={{ color: "#1E293B" }}>{fmt(montoDesdePct)}</b> c/IVA
+                      <p style={{ margin: "4px 0 0", fontSize: 11, color: s.faint }}>
+                        ≈ <b style={{ color: s.text }}>{fmt(montoDesdePct)}</b> c/IVA
                         {factorNeto != null && ` (${fmt(Math.round(montoDesdePct * factorNeto))} neto)`}
                       </p>
                     )}
@@ -485,41 +577,41 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
           {/* M15: resumen ANTES de confirmar. El cierre dispara las compras al proveedor,
               habilita Contabilidad y arranca el reloj de la entrega: el modal era OC,
               fecha, radios y un botón — sin un solo monto a la vista. */}
-          <div style={{ marginBottom: 14, padding: "10px 12px", background: "#F8FAFC", border: "1px solid #E2E8F0", borderRadius: 10, fontSize: 12, color: "#475569" }}>
-            <div style={{ fontSize: 11, fontWeight: 700, color: "#64748B", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>
+          <div style={{ marginBottom: 14, padding: "10px 12px", background: s.sub, border: s.cardBd, borderRadius: 10, fontSize: 12, color: s.text2 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: s.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>
               Resumen de la venta
             </div>
             <div style={fila}>
               <span>Cliente</span>
-              <b style={{ color: "#1E293B", textAlign: "right" }}>{cot.cliente?.nombre || "—"}</b>
+              <b style={{ color: s.text, textAlign: "right" }}>{cot.cliente?.nombre || "—"}</b>
             </div>
             <div style={fila}>
               <span>Ítems</span>
-              <b style={{ color: "#1E293B" }}>{det ? det.items.length : cot.items_count}</b>
+              <b style={{ color: s.text }}>{det ? det.items.length : cot.items_count}</b>
             </div>
             <div style={fila}>
               <span>Total neto</span>
-              <b style={{ color: "#1E293B" }}>{totalNeto > 0 ? fmt(totalNeto) : "—"}</b>
+              <b style={{ color: s.text }}>{totalNeto > 0 ? fmt(totalNeto) : "—"}</b>
             </div>
             {cot.iva_monto != null && cot.iva_monto > 0 && (
               <div style={fila}>
                 <span>IVA</span>
-                <b style={{ color: "#1E293B" }}>{fmt(Number(cot.iva_monto))}</b>
+                <b style={{ color: s.text }}>{fmt(Number(cot.iva_monto))}</b>
               </div>
             )}
-            <div style={{ ...fila, borderTop: "1px solid #E2E8F0", marginTop: 4, paddingTop: 6 }}>
+            <div style={{ ...fila, borderTop: `1px solid ${s.bd}`, marginTop: 4, paddingTop: 6 }}>
               <span style={{ fontWeight: 600 }}>Total c/IVA</span>
               <b style={{ color: "var(--monza-accent)", fontSize: 14 }}>{fmt(totalBruto)}</b>
             </div>
             <div style={{ ...fila, marginTop: 4 }}>
               <span>Entrega prometida</span>
-              <b style={{ color: fechaEntrega ? "#1E293B" : "#B91C1C" }}>
+              <b style={{ color: fechaEntrega ? s.text : "#B91C1C" }}>
                 {fechaEntrega ? fmtFechaIso(fechaEntrega) : "Sin fecha"}
               </b>
             </div>
             <div style={fila}>
               <span>Adelanto</span>
-              <b style={{ color: "#1E293B" }}>
+              <b style={{ color: s.text }}>
                 {pctFinal > 0
                   ? `${pctFinal}%${totalBruto > 0 ? ` · ${fmt(montoFinal)}` : ""}`
                   : "Sin adelanto"}
@@ -527,7 +619,7 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
             </div>
             <div style={fila}>
               <span>Condición</span>
-              <b style={{ color: "#1E293B", textAlign: "right" }}>
+              <b style={{ color: s.text, textAlign: "right" }}>
                 {esLibre ? formaPagoAdelanto(pctFinal) : opt.forma}
               </b>
             </div>
@@ -540,9 +632,10 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
               oc_cliente: oc.trim(),
               oc_fecha: ocFecha,
               fecha_entrega_est: fechaEntrega,
+              cliente_sin_oc: sinOc,
             })}
             disabled={!puedeConfirmar}
-            style={{ width: "100%", padding: 10, borderRadius: 8, border: "none", background: puedeConfirmar ? "var(--monza-accent)" : "#94A3B8", color: "white", fontWeight: 600, fontSize: 14, cursor: puedeConfirmar ? "pointer" : "not-allowed", opacity: loading ? 0.6 : 1 }}>
+            style={{ width: "100%", padding: 10, borderRadius: 8, border: "none", background: puedeConfirmar ? "var(--monza-accent)" : s.faint, color: "white", fontWeight: 600, fontSize: 14, cursor: puedeConfirmar ? "pointer" : "not-allowed", opacity: loading ? 0.6 : 1 }}>
             {loading ? "Guardando…" : !ocOk ? "Falta el N° de OC del cliente" : problemaAdelanto ? "Revisa el adelanto" : "Confirmar venta"}
           </button>
         </div>
@@ -552,6 +645,7 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
 }
 
 export default function MonzaCotizacionesPage() {
+  const s = useStyles();
   const [items, setItems] = useState<Cotizacion[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -566,6 +660,8 @@ export default function MonzaCotizacionesPage() {
   const [loadingDetail, setLoadingDetail] = useState<number | null>(null);
   const [markingVendida, setMarkingVendida] = useState<number | null>(null);
   const [cerrarVenta, setCerrarVenta] = useState<Cotizacion | null>(null);
+  // Reversión pendiente de confirmar: la venta que se quiere DES-CERRAR y a qué estado.
+  const [revertir, setRevertir] = useState<{ cot: Cotizacion; aEstado: string } | null>(null);
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -645,6 +741,10 @@ export default function MonzaCotizacionesPage() {
         forma_pago: p.forma_pago,
         oc_cliente: p.oc_cliente,
         oc_fecha: p.oc_fecha || undefined,
+        // Cliente particular: el backend ignora los dos campos de arriba y graba el N° y
+        // la fecha de esta cotización (ver monza_router_cotizaciones: la marca se
+        // resuelve ANTES del guard del SII, así no es una puerta trasera a la 801).
+        cliente_sin_oc: p.cliente_sin_oc,
         // Hallazgo A1: la fecha prometida de entrega. Es la que enciende el semáforo SLA
         // de Ventas, el orden por urgencia de Despachos, las alertas diarias del
         // scheduler y los avisos de Bodega — hasta ahora ninguna pantalla la escribía.
@@ -662,6 +762,7 @@ export default function MonzaCotizacionesPage() {
   };
 
   const CALIDAD_LABEL: Record<string, string> = { sin_calificar: "—", genuine: "Genuine", oem: "OEM", aftermarket: "Aftermarket" };
+  const ESTADOS = estadoConfig(s);
 
   return (
     <div>
@@ -669,88 +770,88 @@ export default function MonzaCotizacionesPage() {
       <div style={{ marginBottom: 24 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
           <FileText size={22} className="monza-ic" />
-          <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: "#1E293B" }}>Registro de cotizaciones</h1>
+          <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: s.text }}>Registro de cotizaciones</h1>
         </div>
-        <p style={{ margin: 0, fontSize: 13, color: "#64748B" }}>
+        <p style={{ margin: 0, fontSize: 13, color: s.muted }}>
           Todas las cotizaciones emitidas en el sistema, ordenadas por fecha descendente.
         </p>
       </div>
 
       {/* Filters */}
-      <div style={{ background: "white", border: "1px solid #E2E8F0", borderRadius: 10, padding: "14px 16px", marginBottom: 16 }}>
+      <div style={{ background: s.cardBg, border: s.cardBd, borderRadius: 10, padding: "14px 16px", marginBottom: 16 }}>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <div style={{ position: "relative", flex: 1, minWidth: 280 }}>
-            <Search size={14} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "#94A3B8" }} />
+            <Search size={14} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: s.faint }} />
             <input value={q} onChange={(e) => setQ(e.target.value)}
               placeholder="Buscar N° COT, cliente, vehículo, N° parte..."
-              style={{ width: "100%", padding: "8px 10px 8px 32px", border: "1px solid #E2E8F0", borderRadius: 6, fontSize: 13, boxSizing: "border-box" }} />
+              style={{ width: "100%", padding: "8px 10px 8px 32px", border: `1px solid ${s.bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box", background: s.inputBg, color: s.text }} />
           </div>
           <select value={estado} onChange={(e) => setEstado(e.target.value)}
-            style={{ padding: "8px 12px", border: "1px solid #E2E8F0", borderRadius: 6, fontSize: 13, background: "white" }}>
+            style={{ padding: "8px 12px", border: `1px solid ${s.bd}`, borderRadius: 6, fontSize: 13, background: s.inputBg, color: s.text }}>
             <option value="todos">Todos los estados</option>
             <option value="propuesta">Propuesta</option>
             <option value="enviada">Enviada</option>
             <option value="vendida">Vendida</option>
             <option value="rechazada">Rechazada</option>
           </select>
-          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#64748B" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: s.muted }}>
             Fecha:
             <input type="date" value={desde} onChange={(e) => setDesde(e.target.value)}
-              style={{ padding: "6px 8px", border: "1px solid #E2E8F0", borderRadius: 6, fontSize: 12 }} />
+              style={{ padding: "6px 8px", border: `1px solid ${s.bd}`, borderRadius: 6, fontSize: 12, background: s.inputBg, color: s.text }} />
             <span>—</span>
             <input type="date" value={hasta} onChange={(e) => setHasta(e.target.value)}
-              style={{ padding: "6px 8px", border: "1px solid #E2E8F0", borderRadius: 6, fontSize: 12 }} />
+              style={{ padding: "6px 8px", border: `1px solid ${s.bd}`, borderRadius: 6, fontSize: 12, background: s.inputBg, color: s.text }} />
           </div>
-          <button onClick={fetchAll} style={{ padding: "7px 10px", border: "1px solid #E2E8F0", borderRadius: 6, background: "white", cursor: "pointer", color: "#64748B" }}>
+          <button onClick={fetchAll} style={{ padding: "7px 10px", border: `1px solid ${s.bd}`, borderRadius: 6, background: s.cardBg, cursor: "pointer", color: s.muted }}>
             <RefreshCw size={13} />
           </button>
         </div>
       </div>
 
       {/* Table */}
-      <div style={{ background: "white", border: "1px solid #E2E8F0", borderRadius: 10, overflow: "hidden" }}>
+      <div style={{ background: s.cardBg, border: s.cardBd, borderRadius: 10, overflow: "hidden" }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
           <thead>
-            <tr style={{ background: "#F8FAFC", borderBottom: "1px solid #E2E8F0" }}>
+            <tr style={{ background: s.sub, borderBottom: `1px solid ${s.bd}` }}>
               <th style={{ padding: "10px 8px", width: 32 }} />
               {["N° COT", "Fecha", "Cliente", "Vehículo", "Ítems", "Total", "Estado", "Asesor", "Acciones"].map((h) => (
-                <th key={h} style={{ padding: "10px 12px", textAlign: h === "Total" ? "right" : h === "Ítems" ? "center" : h === "Acciones" ? "center" : "left", fontWeight: 600, fontSize: 11, color: "#64748B", textTransform: "uppercase", letterSpacing: 0.5 }}>{h}</th>
+                <th key={h} style={{ padding: "10px 12px", textAlign: h === "Total" ? "right" : h === "Ítems" ? "center" : h === "Acciones" ? "center" : "left", fontWeight: 600, fontSize: 11, color: s.muted, textTransform: "uppercase", letterSpacing: 0.5 }}>{h}</th>
               ))}
             </tr>
           </thead>
           <tbody>
             {loading
-              ? <tr><td colSpan={10} style={{ padding: 40, textAlign: "center", color: "#94A3B8" }}>Cargando...</td></tr>
+              ? <tr><td colSpan={10} style={{ padding: 40, textAlign: "center", color: s.faint }}>Cargando...</td></tr>
               : items.length === 0
-                ? <tr><td colSpan={10} style={{ padding: 40, textAlign: "center", color: "#94A3B8" }}>No se encontraron cotizaciones.</td></tr>
+                ? <tr><td colSpan={10} style={{ padding: 40, textAlign: "center", color: s.faint }}>No se encontraron cotizaciones.</td></tr>
                 : items.flatMap((cot) => {
-                  const ec = ESTADO_CONFIG[cot.estado] || ESTADO_CONFIG.propuesta;
+                  const ec = ESTADOS[cot.estado] || ESTADOS.propuesta;
                   const lc = cot.linea ? LINEA_CONFIG[cot.linea] : null;
                   const isExpanded = expanded.has(cot.id);
                   const det = details[cot.id];
 
                   const mainRow = (
-                    <tr key={cot.id} style={{ borderBottom: isExpanded ? "none" : "1px solid #F1F5F9", background: isExpanded ? "#F8FAFC" : "white" }}>
+                    <tr key={cot.id} style={{ borderBottom: isExpanded ? "none" : `1px solid ${s.bd}`, background: isExpanded ? s.sub : s.cardBg }}>
                       <td style={{ padding: "10px 8px", textAlign: "center" }}>
                         <button onClick={() => toggleExpand(cot.id)}
-                          style={{ background: "transparent", border: "none", cursor: "pointer", color: "#94A3B8", padding: 2, display: "flex", alignItems: "center" }}>
+                          style={{ background: "transparent", border: "none", cursor: "pointer", color: s.faint, padding: 2, display: "flex", alignItems: "center" }}>
                           {isExpanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
                         </button>
                       </td>
                       <td style={{ padding: "10px 12px" }}>
-                        <div style={{ fontWeight: 600, color: "#1E293B", fontSize: 12 }}>{cot.numero}</div>
-                        {cot.lead_numero && <div style={{ fontSize: 10, color: "#94A3B8" }}>Lead {cot.lead_numero}</div>}
+                        <div style={{ fontWeight: 600, color: s.text, fontSize: 12 }}>{cot.numero}</div>
+                        {cot.lead_numero && <div style={{ fontSize: 10, color: s.faint }}>Lead {cot.lead_numero}</div>}
                       </td>
-                      <td style={{ padding: "10px 12px", color: "#475569", fontSize: 12 }}>
+                      <td style={{ padding: "10px 12px", color: s.text2, fontSize: 12 }}>
                         <div>{fmtDate(cot.fecha_creacion)}</div>
-                        {cot.fecha_venta && <div style={{ fontSize: 10, color: "#94A3B8" }}>Vendida {fmtDate(cot.fecha_venta)}</div>}
+                        {cot.fecha_venta && <div style={{ fontSize: 10, color: s.faint }}>Vendida {fmtDate(cot.fecha_venta)}</div>}
                       </td>
                       <td style={{ padding: "10px 12px" }}>
-                        <div style={{ fontWeight: 500, color: "#1E293B" }}>{cot.cliente?.nombre || "—"}</div>
-                        {cot.cliente?.rut && <div style={{ fontSize: 11, color: "#94A3B8" }}>{cot.cliente.rut}</div>}
+                        <div style={{ fontWeight: 500, color: s.text }}>{cot.cliente?.nombre || "—"}</div>
+                        {cot.cliente?.rut && <div style={{ fontSize: 11, color: s.faint }}>{cot.cliente.rut}</div>}
                       </td>
                       <td style={{ padding: "10px 12px" }}>
-                        <div style={{ color: "#475569" }}>{cot.vehiculo || "Sin definir"}</div>
+                        <div style={{ color: s.text2 }}>{cot.vehiculo || "Sin definir"}</div>
                         {lc && cot.linea && (
                           <span style={{ fontSize: 10, background: lc.bg, color: lc.color, padding: "1px 7px", borderRadius: 8, fontWeight: 600 }}>
                             {cot.linea.charAt(0).toUpperCase() + cot.linea.slice(1)}
@@ -758,9 +859,9 @@ export default function MonzaCotizacionesPage() {
                         )}
                       </td>
                       <td style={{ padding: "10px 12px", textAlign: "center" }}>
-                        <span style={{ background: "#F1F5F9", borderRadius: 10, padding: "2px 10px", fontSize: 12, fontWeight: 600, color: "#475569" }}>{cot.items_count}</span>
+                        <span style={{ background: s.sub, borderRadius: 10, padding: "2px 10px", fontSize: 12, fontWeight: 600, color: s.text2 }}>{cot.items_count}</span>
                       </td>
-                      <td style={{ padding: "10px 12px", textAlign: "right", fontWeight: 600, color: "#1E293B" }}>{fmt(cot.total_bruto)}</td>
+                      <td style={{ padding: "10px 12px", textAlign: "right", fontWeight: 600, color: s.text }}>{fmt(cot.total_bruto)}</td>
                       <td style={{ padding: "10px 12px" }}>
                         <select
                           value={cot.estado}
@@ -783,16 +884,26 @@ export default function MonzaCotizacionesPage() {
                               setCerrarVenta(cot);
                               return;
                             }
+                            // DISCLAIMER de reversión: sacar una venta de 'vendida'/
+                            // 'despachado' es DES-CERRARLA. El backend lo permite sólo sin
+                            // plata ni logística colgando y deja la versión marcada en el
+                            // historial — pero el operador tiene que saber QUÉ está
+                            // haciendo antes, no descubrirlo en un 409 o, peor, después.
+                            if ((cot.estado === "vendida" || cot.estado === "despachado")
+                                && e.target.value !== "vendida" && e.target.value !== "despachado") {
+                              setRevertir({ cot, aEstado: e.target.value });
+                              return;
+                            }
                             handleEstado(cot.id, e.target.value);
                           }}
                           disabled={updatingEstado === cot.id}
                           style={{ padding: "4px 8px", border: `1px solid ${ec.color}40`, borderRadius: 8, background: ec.bg, color: ec.color, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
-                          {Object.entries(ESTADO_CONFIG).map(([v, c]) => (
+                          {Object.entries(ESTADOS).map(([v, c]) => (
                             <option key={v} value={v}>{c.label}</option>
                           ))}
                         </select>
                       </td>
-                      <td style={{ padding: "10px 12px", color: "#475569", fontSize: 12 }}>{cot.asesor || "—"}</td>
+                      <td style={{ padding: "10px 12px", color: s.text2, fontSize: 12 }}>{cot.asesor || "—"}</td>
                       <td style={{ padding: "10px 12px", textAlign: "center" }}>
                         <div style={{ display: "flex", gap: 6, justifyContent: "center", alignItems: "center" }}>
                           {/* Hallazgo A5: solo en los estados desde los que SÍ se puede
@@ -812,7 +923,7 @@ export default function MonzaCotizacionesPage() {
                             onClick={() => handleDownload(cot)}
                             disabled={downloading === cot.id}
                             title="Descargar PDF"
-                            style={{ background: "transparent", border: "1px solid #E2E8F0", borderRadius: 6, cursor: "pointer", color: "#475569", padding: "5px 8px", opacity: downloading === cot.id ? 0.5 : 1 }}>
+                            style={{ background: "transparent", border: `1px solid ${s.bd}`, borderRadius: 6, cursor: "pointer", color: s.text2, padding: "5px 8px", opacity: downloading === cot.id ? 0.5 : 1 }}>
                             <Download size={13} />
                           </button>
                         </div>
@@ -821,14 +932,14 @@ export default function MonzaCotizacionesPage() {
                   );
 
                   const expandedRow = isExpanded ? (
-                    <tr key={`exp-${cot.id}`} style={{ borderBottom: "1px solid #E2E8F0" }}>
-                      <td colSpan={10} style={{ padding: 0, background: "#F8FAFC" }}>
+                    <tr key={`exp-${cot.id}`} style={{ borderBottom: `1px solid ${s.bd}` }}>
+                      <td colSpan={10} style={{ padding: 0, background: s.sub }}>
                         {loadingDetail === cot.id ? (
-                          <div style={{ padding: "20px 24px", color: "#94A3B8", fontSize: 13 }}>Cargando detalle...</div>
+                          <div style={{ padding: "20px 24px", color: s.faint, fontSize: 13 }}>Cargando detalle...</div>
                         ) : det ? (
                           <div style={{ padding: "16px 24px 20px" }}>
                             {/* Meta info */}
-                            <div style={{ display: "flex", gap: 24, fontSize: 12, color: "#475569", marginBottom: 12, flexWrap: "wrap" }}>
+                            <div style={{ display: "flex", gap: 24, fontSize: 12, color: s.text2, marginBottom: 12, flexWrap: "wrap" }}>
                               {det.vehiculo && <span><strong style={{ color: "var(--monza-accent)" }}>Vehículo:</strong> {det.vehiculo}</span>}
                               {det.vin && <span><strong style={{ color: "var(--monza-accent)" }}>VIN:</strong> {det.vin}</span>}
                               {det.anio && <span><strong style={{ color: "var(--monza-accent)" }}>Año:</strong> {det.anio}</span>}
@@ -836,24 +947,27 @@ export default function MonzaCotizacionesPage() {
                               {det.tipo_cotizacion && <span><strong style={{ color: "var(--monza-accent)" }}>Tipo:</strong> {det.tipo_cotizacion}</span>}
                             </div>
                             {/* Items table */}
-                            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, border: "1px solid #E2E8F0", borderRadius: 8, overflow: "hidden" }}>
+                            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, border: `1px solid ${s.bd}`, borderRadius: 8, overflow: "hidden" }}>
                               <thead>
-                                <tr style={{ background: "#F5CBA7" }}>
+                                {/* La cabecera durazno es un fondo CLARO fijo, así que su texto no puede
+                                    seguir al tema: en oscuro se invierte igual que en Despachos, que
+                                    pinta esta misma tabla de ítems. */}
+                                <tr style={{ background: s.dark ? "#131b3e" : "#F5CBA7" }}>
                                   {["Repuesto", "Marca", "Calidad", "QTY", "Precio Unit.", "Total", "Plazo"].map((h) => (
-                                    <th key={h} style={{ padding: "7px 10px", textAlign: ["QTY", "Precio Unit.", "Total"].includes(h) ? "right" : "left", fontWeight: 700, color: "#1E293B", fontSize: 11 }}>{h}</th>
+                                    <th key={h} style={{ padding: "7px 10px", textAlign: ["QTY", "Precio Unit.", "Total"].includes(h) ? "right" : "left", fontWeight: 700, color: s.dark ? "#F5CBA7" : "#92400E", fontSize: 11 }}>{h}</th>
                                   ))}
                                 </tr>
                               </thead>
                               <tbody>
                                 {det.items.map((it, idx) => (
-                                  <tr key={it.id} style={{ background: idx % 2 === 0 ? "white" : "#FAFAFA", borderTop: "1px solid #F1F5F9" }}>
-                                    <td style={{ padding: "7px 10px", color: "#1E293B", fontWeight: 500 }}>{it.descripcion}</td>
-                                    <td style={{ padding: "7px 10px", color: "#475569" }}>{it.marca || "—"}</td>
-                                    <td style={{ padding: "7px 10px", color: "#475569" }}>{CALIDAD_LABEL[it.calidad || ""] || it.calidad || "—"}</td>
-                                    <td style={{ padding: "7px 10px", textAlign: "right", color: "#475569" }}>{it.cantidad}</td>
-                                    <td style={{ padding: "7px 10px", textAlign: "right", color: "#475569" }}>{it.precio_unitario_clp ? fmt(it.precio_unitario_clp) : "—"}</td>
-                                    <td style={{ padding: "7px 10px", textAlign: "right", fontWeight: 600, color: "#1E293B" }}>{it.subtotal_clp ? fmt(it.subtotal_clp) : "—"}</td>
-                                    <td style={{ padding: "7px 10px", color: "#475569" }}>{it.plazo_entrega || "—"}</td>
+                                  <tr key={it.id} style={{ background: idx % 2 === 0 ? s.cardBg : s.sub, borderTop: `1px solid ${s.bd}` }}>
+                                    <td style={{ padding: "7px 10px", color: s.text, fontWeight: 500 }}>{it.descripcion}</td>
+                                    <td style={{ padding: "7px 10px", color: s.text2 }}>{it.marca || "—"}</td>
+                                    <td style={{ padding: "7px 10px", color: s.text2 }}>{CALIDAD_LABEL[it.calidad || ""] || it.calidad || "—"}</td>
+                                    <td style={{ padding: "7px 10px", textAlign: "right", color: s.text2 }}>{it.cantidad}</td>
+                                    <td style={{ padding: "7px 10px", textAlign: "right", color: s.text2 }}>{it.precio_unitario_clp ? fmt(it.precio_unitario_clp) : "—"}</td>
+                                    <td style={{ padding: "7px 10px", textAlign: "right", fontWeight: 600, color: s.text }}>{it.subtotal_clp ? fmt(it.subtotal_clp) : "—"}</td>
+                                    <td style={{ padding: "7px 10px", color: s.text2 }}>{it.plazo_entrega || "—"}</td>
                                   </tr>
                                 ))}
                               </tbody>
@@ -866,10 +980,10 @@ export default function MonzaCotizacionesPage() {
                                 </div>
                               )}
                               {(det.total_neto || det.total_bruto) && (
-                                <div style={{ textAlign: "right", fontSize: 12, color: "#475569", minWidth: 180 }}>
+                                <div style={{ textAlign: "right", fontSize: 12, color: s.text2, minWidth: 180 }}>
                                   {det.total_neto && <div>Neto: <strong>{fmt(det.total_neto)}</strong></div>}
                                   {det.iva_monto && <div>IVA: <strong>{fmt(det.iva_monto)}</strong></div>}
-                                  {det.total_bruto && <div style={{ fontSize: 14, fontWeight: 700, color: "#1E293B", marginTop: 4 }}>Total: {fmt(det.total_bruto)}</div>}
+                                  {det.total_bruto && <div style={{ fontSize: 14, fontWeight: 700, color: s.text, marginTop: 4 }}>Total: {fmt(det.total_bruto)}</div>}
                                 </div>
                               )}
                             </div>
@@ -885,7 +999,7 @@ export default function MonzaCotizacionesPage() {
           </tbody>
         </table>
         {total > 0 && (
-          <div style={{ padding: "10px 16px", borderTop: "1px solid #F1F5F9", fontSize: 12, color: "#94A3B8" }}>
+          <div style={{ padding: "10px 16px", borderTop: `1px solid ${s.bd}`, fontSize: 12, color: s.faint }}>
             Mostrando {items.length} de {total}
           </div>
         )}
@@ -901,6 +1015,88 @@ export default function MonzaCotizacionesPage() {
           onConfirm={(payload) => confirmarVenta(cerrarVenta, payload)}
         />
       )}
+      {revertir && (
+        <RevertirVentaModal
+          cot={revertir.cot}
+          aEstado={revertir.aEstado}
+          onClose={() => setRevertir(null)}
+          onConfirm={async (motivo) => {
+            try {
+              await monzaCotizacionesAPI.update(revertir.cot.id, {
+                estado: revertir.aEstado,
+                ...(motivo.trim() ? { motivo_reversion: motivo.trim() } : {}),
+              });
+              toast.success("Venta revertida — el cierre anterior quedó en el historial");
+              setRevertir(null);
+              fetchAll();
+            } catch (e: unknown) {
+              // El 409 del backend (plata/logística colgando) dice qué hacer.
+              toast.error(msgError(e, "No se pudo revertir"), { duration: 8000 });
+            }
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── Modal: confirmar la REVERSIÓN de una venta cerrada ───────────────────────
+// Un des-cierre no es un cambio de estado más: la venta ya generó compromisos (OC del
+// cliente registrada, compras al proveedor liberadas). El backend lo permite sólo sin
+// plata ni logística colgando y guarda la versión en el historial; este modal existe para
+// que el operador lo sepa ANTES, con los datos del cierre a la vista, y pueda dejar el
+// motivo escrito. El motivo es opcional a propósito: bloquear la salida por no escribirlo
+// dejaría sin corrección el cierre hecho por error, que es justo lo que la reversión corrige.
+function RevertirVentaModal({ cot, aEstado, onClose, onConfirm }: {
+  cot: Cotizacion; aEstado: string; onClose: () => void;
+  onConfirm: (motivo: string) => Promise<void> | void;
+}) {
+  const s = useStyles();
+  const [motivo, setMotivo] = useState("");
+  const [saving, setSaving] = useState(false);
+  const inp: React.CSSProperties = { width: "100%", padding: "8px 10px", border: s.cardBd, borderRadius: 6, fontSize: 13, boxSizing: "border-box", background: s.inputBg, color: s.text };
+  // estadoConfig(s) y no la const del componente padre: este modal es función aparte.
+  const label = estadoConfig(s)[aEstado]?.label || aEstado;
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 320, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.5)", padding: 16 }} onClick={onClose}>
+      <div style={{ width: "100%", maxWidth: 480, background: s.cardBg, borderRadius: 14, border: s.cardBd, boxShadow: "0 20px 50px rgba(0,0,0,0.25)" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 18px", borderBottom: s.cardBd }}>
+          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 600, color: s.text }}>Revertir venta · {cot.numero}</h3>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: s.muted, fontSize: 20, lineHeight: 1 }}>×</button>
+        </div>
+        <div style={{ padding: 18, display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ display: "flex", gap: 10, padding: 12, borderRadius: 10, background: s.dark ? "#3f2d0a" : "#FFFBEB", border: `1px solid ${s.dark ? "#78530f" : "#FDE68A"}` }}>
+            <p style={{ margin: 0, fontSize: 13, lineHeight: 1.55, color: s.dark ? "#FDE68A" : "#92400E" }}>
+              <b>Esta es una venta ya CERRADA</b>
+              {cot.oc_cliente ? <> — OC del cliente <b>{cot.oc_cliente}</b></> : null}
+              {cot.fecha_venta ? <> · cerrada el {new Date(cot.fecha_venta).toLocaleDateString("es-CL")}</> : null}
+              — y estás por devolverla a «{label}».
+              El cierre actual quedará guardado en el historial de la venta; si después la
+              vuelves a cerrar con otros datos, quedará como una <b>versión nueva</b> y esta
+              quedará registrada como revertida.
+            </p>
+          </div>
+          <label style={{ display: "block" }}>
+            <span style={{ display: "block", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4, color: s.muted }}>
+              Motivo (opcional, queda en el historial)
+            </span>
+            <input style={inp} value={motivo} autoFocus
+              onChange={(e) => setMotivo(e.target.value)}
+              placeholder="Ej. el cliente cambió el N° de su OC" />
+          </label>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={onClose}
+              style={{ flex: 1, padding: "9px 12px", borderRadius: 8, border: s.cardBd, background: s.sub, color: s.text, fontWeight: 600, fontSize: 13, cursor: "pointer", fontFamily: "inherit" }}>
+              Cancelar
+            </button>
+            <button disabled={saving}
+              onClick={async () => { setSaving(true); try { await onConfirm(motivo); } finally { setSaving(false); } }}
+              style={{ flex: 1, padding: "9px 12px", borderRadius: 8, border: "none", background: "#B45309", color: "white", fontWeight: 600, fontSize: 13, cursor: "pointer", fontFamily: "inherit", opacity: saving ? 0.6 : 1 }}>
+              {saving ? "Revirtiendo…" : "Sí, revertir la venta"}
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

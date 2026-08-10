@@ -139,12 +139,16 @@ def _crear_venta(db, *, cantidad=10, precio=100_000.0):
     db.add(it); db.flush()
     d1 = mm.MonzaDespacho(numero=f"{MARK}-DSP1", cotizacion_id=cot.id,
                           estado="despachado", numero_guia=f"G-{MARK}-1",
-                          cliente_nombre=cli.nombre)
+                          cliente_nombre=cli.nombre,
+                          # regla 2026-08-06: sin firma no se factura (el gate tiene suite propia)
+                          guia_firmada=1)
     db.add(d1); db.flush()
     db.add(mm.MonzaDespachoItem(despacho_id=d1.id, item_id=it.id, qty_despachada=6))
     d2 = mm.MonzaDespacho(numero=f"{MARK}-DSP2", cotizacion_id=cot.id,
                           estado="despachado", numero_guia=f"G-{MARK}-2",
-                          cliente_nombre=cli.nombre)
+                          cliente_nombre=cli.nombre,
+                          # regla 2026-08-06: sin firma no se factura (el gate tiene suite propia)
+                          guia_firmada=1)
     db.add(d2); db.flush()
     db.add(mm.MonzaDespachoItem(despacho_id=d2.id, item_id=it.id, qty_despachada=4))
     db.commit()
@@ -237,7 +241,12 @@ def test_viaje_de_la_plata():
         print("\n───────── 2 · 1ª FACTURA (guía parcial) ANTES DE APROBAR ─────────")
         r = client.post("/api/monza/contabilidad/facturas",
                         json={"cotizacion_id": cot_id, "despacho_id": d1_id,
-                              "numero_factura": f"{MARK}-F1", "plazo_dias": 30,
+                              # plazo LARGO a propósito: con 30 días este test murió
+                              # solo el 2026-08-10 (vencimiento 08-09 < hoy → estado
+                              # 'vencida' en vez de 'por_cobrar'/'parcial'). Las fechas
+                              # de emisión y cobranza son HISTORIA y se quedan fijas;
+                              # lo único que no puede envejecer es el vencimiento.
+                              "numero_factura": f"{MARK}-F1", "plazo_dias": 3650,
                               "fecha_emision": "2026-07-10"})
         check("2 factura 1 emitida (6 u, con folio obligatorio)", r.status_code == 200, r.text)
         fac1_id = r.json()["id"]
@@ -272,7 +281,8 @@ def test_viaje_de_la_plata():
         print("\n───────── 4 · 2ª FACTURA (resto): el adelanto NO se aplica de nuevo ─────────")
         r = client.post("/api/monza/contabilidad/facturas",
                         json={"cotizacion_id": cot_id, "despacho_id": d2_id,
-                              "numero_factura": f"{MARK}-F2", "plazo_dias": 30,
+                              # plazo largo por la misma razón que F1 (no envejecer)
+                              "numero_factura": f"{MARK}-F2", "plazo_dias": 3650,
                               "fecha_emision": "2026-07-12"})
         check("4 factura 2 emitida (4 u)", r.status_code == 200, r.text)
         fac2_id = r.json()["id"]

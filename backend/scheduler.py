@@ -1,19 +1,27 @@
-"""Barrido diario de alertas — CÓDIGO COMPARTIDO por Grupo AM y MonzaParts.
+"""Jobs programados del backend — CÓDIGO COMPARTIDO por Grupo AM y MonzaParts.
 
-Un solo job cron a las 06:00 de Santiago (`start_scheduler`, llamado una vez desde
-`main.py:145`) evalúa las reglas de las DOS marcas.
+`start_scheduler()` (lo llama `main.py` una sola vez, en el evento de arranque) registra
+DOS jobs cron de APScheduler, los dos en hora de Santiago:
 
-HASTA 2026-07-30 EL BARRIDO ERA SOLO DE GRUPO AM. Consecuencia real: un proveedor de
-MonzaParts atrasado NO avisaba NUNCA, aunque `monza_oc_proveedor.plazo_dias` existiera y
-estuviera cargado; y las alertas "venta lista para despacho" / "plazo crítico" de Monza
-solo se disparaban en el INSTANTE de cerrar una recepción en Bodega, nunca por el simple
-paso del tiempo. Las reglas de MonzaParts que siguen son 100% ADITIVAS: las de Grupo AM
-quedaron tal cual, movidas sin un cambio de lógica a `_checks_grupo_am()`.
+  · **05:30 · `run_sii_libro_job`** — libro de compras del SII: barrido contra Wasabil y,
+    si el dueño lo habilitó, la corrida del matcher banco↔libro. Dueño: contabilidad.
+  · **06:00 · `run_daily_checks`** — alertas del día (proveedor atrasado, venta lista para
+    despacho, plazo crítico). Dueño: comercial/abastecimiento.
+
+Nacieron juntos y se separaron el 2026-08-07 (el porqué, completo, en el docstring de
+`run_sii_libro_job`): no comparten cadencia, ni dueño, ni modo de fallar.
+
+HASTA 2026-07-30 EL BARRIDO DE ALERTAS ERA SOLO DE GRUPO AM. Consecuencia real: un
+proveedor de MonzaParts atrasado NO avisaba NUNCA, aunque `monza_oc_proveedor.plazo_dias`
+existiera y estuviera cargado; y las alertas "venta lista para despacho" / "plazo crítico"
+de Monza solo se disparaban en el INSTANTE de cerrar una recepción en Bodega, nunca por el
+simple paso del tiempo. Las reglas de MonzaParts que siguen son 100% ADITIVAS: las de
+Grupo AM quedaron tal cual, movidas sin un cambio de lógica a `_checks_grupo_am()`.
 
 DOS INVARIANTES QUE NO SE NEGOCIAN
 1. AISLAMIENTO ENTRE MARCAS. Cada marca corre con su propia sesión y su propio
-   try/except (`_correr_marca`). Este job es el ÚNICO disparo del día: si un error de
-   Monza se propagara, Grupo AM se quedaría sin alertas hasta mañana (y al revés).
+   try/except (`_correr_marca`). Cada job es el ÚNICO disparo diario de SU concern: si un
+   error de Monza se propagara, Grupo AM se quedaría sin alertas hasta mañana (y al revés).
 2. IDEMPOTENCIA. Cada regla declara su `regla=` y `notificaciones.py` / `monza_notif.py`
    suprimen el aviso repetido dentro de 24 h. Sin eso, cada corrida de las 06:00 vuelve a
    notificar lo mismo, el dueño deja de mirar la campana y las alertas se vuelven ruido —
@@ -27,6 +35,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import joinedload, selectinload
 
+from config import settings
 from database import SessionLocal
 from models.models import (
     OcCliente, OcProveedor, OcProveedorItem, ItemCotizacion,
@@ -70,9 +79,186 @@ def _business_days_between(start: date, end: date) -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_daily_checks():
-    """Evalúa las reglas de alerta de las dos marcas y crea las notificaciones."""
+    """Evalúa las reglas de alerta de las dos marcas y crea las notificaciones.
+
+    SOLO alertas. El libro del SII vive en `run_sii_libro_job` — ver ahí el porqué.
+    """
     _correr_marca("grupo-am", _checks_grupo_am)
     _correr_marca("monzaparts", _checks_monza)
+
+
+def run_sii_libro_job():
+    """Libro de compras del SII de las DOS marcas: barrido + corrida del matcher.
+
+    POR QUÉ ES UN JOB APARTE (revisión multienjambre 2026-08-07)
+        Nació colgado del job de alertas, y eso ataba dos trabajos que no comparten
+        nada: distinta cadencia, distinto dueño, distinto modo de fallar. El acople
+        se pagaba de tres maneras:
+          · el barrido habla por RED con Wasabil y el matcher recorre la cartola
+            entera — minutos de trabajo pesado colados dentro del ÚNICO disparo
+            diario de las alertas;
+          · cualquiera que ejercite las alertas (la suite `test_alertas_diarias`
+            llama a `run_daily_checks` ocho veces) arrastraba ocho barridos y ocho
+            corridas del matcher contra la MISMA base, y el estado que dejaban hacía
+            fallar suites vecinas — el síntoma que destapó esto;
+          · un barrido lento retrasaba las alertas del día.
+        Separarlos restaura el invariante 1 del módulo (aislamiento) un nivel más
+        arriba: ahora también entre CONCERNS, no solo entre marcas.
+
+    LAS DOS PUERTAS QUE ESTE JOB RESPETA (revisión 2026-08-08)
+        · `MONZA_CONTAB_ENABLED` gobierna la mitad MONZA entera. Antes no la miraba:
+          con la contabilidad de MonzaParts apagada en PROD —o sea con su Tesorería
+          en 404 y su pantalla del libro fuera del build— el job igual gastaba cuota
+          del API de Wasabil todas las noches y escribía un espejo que NADIE podía
+          mirar ni corregir. Ahora las tres piezas (router, job y pantalla) obedecen
+          al MISMO flag.
+        · `SII_MATCHER_NOCTURNO` / `SII_MATCHER_NOCTURNO_MONZA` gobiernan la corrida
+          DESATENDIDA del matcher, y nacen APAGADAS. El motor no cambia: cambia la
+          puerta. Sin ellas, la PRIMERA noche después del deploy el matcher corría
+          sobre la cartola histórica completa —no tiene ventana de fecha— y podía
+          dejar movimientos del banco con `conciliado=True` por una decisión
+          automática que nadie revisó nunca; el encargado de Tesorería se encontraba
+          al otro día con plata marcada por un módulo que todavía no conocía. Es el
+          mismo criterio que este proyecto ya aplicó a la señal RUT-en-glosa: una
+          señal nueva nace apagada hasta validarla con cartolas reales. El barrido SÍ
+          corre igual (llenar el espejo del SII es lectura pura y es justo lo que hay
+          que mirar en el estreno) y el botón «Correr matcher» de la pantalla sigue
+          disponible para el humano que esté mirando.
+
+    Conserva los dos invariantes de siempre: cada marca con su sesión PROPIA y su
+    try/except PROPIO, e imports locales (si el paquete no está, el resto sigue).
+    """
+    inicio_barrido_ga = datetime.utcnow()
+    try:
+        from wasabil_compras.client import esta_configurado
+        from wasabil_compras.sync import barrido_nocturno
+        # Sin token, `barrido_nocturno` se omite con un `logger.info` que en el servidor
+        # NO se ve (el backend no configura logging; el manejador de último recurso de
+        # Python solo emite WARNING y superior). El síntoma que llegaba al contador era
+        # "el Libro SII está vacío", sin una sola pista. Acá se dice con `print`, que es
+        # lo que este módulo ya usa para que el aviso aparezca en el log de pm2.
+        if not esta_configurado():
+            print("[scheduler][libro-sii] SIN WASABIL_API_TOKEN en backend/.env: el "
+                  "barrido se omite y el Libro de Compras del SII de Grupo AM NO se "
+                  "llena (no es un error, pero tampoco es normal en producción)",
+                  flush=True)
+        barrido_nocturno()
+    except Exception as e:  # noqa: BLE001 — este job es el único disparo del día
+        import traceback
+        print(f"[scheduler][libro-sii] ERROR en el barrido nocturno: "
+              f"{type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+    # Hallazgos #10 y #16 (revisión matcher 2026-08-06): la spec §5 exige que el
+    # motor corra «tras cada barrido exitoso», pero el único caller era el botón
+    # manual — los AUTOs prometidos tras el barrido no nacían y la re-verificación
+    # de la regla 4 dependía de un click humano. Try aislado adentro.
+    #
+    # La puerta del estreno va ACÁ, en el llamador, y no adentro de
+    # `_matcher_post_barrido_ga`: ese helper es también la pieza que las suites
+    # ejercitan directamente para probar el hook, y apagarlo desde adentro dejaría
+    # esas sondas verdes sin probar nada.
+    if settings.SII_MATCHER_NOCTURNO:
+        _matcher_post_barrido_ga(inicio_barrido_ga)
+    else:
+        print("[scheduler][libro-sii] matcher nocturno APAGADO "
+              "(SII_MATCHER_NOCTURNO en backend/.env): el espejo del libro quedó al día "
+              "y los cruces esperan a que alguien los mire en Contabilidad → Libro SII",
+              flush=True)
+    # ── Mitad MonzaParts ────────────────────────────────────────────────────────────
+    # Obedece al gate de la marca: con MONZA_CONTAB_ENABLED=false su Tesorería no está
+    # montada (los movimientos del banco que el matcher cruzaría no existen) y su
+    # pantalla del Libro SII no entra al build, así que barrer sería construir a ciegas
+    # un espejo que nadie puede ver. Duplicación deliberada del bloque de GA: cero
+    # código compartido entre marcas.
+    if settings.MONZA_CONTAB_ENABLED:
+        inicio_barrido_monza = datetime.utcnow()
+        try:
+            from monza_wasabil_compras.client import esta_configurado as monza_configurado
+            from monza_wasabil_compras.sync import barrido_nocturno as barrido_monza
+            if not monza_configurado():
+                print("[scheduler][libro-sii-monza] SIN WASABIL_API_TOKEN_MONZA en "
+                      "backend/.env: el barrido se omite y el Libro de Compras del SII "
+                      "de MonzaParts NO se llena", flush=True)
+            barrido_monza()
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            print(f"[scheduler][libro-sii-monza] ERROR en el barrido nocturno: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+        # Espejo Monza del hook post-barrido (mismos hallazgos #10/#16, mismo aislamiento)
+        # y de su puerta de estreno.
+        if settings.SII_MATCHER_NOCTURNO_MONZA:
+            _matcher_post_barrido_monza(inicio_barrido_monza)
+        else:
+            print("[scheduler][libro-sii-monza] matcher nocturno APAGADO "
+                  "(SII_MATCHER_NOCTURNO_MONZA en backend/.env): los cruces esperan a "
+                  "que alguien los mire en Contabilidad → Libro SII de MonzaParts",
+                  flush=True)
+
+
+def _matcher_post_barrido_ga(desde: datetime) -> None:
+    """Corrida del matcher banco↔libro de GRUPO AM tras el barrido nocturno EXITOSO
+    (hallazgos #10 y #16, revisión matcher 2026-08-06 — spec §5: «el motor corre tras
+    cada barrido exitoso»). Solo corre si ESTE job dejó un SiiLibroSyncRun con
+    exito=True iniciado después de `desde`: sin token de Wasabil el barrido se omite
+    y el matcher no corre con la etiqueta mentirosa de 'post_barrido'. Try aislado:
+    un fallo del matcher JAMÁS deja el job del libro SII a medias (invariante 1).
+
+    OJO: la puerta del estreno (`SII_MATCHER_NOCTURNO`) NO va acá adentro, va en
+    `run_sii_libro_job`, que es quien decide si el motor corre desatendido. Las suites
+    llaman a este helper directamente para probar el hook."""
+    try:
+        from wasabil_compras.matcher import MatcherEnCurso, correr_matcher
+        from wasabil_compras.models import SiiLibroSyncRun
+        db = SessionLocal()
+        try:
+            ok = (db.query(SiiLibroSyncRun)
+                  .filter(SiiLibroSyncRun.exito.is_(True),
+                          SiiLibroSyncRun.iniciado_at >= desde).first())
+            if ok is None:
+                return   # sin barrido exitoso EN ESTE job no hay 'post_barrido'
+            try:
+                correr_matcher(db, origen="post_barrido")
+            except MatcherEnCurso as e:
+                print(f"[scheduler][libro-sii] matcher post-barrido se abstiene: {e}",
+                      flush=True)
+        finally:
+            db.close()
+    except Exception as e:  # noqa: BLE001 — run_sii_libro_job sigue pase lo que pase
+        import traceback
+        print(f"[scheduler][libro-sii] ERROR en matcher post-barrido: "
+              f"{type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+
+
+def _matcher_post_barrido_monza(desde: datetime) -> None:
+    """Espejo Monza de `_matcher_post_barrido_ga` (duplicación deliberada entre
+    marcas: cero imports cruzados entre paquetes monza_* y los de GA).
+
+    Misma advertencia que el gemelo: su puerta de estreno
+    (`SII_MATCHER_NOCTURNO_MONZA`) vive en `run_sii_libro_job`, no acá."""
+    try:
+        from monza_wasabil_compras.matcher import MatcherEnCurso, correr_matcher
+        from monza_wasabil_compras.models import MonzaSiiLibroSyncRun
+        db = SessionLocal()
+        try:
+            ok = (db.query(MonzaSiiLibroSyncRun)
+                  .filter(MonzaSiiLibroSyncRun.exito.is_(True),
+                          MonzaSiiLibroSyncRun.iniciado_at >= desde).first())
+            if ok is None:
+                return   # sin barrido exitoso EN ESTE job no hay 'post_barrido'
+            try:
+                correr_matcher(db, origen="post_barrido")
+            except MatcherEnCurso as e:
+                print(f"[scheduler][libro-sii-monza] matcher post-barrido se "
+                      f"abstiene: {e}", flush=True)
+        finally:
+            db.close()
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        print(f"[scheduler][libro-sii-monza] ERROR en matcher post-barrido: "
+              f"{type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
 
 
 def _correr_marca(marca: str, fn) -> None:
@@ -478,6 +664,21 @@ def start_scheduler() -> BackgroundScheduler:
         id="daily_checks",
         replace_existing=True,
     )
+    # Libro del SII: job PROPIO (ver el docstring de run_sii_libro_job). Corre ANTES
+    # de las alertas para que el libro esté fresco cuando la oficina abre, y a una
+    # hora distinta para que el trabajo pesado del barrido no compita con ellas.
+    scheduler.add_job(
+        run_sii_libro_job,
+        CronTrigger(hour=5, minute=30, timezone=tz),
+        id="sii_libro",
+        replace_existing=True,
+    )
     scheduler.start()
-    print("[scheduler] APScheduler started — daily checks at 06:00 Santiago")
+    # El estado de las puertas se imprime al arrancar: es la única forma de que el
+    # operador sepa, sin abrir el .env, si el matcher va a escribir solo esta noche.
+    print("[scheduler] APScheduler started — daily checks at 06:00, libro SII at "
+          "05:30 (Santiago) · matcher nocturno GA="
+          f"{'ON' if settings.SII_MATCHER_NOCTURNO else 'OFF'}"
+          + (" · Monza=" + ("ON" if settings.SII_MATCHER_NOCTURNO_MONZA else "OFF")
+             if settings.MONZA_CONTAB_ENABLED else " · Monza=gate apagado"))
     return scheduler

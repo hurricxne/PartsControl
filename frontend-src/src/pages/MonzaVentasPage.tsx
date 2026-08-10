@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { Link } from "react-router-dom";
 import { Search, TrendingUp, ChevronDown, ChevronRight } from "lucide-react";
 import { useMonzaTheme } from "./MonzaLayout";
 import { monzaVentasAPI, monzaCotizacionesAPI } from "../services/monzaApi";
@@ -8,6 +9,9 @@ import toast from "react-hot-toast";
 interface Venta {
   id: number; numero: string; estado: string; linea?: string; vehiculo?: string;
   oc_cliente?: string; fecha_venta?: string; fecha_entrega_est?: string;
+  /** Venta a cliente particular: la "OC" es el N° de esta cotización (no la emitió el
+   *  cliente). Opcional: contra un backend viejo simplemente no se muestra la marca. */
+  cliente_sin_oc?: boolean;
   total_bruto: number; items_count: number; asesor?: string; fecha_creacion: string;
   cliente?: { nombre: string; rut?: string };
   lead_numero?: string; pipeline?: string;
@@ -208,7 +212,19 @@ export default function MonzaVentasPage() {
                         {v.lead_numero && <div style={{ fontSize: 10, color: "#94A3B8" }}>Lead {v.lead_numero}</div>}
                       </td>
                       <td style={{ padding: "10px 12px", cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>
-                        <div style={{ fontWeight: 500, color: txt }}>{v.cliente?.nombre || "—"}</div>
+                        {/* Acceso directo a la ficha (mismo criterio que en Ventas —
+                            Contabilidad): el RUT y la razón social del cliente son lo que
+                            el SII exige para emitir, y corregirlos obligaba a irse a
+                            Configuración a buscarlo a mano. stopPropagation: la fila
+                            entera es expandible, el enlace no debe además desplegarla. */}
+                        <Link to={`/monzaparts/configuracion?tab=clientes&cliente=${encodeURIComponent(v.cliente?.rut || v.cliente?.nombre || "")}`}
+                          onClick={(e) => e.stopPropagation()}
+                          title="Abrir la ficha del cliente (corregir RUT o razón social)"
+                          style={{ fontWeight: 500, color: txt, textDecoration: "none" }}
+                          onMouseEnter={(e) => { e.currentTarget.style.textDecoration = "underline"; }}
+                          onMouseLeave={(e) => { e.currentTarget.style.textDecoration = "none"; }}>
+                          {v.cliente?.nombre || "—"}
+                        </Link>
                         {v.cliente?.rut && <div style={{ fontSize: 11, color: "#94A3B8" }}>{v.cliente.rut}</div>}
                       </td>
                       <td style={{ padding: "10px 12px", cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>
@@ -223,11 +239,22 @@ export default function MonzaVentasPage() {
                             onKeyDown={(e) => { if (e.key === "Enter") handleSaveOC(v.id, updatingOC.val); if (e.key === "Escape") setUpdatingOC(null); }}
                             style={{ padding: "4px 8px", border: "1px solid var(--monza-accent)", borderRadius: 4, fontSize: 12, width: 100 }} />
                         ) : (
-                          <span onClick={(e) => { e.stopPropagation(); setUpdatingOC({ id: v.id, val: v.oc_cliente || "" }); }}
-                            title="Click para editar OC"
-                            style={{ cursor: "pointer", borderBottom: v.oc_cliente ? "none" : `1px dashed ${dark ? "#334155" : "#CBD5E1"}`, color: v.oc_cliente ? txt : (dark ? "#334155" : "#CBD5E1") }}>
-                            {v.oc_cliente || "—"}
-                          </span>
+                          <>
+                            <span onClick={(e) => { e.stopPropagation(); setUpdatingOC({ id: v.id, val: v.oc_cliente || "" }); }}
+                              title={v.cliente_sin_oc
+                                ? "Cliente particular: no emite OC, el respaldo es el N° de esta cotización"
+                                : "Click para editar OC"}
+                              style={{ cursor: "pointer", borderBottom: v.oc_cliente ? "none" : `1px dashed ${dark ? "#334155" : "#CBD5E1"}`, color: v.oc_cliente ? txt : (dark ? "#334155" : "#CBD5E1") }}>
+                              {v.oc_cliente || "—"}
+                            </span>
+                            {/* Sin esta marca, una OC igual al N° de cotización se lee
+                                como un error de digitación. Dice que fue deliberado. */}
+                            {v.cliente_sin_oc && (
+                              <span style={{ marginLeft: 6, fontSize: 10, color: dark ? "#8899cc" : "#64748B", border: `1px solid ${dark ? "#1e2a4a" : "#E2E8F0"}`, padding: "1px 5px", borderRadius: 999, whiteSpace: "nowrap" }}>
+                                particular
+                              </span>
+                            )}
+                          </>
                         )}
                       </td>
                       <td style={{ padding: "10px 12px", fontSize: 12, cursor: "pointer" }} onClick={() => toggleExpand(v.id)}>

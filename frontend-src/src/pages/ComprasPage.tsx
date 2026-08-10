@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   ShoppingCart, Plus, Search, Package, ChevronDown, ChevronRight,
   Loader2, CheckCircle2, AlertTriangle, X, AlertCircle, FileDown,
@@ -114,6 +114,59 @@ function AsignarModal({
     return init
   })
 
+  // ── Asignación PARCIAL ──────────────────────────────────────────────────────
+  // El control de cantidad SOLO aparece en líneas 'cerrado' sin vínculo: la
+  // reasignación parcial de una línea ya comprada NO existe en v1 (el backend la
+  // rechaza con 409) — no se ofrece en pantalla lo que el backend va a rechazar.
+  // Y SOLO con cantidad > 1 (revisión adversarial H1/H6): una línea con cantidad
+  // NULL o 0 (import Excel sucio) quedaba INASIGNABLE — la validación exigía un
+  // entero «entre 1 y 0», que no existe, y antes del cambio esa línea se asignaba
+  // entera por el camino legado sin problema. Y partir 1 no tiene sentido: el
+  // input «1 de 1» solo aceptaba su propio valor y cualquier edición regañaba.
+  // Ambos casos van como línea ENTERA por el camino legado, como siempre.
+  const admiteParcial = (i: OcClienteItem) =>
+    i.estado_item === 'cerrado' && !i.oc_proveedor_id && (i.cantidad ?? 0) > 1
+
+  // Cantidad a asignar por línea, como texto (mismo patrón que itemPlazos: el input
+  // vive como string y se valida al guardar). Default = la cantidad COMPLETA → si el
+  // operador no toca nada, el guardado usa el endpoint LEGADO tal cual (cero cambio
+  // de comportamiento para el caso de siempre).
+  const [itemQtys, setItemQtys] = useState<Record<number, string>>(() => {
+    const init: Record<number, string> = {}
+    selectedItems.forEach(i => { init[i.id] = String(i.cantidad ?? '') })
+    return init
+  })
+
+  // Rechazos (validación local o 400/404/409/422 del backend) al recuadro DENTRO
+  // del modal — patrón H7 de ComprasContabPage: un 409 importante no cabe en un
+  // toast de 4 segundos, y el operador necesita leerlo entero para decidir.
+  const [errorAsignar, setErrorAsignar] = useState<string | null>(null)
+
+  // Anti doble-OC en el reintento: si "Nueva OC-Proveedor" ya se creó y la ASIGNACIÓN
+  // rebotó (el recuadro de error invita a corregir y reintentar sin salir del modal),
+  // el segundo intento REUSA esa OC en vez de fabricar otra vacía. Solo se reusa si
+  // el operador no cambió nada de la OC (proveedor / N° / origen): si cambió algo,
+  // es conceptualmente otra OC y se crea de nuevo (comportamiento de siempre).
+  const creadaRef = useRef<{
+    id: number; proveedorMaestroId: number | ''; numeroOc: string; tipoOrigen: string
+  } | null>(null)
+
+  // H5 (revisión adversarial): si la OC se CREÓ pero la asignación rebotó y el
+  // operador cierra el modal, la OC queda vacía — y no existe cómo borrarla desde la
+  // pantalla. No se le impide cerrar (la OC es real y reutilizable): se le DICE, y
+  // el camino de vuelta queda nombrado (aparece bajo «OC existente» al reabrir).
+  const cerrarSeguro = () => {
+    if (saving) return
+    if (creadaRef.current) {
+      const ok = window.confirm(
+        `La OC-Proveedor ya quedó creada pero sin ítems asignados.\n` +
+        `Al reabrir este modal la encuentras bajo «OC existente» para asignarle ` +
+        `líneas — si no lo haces, quedará vacía en los listados.\n\n¿Cerrar igual?`)
+      if (!ok) return
+    }
+    onClose()
+  }
+
   // A-1.2: Row multi-select for "Duplicar valor"
   const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set())
   const [lastSelected, setLastSelected] = useState<number | null>(null)
@@ -183,6 +236,7 @@ function AsignarModal({
   const proveedorSeleccionado = proveedoresMaestro.find(p => p.id === proveedorMaestroId)
 
   const handleSave = async () => {
+    setErrorAsignar(null)
     if (!numeroOc.trim()) {
       setOcError(true)
       toast.error('El N° OC del proveedor es obligatorio')
@@ -196,6 +250,38 @@ function AsignarModal({
       toast.error('Selecciona un proveedor del maestro')
       return
     }
+
+    // Validación de cantidades ANTES de tocar el backend: entero entre 1 y lo
+    // disponible. El valor por defecto (la cantidad completa) siempre pasa, aunque
+    // la línea legada tenga cantidad no entera: completa = camino legado, sin split.
+    const problemas: string[] = []
+    const cantidades: Record<number, number> = {}
+    for (const item of selectedItems) {
+      if (!admiteParcial(item)) continue
+      const total = item.cantidad ?? 0
+      const raw = (itemQtys[item.id] ?? '').trim()
+      const qty = Number(raw)
+      if (raw === '' || isNaN(qty)) {
+        problemas.push(`${item.numero_parte}: indica cuántas unidades asignar (entre 1 y ${total}).`)
+        continue
+      }
+      if (qty === total) { cantidades[item.id] = qty; continue }  // completa: siempre válida
+      if (!Number.isInteger(qty) || qty < 1 || qty > total) {
+        problemas.push(`${item.numero_parte}: la cantidad debe ser un número entero entre 1 y ${total} (pusiste ${raw}).`)
+        continue
+      }
+      cantidades[item.id] = qty
+    }
+    if (problemas.length > 0) {
+      setErrorAsignar(problemas.join('\n'))
+      return
+    }
+    // ¿Alguna línea va parcial? Si NINGUNA → endpoint legado tal cual (el camino de
+    // siempre no cambia ni un byte). El operador no necesita saber que hay dos rutas.
+    const esParcial = selectedItems.some(
+      i => admiteParcial(i) && cantidades[i.id] !== (i.cantidad ?? 0),
+    )
+
     setSaving(true)
     try {
       let targetId = ocpId as number
@@ -203,36 +289,93 @@ function AsignarModal({
         await comprasAPI.actualizarOcProveedor(ocpId as number, { numero_oc: numeroOc.trim() })
       }
       if (modo === 'nueva') {
-        const prov = proveedoresMaestro.find(p => p.id === proveedorMaestroId)
-        const esNacional = tipoOrigen === 'nacional'
-        const { data } = await comprasAPI.crearOcProveedor({
-          proveedor: prov?.nombre ?? '',
-          numero_oc: numeroOc.trim(),
-          // Nacional → Chile/CLP por defecto en la UI (no cambia el default de la columna).
-          pais: esNacional ? 'Chile' : (prov?.pais ?? undefined),
-          moneda: esNacional ? 'CLP' : (prov?.moneda ?? 'USD'),
-          tipo_origen: tipoOrigen,
-        })
-        targetId = data.id
-        toast.success(`OC-Proveedor ${data.numero} creada`)
+        // Reintento tras un rechazo de la asignación: si la OC ya se creó con estos
+        // mismos datos, se reusa (ver creadaRef) — sin esto cada reintento fabricaba
+        // una OC-Proveedor vacía nueva.
+        const previa = creadaRef.current
+        if (previa && previa.proveedorMaestroId === proveedorMaestroId
+            && previa.numeroOc === numeroOc.trim() && previa.tipoOrigen === tipoOrigen) {
+          targetId = previa.id
+        } else {
+          const prov = proveedoresMaestro.find(p => p.id === proveedorMaestroId)
+          const esNacional = tipoOrigen === 'nacional'
+          const { data } = await comprasAPI.crearOcProveedor({
+            proveedor: prov?.nombre ?? '',
+            numero_oc: numeroOc.trim(),
+            // Nacional → Chile/CLP por defecto en la UI (no cambia el default de la columna).
+            pais: esNacional ? 'Chile' : (prov?.pais ?? undefined),
+            moneda: esNacional ? 'CLP' : (prov?.moneda ?? 'USD'),
+            tipo_origen: tipoOrigen,
+          })
+          targetId = data.id
+          creadaRef.current = {
+            id: data.id, proveedorMaestroId, numeroOc: numeroOc.trim(), tipoOrigen,
+          }
+          toast.success(`OC-Proveedor ${data.numero} creada`)
+        }
       }
 
-      // Build item_plazos array with per-item plazo
-      const item_plazos = selectedItems.map(i => ({
-        id: i.id,
-        plazo_dias_prov: itemPlazos[i.id] ? Number(itemPlazos[i.id]) : null,
-      }))
-
-      await comprasAPI.asignarItems(targetId, {
-        item_ids: selectedItemIds,
-        oc_cliente_id: ocCliente.id,
-        item_plazos,
-      })
-      toast.success(`${selectedItemIds.length} item(s) asignados`)
+      if (!esParcial) {
+        // TODAS las cantidades completas → endpoint LEGADO, mismo body de siempre.
+        const item_plazos = selectedItems.map(i => ({
+          id: i.id,
+          plazo_dias_prov: itemPlazos[i.id] ? Number(itemPlazos[i.id]) : null,
+        }))
+        await comprasAPI.asignarItems(targetId, {
+          item_ids: selectedItemIds,
+          oc_cliente_id: ocCliente.id,
+          item_plazos,
+        })
+        toast.success(`${selectedItemIds.length} item(s) asignados`)
+      } else {
+        // Alguna parcial → endpoint nuevo. `cantidad` se OMITE cuando la línea va
+        // completa (sentinela del contrato: ausente = línea entera, sin clon) y
+        // JAMÁS se manda 0 (el backend lo rechaza con 422 a propósito).
+        const { data: resp } = await comprasAPI.asignarItemsParcial(targetId, {
+          oc_cliente_id: ocCliente.id,
+          items: selectedItems.map(i => ({
+            item_id: i.id,
+            ...(admiteParcial(i) && cantidades[i.id] !== (i.cantidad ?? 0)
+              ? { cantidad: cantidades[i.id] }
+              : {}),
+            plazo_dias_prov: itemPlazos[i.id] ? Number(itemPlazos[i.id]) : null,
+          })),
+        })
+        // Feedback que cuenta QUÉ pasó, línea por línea partida, con los números que
+        // devolvió el backend (no los que creímos mandar). Dura más que el toast
+        // estándar porque hay que alcanzar a leerlo.
+        const ocLabel = numeroOc.trim()
+        const particiones: any[] = resp?.particiones ?? []
+        const lineas = particiones.map(p => {
+          const it = selectedItems.find(i => i.id === p.item_id)
+          const parte = it?.numero_parte || `ítem ${p.item_id}`
+          return `${parte}: asignaste ${p.qty_asignada} de ${p.qty_original} a la OC ${ocLabel}; quedan ${p.qty_remanente} en el panel.`
+        })
+        const enteras = (resp?.asignados ?? selectedItems.length) - particiones.length
+        if (enteras > 0) lineas.push(`Además ${enteras} línea(s) completa(s) asignada(s).`)
+        toast.success(
+          <span style={{ whiteSpace: 'pre-line' }}>{lineas.join('\n')}</span>,
+          { duration: 9000 },
+        )
+      }
       onSuccess()
     } catch (e: any) {
-      const detail = e.response?.data?.detail
-      toast.error(typeof detail === 'string' ? detail : 'Error al asignar')
+      // El detalle del backend viene redactado para humanos (400/404/409/422): se
+      // muestra ENTERO en el recuadro del modal, nunca truncado en un toast. El 422
+      // de validación de Pydantic llega como lista de objetos → se aplanan los msg.
+      const d = e?.response?.data?.detail
+      const msg = typeof d === 'string'
+        ? d
+        : Array.isArray(d)
+          ? d.map((x: any) => {
+              // Con el `loc` el operador sabe QUÉ campo/línea falló (revisión H2):
+              // «items.0.cantidad: Input should be…» en vez del msg suelto en inglés.
+              const loc = Array.isArray(x?.loc) ? x.loc.slice(1).join('.') : ''
+              const msg = typeof x?.msg === 'string' ? x.msg : JSON.stringify(x)
+              return loc ? `${loc}: ${msg}` : msg
+            }).join('\n')
+          : 'No se pudo asignar. Revisa los datos e inténtalo de nuevo.'
+      setErrorAsignar(msg)
     } finally {
       setSaving(false)
     }
@@ -242,17 +385,19 @@ function AsignarModal({
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-4"
       style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)' }}
-      onClick={e => { if (e.target === e.currentTarget) onClose() }}
+      onClick={e => { if (e.target === e.currentTarget) cerrarSeguro() }}
     >
+      {/* max-w-xl (antes lg): la tabla ganó la columna "Cantidad a asignar" y con
+          lg el input quedaba apretado en pantallas chicas. */}
       <div
-        className="w-full max-w-lg rounded-2xl border shadow-2xl p-6 space-y-5 max-h-[90vh] overflow-y-auto"
+        className="w-full max-w-xl rounded-2xl border shadow-2xl p-6 space-y-5 max-h-[90vh] overflow-y-auto"
         style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}
       >
         <div className="flex items-center justify-between">
           <h3 className="font-semibold text-base" style={{ color: 'var(--text-primary)' }}>
             Asignar a OC-Proveedor
           </h3>
-          <button onClick={onClose} className="rounded-lg p-1 hover:bg-[var(--surface-200)] transition-colors">
+          <button onClick={cerrarSeguro} className="rounded-lg p-1 hover:bg-[var(--surface-200)] transition-colors">
             <X className="w-4 h-4" style={{ color: 'var(--text-muted)' }} />
           </button>
         </div>
@@ -399,7 +544,7 @@ function AsignarModal({
         <div>
           <div className="flex items-center justify-between mb-2">
             <label className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>
-              Plazo por item (dias habiles proveedor)
+              Cantidad a asignar y plazo por item
             </label>
             {selectedRows.size >= 2 && (
               <button onClick={handleDuplicar}
@@ -408,7 +553,10 @@ function AsignarModal({
               </button>
             )}
           </div>
-          <div className="rounded-xl border overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+          {/* overflow-x-auto (antes hidden): con la columna nueva de cantidad la tabla
+              puede exceder el ancho del modal en pantallas chicas — que scrollee, no
+              que se corte. */}
+          <div className="rounded-xl border overflow-x-auto" style={{ borderColor: 'var(--border)' }}>
             <table className="w-full text-xs">
               <thead>
                 <tr style={{ backgroundColor: 'var(--surface-200)', borderBottom: '1px solid var(--border)' }}>
@@ -420,6 +568,9 @@ function AsignarModal({
                   </th>
                   <th className="px-3 py-2 text-left font-semibold uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>
                     N° Parte
+                  </th>
+                  <th className="px-3 py-2 text-left font-semibold uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>
+                    Cantidad a asignar
                   </th>
                   <th className="px-3 py-2 text-left font-semibold uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>
                     Plazo Max. cliente
@@ -451,6 +602,44 @@ function AsignarModal({
                     <td className="px-3 py-2 font-mono text-brand-400 font-semibold whitespace-nowrap">
                       {item.numero_parte}
                     </td>
+                    {/* Control de cantidad: por defecto la cantidad completa; mínimo 1,
+                        máximo lo disponible, enteros. Solo en líneas 'cerrado' sin
+                        vínculo — si la línea no admite parcial, se muestra la cantidad
+                        a secas (no se ofrece lo que el backend rechazaría con 409). */}
+                    <td className="px-3 py-2 whitespace-nowrap" onClick={e => e.stopPropagation()}>
+                      {admiteParcial(item) ? (() => {
+                        const total = item.cantidad ?? 0
+                        const q = Number((itemQtys[item.id] ?? '').trim())
+                        const esParcialValida = !isNaN(q) && Number.isInteger(q) && q >= 1 && q < total
+                        return (
+                          <>
+                            <span className="inline-flex items-center gap-1.5">
+                              <input
+                                type="number"
+                                min={1}
+                                max={total}
+                                step={1}
+                                className="input w-16 py-1 text-xs"
+                                value={itemQtys[item.id] ?? ''}
+                                onChange={e => {
+                                  setItemQtys(prev => ({ ...prev, [item.id]: e.target.value }))
+                                  setErrorAsignar(null)
+                                }}
+                                title={`Cuántas unidades asignar a esta OC (entre 1 y ${total}). El resto queda disponible en el panel.`}
+                              />
+                              <span style={{ color: 'var(--text-muted)' }}>de {total}</span>
+                            </span>
+                            {esParcialValida && (
+                              <span className="block text-[10px] mt-0.5 font-semibold text-amber-400">
+                                Asignar {q} de {total} — quedan {total - q} en el panel
+                              </span>
+                            )}
+                          </>
+                        )
+                      })() : (
+                        <span style={{ color: 'var(--text-muted)' }}>{item.cantidad}</span>
+                      )}
+                    </td>
                     <td className="px-3 py-2" style={{ color: 'var(--text-muted)' }}>
                       {item.plazo_entrega_max ? `${item.plazo_entrega_max}d` : '—'}
                     </td>
@@ -475,8 +664,31 @@ function AsignarModal({
           </div>
         </div>
 
+        {/* Rechazo pintado ACÁ, pegado al botón que el operador acaba de apretar, y se
+            queda hasta que él lo cierre — patrón H7 de ComprasContabPage: el detalle
+            del backend viene redactado para humanos y hay que poder leerlo entero
+            (un toast de 4 segundos no alcanza para un 409 importante). */}
+        {errorAsignar && (
+          <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2.5 text-xs space-y-1.5">
+            <p className="font-semibold text-red-400 flex items-start gap-1.5">
+              <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
+              No se pudo asignar
+            </p>
+            <p style={{ color: 'var(--text-muted)', whiteSpace: 'pre-line' }}>{errorAsignar}</p>
+            <button
+              type="button"
+              onClick={() => setErrorAsignar(null)}
+              className="font-semibold hover:underline"
+              style={{ color: 'var(--text-faint)' }}
+            >
+              Ocultar este aviso
+            </button>
+          </div>
+        )}
+
         <div className="flex gap-3 pt-1">
-          <button onClick={onClose} className="btn-secondary flex-1">Cancelar</button>
+          <button onClick={cerrarSeguro} disabled={saving}
+            className="btn-secondary flex-1 disabled:opacity-50">Cancelar</button>
           <button
             onClick={handleSave}
             disabled={saving}

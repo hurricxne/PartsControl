@@ -43,7 +43,8 @@ muestra "pago no verificado / verificado".
 ## Tablas (nuevas, aditivas)
 `monza_cont_factura_cliente`, `monza_cont_factura_cliente_item`, `monza_cont_cobranza`,
 `monza_cont_factoring`, `monza_cont_adelanto`. Además agrega columnas aditivas a tablas
-existentes: `monza_despachos` (`guia_firmada`, `guia_firmada_archivo`) y `monza_cotizaciones`
+existentes: `monza_despachos` (`guia_firmada`, `guia_firmada_archivo`; `fecha_firma` y
+`usuario_firma_id` los agrega `migrations/monza_despachos_fecha_firma.py`) y `monza_cotizaciones`
 (`pct_adelanto`, `adelanto_verificado`).
 
 ## Endpoints — prefijo `/api/monza/contabilidad`
@@ -51,8 +52,7 @@ existentes: `monza_despachos` (`guia_firmada`, `guia_firmada_archivo`) y `monza_
 |---|---|---|
 | GET | `/ventas` | listado de ventas + resumen cobranza |
 | GET | `/ventas/{cot_id}` | detalle (ítems, guías, facturas) |
-| GET | `/ventas/{cot_id}/despachos-facturables` | guías facturables |
-| PATCH | `/ventas/despachos/{desp_id}/guia-firmada` | marca/registra firma (opcional) |
+| GET | `/ventas/{cot_id}/despachos-facturables` | guías facturables (las sin firmar viajan con `guia_firmada=false`; el selector las deshabilita) |
 | POST | `/ventas/{cot_id}/adelanto/verificar` | Contabilidad verifica el adelanto (monto/fecha/banco) |
 | GET | `/facturas` | listado + antigüedad de cartera |
 | POST | `/facturas` | emitir factura |

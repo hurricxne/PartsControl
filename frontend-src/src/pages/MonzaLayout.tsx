@@ -5,6 +5,7 @@ import {
   Users, FileText, TrendingUp, Settings, LogOut,
   ChevronDown, Bell, LayoutDashboard, Car, Sun, Moon, Truck, ScrollText,
   ShoppingCart, PackageSearch, Ship, Boxes, UserCog, Wallet, Receipt, DollarSign, Calculator, CreditCard, Landmark, LifeBuoy,
+  BookOpenCheck,
 } from "lucide-react";
 import { useAuthStore } from "../stores/authStore";
 
@@ -67,6 +68,7 @@ const _NAV_CONTAB_TODOS = [
   { to: "/monzaparts/ventas-contab",     label: "Ventas",            icon: DollarSign },
   { to: "/monzaparts/facturas",          label: "Facturas y cobranzas", icon: Receipt },
   { to: "/monzaparts/compras-contab",    label: "Compras y pagos",   icon: CreditCard },
+  { to: "/monzaparts/libro-sii",         label: "Libro SII",         icon: BookOpenCheck },
   { to: "/monzaparts/tesoreria",         label: "Tesorería",         icon: Landmark },
   { to: "/monzaparts/embarques-pricing", label: "Embarques Pricing", icon: Calculator },
 ];
@@ -74,6 +76,7 @@ const NAV_CONTABILIDAD = MONZA_CONTAB
   ? _NAV_CONTAB_TODOS
   : _NAV_CONTAB_TODOS.filter(i => ![
       "/monzaparts/ventas-contab", "/monzaparts/compras-contab",
+      "/monzaparts/libro-sii",
       "/monzaparts/tesoreria", "/monzaparts/embarques-pricing",
     ].includes(i.to));
 
@@ -111,6 +114,7 @@ const BREADCRUMB: Record<string, string> = {
   "/monzaparts/ventas-contab":  "Ventas — Contabilidad",
   "/monzaparts/facturas":       "Facturas y Cobranzas",
   "/monzaparts/compras-contab": "Compras y Cuentas por Pagar",
+  "/monzaparts/libro-sii":      "Libro de Compras SII",
   "/monzaparts/tesoreria":      "Tesorería",
   "/monzaparts/embarques-pricing": "Embarques — Pricing",
   "/monzaparts/abastecimiento": "Abastecimiento / Compras",

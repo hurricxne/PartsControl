@@ -11,6 +11,7 @@ import json
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 
@@ -22,6 +23,7 @@ from models.models import (
     Cotizacion, ItemCotizacion, OcCliente, OcProveedor, OcProveedorItem,
     User, Proveedor, Embarque, EmbarqueItem, EmbarqueDocumento, PreEmbarque, PreEmbarqueItem,
     ConfiguracionCotizador, FacturaProveedor, FacturaProveedorItem,
+    DespachoItem, ContFacturaClienteItem,
 )
 from services.pricing_service import (
     calcular_cotizacion, config_efectivo, CLAVES_PRICING, snapshot_desde_config,
@@ -211,6 +213,23 @@ class AsignacionItems(BaseModel):
     item_ids: List[int]
     oc_cliente_id: int
     item_plazos: Optional[List[ItemPlazo]] = None
+
+
+class AsignacionParcialItem(BaseModel):
+    item_id: int
+    # None = SENTINELA EXPLÍCITO de "línea entera" (mismo contrato que el
+    # preparar-parcial de Monza). El 0 se RECHAZA con 422: jamás el `if cantidad`
+    # falsy de preparar_items_parcial (donde preparar 0 preparaba todo).
+    # Float por compatibilidad con la columna (models.py: cantidad es Float), pero
+    # el endpoint exige que sea entero: las unidades físicas son enteras.
+    cantidad: Optional[float] = None
+    plazo_dias_prov: Optional[int] = None
+    plazo_entrega_max: Optional[int] = None
+
+
+class AsignacionParcialBody(BaseModel):
+    oc_cliente_id: int
+    items: List[AsignacionParcialItem]
 
 
 class PreparadoItems(BaseModel):
@@ -1077,8 +1096,21 @@ def get_items_preparados(
     return result
 
 
-def _clone_item_cotizacion(item, qty: float, estado: str, db):
-    """Clone an ItemCotizacion with a new quantity and estado. (helper interno)"""
+def _clone_item_cotizacion(item, qty: float, estado: str, db, clonar_vinculo: bool = True):
+    """Clone an ItemCotizacion with a new quantity and estado. (helper interno)
+
+    ÚNICO dueño de la copia de línea en Grupo AM (regla de la casa: una sola copia
+    impide que dos clonadores deriven). Lo usan los 3 splits del pipeline:
+      · preparar-parcial (:1036) y cierre de pre-embarque (:1239): el remanente sigue
+        comprado al MISMO proveedor → `clonar_vinculo=True` (default, comportamiento
+        histórico intacto) clona también su OcProveedorItem.
+      · asignación parcial a OC-Proveedor (_partir_linea_para_asignar): el remanente
+        vuelve al panel SIN proveedor, asignable a otro → `clonar_vinculo=False`.
+        Si acá se clonara el vínculo, el remanente nacería "comprado a X": Seguimiento
+        lo agruparía bajo esa OCP y el panel jamás lo ofrecería a otro proveedor.
+
+    Nota: scraping_error NO se copia a propósito (queda NULL en la hermana): es
+    diagnóstico transiente del scraping, sin valor en el clon."""
     from models.models import ItemCotizacion as _IC
     new_item = _IC(
         cotizacion_id         = item.cotizacion_id,
@@ -1107,8 +1139,9 @@ def _clone_item_cotizacion(item, qty: float, estado: str, db):
     db.add(new_item)
     db.flush()
 
-    # Clone OcProveedorItem
-    asig = db.query(OcProveedorItem).filter_by(item_cotizacion_id=item.id).first()
+    # Clone OcProveedorItem (solo en los splits post-compra; ver docstring)
+    asig = (db.query(OcProveedorItem).filter_by(item_cotizacion_id=item.id).first()
+            if clonar_vinculo else None)
     if asig:
         new_asig = OcProveedorItem(
             oc_proveedor_id  = asig.oc_proveedor_id,
@@ -1121,6 +1154,351 @@ def _clone_item_cotizacion(item, qty: float, estado: str, db):
         db.flush()
 
     return new_item
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# ASIGNACIÓN PARCIAL a OC-Proveedor — split de la línea en el punto de COMPRA
+# ═══════════════════════════════════════════════════════════════════════════════════
+# El encargo del dueño: de una línea 'cerrado' de 3 unidades, asignar 1 o 2 a un
+# proveedor y que el remanente quede en el panel, asignable a otro. Es el mismo split
+# que GA ya hace aguas abajo (preparar-parcial y cierre de pre-embarque) con una
+# diferencia deliberada: el clon NO hereda la OcProveedorItem (clonar_vinculo=False),
+# porque acá el remanente todavía no es de nadie.
+#
+# El endpoint legado POST /oc-proveedor/{id}/items queda INTACTO (código del
+# programador, con su propio contrato); el front elige la vía según si manda
+# cantidades — mismo patrón que /items/preparar vs /items/preparar-parcial.
+#
+# LIMITACIÓN HONESTA (documentada por el panel de diseño): mientras el asignar_items
+# legado siga sin locks, un "asignar entero" legado simultáneo con un split nuevo
+# sobre el mismo ítem sigue siendo una carrera que el lock de acá no puede cerrar
+# solo. Cerrarla exige lockear el legado (código del programador → pedir confirmación
+# al dueño antes de tocarlo).
+
+
+def _validar_pedidos_asignacion(pedidos: list) -> list:
+    """Saneo del body ANTES de tocar la base. Devuelve la lista de ids.
+
+    Cada rechazo es un 422 EXPLÍCITO: ninguno de los 4 vicios del patrón viejo
+    (0 falsy → "todo", clamp silencioso, id repetido que burla el tope por línea,
+    id inexistente tragado con continue) llega a mutar nada."""
+    if not pedidos:
+        raise HTTPException(422, "Sin ítems para asignar")
+    ids = [p.item_id for p in pedidos]
+    # Dos líneas del mismo ítem en un pedido burlarían la validación de cantidad
+    # (cada una se compararía sola contra el total de la línea).
+    if len(set(ids)) != len(ids):
+        raise HTTPException(
+            422, "Hay ítems repetidos en el pedido: consolida la cantidad en una sola línea")
+    for p in pedidos:
+        if p.cantidad is None:
+            continue  # línea entera
+        q = float(p.cantidad)
+        if q <= 0:
+            raise HTTPException(
+                422,
+                f"Cantidad inválida para el ítem {p.item_id}: debe ser mayor que 0 "
+                "(omite el campo para asignar la línea completa)")
+        # La columna es Float pero las unidades físicas son enteras: 1.5 unidades no
+        # existe en bodega (qty_recibida es entero) y jamás cuadraría una recepción.
+        if not q.is_integer():
+            raise HTTPException(
+                422,
+                f"Cantidad {p.cantidad} inválida para el ítem {p.item_id}: "
+                "las unidades son enteras")
+    return ids
+
+
+def _lockear_items_asignacion(db: Session, ids: list) -> dict:
+    """Relectura BAJO LOCK de las líneas a asignar, en orden id ASC (ancla canónica
+    de la casa: el mismo orden que cerrar_despacho, recepción nacional y el costeo
+    de compras → sin deadlock estructural).
+
+    EL LOCK ES OBLIGATORIO, no decorativo: sin él dos asignaciones parciales
+    simultáneas del mismo ítem leen cantidad=3 cada una, cada una clona su remanente
+    y SE INVENTAN UNIDADES. populate_existing(): sin él el identity map de SQLAlchemy
+    devolvería el snapshot viejo aunque el lock haya esperado.
+
+    Ids inexistentes → 404 EXPLÍCITO, nunca el `if not item: continue` del patrón
+    viejo. Las validaciones de estado/pertenencia/cantidad del llamador corren
+    DESPUÉS de este lock, sobre datos frescos."""
+    items = (
+        db.query(ItemCotizacion)
+        .filter(ItemCotizacion.id.in_(ids))
+        .order_by(ItemCotizacion.id.asc())
+        .populate_existing()
+        .with_for_update()
+        .all()
+    )
+    if len(items) != len(set(ids)):
+        faltan = sorted(set(ids) - {i.id for i in items})
+        raise HTTPException(
+            404, f"Ítem(s) inexistente(s): {', '.join(str(i) for i in faltan)}")
+    return {i.id: i for i in items}
+
+
+def _rechazar_split_con_documento_ga(db: Session, item_ids: list) -> None:
+    """409 si una línea que se va a PARTIR ya está referenciada por un documento
+    físico o contable. En 'cerrado' esto es vacuamente cierto (la línea no llegó a
+    pre-embarque, embarque, despacho ni factura), pero es un cinturón fail-closed
+    barato: un dato inconsistente no debe poder duplicar plata.
+
+    Solo consulta tablas del NÚCLEO (models.models, siempre creadas): acá no hay
+    rollback posible por tabla ausente, así que los locks del llamador quedan
+    intactos — a diferencia del guard de Monza, que consulta módulos satélite y
+    debe re-lockear después. Se aplica SOLO a las líneas que realmente se parten
+    (lección de Monza: bloquear movimientos que no parten nada rompía flujos vivos)."""
+    if not item_ids:
+        return
+    ids = sorted({int(i) for i in item_ids})
+    for col, nombre in (
+        (DespachoItem.item_cotizacion_id, "un despacho"),
+        (ContFacturaClienteItem.item_cotizacion_id, "una factura de venta"),
+        (PreEmbarqueItem.item_cotizacion_id, "un pre-embarque"),
+        (EmbarqueItem.item_cotizacion_id, "un embarque"),
+    ):
+        malos = {r[0] for r in db.query(col).filter(col.in_(ids)).all()}
+        if malos:
+            raise HTTPException(
+                409,
+                f"No se puede partir: ítem(s) {', '.join(str(i) for i in sorted(malos))} "
+                f"ya referenciado(s) por {nombre}.")
+
+
+def _partir_linea_para_asignar(db: Session, item, qty):
+    """Aplica la regla de oro del split a UNA línea en el punto de ASIGNACIÓN:
+    deja `qty` unidades en la original y devuelve la hermana remanente en el estado
+    previo ('cerrado', sin vínculo) — o None si no hubo partición.
+
+    `qty is None` o `qty == cantidad` = línea entera: sin clon, camino legado.
+    `qty > cantidad` = 422 EXPLÍCITO, jamás el clamp `min(qty, cantidad)` silencioso
+    del patrón viejo (un typo del operador compraría toda la línea sin avisar).
+
+    Invariantes de plata (regla de oro GA, espejo del molde Monza):
+      · precio_unit_cotizacion COPIADO idéntico (jamás prorratear).
+      · total_cotizacion RECALCULADO en AMBAS mitades como qty × precio... con el
+        guard de coherencia ANTES: el import Excel puede haber guardado un total
+        divergente de cantidad × precio (excel_service lo lee crudo) y recalcular
+        sobre esa línea MOVERÍA plata en silencio → 400.
+      · total None se PRESERVA en ambas mitades: una línea sin monto no gana plata
+        por partirse (el helper compartido escribe qty×(precio or 0); se corrige acá
+        sin cambiar el comportamiento de sus 2 callers viejos).
+      · unitarios copiados sin dividir; cabecera de la cotización INTACTA.
+      · Σ cantidad y Σ total de las hermanas == línea original.
+
+    Caso borde aceptado y documentado: si la cantidad original vino fraccionaria del
+    Excel (la columna es Float), un qty entero menor deja remanente fraccionario —
+    aritméticamente válido (precio copiado, totales recalculados)."""
+    if qty is None:
+        return None
+    cant_total = item.cantidad
+    etiqueta = item.numero_parte or item.descripcion or f"ítem {item.id}"
+    if cant_total is None or cant_total <= 0:
+        raise HTTPException(
+            422,
+            f"La línea '{etiqueta}' no tiene cantidad válida ({cant_total}): "
+            "no se puede partir")
+    qty = float(qty)
+    if qty > cant_total:
+        raise HTTPException(
+            422,
+            f"Cantidad {qty:g} excede lo disponible de '{etiqueta}' ({cant_total:g})")
+    if qty == cant_total:
+        return None  # línea entera: nada que partir
+
+    # Guard de coherencia del total ANTES de tocar plata (solo cuando se parte:
+    # asignar la línea entera no recalcula nada y no debe rebotar por deuda legada).
+    precio = item.precio_unit_cotizacion
+    total = item.total_cotizacion
+    if total is not None:
+        if (precio is None or precio <= 0) and float(total) > 0:
+            raise HTTPException(
+                400,
+                f"La línea '{etiqueta}' tiene total sin precio unitario: partirla "
+                "movería el monto de la venta en silencio. Corrija la línea o "
+                "asígnela completa.")
+        esperado = cant_total * (precio or 0)
+        if abs(float(total) - esperado) > 0.01:
+            raise HTTPException(
+                400,
+                f"La línea '{etiqueta}' tiene un total ({total}) que no cuadra con "
+                f"cantidad × precio unitario ({esperado:g}): partirla movería plata. "
+                "Corrija la línea o asígnela completa.")
+
+    remanente = cant_total - qty
+    # Remanente en el estado PREVIO ('cerrado': vuelve al panel) y SIN vínculo.
+    clon = _clone_item_cotizacion(item, remanente, item.estado_item, db,
+                                  clonar_vinculo=False)
+    if total is None:
+        # Regla del None: el helper compartido escribió qty×(precio or 0) en el clon;
+        # se re-aplica None en ambas mitades (la original ya lo es y no se toca).
+        clon.total_cotizacion = None
+    else:
+        item.total_cotizacion = qty * (precio or 0)
+    item.cantidad = qty
+    return clon
+
+
+def _asignar_parcial_tx(db: Session, ocp_id: int, body: AsignacionParcialBody) -> dict:
+    """Transacción del split de asignación. UN solo commit al final; cualquier
+    rechazo intermedio deja la base intacta (nada se commitea a medias)."""
+    oc = db.query(OcProveedor).filter(OcProveedor.id == ocp_id).first()
+    if not oc:
+        raise HTTPException(404, "OC-Proveedor no encontrada")
+    occ = db.query(OcCliente).filter(OcCliente.id == body.oc_cliente_id).first()
+    if not occ:
+        raise HTTPException(404, "OC-Cliente no encontrada")
+
+    pedidos = list(body.items or [])
+    ids = _validar_pedidos_asignacion(pedidos)
+
+    # LOCK 1 — las líneas, ANTES de validar: las validaciones corren sobre lo lockeado.
+    items_by_id = _lockear_items_asignacion(db, ids)
+
+    # Pertenencia: el ítem debe ser de la cotización de ESTA OC-Cliente (jamás un
+    # continue mudo: el id ajeno es un error del cliente y se le dice cuál).
+    ajenos = sorted(i.id for i in items_by_id.values()
+                    if i.cotizacion_id != occ.cotizacion_id)
+    if ajenos:
+        raise HTTPException(
+            422,
+            f"Ítem(s) de otra cotización: {', '.join(str(i) for i in ajenos)} "
+            "no pertenecen a la OC-Cliente indicada")
+
+    # Estado: la asignación parcial opera SOLO sobre líneas 'cerrado' (las asignables
+    # del panel). 'comprado' → 409 (decisión v1 del panel de diseño); cualquier otro
+    # estado (preparado, embarcado…) → 422: partir ahí es trabajo de preparar-parcial
+    # o del cierre de pre-embarque, no de este endpoint.
+    comprados = [i for i in items_by_id.values() if i.estado_item == "comprado"]
+    if comprados:
+        det = ", ".join(i.numero_parte or i.descripcion or str(i.id) for i in comprados)
+        raise HTTPException(
+            409,
+            f"Ítem(s) ya comprados ({det}): la reasignación parcial no existe "
+            "todavía — mueva la línea entera o use el panel.")
+    otros = [i for i in items_by_id.values() if i.estado_item != "cerrado"]
+    if otros:
+        det = ", ".join(f"{i.numero_parte or i.descripcion or i.id} "
+                        f"(estado: {i.estado_item or 'sin estado'})" for i in otros)
+        raise HTTPException(
+            422, f"Ítem(s) que no están en estado 'cerrado': {det}")
+
+    # LOCK 2 — vínculos existentes del ítem, DESPUÉS de los ítems (orden items→asigs
+    # SIEMPRE, ambos id ASC: cierra la carrera check-then-insert sin crear ciclos).
+    # Una línea 'cerrado' con OcProveedorItem es dato inconsistente → fail-closed.
+    asigs_previas = (
+        db.query(OcProveedorItem)
+        .filter(OcProveedorItem.item_cotizacion_id.in_(ids))
+        .order_by(OcProveedorItem.id.asc())
+        .populate_existing()
+        .with_for_update()
+        .all()
+    )
+    if asigs_previas:
+        det = ", ".join(str(a.item_cotizacion_id) for a in asigs_previas)
+        raise HTTPException(
+            409,
+            f"Ítem(s) {det} ya tienen vínculo con un proveedor: la reasignación "
+            "parcial no existe todavía — mueva la línea entera o use el panel.")
+
+    # Guard duro de documentos, SOLO sobre lo que realmente se parte.
+    a_partir = [p.item_id for p in pedidos
+                if p.cantidad is not None
+                and float(p.cantidad) < float(items_by_id[p.item_id].cantidad or 0)]
+    _rechazar_split_con_documento_ga(db, a_partir)
+
+    now = datetime.utcnow()
+    particiones = []
+    for p in pedidos:
+        it = items_by_id[p.item_id]
+        cant_original = it.cantidad
+        clon = _partir_linea_para_asignar(db, it, p.cantidad)
+        # El trozo asignado: 'comprado' con su vínculo (mismos campos que asignar_items).
+        it.estado_item = "comprado"
+        db.add(OcProveedorItem(
+            oc_proveedor_id=ocp_id,
+            oc_cliente_id=occ.id,
+            item_cotizacion_id=it.id,
+            fecha_asignacion=now,
+            plazo_dias_prov=p.plazo_dias_prov,
+        ))
+        # plazo_entrega_max del body va SOLO al trozo asignado (el clon ya copió el
+        # previo, porque el split corre antes de esta línea).
+        if p.plazo_entrega_max is not None:
+            it.plazo_entrega_max = p.plazo_entrega_max
+        if clon is not None:
+            particiones.append({
+                "item_id": it.id,
+                "item_id_remanente": clon.id,
+                "qty_asignada": it.cantidad,
+                "qty_remanente": clon.cantidad,
+                "qty_original": cant_original,
+            })
+
+    db.commit()
+    return {"ok": True, "asignados": len(pedidos), "particiones": particiones}
+
+
+@router.post(
+    "/oc-proveedor/{ocp_id}/items-parcial",
+    dependencies=[Depends(require_empresa("mineria"))],
+)
+def asignar_items_parcial(
+    ocp_id: int,
+    body: AsignacionParcialBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Asigna líneas 'cerrado' a una OC-Proveedor con cantidad PARCIAL opcional.
+
+    `cantidad` ausente/None = línea entera (mismo efecto que asignar_items para esa
+    línea, sin clon). Con cantidad menor, la línea se PARTE: el trozo asignado queda
+    'comprado' con su OcProveedorItem y el remanente conserva 'cerrado' y CERO
+    vínculo — vuelve al panel, asignable a otro proveedor.
+
+    Retry 1213/1205 (regla de la casa): toma locks sobre ItemCotizacion, las mismas
+    filas que lockean cerrar_despacho y el costeo de compras."""
+    resultado = None
+    for _ in range(3):
+        try:
+            resultado = _asignar_parcial_tx(db, ocp_id, body)
+            break
+        except OperationalError as e:
+            db.rollback()
+            code = getattr(getattr(e, "orig", None), "args", [None])[0]
+            if code not in (1213, 1205):
+                raise
+    if resultado is None:
+        raise HTTPException(409, "Conflicto de concurrencia al asignar: reintenta")
+
+    # Bitácora del split — patrón GA de compras (crear_oc_cliente): notificación
+    # POST-commit, en try/except, nunca dentro de la función reintentada
+    # (crear_notificacion hace commit propio y un fallo posterior re-entraría la
+    # tx sobre un estado ya commiteado).
+    if resultado.get("particiones"):
+        try:
+            from notificaciones import crear_notificacion
+            ocp = db.query(OcProveedor).filter(OcProveedor.id == ocp_id).first()
+            det = "; ".join(
+                f"asignadas {p['qty_asignada']:g} de {p['qty_original']:g}, "
+                f"remanente {p['qty_remanente']:g} "
+                f"(ítem {p['item_id']} → remanente {p['item_id_remanente']})"
+                for p in resultado["particiones"])
+            crear_notificacion(
+                db=db,
+                rol="abastecimiento",
+                severidad="info",
+                titulo=f"Asignación parcial a OC-Prov {ocp.numero if ocp else ocp_id}",
+                mensaje=det,
+                entidad_tipo="oc_proveedor",
+                entidad_id=ocp_id,
+                link="/compras",
+                regla=None,  # sin dedup: es bitácora, cada split es un evento
+            )
+        except Exception as e:
+            print(f"[warn] notificacion asignacion parcial: {e}")
+
+    return resultado
 
 
 @router.post("/pre-embarques", status_code=201)

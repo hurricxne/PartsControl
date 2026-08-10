@@ -333,6 +333,92 @@ function RegistrarEntregaNacionalModal({ ocpId, titulo, onClose, onSuccess }: {
   );
 }
 
+/**
+ * Devolver a compras un ítem que el proveedor dejó en BACK ORDER (caso Baukat).
+ *
+ * Pide cantidad y motivo porque las dos cosas se pierden si no se piden acá: la
+ * cantidad porque el back order suele ser PARCIAL (mandan 6 de 10), y el motivo porque
+ * esta es la única transición que va hacia atrás en el pipeline y borra el vínculo con
+ * la OC — sin él, meses después nadie sabe si fue back order, error o cancelación.
+ */
+function DevolverAComprasModal({ item, onClose, onSuccess }: {
+  item: SegItem;
+  onClose: () => void;
+  onSuccess: () => void;
+}) {
+  const { dark } = useMonzaTheme();
+  const [cantidad, setCantidad] = useState(item.cantidad);
+  const [motivo, setMotivo] = useState("Back order del proveedor");
+  const [saving, setSaving] = useState(false);
+  const bd = dark ? "#1e2a4a" : "#E2E8F0"; const txt = dark ? "white" : "#1E293B";
+  const sub = dark ? "#8899cc" : "#64748B"; const bg = dark ? "#131b3e" : "white";
+  const inp = { width: "100%", padding: "8px 10px", border: `1px solid ${bd}`, borderRadius: 8,
+    fontSize: 13, background: dark ? "#0d1321" : "#F8FAFC", color: txt, boxSizing: "border-box" as const };
+  const parcial = cantidad < item.cantidad;
+  const valido = cantidad >= 1 && cantidad <= item.cantidad && motivo.trim().length >= 3;
+
+  const submit = async () => {
+    setSaving(true);
+    try {
+      // Cantidad completa → se manda SIN `cantidad` (la línea entera, sin partirla).
+      await monzaAbastecimientoAPI.devolverACompras(
+        [{ item_id: item.id, ...(parcial ? { cantidad } : {}) }], motivo.trim());
+      toast.success(parcial
+        ? `${cantidad} de ${item.cantidad} volvieron al panel de compras`
+        : "El ítem volvió al panel de compras");
+      onSuccess();
+    } catch (e: unknown) {
+      toast.error(monzaErrMsg(e, "No se pudo devolver a compras"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 60, padding: 16 }} onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} style={{ background: bg, border: `1px solid ${bd}`, borderRadius: 14, width: "100%", maxWidth: 460, overflow: "hidden" }}>
+        <div style={{ padding: "14px 18px", borderBottom: `1px solid ${bd}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <span style={{ fontWeight: 700, fontSize: 14, color: txt }}>Devolver a compras</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: sub, display: "flex" }}><X size={18} /></button>
+        </div>
+        <div style={{ padding: "16px 18px", display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ fontSize: 12, color: sub, lineHeight: 1.5 }}>
+            <b style={{ color: txt }}>{item.descripcion}</b>{item.numero_parte ? ` · ${item.numero_parte}` : ""}
+            {item.ocp_numero ? <> — comprado en la OC <b style={{ color: txt }}>{item.ocp_numero}</b></> : null}
+            {item.ocp_proveedor ? ` a ${item.ocp_proveedor}` : ""}.
+            <br />Vuelve al <b style={{ color: txt }}>panel de compras</b> para comprarlo de nuevo.
+          </div>
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>
+              Cantidad que vuelve <span style={{ fontWeight: 400 }}>(de {item.cantidad})</span>
+            </label>
+            <input type="number" min={1} max={item.cantidad} step={1} value={cantidad}
+              onChange={(e) => setCantidad(Math.max(1, Math.min(item.cantidad, Math.round(Number(e.target.value) || 0))))}
+              style={inp} />
+            {parcial && (
+              <p style={{ fontSize: 11, color: "#B45309", margin: "5px 0 0" }}>
+                Las otras {item.cantidad - cantidad} unidades siguen compradas en la misma OC.
+              </p>
+            )}
+          </div>
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Motivo *</label>
+            <input value={motivo} onChange={(e) => setMotivo(e.target.value)}
+              placeholder="Ej: back order confirmado por el proveedor" style={inp} />
+          </div>
+        </div>
+        <div style={{ padding: "12px 18px", borderTop: `1px solid ${bd}`, display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          <button onClick={onClose} style={{ padding: "8px 16px", border: `1px solid ${bd}`, borderRadius: 8, background: "transparent", color: sub, cursor: "pointer", fontSize: 13 }}>Cancelar</button>
+          <button onClick={submit} disabled={saving || !valido}
+            style={{ padding: "8px 18px", border: "none", borderRadius: 8, background: saving || !valido ? sub : "#B45309", color: "white", cursor: saving || !valido ? "not-allowed" : "pointer", fontWeight: 700, fontSize: 13 }}>
+            {saving ? "Devolviendo…" : "Devolver a compras"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function KpiCard({ label, value, accent }: { label: string; value: number; accent: string }) {
   const { dark } = useMonzaTheme();
   return (
@@ -356,6 +442,10 @@ export default function MonzaSeguimientoPage() {
   const togglePrep = (id: number) => setSelPrep((p) => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
   // Modal "Registrar entrega nacional" (OC nacional: camión + guía, sin embarque)
   const [entregaOcp, setEntregaOcp] = useState<{ id: number; titulo: string } | null>(null);
+  // Ítem que se va a devolver al panel de compras (back order). Guarda el ítem entero
+  // porque el modal muestra su OC y su cantidad para que el operador confirme sobre
+  // datos, no de memoria.
+  const [devolver, setDevolver] = useState<SegItem | null>(null);
   // Cantidad a PREPARAR por ítem (envío parcial: el proveedor mandó 6 de 10). Sin
   // tocar nada vale toda la línea; si se baja, el backend parte la línea y el
   // remanente sigue en "Comprado" esperando el próximo embarque.
@@ -569,6 +659,16 @@ export default function MonzaSeguimientoPage() {
                           Registrar entrega nacional →
                         </button>
                       )}
+                      {/* BACK ORDER: solo desde 'comprado' — una vez preparado o
+                          embarcado la mercadería ya salió del proveedor y esto deja de
+                          tener sentido (el backend rechaza igual). */}
+                      {it.estado_linea === "comprado" && (
+                        <button onClick={(e) => { e.stopPropagation(); setDevolver(it); }}
+                          title="El proveedor no lo va a enviar (back order): devolver al panel de compras"
+                          style={{ display: "block", marginTop: 4, background: "none", border: "none", cursor: "pointer", color: "#B45309", fontSize: 10, fontWeight: 700, padding: 0, textAlign: "left", fontFamily: "inherit" }}>
+                          ← Devolver a compras
+                        </button>
+                      )}
                     </td>
                   </tr>,
                 ];
@@ -594,6 +694,14 @@ export default function MonzaSeguimientoPage() {
           titulo={entregaOcp.titulo}
           onClose={() => setEntregaOcp(null)}
           onSuccess={() => { setEntregaOcp(null); fetchAll(); }}
+        />
+      )}
+
+      {devolver && (
+        <DevolverAComprasModal
+          item={devolver}
+          onClose={() => setDevolver(null)}
+          onSuccess={() => { setDevolver(null); fetchAll(); }}
         />
       )}
     </div>

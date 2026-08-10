@@ -163,6 +163,11 @@ def _lead_dict(lead: MonzaLead) -> dict:
         "asesor": asesor_nombre,
         "proximo_paso": proximo,
         "sin_contactar_dias": delta,
+        # Flete aéreo elegido para ESTA cotización (uno solo para todos sus ítems).
+        # NULL = nunca se eligió y manda la configuración global, que es como se
+        # comportaba antes de que la moneda del flete fuera seleccionable.
+        "moneda_tarifa": lead.moneda_tarifa,
+        "tarifa_aerea": lead.tarifa_aerea,
         "fecha_creacion": lead.fecha_creacion.isoformat(),
         "fecha_actualizacion": lead.fecha_actualizacion.isoformat(),
         "cliente": _cliente_dict(lead.cliente) if lead.cliente else None,
@@ -196,6 +201,16 @@ def _item_dict(it: MonzaLeadItem) -> dict:
         "cantidad": it.cantidad,
         "precio_clp": it.precio_clp,
         "plazo_entrega": it.plazo_entrega,
+        # Parámetros con que la calculadora obtuvo el precio. Viajan para que al
+        # REABRIRLA se restaure lo que el operador puso (costo en su moneda, peso,
+        # margen) en vez del camino de emergencia que mostraba el precio final como si
+        # fuera el costo, en CLP. NULL en los ítems anteriores a la migración
+        # monza_cotizador_parametros: ahí la pantalla cae al comportamiento viejo.
+        "costo": it.costo,
+        "moneda": it.moneda,
+        "peso_kg": it.peso_kg,
+        "markup_pct": it.markup_pct,
+        "tc_aplicado": it.tc_aplicado,
     }
 
 

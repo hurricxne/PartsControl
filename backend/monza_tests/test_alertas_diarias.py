@@ -309,7 +309,31 @@ def test_alertas_diarias_monza():
 
         # ══ 2) Las 3 reglas nuevas notifican ══════════════════════════════════
         assert _notifs_monza() == [], "arrancamos sin avisos Monza del test"
+        # SONDA DE AISLAMIENTO ENTRE CONCERNS (revisión 2026-08-07): el job de
+        # alertas hace SOLO alertas. Hubo una versión en que el libro del SII
+        # colgaba de acá, y entonces esta suite disparaba ocho barridos y ocho
+        # corridas del matcher contra la base compartida: el estado que dejaban
+        # tumbaba suites vecinas (`test_matcher` se abstenía por «hay un barrido
+        # corriendo»). Se mide por las BITÁCORAS, que es la huella que el barrido
+        # no puede dejar de escribir si corre. Si alguien vuelve a acoplarlos,
+        # esto se pone rojo acá y no tres suites más allá.
+        def _runs_sii():
+            try:
+                from wasabil_compras.models import SiiLibroSyncRun
+                from monza_wasabil_compras.models import MonzaSiiLibroSyncRun
+            except Exception:            # paquete ausente: nada que vigilar
+                return None
+            return (db.query(SiiLibroSyncRun).count(),
+                    db.query(MonzaSiiLibroSyncRun).count())
+
+        _runs_antes = _runs_sii()
         scheduler.run_daily_checks()
+        if _runs_antes is not None:
+            db.expire_all()              # la cuenta se lee de la BD, no del caché
+            assert _runs_sii() == _runs_antes, (
+                "run_daily_checks() arrastró el barrido del libro SII: el job de "
+                "alertas y el del libro tienen que estar separados "
+                "(scheduler.run_sii_libro_job)")
 
         # (a) proveedor atrasado
         n = _notifs_monza("oc_proveedor", ids["ocp_venc"])

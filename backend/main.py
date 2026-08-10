@@ -22,6 +22,13 @@ from monza_router_notificaciones import router as monza_notif_router
 from monza_router_integraciones import router as monza_integraciones_router
 from monza_recepcion_nacional.router import router as monza_recep_nac_router  # camino físico de la compra nacional Monza
 from routers import contabilidad
+# Libro de compras del SII (espejo de documentos RECIBIDOS de Wasabil — solo Grupo AM).
+# Lleva su prefijo /api/sii-libro adentro; el candado 'mineria' va a nivel de router.
+from wasabil_compras.router import router as sii_libro_router
+# Matcher banco↔libro SII↔egresos (misma familia, router propio /api/sii-libro/match).
+from wasabil_compras.router_match import router as sii_match_router
+# El Libro de compras del SII de MONZA (monza_wasabil_compras) se importa DENTRO del
+# gate de MonzaParts, más abajo — ver el comentario del `if`.
 from routers import venta_clp
 from embarques_pricing.router import router as embarques_pricing_router
 from compras_contab.router import router as compras_contab_router
@@ -87,15 +94,33 @@ app.include_router(monza_notif_router)
 app.include_router(monza_integraciones_router)
 app.include_router(monza_recep_nac_router)  # /api/monza/recepcion-nacional (SIN prefix extra: el router ya lo trae)
 app.include_router(contabilidad.router, prefix="/api")
+app.include_router(sii_libro_router)
+app.include_router(sii_match_router)
 app.include_router(venta_clp.router)
 app.include_router(embarques_pricing_router, prefix="/api")
 app.include_router(compras_contab_router, prefix="/api")
 app.include_router(recepcion_nacional_router, prefix="/api")  # /api/recepcion-nacional
 app.include_router(tesoreria_router, prefix="/api")
 app.include_router(wasabil_dte_router, prefix="/api")  # /api/wasabil (guías de despacho electrónicas)
-# Contabilidad MonzaParts, activable por flag. El import va DENTRO del if a
-# proposito: con el flag apagado los modelos no se cargan, asi create_all no crea
-# sus tablas (asi corre PROD desde 2026-07-15; ver deploy/README.md).
+# Contabilidad MonzaParts, activable por flag. TODOS los imports van DENTRO del if a
+# proposito: con el flag apagado los modelos no se cargan, asi create_all no crea sus
+# tablas (asi corre PROD desde 2026-07-15; ver deploy/README.md).
+#
+# EL GATE ES UNA SOLA PUERTA, PARA LAS TRES PIEZAS (revision 2026-08-08, hallazgos #7 y
+# #23). El Libro de compras del SII de Monza se montaba FUERA de este if mientras su
+# pantalla (VITE_MONZA_CONTAB) y su Tesoreria (aca adentro) iban apagadas: en PROD el
+# barrido nocturno gastaba cuota del API de Wasabil y escribia el espejo del libro Monza
+# noche a noche, y NADIE podia mirarlo ni corregirlo — el matcher escribe sobre
+# monza_tes_movimiento, cuyo router responde 404 con el flag apagado. Ahora entra al gate
+# junto a Tesoreria, de la que depende.
+#
+# EFECTO LATERAL QUE HAY QUE CONOCER: monza_wasabil_compras/models.py importa a nivel de
+# modulo monza_tesoreria/monza_models/monza_contabilidad/monza_compras_contab para cerrar
+# el grafo de FKs (sin eso, un import aislado del paquete revienta con
+# NoReferencedTableError). Al montarse SIEMPRE, ese cierre metia las 18 tablas
+# monza-contab + sus 7 propias en Base.metadata con el flag apagado, y create_all las
+# creaba: el paso 4 de deploy/README.md fallaba en TODA promocion a PROD. Con el import
+# aca adentro, el invariante documentado vuelve a ser cierto.
 if settings.MONZA_CONTAB_ENABLED:
     from monza_contabilidad.router import router as monza_contabilidad_router
     from monza_embarques_pricing.router import router as monza_embarques_pricing_router
@@ -104,11 +129,17 @@ if settings.MONZA_CONTAB_ENABLED:
     # Wasabil DTE Monza (guías 52 al SII con el RUT de MonzaParts): dentro del gate
     # a propósito — apagado, el módulo ni se importa ni create_all crea su tabla.
     from monza_wasabil_dte.router import router as monza_wasabil_router
+    # Libro de compras del SII de MONZA (paquete propio, token propio, candado
+    # automotriz). Lleva su prefijo /api/monza/sii-libro adentro.
+    from monza_wasabil_compras.router import router as monza_sii_libro_router
+    from monza_wasabil_compras.router_match import router as monza_sii_match_router
     app.include_router(monza_contabilidad_router)
     app.include_router(monza_embarques_pricing_router)
     app.include_router(monza_compras_contab_router)
     app.include_router(monza_tesoreria_router)
     app.include_router(monza_wasabil_router, prefix="/api")  # /api/monza/wasabil/...
+    app.include_router(monza_sii_libro_router)
+    app.include_router(monza_sii_match_router)
 app.include_router(monza_docs_router)
 app.include_router(monza_catalog_router)
 app.include_router(monza_clientes_router)
