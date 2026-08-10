@@ -117,7 +117,9 @@ def _seed_venta(db, sufijo, *, cantidad=10, precio=100000):
     db.add(item); db.flush()
     desp = mm.MonzaDespacho(numero=f"{MARK}-DSP-{sufijo}", cotizacion_id=cot.id,
                             estado="despachado", numero_guia=f"G-{sufijo}",
-                            cliente_nombre=cli.nombre)
+                            cliente_nombre=cli.nombre,
+                            # regla 2026-08-06: sin firma no se factura (el gate tiene suite propia)
+                            guia_firmada=1)
     db.add(desp); db.flush()
     di = mm.MonzaDespachoItem(despacho_id=desp.id, item_id=item.id, qty_despachada=cantidad)
     db.add(di); db.flush()

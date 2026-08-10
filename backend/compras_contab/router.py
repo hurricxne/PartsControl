@@ -595,6 +595,69 @@ def crear_compra(
         409, "Conflicto momentáneo al registrar la compra (registros simultáneos): reintente")
 
 
+# ─── Anti-duplicado BLANDO del alta (hallazgo #1, revisión matcher 2026-08-06) ──
+# El guard exacto de _crear_compra_tx se burla con ceros a la izquierda o prefijos
+# en el folio ('0004071' vs '4071', 'F-1234' vs '1234') y con el RUT formateado vs
+# canónico ('76.513.680-6' vs '76513680-6'): nacían DOS CxP activas por la misma
+# factura física y Tesorería podía pagarla dos veces. Estos helpers son copia
+# DELIBERADA de wasabil_compras (_folio_blando / rut_canonico): los helpers no se
+# comparten entre paquetes (regla de la casa).
+
+def _folio_blando_dup(x) -> str:
+    """Solo dígitos, sin ceros a la izquierda ('F-0004071' → '4071')."""
+    return "".join(c for c in str(x or "") if c.isdigit()).lstrip("0")
+
+
+def _rut_canon_estricto_dup(x):
+    """Texto libre → RUT canónico 'CUERPO-DV', o None si no tiene forma de RUT."""
+    if x is None:
+        return None
+    texto = str(x).strip().upper().replace(" ", "")
+    if not texto:
+        return None
+    if "-" in texto:
+        cuerpo_txt, _, dv = texto.rpartition("-")
+        cuerpo_txt = cuerpo_txt.replace(".", "")
+    elif "." in texto:
+        return None  # puntos sin guión = le falta el DV
+    else:
+        cuerpo_txt, dv = texto[:-1], texto[-1]
+    if not cuerpo_txt.isdigit() or not (dv.isdigit() or dv == "K") or len(dv) != 1:
+        return None
+    cuerpo = int(cuerpo_txt)  # bota ceros a la izquierda
+    if not (6 <= len(str(cuerpo)) <= 8):
+        return None
+    return f"{cuerpo}-{dv}"
+
+
+def _rut_canon_dup(x):
+    """La versión TOLERANTE al espacio donde iba el guión ('96.631.520 2').
+
+    HALLAZGO #9 (revisión 2026-08-08, severidad ALTA — el más grave de la tanda):
+    este helper canonizaba con la regla ESTRICTA, y esa regla se rinde ante el RUT
+    escrito con puntos y un ESPACIO en lugar del guión. Pero `cont_compra.proveedor_rut`
+    es TEXTO LIBRE tecleado a mano: el dato sucio es el caso normal, no el raro. Con la
+    compra vieja guardada como '96.631.520 2', `_rut_canon_dup` devolvía None sobre la
+    CANDIDATA, la fila se descartaba del bucle y el guard quedaba apagado justo para
+    ella — mientras el guard exacto tampoco choca ('96631520-2' ≠ '96.631.520 2') y el
+    UNIQUE (empresa, proveedor_rut, numero_documento_activo) compara el TEXTO del RUT.
+    Resultado: dos CxP ACTIVAS por la misma factura física, las dos pagables por
+    Tesorería. O sea, el doble pago que este guard existe para impedir.
+
+    El propio paquete del libro SII ya había resuelto esto y validado la regla
+    (`_rut_canon_sucio` en wasabil_compras/matcher.py): si la forma estricta se rinde y
+    el texto tiene un espacio, se reintenta cambiando el espacio por el guión. Se copia
+    rama por rama (los helpers no se comparten entre paquetes: regla de la casa).
+
+    Se aplica a los DOS lados de la comparación (payload y candidata) a propósito: la
+    suciedad puede venir de cualquiera de los dos.
+    """
+    canon = _rut_canon_estricto_dup(x)
+    if canon is None and x is not None and " " in str(x).strip():
+        canon = _rut_canon_estricto_dup(str(x).strip().replace(" ", "-"))
+    return canon
+
+
 def _crear_compra_tx(payload: CompraCreate, db: Session, current_user: User):
     empresa = empresa_de(current_user)
     if payload.tipo_gasto not in TIPOS_GASTO:
@@ -613,6 +676,65 @@ def _crear_compra_tx(payload: CompraCreate, db: Session, current_user: User):
         ).first())
         if dup:
             raise HTTPException(409, f"Ya existe una compra con documento {payload.numero_documento} para este proveedor")
+        # Anti-duplicado BLANDO (hallazgo #1, revisión matcher 2026-08-06): además
+        # del exacto de arriba, se compara RUT CANONIZADO + folio BLANDO — la vía
+        # típica del doble conteo es el prefill de la bandeja del libro SII ('4071'
+        # / '76.513.680-6') contra la compra tecleada a mano ('0004071' /
+        # '76513680-6'). Solo aplica si el RUT del payload canoniza (sin RUT no hay
+        # llave confiable y decide el guard exacto). El 409 NOMBRA la compra.
+        rut_obj = _rut_canon_dup(payload.proveedor_rut)
+        folio_obj = _folio_blando_dup(payload.numero_documento)
+        # HALLAZGO #6/#12 (revisión 2026-08-08): el guard blando ignoraba el TIPO de
+        # documento. En Chile la serie de folios es POR TIPO y por emisor: el mismo
+        # proveedor puede emitir la boleta N° 1234 y la factura N° 0001234, que son dos
+        # documentos DISTINTOS y dos deudas distintas. Al canonizar ambos folios a
+        # '1234' el guard los declaraba «la misma factura tecleada distinto» y devolvía
+        # un 409 SIN salida: no hay flag de forzado, no hay endpoint para corregir el
+        # N° después, y el único escape era inventarle un dígito al folio — que es
+        # exactamente lo que el mensaje (con razón) le prohíbe al operador.
+        #
+        # El módulo YA sabía que el tipo discrimina: `_bloqueo_factura_fisica` se limita
+        # a tipo_doc == 'factura' a propósito. Esta era la única capa que lo ignoraba.
+        #
+        # POR QUÉ RELAJAR NO ABRE EL DOBLE PAGO: la vía que de verdad fabrica duplicados
+        # (el prefill de la bandeja del libro SII) llega SIEMPRE como 'factura' contra
+        # una compra tecleada como 'factura', así que el guard sigue disparando donde
+        # está la plata. Y si los dos documentos comparten el N° EXACTO, el guard
+        # exacto de más arriba y el UNIQUE los siguen bloqueando aunque el tipo difiera.
+        tipo_obj = (payload.tipo_doc or "factura").strip().lower()
+        if rut_obj and folio_obj:
+            candidatas = (db.query(ContCompra.id, ContCompra.proveedor_rut,
+                                   ContCompra.numero_documento, ContCompra.tipo_doc)
+                          .filter(ContCompra.empresa == empresa,
+                                  ContCompra.anulado.is_(False),
+                                  ContCompra.numero_documento.isnot(None)).all())
+            for cid, c_rut, c_num, c_tipo in candidatas:
+                # `or 'factura'` en los dos lados: es el default de la columna y del
+                # alta, así que una fila legada con tipo_doc NULL se sigue comparando
+                # contra una factura (el guard no se apaga por un dato ausente).
+                if _folio_blando_dup(c_num) == folio_obj \
+                        and _rut_canon_dup(c_rut) == rut_obj \
+                        and (c_tipo or "factura").strip().lower() == tipo_obj:
+                    raise HTTPException(
+                        409, f"Ya existe la compra #{cid} con documento "
+                             f"'{(c_num or '').strip()}' ({(c_tipo or 'factura')}) "
+                             f"del proveedor "
+                             f"{(c_rut or '').strip()}: es el mismo folio "
+                             f"({folio_obj}), el mismo RUT y el mismo tipo de "
+                             "documento que intenta registrar "
+                             "(difieren solo en ceros/prefijos del folio o en el "
+                             "formato del RUT). Lo más probable es que sea la MISMA "
+                             "factura tecleada distinto: vaya a verla en la lista de "
+                             "compras, con el papel a la vista, antes de cambiar nada. "
+                             # H7: la frase que estaba acá ("si es otra, corrija el N° de
+                             # documento") era la receta EXACTA para fabricar el duplicado
+                             # que este guard existe para impedir — el operador que leía
+                             # medio cartel de 4 segundos le cambiaba un dígito al folio y
+                             # nacía la segunda CxP pagable.
+                             "Si es la misma, no la registre de nuevo. Si de verdad es "
+                             "otra factura distinta, avise a contabilidad antes de "
+                             "forzarla: cambiarle el número para que pase deja la misma "
+                             "deuda cargada dos veces.")
 
     # PORTÓN del embarque: se toma ANTES del lock del gasto (mismo orden que el router del
     # pricing: cabecera → gastos) y serializa el chequeo por FACTURA FÍSICA de más abajo,

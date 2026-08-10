@@ -7,15 +7,19 @@ Es el lado de CUENTAS POR COBRAR de MonzaParts. Espejo de routers/contabilidad.p
 Grupo AM, pero:
   - La VENTA es una MonzaCotizacion (estado 'vendida'/'despachado'); cliente y montos
     ya viven en la cotización y sus ítems (precio neto ya calculado → sin pricing_service).
-  - Se factura una guía de despacho 'despachado' (MonzaDespacho), con doble tope por
-    ÍTEM y por GUÍA contra lo ya facturado. La firma de la guía es OPCIONAL/registrable
-    (no bloquea la emisión).
+  - Se factura una guía de despacho 'despachado' Y con la guía FIRMADA por el cliente
+    (regla 2026-08-06, paridad MachParts): la marca la pone Despachos
+    (monza_router_despachos.py: POST /entidades/{id}/firmar, foto/PDF + fecha) y acá
+    _construir_factura la EXIGE. Doble tope por ÍTEM y por GUÍA contra lo ya facturado.
+    El RETIRO EN OFICINA (sin_guia) solo factura mercadería que NO esté comprometida
+    en despachos; la única factura que no nace de guía es la de ANTICIPO.
 
 Endpoints (todos requieren autenticación + empresa automotriz):
   GET    /ventas                              listado de ventas (cotizaciones) + resumen cobranza
   GET    /ventas/{cot_id}                     detalle de una venta (ítems, guías, facturas)
-  GET    /ventas/{cot_id}/despachos-facturables  guías despachadas aún facturables
-  PATCH  /ventas/despachos/{desp_id}/guia-firmada  marca/registra la guía firmada (opcional)
+  GET    /ventas/{cot_id}/despachos-facturables  guías despachadas aún facturables (las sin
+                                              firmar viajan con guia_firmada=false y el
+                                              selector las deshabilita con el motivo)
   POST   /ventas/{cot_id}/adelanto/verificar  Contabilidad verifica el adelanto informado
   POST   /adelantos/{id}/anular               anula el adelanto (deja la traza 'anulado')
   DELETE /adelantos/{id}                      ELIMINA el registro del adelanto (reversión
@@ -80,7 +84,7 @@ from .models import (
     MonzaContAdelanto,
 )
 from .schemas import (FacturaItemIn, FacturaCreate, CobranzaIn, FactoringIn,
-                      RevertirFactoringIn, GuiaFirmadaIn, AdelantoVerificarIn)
+                      RevertirFactoringIn, AdelantoVerificarIn)
 from .service import (
     TOL, TOL_QTY, TOL_PAGO, MEDIO_FACT_ADELANTO, MEDIO_FACT_RETENCION, MEDIO_ADELANTO,
     ADEL_ANULADO, ADEL_APROBADO,
@@ -123,8 +127,11 @@ def _config(db: Session) -> Optional[MonzaConfig]:
 
 
 def _despacho_items_de_cot(db: Session, cot_id: int):
-    """(MonzaDespachoItem, MonzaDespacho) facturables de la cotización: despachos en
-    estado 'despachado'. La firma de la guía NO se exige (es opcional)."""
+    """(MonzaDespachoItem, MonzaDespacho) de los despachos CERRADOS ('despachado') de la
+    cotización. OJO: cerrado ya NO es sinónimo de facturable — desde 2026-08-06 la
+    emisión exige además la guía FIRMADA (paridad MachParts; el gate vive en
+    _construir_factura). Este helper sigue devolviendo TODOS los cerrados porque los
+    serializadores y el desglose por-facturar (base física) los necesitan completos."""
     return (
         db.query(MonzaDespachoItem, MonzaDespacho)
         .filter(
@@ -140,6 +147,31 @@ def _qty_despachada_por_item(db: Session, cot_id: int) -> dict:
     out = {}
     for di, _d in _despacho_items_de_cot(db, cot_id):
         out[di.item_id] = out.get(di.item_id, 0.0) + _f(di.qty_despachada)
+    return out
+
+
+def _qty_comprometida_en_despachos_por_item(db: Session, cot_id: int) -> dict:
+    """Qty por ítem COMPROMETIDA en despachos VIVOS (en_preparacion + despachado).
+
+    Alimenta el tope del RETIRO EN OFICINA (sin_guia): esa vía solo puede facturar
+    mercadería que el cliente pasa a buscar, es decir, la que NO está asociada a
+    ninguna guía de despacho. Cuenta también los BORRADORES a propósito: un borrador
+    es mercadería ya comprometida a salir con guía — facturarla por caja mientras
+    tanto es el mismo bypass del candado de la firma que esta regla cierra (y si el
+    borrador se anula, el cupo vuelve solo). Los anulados no cuentan."""
+    rows = (
+        db.query(MonzaDespachoItem.item_id, MonzaDespachoItem.qty_despachada)
+        .join(MonzaDespacho, MonzaDespacho.id == MonzaDespachoItem.despacho_id)
+        .filter(
+            MonzaDespacho.cotizacion_id == cot_id,
+            MonzaDespacho.estado.in_(("en_preparacion", "despachado")),
+        )
+        .all()
+    )
+    out = {}
+    for iid, qty in rows:
+        if iid is not None:
+            out[iid] = out.get(iid, 0.0) + _f(qty)
     return out
 
 
@@ -170,6 +202,39 @@ def _qty_facturada_por_despacho_item(db: Session, cot_id: int) -> dict:
     out = {}
     for did, qty in rows:
         out[did] = out.get(did, 0.0) + _f(qty)
+    return out
+
+
+def _qty_facturada_retiro_por_item(db: Session, cot_id: int) -> dict:
+    """Qty por ítem facturada por el canal RETIRO EN OFICINA (facturas sin_guia=1).
+
+    Es la mitad que faltaba del neteo entre canales (hallazgo HIGH del multienjambre
+    2026-08-07): sin el canal persistido, el tope de la guía restaba TODO lo facturado
+    (retiro incluido) mientras el retiro ya había reservado esa mercadería vía
+    pendiente_guias — doble descuento, y unidades ENTREGADAS quedaban infacturables
+    para siempre. Las facturas históricas (pre-columna) quedan en sin_guia=0 ("canal
+    guía"): atribución conservadora — puede achicar el cupo de la guía a favor del
+    retiro, y el techo global vendido−facturado garantiza que NUNCA se sobre-factura.
+
+    Matiz honesto sobre el legado (ronda 2 de la auditoría): con facturas antiguas de
+    RETIRO atribuidas al canal guía, una guía NUEVA y firmada puede quedar
+    transitoriamente sin cupo por los dos canales. No es una trampa permanente —
+    marcar como firmada también la guía antigua sube el firmado del ítem y libera el
+    cupo—, y el 409 del modo despacho nombra exactamente esa salida en vez del
+    genérico "ya fue facturado por completo"."""
+    rows = (
+        db.query(MonzaContFacturaClienteItem.item_cotizacion_id, MonzaContFacturaClienteItem.cantidad)
+        .join(MonzaContFacturaCliente, MonzaContFacturaCliente.id == MonzaContFacturaClienteItem.factura_id)
+        .filter(
+            MonzaContFacturaCliente.cotizacion_id == cot_id,
+            MonzaContFacturaCliente.sin_guia == 1,
+        )
+        .all()
+    )
+    out = {}
+    for iid, qty in rows:
+        if iid is not None:
+            out[iid] = out.get(iid, 0.0) + _f(qty)
     return out
 
 
@@ -1154,7 +1219,10 @@ def detalle_venta(
             "despacho_item_id": di.id, "despacho_id": d.id,
             "numero_despacho": d.numero, "numero_guia": d.numero_guia,
             "estado": d.estado, "qty_despachada": _f(di.qty_despachada),
+            # SOLO LECTURA aquí: la firma se marca en Despachos (con foto/PDF + fecha),
+            # no desde Ventas — regla 2026-08-06, el chip de marcado se eliminó.
             "guia_firmada": bool(getattr(d, "guia_firmada", 0)),
+            "fecha_firma": d.fecha_firma.isoformat() if getattr(d, "fecha_firma", None) else None,
             "guia_firmada_archivo": getattr(d, "guia_firmada_archivo", None),
         })
 
@@ -1270,7 +1338,11 @@ def despachos_facturables(
             # el folio real del SII está por llegar y lo va a pisar. La vía SII sí frena;
             # la manual solo avisa, para no divergir de Grupo AM.
             "guia_sii_en_proceso": _guia_sii_en_proceso(db, d.id),
+            # REGLA 2026-08-06: sin firma NO se factura. La guía se lista IGUAL (con el
+            # flag en falso) para que el selector la muestre deshabilitada con el motivo
+            # — ocultarla mandaba al operador a buscar una guía "desaparecida".
             "guia_firmada": bool(getattr(d, "guia_firmada", 0)),
+            "fecha_firma": d.fecha_firma.isoformat() if getattr(d, "fecha_firma", None) else None,
             "guia_firmada_archivo": getattr(d, "guia_firmada_archivo", None),
             "items_count": 0, "facturable": 0.0,
         })
@@ -1279,32 +1351,12 @@ def despachos_facturables(
     return [e for e in by_desp.values() if e["facturable"] > TOL_QTY]
 
 
-@router.patch("/ventas/despachos/{desp_id}/guia-firmada")
-def marcar_guia_firmada(
-    desp_id: int,
-    payload: GuiaFirmadaIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Marca/registra (opcional) que la guía de un despacho fue firmada por el cliente.
-    Es informativo: NO es requisito para facturar."""
-    desp = db.query(MonzaDespacho).filter(MonzaDespacho.id == desp_id).first()
-    if not desp:
-        raise HTTPException(404, "Despacho no encontrado")
-    # Defensa anti-IDOR: el despacho debe pertenecer a una venta (cotización) real.
-    if not desp.cotizacion_id or not db.query(MonzaCotizacion.id).filter(
-        MonzaCotizacion.id == desp.cotizacion_id
-    ).first():
-        raise HTTPException(404, "El despacho no pertenece a una venta válida")
-    desp.guia_firmada = 1 if payload.firmada else 0
-    if payload.archivo is not None:
-        desp.guia_firmada_archivo = payload.archivo or None
-    db.commit()
-    return {
-        "id": desp.id,
-        "guia_firmada": bool(desp.guia_firmada),
-        "guia_firmada_archivo": desp.guia_firmada_archivo,
-    }
+# El PATCH /ventas/despachos/{id}/guia-firmada se ELIMINÓ (2026-08-06): era un toggle
+# sin validaciones ("informativo") y la firma ahora GATEA la facturación. Marcar la
+# firma vive donde ocurre la entrega — Despachos (monza_router_despachos.py:
+# POST /entidades/{id}/firmar), que exige despacho cerrado + foto/PDF + fecha, con
+# des-firmar prohibido. Contabilidad la LEE (despachos-facturables, detalle de venta)
+# y la EXIGE (_construir_factura); no la escribe.
 
 
 @router.post("/ventas/{cot_id}/adelanto/verificar")
@@ -1756,9 +1808,48 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
     # Despachos 'despachado' de la cotización (lo que se puede facturar)
     desp_items = _despacho_items_de_cot(db, cot.id)
     di_by_id = {di.id: di for di, _d in desp_items}
+    desp_by_id = {d.id: d for _di, d in desp_items}
     desp_qty_item = _qty_despachada_por_item(db, cot.id)
     fact_qty_item = _qty_facturada_por_item(db, cot.id)
     fact_qty_di = _qty_facturada_por_despacho_item(db, cot.id)
+
+    # ── REGLA 2026-08-06 · guía FIRMADA obligatoria (paridad MachParts) ────────
+    # El flujo CON guía solo factura despachos cuya guía esté FIRMADA por el cliente
+    # (guia_firmada==1, la marca Despachos con foto/PDF + fecha). Derivados:
+    #   · desp_qty_item_firmada: tope agregado por ítem del flujo con guía — contar
+    #     ahí un despacho SIN firmar dejaría colar sus cantidades por la vía de
+    #     ítems explícitos sin despacho_item_id.
+    #   · fact_retiro_item / fact_guia_item: lo facturado partido POR CANAL (la
+    #     columna factura.sin_guia). El canal es lo que evita el DOBLE descuento
+    #     entre guía y retiro (hallazgo HIGH del multienjambre 2026-08-07: retiro
+    #     primero + guía después dejaba las unidades de la guía infacturables,
+    #     porque el tope de la guía restaba también lo facturado por retiro).
+    #   · pendiente_guias_item: lo COMPROMETIDO en despachos vivos que el canal
+    #     guía aún no factura. Es lo que el RETIRO EN OFICINA no puede tocar: esa
+    #     mercadería sale (o salió) con guía y se factura POR su guía firmada. Sin
+    #     este descuento, bastaba marcar "retiro" para facturar una guía jamás
+    #     firmada — el bypass exacto que la regla cierra.
+    # Lo YA facturado no se re-litiga: el gate aplica hacia adelante (las facturas
+    # históricas pre-candado quedan como están; los topes usan max(0, ...) para que
+    # un legado sobre-facturado no descuadre el cálculo).
+    desp_qty_item_firmada = {}
+    for di, d in desp_items:
+        if getattr(d, "guia_firmada", 0):
+            desp_qty_item_firmada[di.item_id] = (
+                desp_qty_item_firmada.get(di.item_id, 0.0) + _f(di.qty_despachada)
+            )
+    fact_retiro_item = _qty_facturada_retiro_por_item(db, cot.id)
+    # Consumo atribuible al canal GUÍA = todo lo facturado que no fue retiro (líneas
+    # ligadas a despacho_item + sueltas validadas contra el tope firmado).
+    fact_guia_item = {
+        iid: max(0.0, qty - fact_retiro_item.get(iid, 0.0))
+        for iid, qty in fact_qty_item.items()
+    }
+    comprometida_viva = _qty_comprometida_en_despachos_por_item(db, cot.id)
+    pendiente_guias_item = {
+        iid: max(0.0, qty - fact_guia_item.get(iid, 0.0))
+        for iid, qty in comprometida_viva.items()
+    }
 
     # Determinar líneas a facturar
     lineas: List[FacturaItemIn] = []
@@ -1786,15 +1877,29 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
                 probs.add(404, "Despacho no encontrado para esta venta")
             elif desp_sel.estado != "despachado":
                 probs.add(400, "Solo se puede facturar una guía en estado 'despachado'")
+            elif not getattr(desp_sel, "guia_firmada", 0):
+                # Mismo texto que el modo despacho (un solo mensaje por regla).
+                probs.add(400, "La guía de este despacho no está FIRMADA por el cliente: "
+                               "márcala en Despachos (subiendo la foto/PDF firmada y la "
+                               "fecha de la firma) antes de facturar")
     elif payload.sin_guia:
-        # Retiro en oficina: derivar del saldo pendiente de la cotización (sin despacho).
+        # Retiro en oficina: derivar del saldo pendiente de la cotización que NO esté
+        # comprometido en despachos (esa parte sale con guía y se factura POR su guía
+        # firmada — ver pendiente_guias_item arriba).
+        en_guias = 0.0
         for it in cot.items:
-            disp = _f(it.cantidad) - fact_qty_item.get(it.id, 0.0)
+            pend_guia = pendiente_guias_item.get(it.id, 0.0)
+            en_guias += pend_guia
+            disp = _f(it.cantidad) - fact_qty_item.get(it.id, 0.0) - pend_guia
             if disp > TOL_QTY:
                 lineas.append(FacturaItemIn(item_cotizacion_id=it.id, cantidad=round(disp, 4)))
         if not lineas:
             if not cot.items:
                 probs.add(400, "La venta no tiene ítems para facturar")
+            elif en_guias > TOL_QTY:
+                probs.add(409, "Todo lo pendiente de esta venta está asociado a guías de "
+                               "despacho: factúralo desde su guía (firmada), no como retiro "
+                               "en oficina")
             else:
                 probs.add(409, "Esta venta ya fue facturada por completo")
     elif payload.despacho_id:
@@ -1806,6 +1911,13 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
             probs.add(404, "Despacho no encontrado para esta venta")
         elif desp.estado != "despachado":
             probs.add(400, "Solo se puede facturar una guía en estado 'despachado'")
+        elif not getattr(desp, "guia_firmada", 0):
+            # REGLA 2026-08-06 (espejo del guard de routers/contabilidad.py de GA):
+            # SOLO se factura una guía FIRMADA — entregada y firmada por el cliente.
+            # La marca la pone Despachos (foto/PDF + fecha); acá únicamente se exige.
+            probs.add(400, "La guía de este despacho no está FIRMADA por el cliente: "
+                           "márcala en Despachos (subiendo la foto/PDF firmada y la "
+                           "fecha de la firma) antes de facturar")
         else:
             # AUDITORÍA (hallazgo LOW «facturar por la vía manual un despacho SIN N° de
             # guía no avisa nada»): paridad con Grupo AM (routers/contabilidad.py) — la
@@ -1822,11 +1934,23 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
             ).all()
             for di in desp_item_rows:
                 disp_di = _f(di.qty_despachada) - fact_qty_di.get(di.id, 0.0)
-                disp_item = (
-                    desp_qty_item.get(di.item_id, 0.0)
+                # Tope agregado con las MISMAS fórmulas (por canal) que la validación
+                # por línea de abajo: derivar con otras colaría cantidades que la
+                # propia validación rechazaría después. Dos techos:
+                #   · canal guía: firmado − facturado POR el canal guía (restar lo del
+                #     retiro acá era el doble descuento del hallazgo HIGH);
+                #   · global: vendido − facturado TOTAL (nunca facturar de más aunque
+                #     la atribución de canal del legado sea imperfecta).
+                it_der = items_by_id.get(di.item_id)
+                techo_global = (
+                    (_f(it_der.cantidad) if it_der else 0.0)
                     - fact_qty_item.get(di.item_id, 0.0)
-                    - usado_deriv.get(di.item_id, 0.0)
                 )
+                disp_item = min(
+                    desp_qty_item_firmada.get(di.item_id, 0.0)
+                    - fact_guia_item.get(di.item_id, 0.0),
+                    techo_global,
+                ) - usado_deriv.get(di.item_id, 0.0)
                 disponible = min(disp_di, disp_item)
                 if disponible > TOL_QTY:
                     lineas.append(FacturaItemIn(
@@ -1836,7 +1960,25 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
                     ))
                     usado_deriv[di.item_id] = usado_deriv.get(di.item_id, 0.0) + disponible
             if not lineas:
-                probs.add(409, "El despacho ya fue facturado por completo")
+                # Un cupo NEGATIVO del canal guía (firmado − facturado_del_canal < 0)
+                # solo ocurre con facturas LEGADAS: las anteriores a la regla quedaron
+                # todas en sin_guia=0 ("canal guía"), así que una de retiro antigua le
+                # come cupo a una guía nueva. Decirle "ya fue facturado por completo"
+                # a un despacho SIN una sola línea facturada manda a buscar donde no
+                # hay nada; el mensaje nombra la salida real (firmar también la guía
+                # antigua devuelve el cupo, porque sube el firmado del ítem).
+                legado = any(
+                    desp_qty_item_firmada.get(di.item_id, 0.0)
+                    - fact_guia_item.get(di.item_id, 0.0) < -TOL_QTY
+                    for di in desp_item_rows
+                )
+                if legado:
+                    probs.add(409, "Esta venta tiene facturas ANTIGUAS (anteriores a la regla de "
+                                   "la guía firmada) atribuidas al canal guía que superan lo "
+                                   "firmado: marca como firmada también la guía antigua de esta "
+                                   "venta para liberar el cupo de esta")
+                else:
+                    probs.add(409, "El despacho ya fue facturado por completo")
     if not lineas and not probs.items:
         probs.add(400, "Debe indicar ítems o un despacho a facturar")
 
@@ -1855,30 +1997,49 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
             continue
 
         if payload.sin_guia:
-            # RETIRO EN OFICINA: tope por lo VENDIDO − ya facturado (no requiere despacho ni guía).
+            # RETIRO EN OFICINA: tope por lo VENDIDO − ya facturado − COMPROMETIDO en
+            # despachos (eso sale con guía y se factura por su guía firmada). La derivación
+            # de arriba ya aplicó este tope; acá se re-exige por línea (defensa en
+            # profundidad: el tope no depende de quién armó la línea).
             disponible = (
                 _f(it.cantidad)
                 - fact_qty_item.get(ln.item_cotizacion_id, 0.0)
+                - pendiente_guias_item.get(ln.item_cotizacion_id, 0.0)
                 - usado_item.get(ln.item_cotizacion_id, 0.0)
             )
             if cantidad > disponible + TOL_QTY:
-                probs.add(409, f"{it.numero_parte or it.descripcion}: cantidad excede lo vendido/no facturado (disp {max(disponible,0):.0f})")
+                probs.add(409, f"{it.numero_parte or it.descripcion}: cantidad excede lo vendido "
+                               f"no facturado y sin guía asociada (disp {max(disponible,0):.0f}); "
+                               "lo que está en guías de despacho se factura desde su guía firmada")
                 continue
         else:
-            # FLUJO CON GUÍA: tope por lo DESPACHADO − ya facturado, y por GUÍA si aplica.
-            despachado_item = desp_qty_item.get(ln.item_cotizacion_id, 0.0)
+            # FLUJO CON GUÍA: tope por lo DESPACHADO CON GUÍA FIRMADA − facturado POR
+            # el canal guía (restar lo del retiro era el doble descuento del hallazgo
+            # HIGH), con techo global vendido − facturado total; y por GUÍA si aplica.
+            # Contar despachos sin firmar dejaría colar sus cantidades por ítems
+            # explícitos sin despacho_item_id (regla 2026-08-06).
+            despachado_item = desp_qty_item_firmada.get(ln.item_cotizacion_id, 0.0)
             if despachado_item <= 0:
-                probs.add(400, f"{it.numero_parte or it.descripcion} no ha sido despachado; no se puede facturar")
+                if desp_qty_item.get(ln.item_cotizacion_id, 0.0) > 0:
+                    probs.add(400, f"{it.numero_parte or it.descripcion}: su guía de despacho no "
+                                   "está FIRMADA por el cliente; márcala en Despachos antes de facturar")
+                else:
+                    probs.add(400, f"{it.numero_parte or it.descripcion} no ha sido despachado; no se puede facturar")
                 continue
-            disponible = (
-                despachado_item
-                - fact_qty_item.get(ln.item_cotizacion_id, 0.0)
-                - usado_item.get(ln.item_cotizacion_id, 0.0)
-            )
+            disponible = min(
+                despachado_item - fact_guia_item.get(ln.item_cotizacion_id, 0.0),
+                _f(it.cantidad) - fact_qty_item.get(ln.item_cotizacion_id, 0.0),
+            ) - usado_item.get(ln.item_cotizacion_id, 0.0)
             if ln.despacho_item_id is not None:
                 di = di_by_id.get(ln.despacho_item_id)
                 if not di or di.item_id != ln.item_cotizacion_id:
                     probs.add(400, f"Guía/despacho inválido para {it.numero_parte or it.descripcion}")
+                    continue
+                d_de_linea = desp_by_id.get(di.despacho_id)
+                if not d_de_linea or not getattr(d_de_linea, "guia_firmada", 0):
+                    probs.add(400, "La guía de este despacho no está FIRMADA por el cliente: "
+                                   "márcala en Despachos (subiendo la foto/PDF firmada y la "
+                                   "fecha de la firma) antes de facturar")
                     continue
                 disp_di = _f(di.qty_despachada) - fact_qty_di.get(di.id, 0.0) - usado_di.get(di.id, 0.0)
                 disponible = min(disponible, disp_di)
@@ -2100,6 +2261,35 @@ def _construir_factura_anticipo(db: Session, payload: FacturaCreate, cot: MonzaC
     if neto <= 0:
         probs.add(400, "Indica el monto NETO del anticipo (mayor a 0)")
 
+    # 2.b) ADVERTENCIA (no bloqueo) cuando la venta tiene mercadería COMPROMETIDA en
+    # despachos vivos aún sin facturar. El multienjambre 2026-08-07 mostró que el
+    # anticipo es la salida obvia del operador al que el gate de la firma le rechaza
+    # la guía (400 → "factura de anticipo" → 200 por el total, sin referencia 52): un
+    # «anticipo» por mercadería YA en guía no respalda un depósito, y el DTE nace
+    # materialmente cuestionable. NO se bloquea porque la Fase 7 fijó a propósito que
+    # la vía manual no bloquea (punto 15: anticipo por el total → final en $0 con
+    # advertencia) y hay flujo legítimo tardío (adelanto aprobado con la mercadería
+    # ya despachada). Endurecerlo es DECISIÓN DEL DUEÑO (pendiente registrado).
+    comprometida_ant = _qty_comprometida_en_despachos_por_item(db, cot.id)
+    if comprometida_ant:
+        # Se descuenta SOLO lo facturado por el canal GUÍA (mismo criterio que
+        # pendiente_guias_item de _construir_factura). Con el facturado TOTAL, un
+        # retiro previo tapaba la cuenta y el aviso se callaba justo en el escenario
+        # mixto que debía alertar: venta de 10 con 4 en guía sin firmar + 4 de retiro
+        # ya facturado daba pendiente 0 y ninguna advertencia.
+        fact_ant_total = _qty_facturada_por_item(db, cot.id)
+        fact_ant_retiro = _qty_facturada_retiro_por_item(db, cot.id)
+        pendiente_ant = sum(
+            max(0.0, qty - max(0.0, fact_ant_total.get(iid, 0.0) - fact_ant_retiro.get(iid, 0.0)))
+            for iid, qty in comprometida_ant.items()
+        )
+        if pendiente_ant > TOL_QTY:
+            advertencias.append(
+                "Esta venta tiene mercadería en guías de despacho aún sin facturar: una "
+                "factura de ANTICIPO no la ampara ni referencia su guía. Si lo que "
+                "quieres es facturar la entrega, hazlo desde la guía FIRMADA (Despachos "
+                "→ Marcar guía firmada); el anticipo es solo para respaldar un depósito")
+
     # 3) IVA con la tasa CONGELADA DE LA VENTA (iva_rate_de), nunca un 0,19 fijo: la
     #    factura de anticipo y la del despacho real tienen que sumar exactamente el
     #    total de esa venta, y ese total se congeló con la tasa de la cotización.
@@ -2235,6 +2425,10 @@ def _persistir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
         despacho_id=None if es_anticipo else datos["snap_desp_id"],
         numero_guia=None if es_anticipo else datos["snap_guia"],
         es_anticipo=1 if es_anticipo else 0,
+        # CANAL de la factura (regla 2026-08-06): el retiro en oficina queda marcado
+        # para que el neteo guía↔retiro de _construir_factura no descuente la misma
+        # mercadería dos veces. Un anticipo nunca es retiro (no consume mercadería).
+        sin_guia=0 if es_anticipo else (1 if payload.sin_guia else 0),
         numero_factura=folio or None,
         tipo_doc=tipo_doc,
         fecha_emision=fecha_emision, condicion_pago=payload.condicion_pago,

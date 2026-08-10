@@ -3,12 +3,15 @@ import shutil
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from database import get_db
 from auth import get_current_user
+# Candado de empresa SOLO para el endpoint nuevo /bodega/items (el resto del
+# router queda como está: decisión pendiente del dueño).
+from empresa_guard import require_empresa
 from models.models import (
     User, Embarque, EmbarqueItem, ItemCotizacion, OcCliente, OcProveedor,
     OcProveedorItem, FacturaProveedor, FacturaProveedorItem,
@@ -1009,3 +1012,237 @@ def alertas_plazo_critico(
                 "total_items": len(items),
             })
     return result
+
+
+# ── BUSCADOR DE ÍTEMS («Buscar ítem», aditivo 2026-08-05) ─────────────────────
+# Bodega listaba EMBARQUES, nunca ítems: para responder «¿dónde está esta parte?»
+# este endpoint introduce la vista de ítems (fila = ItemCotizacion), con el
+# contrato común de búsqueda (docs/spec-buscadores-bodega-despachos-2026-08-05.md).
+# Los helpers de normalización viven en routers/despachos.py (helper único de la
+# marca) y se importan localmente — patrón probado bodega→despachos, sin ciclo.
+# El endpoint nace con candado de empresa PROPIO (a nivel de ruta): el resto del
+# router queda tal cual está (decisión pendiente del dueño).
+
+# Alcance de estados (decisión de la spec, no opción): la respuesta del buscador
+# suele ser «todavía en el aire», así que se listan también los estados previos
+# a bodega. Cada fila muestra el suyo.
+_ESTADOS_BUSCABLES = (
+    "comprado", "preparado", "pre_embarcado",
+    "embarcado", "en_bodega", "reclamo_proveedor",
+)
+
+
+@router.get("/items", dependencies=[Depends(require_empresa("mineria"))])
+def buscar_items(
+    q: Optional[str] = None,
+    estado: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Búsqueda de ítems para el operador de Bodega.
+
+    Campos del OR (el placeholder del frontend es un CONTRATO con esta lista):
+    n° de parte (con pasada colapsada sin guiones), descripción/nombre_cat (las
+    dos: la pantalla imprime `descripcion or nombre_cat`), marca, n° de
+    cotización (con y sin prefijo COT-), cliente, n° de OC del cliente, n° de
+    embarque, n° de AWB (awb_numero, NUNCA `awb` que guarda el archivo adjunto)
+    y n° de guía del proveedor nacional (la compra nacional no pasa por
+    embarques: sin ese EXISTS quedaría invisible).
+
+    Sobre de respuesta: {items, total, page, page_size, q_efectivo, normalizado}.
+    Serialización en lote (queries fijas, nunca por ítem): PROHIBIDO _item_detail
+    aquí — dispara hasta 6 queries por ítem.
+    """
+    from sqlalchemy import and_, exists, func, or_  # noqa: F401 (func: pasada B)
+    from models.models import Cotizacion, OcCliente as OcClienteM, Despacho, DespachoItem
+    from recepcion_nacional.models import RecepcionNacional, RecepcionNacionalItem
+    from routers.despachos import (
+        _normalizar_q, _variantes_token, _patron, _colapsar,
+        _np_colapsado_sql, _matchea, _qty_recibida_utilizable, _tope_fisico,
+    )
+
+    estados = (
+        (estado,) if estado in _ESTADOS_BUSCABLES else _ESTADOS_BUSCABLES
+    )
+    # LEFT JOIN a oc_cliente por el camino CANÓNICO (relación 1-1 con la
+    # cotización), el mismo que muestra la fila — si el WHERE usara otro camino
+    # el operador buscaría una OC y vería otra.
+    base = (
+        db.query(ItemCotizacion, Cotizacion, OcClienteM)
+        .join(Cotizacion, Cotizacion.id == ItemCotizacion.cotizacion_id)
+        .outerjoin(OcClienteM, OcClienteM.cotizacion_id == Cotizacion.id)
+        .filter(ItemCotizacion.estado_item.in_(estados))
+    )
+
+    def _aplicar_q(query, tokens, con_colapsado=False):
+        """AND entre tokens; OR entre campos por token. Tablas hijas con EXISTS
+        correlacionado, NUNCA join (multiplicaría filas y mentiría el total)."""
+        for tok in tokens:
+            conds = []
+            for v in _variantes_token(tok):
+                pat = _patron(v)
+                conds += [
+                    ItemCotizacion.numero_parte.like(pat, escape="\\"),
+                    ItemCotizacion.descripcion.like(pat, escape="\\"),
+                    ItemCotizacion.nombre_cat.like(pat, escape="\\"),
+                    ItemCotizacion.marca.like(pat, escape="\\"),
+                    Cotizacion.numero.like(pat, escape="\\"),
+                    Cotizacion.cliente.like(pat, escape="\\"),
+                    OcClienteM.numero_oc.like(pat, escape="\\"),
+                    exists().where(and_(
+                        EmbarqueItem.item_cotizacion_id == ItemCotizacion.id,
+                        Embarque.id == EmbarqueItem.embarque_id,
+                        or_(
+                            Embarque.numero.like(pat, escape="\\"),
+                            Embarque.awb_numero.like(pat, escape="\\"),
+                        ),
+                    )),
+                    exists().where(and_(
+                        RecepcionNacionalItem.item_cotizacion_id == ItemCotizacion.id,
+                        RecepcionNacional.id == RecepcionNacionalItem.recepcion_id,
+                        RecepcionNacional.numero_guia_proveedor.like(pat, escape="\\"),
+                    )),
+                ]
+            if con_colapsado and any(ch.isdigit() for ch in tok):
+                conds.append(
+                    _np_colapsado_sql(ItemCotizacion.numero_parte)
+                    .like(_patron(_colapsar(tok)), escape="\\")
+                )
+            query = query.filter(or_(*conds))
+        return query
+
+    tokens = _normalizar_q(q)
+    normalizado = False
+    query = _aplicar_q(base, tokens) if tokens else base
+    total = query.count()
+    if tokens and total == 0 and any(any(c.isdigit() for c in t) for t in tokens):
+        # Pasada B (red de seguridad, full scan reconocido): parte colapsada.
+        query = _aplicar_q(base, tokens, con_colapsado=True)
+        total = query.count()
+        normalizado = total > 0
+
+    # Orden determinista: sin desempate estable, OFFSET puede repetir/perder filas.
+    rows = (
+        query.order_by(ItemCotizacion.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    # ── Serialización EN LOTE (queries fijas sobre los ≤page_size ids) ──
+    item_ids = [it.id for it, _cot, _occ in rows]
+    emb_por_item: dict = {}
+    guias_nac_por_item: dict = {}
+    qty_desp: dict = {}
+    recibidos: dict = {}
+    if item_ids:
+        for item_id, emb_num, emb_awb_num in (
+            db.query(EmbarqueItem.item_cotizacion_id, Embarque.numero, Embarque.awb_numero)
+            .join(Embarque, Embarque.id == EmbarqueItem.embarque_id)
+            .filter(EmbarqueItem.item_cotizacion_id.in_(item_ids))
+            .all()
+        ):
+            emb_por_item.setdefault(item_id, []).append(
+                {"numero": emb_num, "awb_numero": emb_awb_num})
+        for item_id, guia in (
+            db.query(RecepcionNacionalItem.item_cotizacion_id,
+                     RecepcionNacional.numero_guia_proveedor)
+            .join(RecepcionNacional,
+                  RecepcionNacional.id == RecepcionNacionalItem.recepcion_id)
+            .filter(RecepcionNacionalItem.item_cotizacion_id.in_(item_ids))
+            .all()
+        ):
+            if guia:
+                guias_nac_por_item.setdefault(item_id, []).append(guia)
+        # Cobertura por línea (misma verdad que Despachos): recibido y disponible.
+        recibidos = _qty_recibida_utilizable(db, item_ids)
+        for item_id, suma in (
+            db.query(DespachoItem.item_cotizacion_id,
+                     func.sum(DespachoItem.qty_despachada))
+            .join(Despacho, Despacho.id == DespachoItem.despacho_id)
+            .filter(
+                DespachoItem.item_cotizacion_id.in_(item_ids),
+                Despacho.estado != "anulado",
+            )
+            .group_by(DespachoItem.item_cotizacion_id)
+            .all()
+        ):
+            qty_desp[item_id] = float(suma or 0)
+
+    variantes_por_token = [_variantes_token(t) for t in tokens]
+    colapsados = [_colapsar(t) for t in tokens if any(c.isdigit() for c in t)]
+
+    items_out = []
+    for it, cot, occ in rows:
+        disponible = 0.0
+        if it.estado_item == "en_bodega":
+            disponible = max(
+                float(_tope_fisico(it, recibidos)) - qty_desp.get(it.id, 0.0), 0.0)
+
+        match: list = []
+        if tokens:
+            encontrados: dict = {}
+
+            def _agregar(campo, valor):
+                if valor and campo not in encontrados:
+                    encontrados[campo] = valor
+
+            if _matchea(it.numero_parte, variantes_por_token):
+                _agregar("numero_parte", it.numero_parte)
+            if _matchea(it.descripcion, variantes_por_token) or \
+                    _matchea(it.nombre_cat, variantes_por_token):
+                _agregar("repuesto", it.descripcion or it.nombre_cat)
+            if _matchea(it.marca, variantes_por_token):
+                _agregar("marca", it.marca)
+            if normalizado and it.numero_parte and any(
+                    c in _colapsar(it.numero_parte) for c in colapsados):
+                _agregar("numero_parte_colapsado", it.numero_parte)
+            if _matchea(cot.numero, variantes_por_token):
+                _agregar("cotizacion", cot.numero)
+            if _matchea(cot.cliente, variantes_por_token):
+                _agregar("cliente", cot.cliente)
+            if occ is not None and _matchea(occ.numero_oc, variantes_por_token):
+                _agregar("oc_cliente", occ.numero_oc)
+            for emb in emb_por_item.get(it.id, []):
+                if _matchea(emb["numero"], variantes_por_token):
+                    _agregar("embarque", emb["numero"])
+                if _matchea(emb["awb_numero"], variantes_por_token):
+                    _agregar("awb", emb["awb_numero"])
+            for guia in guias_nac_por_item.get(it.id, []):
+                if _matchea(guia, variantes_por_token):
+                    _agregar("guia_nacional", guia)
+            match = [{"campo": c, "valor": v} for c, v in encontrados.items()]
+
+        items_out.append({
+            "item_cotizacion_id": it.id,
+            "numero_parte": it.numero_parte or "",
+            # Lo que la pantalla imprime (mismo criterio que _item_detail):
+            "descripcion": it.descripcion or it.nombre_cat or "",
+            "marca": it.marca or "",
+            "cantidad": float(it.cantidad or 0),
+            "estado_item": it.estado_item,
+            # None = sin recepción registrada (flujo antiguo / carga manual)
+            "qty_recibida": (
+                float(recibidos[it.id]) if it.id in recibidos else None),
+            "qty_disponible": disponible,
+            "cotizacion_id": cot.id,
+            "numero_cotizacion": cot.numero,
+            "cliente": cot.cliente,
+            "numero_oc_cliente": occ.numero_oc if occ else None,
+            "embarques": emb_por_item.get(it.id, []),
+            # Identificador del ítem NACIONAL (no tiene N° de embarque; decirlo
+            # en pantalla, no inventar un join):
+            "guias_nacionales": guias_nac_por_item.get(it.id, []),
+            "match": match,
+        })
+
+    return {
+        "items": items_out,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "q_efectivo": " ".join(tokens),
+        "normalizado": normalizado,
+    }

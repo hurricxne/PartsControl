@@ -1048,10 +1048,12 @@ def run():
         # ══════════════════════════════════════════════════════════════════════
         original_clonar = abast._clonar_item_remanente
 
-        def _clonar_vicioso(db_, it_, remanente, estado):
+        def _clonar_vicioso(db_, it_, remanente, estado, copiar_oc=True):
             """El vicio: subtotal completo heredado (partir 10 en 6+4 dejando el
-            subtotal de 10 en la hermana de 4 infla su precio derivado 2,5×)."""
-            clon = original_clonar(db_, it_, remanente, estado)
+            subtotal de 10 en la hermana de 4 infla su precio derivado 2,5×).
+            `copiar_oc` espeja la firma real (creció con la asignación parcial a
+            OC de proveedor): un mock con firma vieja revienta con TypeError."""
+            clon = original_clonar(db_, it_, remanente, estado, copiar_oc)
             clon.subtotal_clp = it_.subtotal_clp
             db_.flush()
             return clon

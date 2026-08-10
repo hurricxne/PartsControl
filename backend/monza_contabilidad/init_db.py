@@ -240,7 +240,24 @@ def main() -> None:
         else:
             print("[monza_contabilidad] = monza_cont_adelanto.estado ya es NOT NULL DEFAULT 'aprobado'")
 
-    # 4) Columnas aditivas en monza_despachos (firma opcional de la guía)
+    # 3.d) Regla 2026-08-06 (gate de la guía firmada) — canal de la factura.
+    # sin_guia: 1 = RETIRO EN OFICINA. Sin el canal, el neteo guía↔retiro descontaba la
+    # misma mercadería dos veces y dejaba unidades entregadas infacturables (hallazgo
+    # HIGH del multienjambre). Va sobre monza_cont_* (propias del módulo), ANTES del
+    # bloque de monza_despachos y su `return` temprano — misma razón que 3.b/3.c.
+    # Nace NOT NULL DEFAULT 0 de una vez (las históricas SON "canal guía": atribución
+    # conservadora, el techo global vendido−facturado evita que algo quede atrapado).
+    with engine.begin() as conn:
+        if not _columna_existe(conn, "monza_cont_factura_cliente", "sin_guia"):
+            conn.execute(text(
+                "ALTER TABLE monza_cont_factura_cliente "
+                "ADD COLUMN sin_guia INT NOT NULL DEFAULT 0"))
+            print("[monza_contabilidad] + columna monza_cont_factura_cliente.sin_guia")
+        else:
+            print("[monza_contabilidad] = monza_cont_factura_cliente.sin_guia ya existe")
+
+    # 4) Columnas aditivas en monza_despachos (firma de la guía — desde 2026-08-06 la
+    # firma GATEA la facturación: foto/PDF + fecha + quién, ver monza_router_despachos).
     with engine.begin() as conn:
         existe_tabla = conn.execute(
             text(
@@ -261,6 +278,20 @@ def main() -> None:
             print("[monza_contabilidad] + columna monza_despachos.guia_firmada_archivo")
         else:
             print("[monza_contabilidad] = monza_despachos.guia_firmada_archivo ya existe")
+        # fecha_firma / usuario_firma_id (regla 2026-08-06): también los agrega
+        # migrations/monza_despachos_fecha_firma.py — DOBLE CAMINO a propósito, para
+        # que el deploy quede a prueba del olvido de cualquiera de los dos (la trampa
+        # de la Fase 5: columna que el ORM declara y la tabla no tiene = módulo caído).
+        if not _columna_existe(conn, "monza_despachos", "fecha_firma"):
+            conn.execute(text("ALTER TABLE monza_despachos ADD COLUMN fecha_firma DATETIME NULL"))
+            print("[monza_contabilidad] + columna monza_despachos.fecha_firma")
+        else:
+            print("[monza_contabilidad] = monza_despachos.fecha_firma ya existe")
+        if not _columna_existe(conn, "monza_despachos", "usuario_firma_id"):
+            conn.execute(text("ALTER TABLE monza_despachos ADD COLUMN usuario_firma_id INTEGER NULL"))
+            print("[monza_contabilidad] + columna monza_despachos.usuario_firma_id")
+        else:
+            print("[monza_contabilidad] = monza_despachos.usuario_firma_id ya existe")
 
     print("[monza_contabilidad] init OK.")
 

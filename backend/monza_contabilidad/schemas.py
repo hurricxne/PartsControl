@@ -18,11 +18,13 @@ class FacturaItemIn(BaseModel):
 
 class FacturaCreate(BaseModel):
     """Emitir una factura. Tres modos:
-      - `despacho_id`: deriva las líneas de esa guía despachada (tope por lo despachado).
-      - `sin_guia=True` (retiro en oficina): factura el saldo pendiente de la cotización,
-        SIN requerir despacho (tope por lo VENDIDO − ya facturado). EXCLUYENTE: no se
-        combina con despacho_id ni items.
-      - `items` explícitos (tope por lo despachado).
+      - `despacho_id`: deriva las líneas de esa guía despachada Y FIRMADA por el cliente
+        (regla 2026-08-06: sin guia_firmada==1 se rechaza; tope por lo despachado firmado).
+      - `sin_guia=True` (retiro en oficina): factura el saldo de la cotización que NO
+        esté comprometido en despachos (tope por lo VENDIDO − facturado − en guías: lo
+        que sale con guía se factura desde su guía firmada). EXCLUYENTE: no se combina
+        con despacho_id ni items.
+      - `items` explícitos (tope por lo despachado con guía firmada).
       - `es_anticipo=True` (vía B): factura de ANTICIPO, la ÚNICA que NO nace de una
         guía; el tope es el total de la venta aún no facturado.
     numero_factura es el folio SII (único).
@@ -93,11 +95,10 @@ class RevertirFactoringIn(BaseModel):
     motivo: str = Field(..., min_length=5, max_length=500)
 
 
-class GuiaFirmadaIn(BaseModel):
-    """Marca/registra (opcional) si la guía de un despacho fue firmada por el cliente.
-    No es requisito para facturar; es informativo y registrable caso a caso."""
-    firmada: bool = True
-    archivo: Optional[str] = Field(None, max_length=255)
+# GuiaFirmadaIn se ELIMINÓ (2026-08-06): la firma dejó de ser un toggle informativo de
+# Contabilidad y pasó a marcarse en Despachos (monza_router_despachos.py:
+# POST /entidades/{id}/firmar, multipart con foto/PDF + fecha) — ahora ES requisito
+# para facturar y este módulo solo la lee/exige.
 
 
 class AdelantoVerificarIn(BaseModel):

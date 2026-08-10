@@ -6,6 +6,7 @@ import {
   FileText, TrendingUp, Ship, DollarSign, Users, BarChart3,
   ShoppingCart, Package, Receipt, Settings, UserCog,
   FileSignature, PackageSearch, Banknote, Calculator, Building2, Anchor, Truck, Wallet, Landmark,
+  BookOpenCheck,
 } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
 import { useTheme } from '../context/ThemeContext'
@@ -65,6 +66,7 @@ const navGroups: NavGroup[] = [
       { to: '/embarques-pricing',  icon: Calculator,  label: 'Embarques Pricing',exact: false },
       { to: '/facturas',           icon: Receipt,     label: 'Facturas y Cobranzas', exact: false },
       { to: '/compras-contab',     icon: Wallet,      label: 'Compras y Pagos', exact: false },
+      { to: '/libro-sii',          icon: BookOpenCheck, label: 'Libro SII',     exact: false },
       { to: '/tesoreria',          icon: Landmark,    label: 'Tesorería',       exact: false },
     ],
   },
@@ -104,6 +106,7 @@ const pageLabels: Record<string, string> = {
   '/embarques-pricing':   'Embarques Pricing',
   '/facturas':            'Facturas y Cobranzas',
   '/compras-contab':      'Compras y Cuentas por Pagar',
+  '/libro-sii':           'Libro de Compras SII',
   '/tesoreria':           'Tesorería',
   '/reportes':            'Reportes',
   '/proveedores':         'Proveedores',

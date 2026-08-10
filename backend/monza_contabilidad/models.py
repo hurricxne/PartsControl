@@ -65,6 +65,16 @@ class MonzaContFacturaCliente(Base):
     # (MySQL manda los NULL al final en DESC) → la plata entraba a la factura equivocada.
     es_anticipo = Column(Integer, nullable=False, default=0,
                          server_default=text("0"))                 # 0 normal | 1 factura de anticipo
+    # CANAL de la factura (regla 2026-08-06, gate de la guía firmada): 1 = RETIRO EN
+    # OFICINA (sin_guia). Sin esta marca, las líneas sin despacho_item_id no tienen
+    # canal y el neteo guía↔retiro descuenta la misma mercadería DOS veces (hallazgo
+    # HIGH del multienjambre: retiro primero + guía después dejaba unidades entregadas
+    # infacturables para siempre). Las facturas históricas quedan en 0 ("consumo del
+    # canal guía"): atribución imperfecta pero con el techo global vendido−facturado
+    # nada queda atrapado ni se sobre-factura. Mismo patrón server_default que
+    # es_anticipo (ver la nota de arriba: el default de Python no basta).
+    sin_guia = Column(Integer, nullable=False, default=0,
+                      server_default=text("0"))                    # 0 canal guía | 1 retiro en oficina
     fecha_emision = Column(Date, nullable=True, index=True)         # índice: filtros por período (KPIs/listados)
     condicion_pago = Column(String(100), nullable=True)
     plazo_dias = Column(Integer, nullable=True)

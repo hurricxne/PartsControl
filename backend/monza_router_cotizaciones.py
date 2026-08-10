@@ -6,7 +6,7 @@ from typing import Optional, List
 from fastapi import Request, APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 from pydantic import BaseModel, Field
 
 from database import get_db
@@ -16,7 +16,8 @@ from role_guard import require_rol
 from monza_notif import crear_notif
 from monza_models import (
     MonzaCotizacion, MonzaCotizacionItem, MonzaCliente,
-    MonzaLead, MonzaLeadItem, MonzaLeadActividad, MonzaConfig
+    MonzaLead, MonzaLeadItem, MonzaLeadActividad, MonzaConfig,
+    MonzaCotizacionCierre,
 )
 
 router = APIRouter(prefix="/api/monza/cotizaciones", tags=["monza-cotizaciones"])
@@ -69,6 +70,13 @@ class CotUpdate(BaseModel):
     estado: Optional[str] = None
     oc_cliente: Optional[str] = None
     oc_fecha: Optional[date] = None
+    # VENTA A CLIENTE PARTICULAR (2026-08-08): un consumidor final no emite OC. Con
+    # `True`, el cierre usa la COTIZACIÓN como documento de respaldo y llena
+    # `oc_cliente`/`oc_fecha` con su N° y su fecha de emisión — la referencia 801 del
+    # SII sigue apuntando a un documento real. `False` vuelve a exigir la OC del
+    # cliente; `None` (ausente) NO toca la marca, para que un PATCH de otro campo no
+    # la borre sin querer (mismo tri-estado que el resto del schema).
+    cliente_sin_oc: Optional[bool] = None
     fecha_entrega_est: Optional[date] = None
     fecha_venta: Optional[datetime] = None
     forma_pago: Optional[str] = None
@@ -79,9 +87,88 @@ class CotUpdate(BaseModel):
     numero_factura: Optional[str] = None
     fecha_despacho: Optional[date] = None
     tipo_documento: Optional[str] = None
+    # Motivo de una REVERSIÓN (sacar la venta de 'vendida'/'despachado'). Opcional a
+    # propósito: la reversión no se bloquea por no escribirlo — bloquearla dejaría al
+    # operador sin la salida que corrige un cierre por error —, pero si lo escribe queda
+    # en el historial. Ver MonzaCotizacionCierre y _registrar_reversion.
+    motivo_reversion: Optional[str] = Field(None, max_length=400)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# Campos del body que NO son columnas de la cotización: si se les hace setattr, quedan
+# como atributos sueltos del objeto ORM (silenciosos, pero basura). Se excluyen del
+# volcado genérico de abajo.
+_CAMPOS_NO_PERSISTENTES = {"motivo_reversion"}
+
+
+def _registrar_cierre(db: Session, cot, usuario_id=None, usuario_email=None):
+    """Deja la FOTO de este cierre de venta como una versión nueva.
+
+    Una cotización cerrada puede revertirse (si no tiene plata ni logística colgando) y
+    volver a cerrarse con otros datos. El re-cierre PISA el N° de OC, la fecha de OC y la
+    fecha prometida, y hasta acá lo hacía sin dejar rastro: en Ventas la venta aparecía
+    como si siempre hubiera tenido esos datos. Esta fila es la memoria de que hubo un
+    cierre anterior y con qué se cerró.
+
+    El número de versión se calcula BAJO EL MISMO LOCK que el cierre (el `with_for_update`
+    de la cotización, más arriba en el PATCH), así que dos cierres simultáneos no pueden
+    quedarse con el mismo número.
+    """
+    ultima = (db.query(func.max(MonzaCotizacionCierre.version))
+              .filter(MonzaCotizacionCierre.cotizacion_id == cot.id).scalar()) or 0
+    db.add(MonzaCotizacionCierre(
+        cotizacion_id=cot.id,
+        version=ultima + 1,
+        oc_cliente=cot.oc_cliente,
+        oc_fecha=cot.oc_fecha,
+        fecha_entrega_est=cot.fecha_entrega_est,
+        pct_adelanto=cot.pct_adelanto,
+        forma_pago=cot.forma_pago,
+        total_bruto=cot.total_bruto,
+        cerrado_por_id=usuario_id,
+        cerrado_por_email=usuario_email,
+    ))
+
+
+def _registrar_reversion(db: Session, cot, nuevo_estado: str, usuario_id=None,
+                         usuario_email=None, motivo: str = None):
+    """Marca como REVERTIDA la versión vigente del cierre y deshace lo que el cierre sumó.
+
+    Nunca borra la fila: es auditoría, y el punto es justamente que quede el rastro.
+
+    EL LTV. `c.ltv` se suma cuando la venta pasa a 'despachado' (no al cerrarse), y hasta
+    acá NADIE lo restaba al volver atrás. El camino era angosto —hay que despachar, anular
+    todos los despachos, revertir y re-despachar— pero al recorrerlo el cliente terminaba
+    con la venta contada DOS veces en su histórico. Se resta sólo si se está saliendo de
+    'despachado', que es el único estado que la sumó, y con el mismo total que se sumó (el
+    de la versión, no el vivo: si el total cambió entremedio, restar el vivo dejaría un
+    residuo).
+    """
+    vigente = (db.query(MonzaCotizacionCierre)
+               .filter(MonzaCotizacionCierre.cotizacion_id == cot.id,
+                       MonzaCotizacionCierre.revertido_at.is_(None))
+               .order_by(MonzaCotizacionCierre.version.desc())
+               .first())
+    if vigente:
+        vigente.revertido_at = datetime.utcnow()
+        vigente.revertido_por_id = usuario_id
+        vigente.revertido_por_email = usuario_email
+        vigente.revertido_a_estado = nuevo_estado
+        vigente.motivo = (motivo or "").strip() or None
+
+    if (cot.estado or "") == "despachado" and cot.lead_id:
+        lead = db.query(MonzaLead).filter(MonzaLead.id == cot.lead_id).first()
+        if lead and lead.cliente_id:
+            c = db.query(MonzaCliente).filter(MonzaCliente.id == lead.cliente_id).first()
+            if c:
+                # El total de la versión que se está revirtiendo; si no hay versión
+                # registrada (venta anterior a esta entrega) se cae al total vivo, que es
+                # lo mejor disponible.
+                monto = (vigente.total_bruto if vigente and vigente.total_bruto is not None
+                         else cot.total_bruto) or 0
+                c.ltv = max((c.ltv or 0) - monto, 0)
+
 
 def _gen_numero_cot(db: Session) -> str:
     anio = datetime.utcnow().year
@@ -194,7 +281,7 @@ def _dte_vivo_de_la_venta(db: Session, cot_id: int):
     return (vivos[0] if vivos else None), reiniciada
 
 
-def _cot_dict(c: MonzaCotizacion) -> dict:
+def _cot_dict(c: MonzaCotizacion, db: Session = None) -> dict:
     return {
         "id": c.id,
         "numero": c.numero,
@@ -211,6 +298,10 @@ def _cot_dict(c: MonzaCotizacion) -> dict:
         "fecha_venta": c.fecha_venta.isoformat() if c.fecha_venta else None,
         "fecha_entrega_est": c.fecha_entrega_est.isoformat() if c.fecha_entrega_est else None,
         "oc_cliente": c.oc_cliente,
+        # Venta a cliente PARTICULAR: sin este dato el modal de cierre no puede volver a
+        # abrirse con la casilla marcada y el operador leería la OC (= N° de cotización)
+        # como un error de digitación.
+        "cliente_sin_oc": bool(c.cliente_sin_oc),
         # Hallazgos #14 y #20 (auditoría integral Fases 1-6): oc_fecha y pct_adelanto
         # eran WRITE-ONLY — el modal de cierre no podía leerlos, así que inicializaba
         # la fecha de OC con HOY (pisando la real, que viaja como referencia 801 al SII)
@@ -238,8 +329,8 @@ def _cot_dict(c: MonzaCotizacion) -> dict:
     }
 
 
-def _cot_detail(c: MonzaCotizacion) -> dict:
-    d = _cot_dict(c)
+def _cot_detail(c: MonzaCotizacion, db: Session = None) -> dict:
+    d = _cot_dict(c, db)
     d["items"] = [
         {
             "id": it.id,
@@ -272,6 +363,31 @@ def _cot_detail(c: MonzaCotizacion) -> dict:
         "tarifa_aerea": c.tarifa_aerea,
         "iva_pct": c.iva_pct,
     }
+    if db is not None:
+        # Historial de cierres. Se sirve SÓLO con `db` explícito (o sea, en el detalle):
+        # meterlo en el listado sería una consulta por fila, que es el N+1 clásico.
+        cierres = (db.query(MonzaCotizacionCierre)
+                   .filter(MonzaCotizacionCierre.cotizacion_id == c.id)
+                   .order_by(MonzaCotizacionCierre.version.desc()).all())
+        d["cierres"] = [{
+            "version": x.version,
+            "oc_cliente": x.oc_cliente,
+            "oc_fecha": x.oc_fecha.isoformat() if x.oc_fecha else None,
+            "fecha_entrega_est": x.fecha_entrega_est.isoformat() if x.fecha_entrega_est else None,
+            "pct_adelanto": x.pct_adelanto,
+            "forma_pago": x.forma_pago,
+            "total_bruto": x.total_bruto,
+            "cerrado_at": x.cerrado_at.isoformat() if x.cerrado_at else None,
+            "cerrado_por": x.cerrado_por_email,
+            "revertido_at": x.revertido_at.isoformat() if x.revertido_at else None,
+            "revertido_por": x.revertido_por_email,
+            "revertido_a_estado": x.revertido_a_estado,
+            "motivo": x.motivo,
+        } for x in cierres]
+        # Atajo para la pantalla: cuántas veces se cerró esta venta. Con >= 1 y estado
+        # 'vendida', el aviso de reversión puede decir desde cuándo está cerrada y con qué
+        # OC, en vez de una advertencia genérica.
+        d["veces_cerrada"] = len(cierres)
     return d
 
 
@@ -340,6 +456,23 @@ def create_cotizacion(body: CotCreate, db: Session = Depends(get_db), current_us
 
     condiciones = body.condiciones_servicio or cfg.condiciones_default
 
+    # ── Foto del FLETE: sale del LEAD, no de la configuración global ──────────
+    # El operador elige la moneda del flete EN LA CALCULADORA y esa elección queda en el
+    # lead (monza_leads.moneda_tarifa / .tarifa_aerea) junto con los precios que produjo.
+    # Congelar acá la global significaba guardar una tarifa DISTINTA de la que generó los
+    # precios de estos mismos ítems: la foto dejaba de reproducir su propia cotización.
+    # Antes casi no se notaba (la moneda solo cambiaba el TC); desde que cada moneda tiene
+    # SU tarifa por kilo (2026-08-08), la diferencia es el flete completo.
+    # Sin lead —cotización creada a mano— se cae a la configuración, resolviendo la tarifa
+    # POR MONEDA con el mismo helper que usa la calculadora (fuente única).
+    from monza_router_cotizador import _tarifa_configurada  # local: evita ciclo
+    lead_flete = (db.query(MonzaLead).filter(MonzaLead.id == body.lead_id).first()
+                  if body.lead_id else None)
+    moneda_flete = ((lead_flete.moneda_tarifa if lead_flete else None)
+                    or cfg.moneda_tarifa or "EUR").upper()
+    tarifa_flete = (lead_flete.tarifa_aerea if lead_flete and lead_flete.tarifa_aerea is not None
+                    else _tarifa_configurada(cfg, moneda_flete))
+
     cot = MonzaCotizacion(
         numero=_gen_numero_cot(db),
         lead_id=body.lead_id,
@@ -355,10 +488,11 @@ def create_cotizacion(body: CotCreate, db: Session = Depends(get_db), current_us
         oc_cliente=body.oc_cliente,
         tc_usd_clp=cfg.tc_usd_clp,
         tc_eur_clp=cfg.tc_eur_clp,
-        # Moneda de la tarifa congelada junto al resto de la foto: sin ella el
-        # cálculo no es reproducible (espejo del pricing_snapshot de GA).
-        moneda_tarifa=cfg.moneda_tarifa,
-        tarifa_aerea=cfg.tarifa_aerea_por_kg,
+        # Moneda y tarifa del flete congeladas junto al resto de la foto: sin ellas el
+        # cálculo no es reproducible (espejo del pricing_snapshot de GA). Salen del LEAD
+        # —la elección que produjo estos precios—, ver el bloque de arriba.
+        moneda_tarifa=moneda_flete,
+        tarifa_aerea=tarifa_flete,
         iva_pct=cfg.iva_pct,
     )
     db.add(cot)
@@ -391,7 +525,9 @@ def create_cotizacion(body: CotCreate, db: Session = Depends(get_db), current_us
             moneda=it.moneda,
             peso_kg=it.peso_kg,
             tc_aplicado=tc_item,
-            tarifa_aerea=cfg.tarifa_aerea_por_kg,
+            # MISMA tarifa que la cabecera (la del lead): Embarques Pricing la lee por
+            # ítem, y si difiriera de la cabecera habría dos fletes para la misma venta.
+            tarifa_aerea=tarifa_flete,
             markup_pct=it.markup_pct / 100 if it.markup_pct > 1 else it.markup_pct,
             precio_unitario_clp=precio_unit,
             subtotal_clp=subtotal,
@@ -422,7 +558,7 @@ def create_cotizacion(body: CotCreate, db: Session = Depends(get_db), current_us
     db.refresh(cot)
     _log(db, current_user.email, "CREATE", "cotizacion",
          cot.id, cot.numero, f"Cotización {cot.numero} emitida")
-    return _cot_dict(cot)
+    return _cot_dict(cot, db)
 
 
 # ── Get detail ────────────────────────────────────────────────────────────────
@@ -442,7 +578,7 @@ def get_cotizacion(cot_id: int, db: Session = Depends(get_db), _=Depends(get_cur
     )
     if not cot:
         raise HTTPException(status_code=404, detail="Cotización no encontrada")
-    return _cot_detail(cot)
+    return _cot_detail(cot, db)
 
 
 # ── Update estado ─────────────────────────────────────────────────────────────
@@ -502,6 +638,51 @@ def update_cotizacion(
     if not cot:
         raise HTTPException(status_code=404, detail="Cotización no encontrada")
 
+    # ── VENTA A CLIENTE PARTICULAR (2026-08-08) ───────────────────────────────
+    # Un consumidor final no emite orden de compra. Con la casilla marcada, el
+    # documento de respaldo pasa a ser NUESTRA cotización: su N° y su fecha de emisión
+    # se graban en oc_cliente/oc_fecha, así la referencia 801 del SII sigue apuntando a
+    # un documento real y verificable (sin ella la venta cerraría pero no se podría
+    # emitir ni guía 52 ni factura 33 — los tres guards del módulo DTE exigen ambos).
+    #
+    # Va ANTES del guard W6 A PROPÓSITO: la marca REESCRIBE oc_cliente/oc_fecha, así que
+    # tiene que pasar por el mismo candado que una edición manual. Si se resolviera
+    # después, marcar la casilla sería la puerta trasera para cambiar la referencia 801
+    # de una venta ya facturada — exactamente lo que W6 existe para impedir.
+    if body.cliente_sin_oc:
+        numero_cot = (cot.numero or "").strip()
+        if not numero_cot:
+            raise HTTPException(
+                400,
+                "Esta cotización no tiene número: no se puede usar como documento de "
+                "respaldo de una venta a cliente particular.",
+            )
+        # El SII limita el folio de una referencia a 18 caracteres. El formato de la
+        # casa (COT-2026-0001) entra de sobra, pero si algún día crece, mejor un 400
+        # explicado acá que el rechazo del SII al emitir un documento irreversible.
+        from monza_wasabil_dte.service import FOLIO_REF_MAX  # local: evita ciclo
+        if len(numero_cot) > FOLIO_REF_MAX:
+            raise HTTPException(
+                400,
+                f"El N° de esta cotización ('{numero_cot}') tiene {len(numero_cot)} "
+                f"caracteres y el SII permite máximo {FOLIO_REF_MAX} en la referencia "
+                "a la orden de compra: no puede usarse como respaldo de la venta.",
+            )
+        # La FECHA es la de emisión de la cotización, no la de hoy: folio y fecha tienen
+        # que ser del MISMO documento, o la referencia 801 cita un papel que no existe.
+        fecha_cot = cot.fecha_creacion.date() if cot.fecha_creacion else None
+        if not fecha_cot:
+            raise HTTPException(
+                400,
+                "Esta cotización no tiene fecha de emisión: no se puede usar como "
+                "documento de respaldo (la referencia al SII la exige).",
+            )
+        # Se inyectan en el body para que TODO el resto del PATCH —el guard W6, la
+        # validación del cierre y el versionado— vea exactamente los mismos valores que
+        # se van a persistir. Sin esto habría dos verdades en la misma función.
+        body.oc_cliente = numero_cot
+        body.oc_fecha = fecha_cot
+
     # ── Hallazgo W6 (paridad contable): el N° y la FECHA de la OC son REFERENCIA 801
     # del DTE. Con un documento tributario vivo no se editan (espejo del PUT
     # /oc-cliente de GA en routers/compras.py, que responde 409 nombrando el folio).
@@ -560,7 +741,16 @@ def update_cotizacion(
             )
         oc_num = (body.oc_cliente if body.oc_cliente is not None else cot.oc_cliente) or ""
         if not oc_num.strip():
-            raise HTTPException(400, "El N° de OC del cliente es obligatorio para cerrar la venta")
+            # La salida para el consumidor final: marcar «Cliente particular» en el
+            # cierre, que usa esta cotización como documento de respaldo. Se nombra en
+            # el mensaje porque el operador que ve este error es justo el que no sabe
+            # qué poner cuando el cliente no tiene OC.
+            raise HTTPException(
+                400,
+                "El N° de OC del cliente es obligatorio para cerrar la venta. Si el "
+                "cliente es un particular y no emite orden de compra, marca «Cliente "
+                "particular (sin OC)» y se usará el N° de esta cotización.",
+            )
 
     # ── Hallazgo #8 (auditoría integral Fases 1-6): el flip a 'despachado' era CIEGO —
     # marcaba TODAS las líneas como despachadas sin un solo despacho, rompiendo el
@@ -621,6 +811,13 @@ def update_cotizacion(
                 f"asociada ({n_fact} factura(s), {n_adel} adelanto(s), {n_desp} despacho(s)): "
                 f"no puede volver a '{body.estado}'. Anula/elimina eso primero.",
             )
+        # La reversión está autorizada: se deja el RASTRO antes de tocar el estado, porque
+        # `_registrar_reversion` decide sobre `cot.estado` (el de ANTES) para saber si hay
+        # que deshacer el LTV. Después del volcado de campos ya sería tarde.
+        _registrar_reversion(db, cot, body.estado,
+                             usuario_id=getattr(current_user, "id", None),
+                             usuario_email=current_user.email,
+                             motivo=body.motivo_reversion)
 
     # Hallazgo #14 (auditoría integral Fases 1-6): como el modal manda opt.pct FIJO,
     # un re-cierre eligiendo "contado" bajaba pct_adelanto de 50 a 0 en silencio y con
@@ -642,6 +839,8 @@ def update_cotizacion(
             )
 
     for field, value in body.model_dump(exclude_none=True).items():
+        if field in _CAMPOS_NO_PERSISTENTES:
+            continue
         setattr(cot, field, value)
     if es_cierre_nuevo and not cot.fecha_venta:
         cot.fecha_venta = datetime.utcnow()
@@ -649,6 +848,13 @@ def update_cotizacion(
         for _it in cot.items:
             if (_it.estado_linea or "cotizado") == "cotizado":
                 _it.estado_linea = "por_comprar"
+        # La foto del cierre se toma DESPUÉS del volcado: tiene que retratar los datos con
+        # que la venta quedó cerrada, no los que tenía antes. Si esta es la segunda o
+        # tercera vez que se cierra, queda como una versión nueva y las anteriores siguen
+        # ahí, marcadas como revertidas.
+        _registrar_cierre(db, cot,
+                          usuario_id=getattr(current_user, "id", None),
+                          usuario_email=current_user.email)
     if body.estado == "despachado" and not cot.fecha_despacho:
         cot.fecha_despacho = datetime.utcnow().date()
     if body.estado == "despachado":
@@ -686,7 +892,7 @@ def update_cotizacion(
     elif es_despacho_nuevo:
         # Solo el despacho NUEVO notifica: el re-PATCH no repite la notificación.
         crear_notif(db, f"Despacho realizado · {cot.numero}", "Cotización despachada al cliente", "info", "/monzaparts/despachos", "cotizacion", cot.id)
-    return _cot_dict(cot)
+    return _cot_dict(cot, db)
 
 
 

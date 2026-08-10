@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from database import get_db
 from models.models import (
     Cotizacion, ItemCotizacion, ConfiguracionCotizador,
-    EstadoCotizacion, User, PartsCache,
+    EstadoCotizacion, User, PartsCache, OcProveedorItem,
 )
 from auth import get_current_user
 from services.pricing_service import calcular_cotizacion, config_efectivo
@@ -219,6 +219,34 @@ def update_meta(
     return {"ok": True}
 
 
+def _guard_linea_en_pipeline(db, item, accion: str) -> None:
+    """Guard ADITIVO del editor (revisión adversarial 2026-08-10, hallazgo MEDIO).
+
+    Una línea que ya entró al pipeline físico —tiene OC de proveedor o un estado de
+    compra en adelante— es PLATA comprometida: editarle cantidad/precio descuadra la
+    familia de líneas hermanas que dejan los splits (asignación parcial, preparar
+    parcial, cierre de pre-embarque), y BORRARLA o bien reventaba 500 por la FK de
+    oc_proveedor_items (sin ondelete) o bien hacía desaparecer unidades de una venta
+    con OC de cliente emitida. Deuda preexistente de los splits viejos; la asignación
+    parcial fabrica justamente hermanas y multiplicó la exposición, así que se cierra.
+
+    Se bloquea SOLO lo comprometido: la línea 'cerrado' sin vínculo (post-cierre,
+    pre-compra) sigue editable — restringirla es decisión del dueño y quedó anotada.
+    """
+    en_pipeline = item.estado_item in ("comprado", "preparado", "pre_embarcado",
+                                       "embarcado")
+    vinculo = (db.query(OcProveedorItem)
+               .filter(OcProveedorItem.item_cotizacion_id == item.id).first())
+    if en_pipeline or vinculo:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"No se puede {accion} este ítem: ya está en el flujo de compras "
+                    f"(estado '{item.estado_item}'"
+                    + (f", asignado a una OC de proveedor" if vinculo else "")
+                    + "). Devuélvelo desde el panel de Compras/Seguimiento antes de "
+                    "modificarlo."))
+
+
 @router.put("/{cotizacion_id}/items/{item_id}")
 def update_item(
     cotizacion_id: int,
@@ -234,6 +262,7 @@ def update_item(
     ).first()
     if not item:
         raise HTTPException(status_code=404, detail="Ítem no encontrado")
+    _guard_linea_en_pipeline(db, item, "editar")
 
     updates = body.model_dump(exclude_none=True)
     precio_venta_edit = updates.pop("precio_venta_clp", None)
@@ -274,6 +303,7 @@ def delete_item(
     ).first()
     if not item:
         raise HTTPException(status_code=404, detail="Ítem no encontrado")
+    _guard_linea_en_pipeline(db, item, "eliminar")
     db.delete(item)
 
     # Actualizar total_items en cotización
@@ -788,6 +818,26 @@ def restaurar_version(
     ).first()
     if not ver:
         raise HTTPException(404, "Versión no encontrada")
+    # ── Guard anti-split (aditivo, 2026-08-10) ─────────────────────────────────────
+    # La foto restaura `cantidad` POR ID. Si después de la foto una línea se PARTIÓ
+    # (asignación parcial, preparar-parcial o cierre de pre-embarque clonan líneas
+    # hermanas), restaurar repondría la cantidad pre-split en la original mientras la
+    # hermana conserva la suya → unidades y plata DUPLICADAS (3 pasa a ser 3+2).
+    # Si el conjunto de líneas actual ya no calza con el de la versión, la restauración
+    # COMPLETA se bloquea con 409: los campos de la foto (cantidad, precio, margen…)
+    # viajan juntos por ítem, y restaurar "solo lo demás" dejaría hermanas con precios
+    # divergentes — con este formato de snapshot no es separable con seguridad.
+    try:
+        _snap_ids = {int(i["id"]) for i in _json.loads(ver.snapshot_json).get("items", [])
+                     if i.get("id") is not None}
+    except Exception:
+        _snap_ids = None  # snapshot ilegible: sigue el flujo original de abajo
+    if _snap_ids is not None and _snap_ids != {i.id for i in cotizacion.items}:
+        raise HTTPException(
+            409,
+            "La cotización cambió de estructura después de esa versión (hay líneas "
+            "partidas, agregadas o eliminadas): restaurar cantidades duplicaría "
+            "unidades y plata. Cree una versión nueva o corrija las líneas a mano.")
     try:
         snap = _json.loads(ver.snapshot_json)
         # Restore items from snapshot

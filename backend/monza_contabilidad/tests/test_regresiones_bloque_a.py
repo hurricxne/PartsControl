@@ -278,7 +278,9 @@ def _crear_venta(db, sufijo, *, cantidad=10, precio=10_000.0, pct_adelanto=50, g
     for n, qty in enumerate(guias, start=1):
         d = mm.MonzaDespacho(numero=f"{MARK}-D{sufijo}{n}", cotizacion_id=cot.id,
                              estado="despachado", numero_guia=f"G-{sufijo}-{n}",
-                             cliente_nombre=cli.nombre)
+                             cliente_nombre=cli.nombre,
+                             # regla 2026-08-06: sin firma no se factura (el gate tiene suite propia)
+                             guia_firmada=1)
         db.add(d); db.flush()
         db.add(mm.MonzaDespachoItem(despacho_id=d.id, item_id=it.id, qty_despachada=qty))
         desps.append(d.id)
@@ -535,8 +537,21 @@ def _a4(db):
           and abs(sum(c["monto"] for c in cobs) - 59500.0) < 0.01, (a, cobs))
     check("A-4 INVARIANTE Σ brutos == total de la venta (119.000)",
           abs(_brutos_de(v.cot) - 119000.0) < 0.01, _brutos_de(v.cot))
+    # El check mira SOLO las advertencias del RE-RUTEO (las que nombran el traspaso
+    # fallido del adelanto — router.py:951). Antes exigía la lista VACÍA, y eso lo
+    # volvía frágil ante cualquier advertencia ajena: la regla de la firma
+    # (2026-08-07) agregó una advertencia legítima que aquí es CIERTA, porque esta
+    # venta tiene dos guías de 5 y solo se facturó la primera (quedan 5 unidades
+    # despachadas sin facturar). Estrechar el check no lo debilita: se le suma la
+    # aserción POSITIVA de esa advertencia, así que ahora falla por partida doble
+    # (si el re-ruteo inventa ruido, y si la advertencia de mercadería desaparece).
+    advs = r.json().get("advertencias") or []
+    ruido_reruteo = [a for a in advs if "traspasar" in a or "adelanto ya estaba aplicado" in a]
     check("A-4 el re-ruteo NO inventa advertencias cuando pudo hacerse completo",
-          (r.json().get("advertencias") or []) == [], r.json().get("advertencias"))
+          ruido_reruteo == [], advs)
+    check("A-4 la advertencia de mercadería despachada sin facturar SÍ aparece "
+          "(quedan 5 unidades en la 2ª guía)",
+          any("sin facturar" in a for a in advs), advs)
 
     print("\n═════ A-4b · mismo caso con EXCEDENTE (adelanto 70.000) ═════")
     v = _crear_venta(db, "A4B", guias=(5, 5))

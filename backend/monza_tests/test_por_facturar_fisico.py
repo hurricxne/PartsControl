@@ -49,6 +49,24 @@ app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
 client = TestClient(app)
 
 
+def _hoy_chile_str() -> str:
+    """Hoy en Chile (YYYY-MM-DD) para la fecha de la firma: el endpoint rechaza
+    fechas futuras contra hoy_chile(), así que el test usa el mismo reloj."""
+    from monza_wasabil_dte.service import hoy_chile
+    return hoy_chile().isoformat()
+
+
+def _borrar_doc_subido(filename):
+    """Borra de uploads/docs el archivo que subió el firmar e2e (la suite deja el
+    disco como lo encontró; el gate lee guia_firmada en BD, no el archivo)."""
+    if not filename:
+        return
+    from monza_router_despachos import _DOCS_DIR
+    ruta = os.path.join(_DOCS_DIR, filename)
+    if os.path.isfile(ruta):
+        os.remove(ruta)
+
+
 def _setup():
     """Venta: A 10×$1.000 + B 4×$5.000, IVA 19% congelado → total $35.700."""
     db = SessionLocal()
@@ -149,6 +167,14 @@ def test_por_facturar_base_fisica():
         assert r.status_code == 200, r.text
         d1 = r.json()["id"]
         assert client.post(f"/api/monza/despachos/entidades/{d1}/cerrar").status_code == 200
+        # Guía FIRMADA por el ENDPOINT REAL (regla 2026-08-06: sin firma no se
+        # factura). Es el único e2e del multipart en esta suite; el archivo subido
+        # se borra de inmediato — el gate lee el flag en BD, no el disco.
+        r = client.post(f"/api/monza/despachos/entidades/{d1}/firmar",
+                        files={"file": ("guia-firmada.jpg", b"foto", "image/jpeg")},
+                        data={"fecha_firma": _hoy_chile_str()})
+        assert r.status_code == 200, r.text
+        _borrar_doc_subido(r.json().get("guia_firmada_archivo"))
         r = client.post("/api/monza/contabilidad/facturas", json={
             "cotizacion_id": ids["cot"], "despacho_id": d1, "numero_factura": f"F-{MARK}-1"})
         assert r.status_code in (200, 201), r.text

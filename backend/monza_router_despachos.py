@@ -1,8 +1,12 @@
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Form
+from fastapi.responses import FileResponse
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import or_, func
+from sqlalchemy import or_, and_, exists, func
+import os
 import re
+import unicodedata
+import uuid
 from typing import Optional
 from datetime import date, datetime
 
@@ -10,7 +14,7 @@ from database import get_db
 from auth import get_current_user
 from monza_models import (
     MonzaCotizacion, MonzaCliente, MonzaCotizacionItem, MonzaDespacho, MonzaDespachoItem,
-    MonzaRecepcion, MonzaRecepcionItem, MonzaEmbarque, MonzaEmbarqueItem,
+    MonzaRecepcion, MonzaRecepcionItem, MonzaEmbarque, MonzaEmbarqueItem, MonzaOcProveedor,
 )
 from monza_fechas import business_days_remaining
 from pydantic import BaseModel
@@ -97,6 +101,71 @@ def _parse_fecha_guia(valor) -> Optional[date]:
     return fecha
 
 
+# ── Guía FIRMADA (respaldo de la entrega) ─────────────────────────────────────
+# Repositorio FÍSICO de documentos de la casa: el mismo uploads/docs que usa GA
+# (compras.py DOCS_DIR / despachos.py _DOCS_DIR). Se comparte el DIRECTORIO, no el
+# endpoint: cada marca sube y sirve por SU router, con SU candado de empresa —
+# el serve de GA exige 'mineria' y uno de Monza con él recibía 403.
+_DOCS_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "uploads", "docs")
+)
+os.makedirs(_DOCS_DIR, exist_ok=True)
+
+# La guía firmada es una FOTO o un ESCANEO (el modal manda image/*+pdf): no se acepta
+# Office como en el upload genérico de compras — un .xlsx jamás es una guía firmada.
+_EXT_GUIA_FIRMADA = {".pdf", ".jpg", ".jpeg", ".png", ".webp", ".heic"}
+_MAX_GUIA_FIRMADA_BYTES = 20 * 1024 * 1024  # 20 MB (espejo del upload de la casa)
+
+
+def _parse_fecha_firma(valor: str, fecha_guia: Optional[date]) -> date:
+    """Texto YYYY-MM-DD → date, para la fecha en que el CLIENTE FIRMÓ la guía.
+
+    OBLIGATORIA (a diferencia de GA, que la defaultea a hoy): es el dato que el dueño
+    pidió registrar y el que después ordena la cobranza (OC + factura + guía firmada).
+    Mismas mallas que _parse_fecha_guia (formato estricto, no futura, tope 2 años) y una
+    más: la firma no puede ser ANTERIOR a la emisión de la guía en papel (nadie firma
+    un documento que aún no existe). No se valida contra fecha (creación) ni
+    fecha_despacho (cierre): ambas son relojes del SERVIDOR en UTC y el registro en el
+    sistema puede ir atrasado respecto del hecho físico — validar contra ellas
+    fabricaría falsos rechazos justo en los despachos registrados tarde."""
+    texto = (valor or "").strip()
+    if not texto or not _RE_FECHA_GUIA.match(texto):
+        raise HTTPException(
+            400,
+            "La fecha de la firma debe tener el formato AAAA-MM-DD "
+            f"(recibido: '{texto}')",
+        )
+    try:
+        fecha = datetime.strptime(texto[:10], "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            400,
+            f"La fecha de la firma '{texto[:10]}' no existe en el calendario",
+        )
+    hoy = hoy_chile()
+    if fecha > hoy:
+        raise HTTPException(
+            400,
+            f"La fecha de la firma ({fecha.isoformat()}) es futura: revisa el dato "
+            f"(hoy en Chile es {hoy.isoformat()}).",
+        )
+    if (hoy - fecha).days > _ANTIGUEDAD_MAX_FECHA_GUIA_DIAS:
+        raise HTTPException(
+            400,
+            f"La fecha de la firma ({fecha.isoformat()}) tiene más de "
+            f"{_ANTIGUEDAD_MAX_FECHA_GUIA_DIAS // 365} años: revisa el año antes de "
+            "guardar (es el error de tipeo más común).",
+        )
+    if fecha_guia and fecha < fecha_guia:
+        raise HTTPException(
+            400,
+            f"La fecha de la firma ({fecha.isoformat()}) es ANTERIOR a la emisión de "
+            f"la guía ({fecha_guia.isoformat()}): el cliente no puede firmar una guía "
+            "que todavía no existía. Revisa ambas fechas.",
+        )
+    return fecha
+
+
 def _despacho_dict(c: MonzaCotizacion) -> dict:
     asesor_nombre = c.asesor.email.split("@")[0].title() if c.asesor else None
     return {
@@ -126,6 +195,249 @@ def _despacho_dict(c: MonzaCotizacion) -> dict:
     }
 
 
+# ── Buscador de operador (spec buscadores Bodega/Despachos 2026-08-05) ─────────
+#
+# Helper PROPIO de MonzaParts, DUPLICADO a propósito respecto de MachParts: las
+# marcas comparten la FORMA del contrato (parámetro q, tokens AND/OR, escapado,
+# doble pasada), nunca el código — un import cruzado entre routers de marcas es
+# justo lo que la separación por empresa existe para impedir.
+# Lo importa monza_router_bodega con import LOCAL (misma dirección de dependencia
+# que ya usa cerrar_recepcion: bodega → despachos; despachos no importa bodega).
+
+_Q_MAX_LEN = 64      # defensa contra pegados de Excel
+_Q_MIN_LEN = 2       # bajo esto NO se filtra (misma vara que monza_router_catalog)
+_Q_MAX_TOKENS = 4    # el 5º token y siguientes se descartan
+# Prefijos que la UI imprime y el operador copia. En Monza el COT- SÍ se guarda,
+# así que la variante sin prefijo es DEFENSIVA (en MachParts es obligatoria).
+_Q_PREFIJOS = ("COT-", "OCP-", "OC-", "EMB-", "DSP-", "N°", "Nº", "#")
+
+
+def _patron(v: str) -> str:
+    """Patrón LIKE con \\, % y _ escapados. Usar SIEMPRE como
+    col.like(_patron(tok), escape="\\\\"). Sin esto teclear '_' devuelve la tabla
+    entera y '100_4567' matchea '100-4567' Y '100X4567' — dos partes DISTINTAS
+    (el único defecto de la lista que cuesta plata, no tiempo)."""
+    for c in ("\\", "%", "_"):
+        v = v.replace(c, "\\" + c)
+    return f"%{v}%"
+
+
+def _normalizar_q(q: Optional[str]) -> dict:
+    """Contrato común del parámetro q (una implementación por marca):
+    strip + colapsar espacios internos + truncar a 64; con menos de 2 caracteres
+    el filtro se IGNORA por completo (igual que hoy con q vacío); tokenizar por
+    espacio con máximo 4 tokens. Semántica: AND entre tokens, OR entre campos."""
+    q = re.sub(r"\s+", " ", (q or "").strip())[:_Q_MAX_LEN]
+    if len(q) < _Q_MIN_LEN:
+        return {"q": q, "tokens": [], "activo": False}
+    return {"q": q, "tokens": q.split(" ")[:_Q_MAX_TOKENS], "activo": True}
+
+
+def _variantes_q(tok: str) -> list:
+    """El token crudo y, si trae un prefijo conocido de la UI, también sin él."""
+    out = [tok]
+    up = tok.upper()
+    for p in _Q_PREFIJOS:
+        if up.startswith(p) and len(tok) > len(p):
+            out.append(tok[len(p):])
+            break
+    return out
+
+
+def _colapsar_q(tok: str) -> str:
+    """Forma colapsada del token para número de parte: sin guiones ni espacios,
+    en mayúsculas. 7T-1997 y 7T1997 conviven como filas distintas en los datos
+    (verificado en la spec): la comparación colapsada cubre las DOS direcciones."""
+    return re.sub(r"[\s\-]", "", tok).upper()
+
+
+def _q_tiene_digitos(ncfg: dict) -> bool:
+    return any(any(ch.isdigit() for ch in t) for t in ncfg["tokens"])
+
+
+def _np_colapsado_sql():
+    """Columna numero_parte colapsada en SQL (para la pasada B). Full scan
+    reconocido: corre SOLO como red de seguridad cuando la pasada A dio 0 filas,
+    nunca en la primera pasada, y siempre bajo el filtro de estado que la acota."""
+    return func.replace(func.replace(func.upper(MonzaCotizacionItem.numero_parte), "-", ""), " ", "")
+
+
+def _cond_token_venta(tok: str, con_colapsado: bool = False):
+    """Condición OR de un token sobre la VENTA (MonzaCotizacion) y sus hijas.
+
+    REGLA INVIOLABLE: todo campo de tabla HIJA (ítems, embarques, despachos, OCP)
+    entra como EXISTS correlacionado, NUNCA como .join() — un join a la colección
+    multiplica la fila de la cabecera, infla total = query.count() y el LIMIT se
+    come los cupos con duplicados (el operador ve "9 resultados" donde hay 3).
+
+    Requiere que el llamador ya haya hecho join(MonzaCotizacion.cliente, isouter=True)
+    (el joinedload NO habilita filtrar)."""
+    ors = []
+    for v in _variantes_q(tok):
+        p = _patron(v)
+        ors += [
+            MonzaCotizacion.numero.like(p, escape="\\"),
+            MonzaCotizacion.oc_cliente.like(p, escape="\\"),
+            MonzaCotizacion.vehiculo.like(p, escape="\\"),
+            MonzaCotizacion.vin.like(p, escape="\\"),
+            MonzaCotizacion.numero_factura.like(p, escape="\\"),
+            MonzaCliente.nombre.like(p, escape="\\"),
+            MonzaCliente.rut.like(p, escape="\\"),
+            # EXISTS a ítems: numero_parte / descripcion / marca
+            exists().where(and_(
+                MonzaCotizacionItem.cotizacion_id == MonzaCotizacion.id,
+                or_(
+                    MonzaCotizacionItem.numero_parte.like(p, escape="\\"),
+                    MonzaCotizacionItem.descripcion.like(p, escape="\\"),
+                    MonzaCotizacionItem.marca.like(p, escape="\\"),
+                ),
+            )),
+            # EXISTS a embarque (2 saltos). OJO asimetría de marcas: en Monza `awb`
+            # guarda EL NÚMERO (no el nombre del archivo, como en MachParts).
+            exists().where(and_(
+                MonzaCotizacionItem.cotizacion_id == MonzaCotizacion.id,
+                MonzaEmbarqueItem.item_id == MonzaCotizacionItem.id,
+                MonzaEmbarque.id == MonzaEmbarqueItem.embarque_id,
+                or_(
+                    MonzaEmbarque.numero.like(p, escape="\\"),
+                    MonzaEmbarque.awb.like(p, escape="\\"),
+                    MonzaEmbarque.tracking.like(p, escape="\\"),
+                    MonzaEmbarque.forwarder.like(p, escape="\\"),
+                ),
+            )),
+            # EXISTS a despachos: N° DSP, N° guía SII, expedición, transportista
+            exists().where(and_(
+                MonzaDespacho.cotizacion_id == MonzaCotizacion.id,
+                or_(
+                    MonzaDespacho.numero.like(p, escape="\\"),
+                    MonzaDespacho.numero_guia.like(p, escape="\\"),
+                    MonzaDespacho.numero_expedicion.like(p, escape="\\"),
+                    MonzaDespacho.transportista.like(p, escape="\\"),
+                    MonzaDespacho.destinatario.like(p, escape="\\"),
+                ),
+            )),
+            # EXISTS a OCP (vínculo Integer suelto sin FK: se filtra igual)
+            exists().where(and_(
+                MonzaCotizacionItem.cotizacion_id == MonzaCotizacion.id,
+                MonzaOcProveedor.id == MonzaCotizacionItem.oc_proveedor_id,
+                or_(
+                    MonzaOcProveedor.numero.like(p, escape="\\"),
+                    MonzaOcProveedor.numero_oc.like(p, escape="\\"),
+                ),
+            )),
+        ]
+    if con_colapsado and any(ch.isdigit() for ch in tok):
+        cc = _colapsar_q(tok)
+        if cc:
+            ors.append(exists().where(and_(
+                MonzaCotizacionItem.cotizacion_id == MonzaCotizacion.id,
+                _np_colapsado_sql().like(_patron(cc), escape="\\"),
+            )))
+    return or_(*ors)
+
+
+def _filtro_q(query, ncfg: dict, con_colapsado: bool = False):
+    """UN solo filtro para los endpoints de Despachos (la deuda era que el listado
+    y /avance divergían: SQL vs Python, 5 vs 4 campos, tildes distintas). Hace su
+    propio join explícito al cliente — el llamador NO debe joinearlo de nuevo."""
+    if not ncfg["activo"]:
+        return query
+    query = query.join(MonzaCotizacion.cliente, isouter=True)
+    for tok in ncfg["tokens"]:
+        query = query.filter(_cond_token_venta(tok, con_colapsado))
+    return query
+
+
+# ── Motivo de coincidencia (insignia): lo calcula el BACKEND sobre la página ───
+
+def _plegar_txt(s) -> str:
+    """minúsculas + sin tildes, espejo en Python de la collation utf8mb4_unicode_ci
+    (str.lower() a secas NO ignora tildes y la insignia se perdería en silencio)."""
+    if not s:
+        return ""
+    return "".join(c for c in unicodedata.normalize("NFD", str(s).lower())
+                   if not unicodedata.combining(c))
+
+
+def _match_de_candidatos(candidatos, ncfg: dict, normalizado: bool = False) -> list:
+    """[{campo, valor}] de los campos que explican por qué la fila salió.
+    Se corre SOLO sobre la página ya paginada (≤50 filas): costo despreciable, y
+    evita que el frontend re-implemente la lógica de matcheo y se desincronice.
+    Con la pasada colapsada activa, numero_parte también se compara sin guiones y
+    la insignia dice 'n° parte (sin guiones)' — no se puede mapear 6003113721
+    sobre 600-311-3721 carácter a carácter sin mentir."""
+    toks = [[_plegar_txt(v) for v in _variantes_q(t)] for t in ncfg["tokens"]]
+    out, vistos = [], set()
+    for campo, valor in candidatos:
+        if not valor:
+            continue
+        plano = _plegar_txt(valor)
+        if any(any(v and v in plano for v in vs) for vs in toks):
+            clave = (campo, str(valor))
+            if clave not in vistos:
+                vistos.add(clave)
+                out.append({"campo": campo, "valor": str(valor)})
+        elif normalizado and campo == "numero_parte":
+            colapsado_val = re.sub(r"[\s\-]", "", str(valor)).upper()
+            if any(_colapsar_q(t) and _colapsar_q(t) in colapsado_val
+                   for t in ncfg["tokens"] if any(ch.isdigit() for ch in t)):
+                clave = ("numero_parte_sin_guiones", str(valor))
+                if clave not in vistos:
+                    vistos.add(clave)
+                    out.append({"campo": "numero_parte_sin_guiones", "valor": str(valor)})
+        if len(out) >= 6:
+            break
+    return out
+
+
+def _match_ventas(db: Session, cots, ncfg: dict, normalizado: bool = False) -> dict:
+    """{cot_id: match} para una PÁGINA de ventas. Los hijos (embarques, despachos,
+    OCP) se precargan en LOTE sobre los ids de la página — nunca por venta."""
+    if not ncfg["activo"] or not cots:
+        return {}
+    cot_ids = [c.id for c in cots]
+    item_ids = [i.id for c in cots for i in (c.items or [])]
+    emb_por_cot: dict = {}
+    if item_ids:
+        item_a_cot = {i.id: c.id for c in cots for i in (c.items or [])}
+        rows = (
+            db.query(MonzaEmbarqueItem.item_id, MonzaEmbarque)
+            .join(MonzaEmbarque, MonzaEmbarque.id == MonzaEmbarqueItem.embarque_id)
+            .filter(MonzaEmbarqueItem.item_id.in_(item_ids))
+            .all()
+        )
+        for iid, e in rows:
+            emb_por_cot.setdefault(item_a_cot.get(iid), []).append(e)
+    dsp_por_cot: dict = {}
+    for d in db.query(MonzaDespacho).filter(MonzaDespacho.cotizacion_id.in_(cot_ids)).all():
+        dsp_por_cot.setdefault(d.cotizacion_id, []).append(d)
+    ocp_ids = list({i.oc_proveedor_id for c in cots for i in (c.items or []) if i.oc_proveedor_id})
+    ocps = {o.id: o for o in db.query(MonzaOcProveedor).filter(MonzaOcProveedor.id.in_(ocp_ids)).all()} if ocp_ids else {}
+
+    out = {}
+    for c in cots:
+        cands = [
+            ("cotizacion", c.numero), ("oc_cliente", c.oc_cliente),
+            ("cliente", c.cliente.nombre if c.cliente else None),
+            ("rut", c.cliente.rut if c.cliente else None),
+            ("vehiculo", c.vehiculo), ("vin", c.vin), ("factura", c.numero_factura),
+        ]
+        for i in (c.items or []):
+            cands += [("numero_parte", i.numero_parte), ("repuesto", i.descripcion), ("marca", i.marca)]
+        for e in emb_por_cot.get(c.id, []):
+            cands += [("embarque", e.numero), ("awb", e.awb), ("tracking", e.tracking), ("forwarder", e.forwarder)]
+        for d in dsp_por_cot.get(c.id, []):
+            cands += [("despacho", d.numero), ("guia", d.numero_guia),
+                      ("expedicion", d.numero_expedicion), ("transportista", d.transportista),
+                      ("destinatario", d.destinatario)]
+        for i in (c.items or []):
+            o = ocps.get(i.oc_proveedor_id)
+            if o:
+                cands += [("ocp", o.numero), ("ocp", o.numero_oc)]
+        out[c.id] = _match_de_candidatos(cands, ncfg, normalizado)
+    return out
+
+
 @router.get("")
 def list_despachos(
     q: Optional[str] = Query(None),
@@ -147,17 +459,6 @@ def list_despachos(
         .filter(MonzaCotizacion.estado == "despachado")
     )
 
-    if q:
-        query = query.join(MonzaCotizacion.cliente, isouter=True).filter(
-            or_(
-                MonzaCotizacion.numero.ilike(f"%{q}%"),
-                MonzaCliente.nombre.ilike(f"%{q}%"),
-                MonzaCotizacion.oc_cliente.ilike(f"%{q}%"),
-                MonzaCotizacion.vehiculo.ilike(f"%{q}%"),
-                MonzaCotizacion.numero_factura.ilike(f"%{q}%"),
-            )
-        )
-
     if desde:
         try:
             query = query.filter(MonzaCotizacion.fecha_despacho >= datetime.fromisoformat(desde).date())
@@ -169,7 +470,24 @@ def list_despachos(
         except Exception:
             pass
 
-    total = query.count()
+    # Buscador con el contrato común (spec 2026-08-05): _filtro_q reemplaza el or_
+    # de 5 campos con ilike (que mataba índices y no cubría n° de parte, embarque
+    # ni N° de guía) y unifica la semántica con /avance. Doble pasada: si la
+    # literal da 0 y el término trae dígitos, se compara numero_parte COLAPSADO
+    # (sin guiones/espacios) — 7T-1997 encuentra 7T1997 y viceversa.
+    nq = _normalizar_q(q)
+    normalizado = False
+    if nq["activo"]:
+        con_q = _filtro_q(query, nq)
+        total = con_q.count()
+        if total == 0 and _q_tiene_digitos(nq):
+            normalizado = True
+            con_q = _filtro_q(query, nq, con_colapsado=True)
+            total = con_q.count()
+        query = con_q
+    else:
+        total = query.count()
+
     items = (
         query.order_by(MonzaCotizacion.fecha_despacho.desc(), MonzaCotizacion.id.desc())
         .offset((page - 1) * page_size)
@@ -177,11 +495,22 @@ def list_despachos(
         .all()
     )
 
+    # Insignia de motivo: SOLO sobre la página ya paginada (≤ page_size filas).
+    matches = _match_ventas(db, items, nq, normalizado)
+
+    def _con_match(c):
+        d = _despacho_dict(c)
+        d["match"] = matches.get(c.id, [])
+        return d
+
     return {
         "total": total,
         "page": page,
         "page_size": page_size,
-        "items": [_despacho_dict(c) for c in items],
+        # Claves ADITIVAS del contrato (los consumidores viejos las ignoran):
+        "q_efectivo": nq["q"] if nq["activo"] else "",
+        "normalizado": normalizado,
+        "items": [_con_match(c) for c in items],
     }
 
 
@@ -452,8 +781,21 @@ def _qty_dispatched_closed(db: Session, cotizacion_id: int, con_lock: bool = Fal
 # local del módulo DTE, y la dirección de dependencia establecida es
 # abastecimiento/logística/bodega → despachos (despachos no importa ninguno).
 
-def _rechazar_split_sobre_documento(db: Session, item_ids) -> None:
+def _rechazar_split_sobre_documento(db: Session, item_ids, *,
+                                    incluir_recepciones: bool = True) -> None:
     """409 si alguna de las líneas pedidas ya no se puede PARTIR (7 comprobaciones).
+
+    `incluir_recepciones=False` omite SOLO las comprobaciones 4 y 5 (recepción de
+    embarque y nacional). Es para quien NO parte la línea y únicamente necesita el
+    candado de los documentos que congelaron cantidad y precio — hoy, la DEVOLUCIÓN A
+    COMPRAS de una línea completa (monza_router_abastecimiento.py). El motivo de 4 y 5
+    es que partir rompe el vínculo recepción↔línea; sin partición ese vínculo queda
+    intacto, y bloquear por él dejaba ATRAPADO el back order nacional legítimo (una
+    entrega cerrada en la que el proveedor no mandó nada deja la línea en 'comprado'
+    con su fila de recepción, que es justo el caso que hay que poder devolver).
+    Los demás candados —despacho, guía 52, factura, costos congelados— se aplican
+    SIEMPRE: no dependen de si la línea se parte, sino de que el documento ya exista.
+    Default True: ningún llamador existente cambia de comportamiento.
 
     Los 5 módulos satélite (contabilidad, recepción nacional, embarques pricing,
     compras contab, DTE) pueden no tener su `init_db` corrido en un deploy: MySQL
@@ -536,25 +878,28 @@ def _rechazar_split_sobre_documento(db: Session, item_ids) -> None:
 
     # 4) Recepción de EMBARQUE (cualquier estado, abierta incluida: el bodeguero ya
     #    está contando físicamente contra la cantidad de esta línea).
-    recibidos = {
-        r[0] for r in db.query(MonzaRecepcionItem.item_id)
-        .filter(MonzaRecepcionItem.item_id.in_(ids)).all()
-    }
-    if recibidos:
-        raise HTTPException(
-            409,
-            f"No se puede partir: {_nombres(recibidos)} ya tiene recepción de "
-            "bodega registrada. Se parte ANTES de que la mercadería llegue.",
-        )
+    #    4 y 5 son las que `incluir_recepciones=False` omite: su motivo es que PARTIR
+    #    rompe el vínculo recepción↔línea (ver el docstring).
+    if incluir_recepciones:
+        recibidos = {
+            r[0] for r in db.query(MonzaRecepcionItem.item_id)
+            .filter(MonzaRecepcionItem.item_id.in_(ids)).all()
+        }
+        if recibidos:
+            raise HTTPException(
+                409,
+                f"No se puede partir: {_nombres(recibidos)} ya tiene recepción de "
+                "bodega registrada. Se parte ANTES de que la mercadería llegue.",
+            )
 
-    # 5) Recepción NACIONAL (camión + guía del proveedor, sin embarque).
-    nacionales = _opcional(lambda: _split_ids_recepcion_nacional(db, ids))
-    if nacionales:
-        raise HTTPException(
-            409,
-            f"No se puede partir: {_nombres(nacionales)} ya tiene recepción "
-            "nacional registrada.",
-        )
+        # 5) Recepción NACIONAL (camión + guía del proveedor, sin embarque).
+        nacionales = _opcional(lambda: _split_ids_recepcion_nacional(db, ids))
+        if nacionales:
+            raise HTTPException(
+                409,
+                f"No se puede partir: {_nombres(nacionales)} ya tiene recepción "
+                "nacional registrada.",
+            )
 
     # 6) Costo INTERNACIONAL congelado (landed cost del embarque).
     con_pricing = _opcional(lambda: _split_ids_pricing(db, ids))
@@ -699,6 +1044,10 @@ def _serialize_venta_card(c: MonzaCotizacion, cupos: Optional[dict] = None) -> d
 def avance_ventas(
     tab: str = Query("listas"),
     q: Optional[str] = Query(None),
+    # page=None conserva la respuesta LEGADA (array pelado) para los consumidores
+    # existentes; con page el sobre nuevo {items,total,...} trae paginación honesta.
+    page: Optional[int] = Query(None, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
     _=Depends(get_current_user),
 ):
@@ -708,12 +1057,27 @@ def avance_ventas(
     venta parcialmente despachada aparece en historial aunque siga 'vendida')."""
     if tab not in ("listas", "en_curso", "historial"):
         raise HTTPException(400, f"tab inválido: {tab}")
-    cots = (
+    base = (
         db.query(MonzaCotizacion)
         .options(joinedload(MonzaCotizacion.cliente), joinedload(MonzaCotizacion.items))
         .filter(MonzaCotizacion.estado.in_(("vendida", "despachado")))
-        .all()
     )
+    # Buscador con el MISMO _filtro_q del listado (la deuda era la divergencia:
+    # aquí corría en Python sobre un haystack de 4 campos concatenados — "codelco
+    # 4500" matcheaba si el cliente TERMINABA en codelco y la OC EMPEZABA con 4500
+    # sin que ningún campo contuviera la frase — y str.lower() no ignora tildes,
+    # al revés que la collation _ci del listado). La doble pasada se decide sobre
+    # el resultado SQL completo (antes del filtro de pestaña): si hay coincidencias
+    # en otra pestaña, el conteo cruzado las muestra y la pasada B no corre.
+    nq = _normalizar_q(q)
+    normalizado = False
+    if nq["activo"]:
+        cots = _filtro_q(base, nq).all()
+        if not cots and _q_tiene_digitos(nq):
+            normalizado = True
+            cots = _filtro_q(base, nq, con_colapsado=True).all()
+    else:
+        cots = base.all()
     # Precarga en LOTE (anti N+1): qué ventas tienen despachos abiertos/cerrados.
     cot_ids = [c.id for c in cots]
     con_abierto, con_cerrado = set(), set()
@@ -735,10 +1099,22 @@ def avance_ventas(
     cupos = {i.id: _cupo_disponible(i.id, i.cantidad, recibidos, ya) for i in items_en_bod}
 
     result = []
+    cot_de_card = {}
+    # Conteo CRUZADO de pestañas (spec, decisión 1/4): la pregunta real del
+    # operador no es "filtrá esta lista" sino "dónde está esto" — se cuenta la
+    # coincidencia en las TRES pestañas en la misma pasada, sin queries extra.
+    tabs_count = {"listas": 0, "en_curso": 0, "historial": 0}
     for c in cots:
         card = _serialize_venta_card(c, cupos)
+        en_listas = card["items_en_bodega"] > 0 and card["estado"] != "completado"
+        if en_listas:
+            tabs_count["listas"] += 1
+        if c.id in con_abierto:
+            tabs_count["en_curso"] += 1
+        if c.id in con_cerrado:
+            tabs_count["historial"] += 1
         if tab == "listas":
-            if card["items_en_bodega"] == 0 or card["estado"] == "completado":
+            if not en_listas:
                 continue
         elif tab == "en_curso":
             if c.id not in con_abierto:
@@ -746,18 +1122,32 @@ def avance_ventas(
         else:  # historial
             if c.id not in con_cerrado:
                 continue
-        if q:
-            ql = q.lower()
-            haystack = " ".join([
-                card.get("numero") or "", (card.get("cliente") or {}).get("nombre") or "",
-                card.get("oc_cliente") or "", card.get("vehiculo") or "",
-            ]).lower()
-            if ql not in haystack:
-                continue
         result.append(card)
-    # Urgente primero: fecha_entrega_est ascendente, sin fecha al final (espejo GA :532)
-    result.sort(key=lambda card: (card["fecha_entrega_est"] is None, card["fecha_entrega_est"] or ""))
-    return result
+        cot_de_card[card["id"]] = c
+    # Urgente primero: fecha_entrega_est ascendente, sin fecha al final (espejo GA
+    # :532) + desempate DETERMINISTA por id (sin él, con OFFSET, una fila puede
+    # repetirse en la página 1 y perderse en la 2).
+    result.sort(key=lambda card: (card["fecha_entrega_est"] is None,
+                                  card["fecha_entrega_est"] or "", -card["id"]))
+    if page is None:
+        return result
+
+    # Sobre nuevo (frontend del buscador): paginación honesta + insignias de motivo
+    # calculadas SOLO sobre la página (≤ page_size filas).
+    total = len(result)
+    pagina = result[(page - 1) * page_size: (page - 1) * page_size + page_size]
+    matches = _match_ventas(db, [cot_de_card[card["id"]] for card in pagina], nq, normalizado)
+    for card in pagina:
+        card["match"] = matches.get(card["id"], [])
+    return {
+        "items": pagina,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "q_efectivo": nq["q"] if nq["activo"] else "",
+        "normalizado": normalizado,
+        "tabs": tabs_count,
+    }
 
 
 @router.get("/avance/{cot_id}")
@@ -1038,6 +1428,10 @@ def _despacho_entidad_dict(db: Session, d: MonzaDespacho, con_items: bool = Fals
         "estado": d.estado, "numero_expedicion": d.numero_expedicion,
         "fecha": d.fecha.isoformat() if d.fecha else None,
         "fecha_despacho": d.fecha_despacho.isoformat() if d.fecha_despacho else None,
+        # Firma de la guía: desde 2026-08-06 gatea la facturación (ver firmar_despacho).
+        "guia_firmada": bool(d.guia_firmada),
+        "fecha_firma": d.fecha_firma.isoformat() if d.fecha_firma else None,
+        "guia_firmada_archivo": d.guia_firmada_archivo,
     }
     if con_items:
         dis = db.query(MonzaDespachoItem).filter(MonzaDespachoItem.despacho_id == d.id).all()
@@ -1058,17 +1452,47 @@ def _despacho_entidad_dict(db: Session, d: MonzaDespacho, con_items: bool = Fals
 
 @router.get("/entidades")
 def list_despachos_entidades(db: Session = Depends(get_db), _=Depends(get_current_user)):
-    # Los borradores (en_preparacion) SIEMPRE completos + los últimos 100 del resto:
-    # un borrador antiguo jamás desaparece del panel que permite confirmarlo/anularlo.
+    # Los borradores (en_preparacion) SIEMPRE completos + los cerrados con la guía SIN
+    # FIRMAR también SIEMPRE completos + los últimos 100 del resto. El criterio es el
+    # mismo para ambos grupos: una fila que EXIGE acción no puede desaparecer del único
+    # panel que permite ejecutarla — el borrador espera confirmarse/anularse, y el
+    # cerrado sin firmar espera "Marcar guía firmada", sin la cual NO SE FACTURA
+    # (regla 2026-08-06). Antes el corte de 100 (contando anulados) sacaba de la vista
+    # justo las guías que llevan semanas esperando la firma: quedaban infacturables
+    # desde la UI (hallazgo HIGH del multienjambre 2026-08-07).
+    # coalesce: filas legadas con guia_firmada NULL cuentan como sin firmar.
     abiertos = (
         db.query(MonzaDespacho).filter(MonzaDespacho.estado == "en_preparacion")
         .order_by(MonzaDespacho.id.desc()).all()
     )
+    # Tope defensivo del grupo sin firmar: al ACTIVAR la regla, todo el histórico
+    # cerrado nace con guia_firmada=0 y sin tope la respuesta traería la tabla entera
+    # (panel inusable + N consultas de estado SII en tandas). 500 es holgadamente más
+    # que cualquier backlog real de guías pendientes de firma, así que el arreglo del
+    # hallazgo HIGH sigue en pie; los más NUEVOS primero (id DESC), que son los que
+    # esperan firma de verdad — los legados viejos ya facturados no exigen acción.
+    sin_firmar = (
+        db.query(MonzaDespacho)
+        .filter(MonzaDespacho.estado == "despachado",
+                func.coalesce(MonzaDespacho.guia_firmada, 0) != 1)
+        .order_by(MonzaDespacho.id.desc()).limit(500).all()
+    )
     resto = (
-        db.query(MonzaDespacho).filter(MonzaDespacho.estado != "en_preparacion")
+        db.query(MonzaDespacho)
+        .filter(MonzaDespacho.estado != "en_preparacion",
+                or_(MonzaDespacho.estado != "despachado",
+                    func.coalesce(MonzaDespacho.guia_firmada, 0) == 1))
         .order_by(MonzaDespacho.id.desc()).limit(100).all()
     )
-    ds = abiertos + resto
+    # DEDUP por id: los 3 grupos se leen en 3 SELECTs y bajo READ COMMITTED una
+    # transición commiteada entre medio (confirmar un borrador, firmar una guía)
+    # puede hacer que la MISMA fila caiga en dos grupos → la respuesta traía la fila
+    # duplicada y React pintaba dos <tr> con la misma key.
+    ds, vistos = [], set()
+    for d in abiertos + sin_firmar + resto:
+        if d.id not in vistos:
+            vistos.add(d.id)
+            ds.append(d)
     # Precarga en LOTE (anti N+1): números de cotización y conteo de ítems en 2 queries.
     cot_nums = {}
     cids = list({d.cotizacion_id for d in ds if d.cotizacion_id})
@@ -1097,6 +1521,11 @@ def list_despachos_entidades(db: Session = Depends(get_db), _=Depends(get_curren
             "estado": d.estado, "numero_expedicion": d.numero_expedicion,
             "fecha": d.fecha.isoformat() if d.fecha else None,
             "fecha_despacho": d.fecha_despacho.isoformat() if d.fecha_despacho else None,
+            # Firma de la guía: el panel "Despachos en curso" pinta con esto el badge
+            # "firmada ✓" o el botón "Marcar guía firmada" (solo en 'despachado').
+            "guia_firmada": bool(d.guia_firmada),
+            "fecha_firma": d.fecha_firma.isoformat() if d.fecha_firma else None,
+            "guia_firmada_archivo": d.guia_firmada_archivo,
             "items_count": counts.get(d.id, 0),
         })
     return out
@@ -1247,19 +1676,45 @@ def actualizar_despacho(despacho_id: int, body: ActualizarDespachoBody, db: Sess
     suelen llegar DESPUÉS del despacho (flujo guía-primero). Con guía electrónica
     SII viva (Fase 5) el folio queda protegido: _rechazar_si_pisa_folio bloquea
     solo el cambio manual de numero_guia, el resto de la cabecera sigue editable."""
-    d = db.query(MonzaDespacho).filter(MonzaDespacho.id == despacho_id).first()
+    # FOR UPDATE + populate_existing (mismo cierre del TOCTOU que firmar_despacho):
+    # sin el lock, la adopción del folio SII ("Reintentar" sobre una emisión ambigua)
+    # podía intercalarse entre el guard del folio y el commit, y el N° manual la
+    # pisaba dejando el estado incorregible por API.
+    d = (
+        db.query(MonzaDespacho)
+        .filter(MonzaDespacho.id == despacho_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
     if not d:
         raise HTTPException(404, "Despacho no encontrado")
     if d.estado == "anulado":
         raise HTTPException(400, "No se puede editar un despacho anulado")
     cambios = body.dict(exclude_unset=True)
     if "numero_guia" in cambios:
+        if len((cambios["numero_guia"] or "").strip()) > 100:
+            # Columna String(100): mejor un 400 claro que el DataError del commit.
+            raise HTTPException(400, "El N° de guía no puede superar los 100 caracteres")
         _rechazar_si_pisa_folio(db, d, cambios["numero_guia"])
     # fecha_guia llega como texto y la columna es Date: se convierte y valida ANTES del
     # setattr genérico (si no, SQLAlchemy guardaría el string crudo). Se saca del dict para
     # que el bucle de abajo no la pise con el valor sin parsear.
     if "fecha_guia" in cambios:
-        d.fecha_guia = _parse_fecha_guia(cambios.pop("fecha_guia"))
+        nueva_fecha_guia = _parse_fecha_guia(cambios.pop("fecha_guia"))
+        # Invariante de la firma (regla 2026-08-06): firmar exige fecha_firma >= fecha
+        # de emisión. Editar la emisión DESPUÉS de la firma no puede romperlo por la
+        # puerta de atrás — si la fecha buena de la guía es posterior a la firma, lo
+        # que está mal es la firma: se corrige re-firmando (y ahí ambas quedan sanas).
+        if (nueva_fecha_guia and d.guia_firmada and d.fecha_firma
+                and nueva_fecha_guia > d.fecha_firma.date()):
+            raise HTTPException(
+                400,
+                f"La guía quedó FIRMADA el {d.fecha_firma.date().isoformat()}: una fecha de "
+                f"emisión posterior ({nueva_fecha_guia.isoformat()}) es inconsistente. "
+                "Corrige primero la firma (Marcar guía firmada → Corregir) y luego la emisión.",
+            )
+        d.fecha_guia = nueva_fecha_guia
     for field, value in cambios.items():
         setattr(d, field, value)
     db.commit()
@@ -1471,3 +1926,151 @@ def _anular_despacho_tx(db: Session, despacho_id: int, current_user):
     db.add(MonzaLog(user_email=current_user.email, accion="ANULADO", entidad="despacho", entidad_id=d.id, entidad_ref=d.numero, detalle=f"Despacho {d.numero} anulado (borrador)"))
     db.commit()
     return {"ok": True}
+
+
+@router.post("/entidades/{despacho_id}/firmar")
+async def firmar_despacho(
+    despacho_id: int,
+    file: UploadFile = File(...),
+    fecha_firma: str = Form(...),
+    numero_guia: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Marca la guía del despacho como FIRMADA (entregada y firmada por el cliente).
+
+    Desde 2026-08-06 la firma GATEA la facturación (paridad con MachParts,
+    routers/despachos.py:firmar_despacho): monza_contabilidad rechaza emitir la
+    factura de un despacho sin guia_firmada==1. Por eso la foto/PDF y la fecha de la
+    firma son OBLIGATORIAS — son el respaldo de la entrega y lo que ordena la
+    cobranza (OC + factura + guía firmada).
+
+    A diferencia de GA (upload genérico de compras + PATCH con el filename), acá el
+    archivo viaja EN el mismo request (multipart) y se guarda en una sola pasada:
+    Monza no tiene endpoint genérico de docs propio, y montar la firma sobre el de
+    compras de GA la dejaba detrás del candado 'mineria' (403 para automotriz).
+
+    RE-FIRMAR está permitido y CORRIGE (reemplaza archivo y fecha; el archivo
+    anterior queda huérfano en disco, igual que el resto de los uploads de la casa).
+    DES-firmar NO existe: la facturación depende de esta marca y quitarla con una
+    emisión en vuelo abriría la carrera firma↔factura — el error se corrige
+    re-firmando con los datos buenos.
+    """
+    d = db.query(MonzaDespacho).filter(MonzaDespacho.id == despacho_id).first()
+    if not d:
+        raise HTTPException(404, "Despacho no encontrado")
+    # Defensa anti-IDOR (heredada del PATCH viejo de contabilidad que este endpoint
+    # reemplaza): el despacho debe pertenecer a una venta (cotización) real.
+    if not d.cotizacion_id or not db.query(MonzaCotizacion.id).filter(
+        MonzaCotizacion.id == d.cotizacion_id
+    ).first():
+        raise HTTPException(404, "El despacho no pertenece a una venta válida")
+    if d.estado != "despachado":
+        raise HTTPException(400, "Primero confirma (cierra) el despacho; luego marca la guía como firmada")
+
+    # La fecha se valida ANTES de tocar el disco: un 400 no debe dejar archivos sueltos.
+    fecha = _parse_fecha_firma(fecha_firma, fecha_guia=d.fecha_guia)
+
+    numero_guia_limpio = (numero_guia or "").strip()
+    if len(numero_guia_limpio) > 100:
+        # La columna es String(100): sin este corte el commit revienta DESPUÉS de
+        # escribir el archivo a disco (huérfano + 500 en vez de un 400 claro).
+        raise HTTPException(400, "El N° de guía no puede superar los 100 caracteres")
+
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in _EXT_GUIA_FIRMADA:
+        raise HTTPException(
+            400,
+            f"Tipo de archivo no permitido para la guía firmada: '{ext or 'sin extensión'}'. "
+            "Sube la foto (JPG/PNG/WEBP/HEIC) o el PDF escaneado.",
+        )
+    # El archivo se LEE antes de tomar el lock: el await cede el event loop y no debe
+    # ocurrir con la fila del despacho bloqueada.
+    content = await file.read()
+    if not content:
+        raise HTTPException(400, "El archivo de la guía firmada llegó vacío: súbelo de nuevo")
+    if len(content) > _MAX_GUIA_FIRMADA_BYTES:
+        raise HTTPException(400, "Archivo demasiado grande (máximo 20 MB)")
+
+    # ── Recarga BAJO LOCK y re-validación (cierra el TOCTOU del folio, hallazgo del
+    # multienjambre 2026-08-07): entre el guard optimista de arriba y el commit, el
+    # rescate de "Reintentar" puede ADOPTAR el folio SII de una emisión ambigua y
+    # escribirlo en numero_guia — sin el lock, el N° manual staged lo pisaba y el
+    # estado quedaba incorregible por API (el propio guard rechaza después toda
+    # corrección). populate_existing: la relectura debe ver lo COMMITEADO, no el
+    # snapshot de la sesión. La adopción escribe dte+despacho en una transacción, así
+    # que el lock del despacho basta como punto de serialización.
+    d = (
+        db.query(MonzaDespacho)
+        .filter(MonzaDespacho.id == despacho_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
+    if not d or d.estado != "despachado":
+        raise HTTPException(400, "El despacho cambió de estado mientras se firmaba: recarga y reintenta")
+    # RE-VALIDACIÓN del invariante firma >= emisión con el dato FRESCO: la primera
+    # pasada se hizo sobre el snapshot PRE-lock, y un PUT de cabecera que cargue
+    # fecha_guia en esa ventana dejaría persistido justo el par que el guard del PUT
+    # (R9) prohíbe. Barato y cierra la carrera por los dos lados.
+    fecha = _parse_fecha_firma(fecha_firma, fecha_guia=d.fecha_guia)
+    if numero_guia_limpio:
+        # Con guía electrónica viva, el N° correcto ya es (o será) el folio del SII:
+        # se bloquea el reemplazo manual. La firma en sí sigue funcionando sin tocar
+        # el N° (espejo GA). El DTE se lee por PRIMERA vez en esta sesión (fresco bajo
+        # READ COMMITTED); si la adopción del folio corre después de esta lectura,
+        # queda esperando el lock del despacho y escribe DESPUÉS del commit de la
+        # firma — el folio gana, que es el orden correcto.
+        _rechazar_si_pisa_folio(db, d, numero_guia_limpio)
+        d.numero_guia = numero_guia_limpio
+
+    # uuid4().hex + ext = el MISMO formato del upload de la casa (32 hex + extensión):
+    # cumple el _UPLOAD_FILE_RE de GA y jamás colisiona con otro documento.
+    unique_name = f"{uuid.uuid4().hex}{ext}"
+    with open(os.path.join(_DOCS_DIR, unique_name), "wb") as f_out:
+        f_out.write(content)
+
+    d.guia_firmada = 1
+    # La columna es DATETIME: se guarda a medianoche del día firmado (espejo del
+    # strptime de GA). La HORA de la firma no se captura — el dato de negocio es el día.
+    d.fecha_firma = datetime.combine(fecha, datetime.min.time())
+    d.usuario_firma_id = getattr(current_user, "id", None)
+    d.guia_firmada_archivo = unique_name
+    # UN solo commit con el log adentro (patrón de crear/cerrar/anular).
+    from monza_models import MonzaLog
+    db.add(MonzaLog(
+        user_email=current_user.email, accion="GUIA_FIRMADA", entidad="despacho",
+        entidad_id=d.id, entidad_ref=d.numero,
+        detalle=f"Guía {d.numero_guia or d.numero} firmada por el cliente el {fecha.isoformat()} · {unique_name}",
+    ))
+    db.commit()
+    return {
+        "ok": True,
+        "guia_firmada": True,
+        "numero_guia": d.numero_guia,
+        "fecha_firma": d.fecha_firma.isoformat(),
+        "guia_firmada_archivo": d.guia_firmada_archivo,
+    }
+
+
+@router.get("/docs/{filename}")
+def serve_doc(
+    filename: str,
+    current_user=Depends(get_current_user),
+):
+    """Sirve un documento del repositorio uploads/docs (hoy: la guía firmada).
+
+    Espejo de routers/despachos.py:serve_doc de GA — mismo directorio físico, pero
+    detrás del candado 'automotriz' de ESTE router: el serve de GA exige 'mineria'
+    y un usuario Monza recibía 403 al intentar ver su propia guía firmada.
+
+    Path traversal cortado en dos capas: formato estricto del nombre y resolución
+    del path final contra el directorio (igual que GA)."""
+    if not re.match(r"^[A-Za-z0-9._-]{1,255}$", filename):
+        raise HTTPException(400, "Nombre de archivo inválido")
+    full_path = os.path.abspath(os.path.join(_DOCS_DIR, filename))
+    if not full_path.startswith(_DOCS_DIR + os.sep):
+        raise HTTPException(400, "Ruta inválida")
+    if not os.path.isfile(full_path):
+        raise HTTPException(404, "Documento no encontrado")
+    return FileResponse(full_path, filename=filename)

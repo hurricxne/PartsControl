@@ -220,6 +220,13 @@ def crear_venta(db, mark: str, *, rut: str = RUT_CLIENTE, numero_oc: str = "OC-4
                              # a propósito: así ninguna suite pasa por confundirlas.
                              fecha_guia=(FECHA_GUIA_PAPEL if numero_guia_manual else None),
                              fecha_despacho=datetime(2026, 6, 20, 10, 0, 0),
+                             # REGLA 2026-08-06: sin guía FIRMADA no se factura. El
+                             # harness la deja firmada de fábrica para que las suites
+                             # ejerciten lo suyo (SII, topes, concurrencia) sin chocar
+                             # con el gate; el gate en sí tiene su propia suite
+                             # (monza_contabilidad/tests/test_guia_firmada_gate.py).
+                             guia_firmada=1,
+                             fecha_firma=datetime(2026, 7, 20, 0, 0, 0),
                              direccion_entrega="Bodega central, Roger de Flor 2996")
         db.add(desp); db.flush()
         db.add_all([
@@ -243,6 +250,8 @@ def despacho_extra(db, mark: str, cot, items_qty: dict, *, estado: str = "despac
                          estado=estado, destinatario="Juan Pérez", numero_guia=numero_guia,
                          fecha_guia=(FECHA_GUIA_PAPEL if numero_guia else None),
                          fecha_despacho=datetime(2026, 6, 22, 10, 0, 0),
+                         # Firmada de fábrica (regla 2026-08-06, ver arriba).
+                         guia_firmada=1, fecha_firma=datetime(2026, 7, 21, 0, 0, 0),
                          direccion_entrega="Bodega central, Roger de Flor 2996")
     db.add(desp); db.flush()
     for item_id, qty in items_qty.items():

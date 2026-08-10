@@ -6,9 +6,11 @@
 // se pasa a CxP con un botón (los datos viajan de allá, NO se re-digitan: así la
 // compra nace con emb_pricing_gasto_id y el anti-duplicado del backend funciona).
 import { useState, useEffect, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
-  Wallet, Plus, Search, AlertCircle, CheckCircle2, DollarSign,
+  Wallet, Plus, Search, AlertCircle, CheckCircle2, DollarSign, BookOpenCheck,
   Loader2, RefreshCw, ChevronDown, ChevronUp, CreditCard, X, Trash2, Ban, Ship, Truck,
+  ArrowLeft, AlertTriangle,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { fmtClp, fmtDate, hoyLocal } from '../utils/format'
@@ -34,9 +36,14 @@ const GASTO_TIPO_BADGE: Record<string, string> = {
 }
 
 // ─── Modal genérico + helpers de formulario ─────────────────────────────────
-function Modal({ title, wide, onClose, children }: { title: string; wide?: boolean; onClose: () => void; children: React.ReactNode }) {
+/** `bloquearFondo` (H5): el clic en el fondo oscuro NO cierra el modal. Se usa en el
+ *  alta que llega pre-llenada desde el Libro SII: ese formulario no se puede "volver a
+ *  pedir" (la llave de sessionStorage se consume al montar la página), así que un clic
+ *  distraído en un espacio en blanco borraba el trabajo sin preguntar nada. Los modales
+ *  que no lo piden siguen cerrándose con el fondo, como siempre. */
+function Modal({ title, wide, onClose, bloquearFondo, children }: { title: string; wide?: boolean; onClose: () => void; bloquearFondo?: boolean; children: React.ReactNode }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={bloquearFondo ? undefined : onClose}>
       <div className={`w-full ${wide ? 'max-w-2xl' : 'max-w-md'} rounded-2xl border shadow-2xl max-h-[90vh] overflow-y-auto`}
         style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }} onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between px-5 py-3 border-b sticky top-0" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-100)' }}>
@@ -64,32 +71,78 @@ interface Prefill {
   emb_pricing_gasto_id: number; embarque_id: number
 }
 
+/** Prefill que llega del Libro SII (GET /sii-libro/documentos/{id}/prefill-compra):
+ *  nombres EXACTOS de CompraCreate. Viaja por sessionStorage (llave 'prefillCompraSii')
+ *  desde la bandeja y se consume UNA vez al montar esta página. A diferencia del prefill
+ *  de embarque, NO bloquea campos ni cambia la lógica de guardado: el operador revisa y
+ *  guarda por el camino normal, con todos los guards (anti-duplicado incluido) intactos. */
+interface PrefillSii {
+  proveedor_id: number | null
+  acreedor: string | null
+  proveedor_rut: string | null
+  numero_documento: string | null
+  fecha: string | null
+  monto_neto: number
+  iva: number
+  monto_total: number
+  /** OPCIONALES: si la bandeja del Libro SII los manda (documento en cubeta
+   *  INDETERMINADO), acá se pinta el aviso ámbar con la leyenda del servidor y el alta
+   *  queda trabada hasta que el operador confirme que fue a revisar. Es el paso de
+   *  revisión que el botón "Registrar igualmente…" prometía con sus puntos suspensivos
+   *  y que hoy no existía en ninguna parte del camino. Si no vienen, el formulario se
+   *  comporta exactamente como siempre. */
+  cubeta?: string | null
+  cubeta_detalle?: string | null
+}
+const PREFILL_COMPRA_SII_KEY = 'prefillCompraSii'
+
 // ─── Modal: registrar compra ────────────────────────────────────────────────
-function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
-  catalogos: Catalogos | null; prefill?: Prefill | null; onClose: () => void; onDone: () => void
+function RegistrarCompraModal({ catalogos, prefill, prefillSii, onVolverLibroSii, onBuscarEnLista, onClose, onDone }: {
+  catalogos: Catalogos | null; prefill?: Prefill | null; prefillSii?: PrefillSii | null
+  /** H5: vuelta al Libro SII desde adentro del formulario (antes había que buscar el
+   *  módulo en el menú lateral otra vez). */
+  onVolverLibroSii?: () => void
+  /** H7: "ir a verla antes de tocar nada" — cierra el formulario y deja la lista de
+   *  compras filtrada por ese proveedor. */
+  onBuscarEnLista?: (texto: string) => void
+  onClose: () => void; onDone: () => void
 }) {
   const [tipoGasto, setTipoGasto] = useState(prefill?.tipo_gasto || 'gasto_operacional')
   const [categoria, setCategoria] = useState(prefill ? 'Gastos de importación' : '')
   const [cuentaId, setCuentaId] = useState<number | ''>('')
   const [esAnticipo, setEsAnticipo] = useState(false)
-  const [proveedorId, setProveedorId] = useState<number | ''>('')
-  const [acreedor, setAcreedor] = useState(prefill?.acreedor || '')
-  const [rut, setRut] = useState('')
-  const [fecha, setFecha] = useState(hoyLocal())
-  const [numDoc, setNumDoc] = useState(prefill?.numero_documento || '')
+  const [proveedorId, setProveedorId] = useState<number | ''>(prefillSii?.proveedor_id ?? '')
+  const [acreedor, setAcreedor] = useState(prefill?.acreedor || prefillSii?.acreedor || '')
+  const [rut, setRut] = useState(prefillSii?.proveedor_rut || '')
+  const [fecha, setFecha] = useState(prefillSii?.fecha || hoyLocal())
+  const [numDoc, setNumDoc] = useState(prefill?.numero_documento || prefillSii?.numero_documento || '')
   const [tipoDoc, setTipoDoc] = useState('factura')
   const [descripcion, setDescripcion] = useState('')
   const [referencia, setReferencia] = useState(prefill?.referencia || '')
   const [moneda, setMoneda] = useState('CLP')
   const [tc, setTc] = useState('')
-  const [neto, setNeto] = useState(prefill ? String(Math.round(prefill.monto_neto)) : '')
-  const [afectoIva, setAfectoIva] = useState(prefill ? prefill.iva > 0 : true)
+  const [neto, setNeto] = useState(
+    prefill ? String(Math.round(prefill.monto_neto))
+      : prefillSii ? String(Math.round(prefillSii.monto_neto)) : '')
+  const [afectoIva, setAfectoIva] = useState(prefill ? prefill.iva > 0 : prefillSii ? prefillSii.iva > 0 : true)
+  // IVA TAL CUAL del documento SII (puede diferir en $1 del 19% redondeado, o ser 0 en
+  // una exenta): se respeta mientras el operador no toque neto/afecto — cualquier
+  // edición manual lo descarta y vuelve el cálculo normal del formulario.
+  const [ivaSii, setIvaSii] = useState<number | null>(prefillSii ? Math.round(prefillSii.iva) : null)
   const [condicion, setCondicion] = useState<'contado' | 'credito'>('credito')
   const [plazo, setPlazo] = useState('30')
   const [pagoMedio, setPagoMedio] = useState('transferencia')
   const [pagoBanco, setPagoBanco] = useState('')
   const [pagoFechaBanco, setPagoFechaBanco] = useState(hoyLocal())
   const [saving, setSaving] = useState(false)
+  // H7 — el rechazo del alta ya NO viaja en un toast de 4 segundos: se queda pegado
+  // dentro del modal hasta que el operador lo cierre. El 409 del anti-duplicado son 55
+  // palabras que hay que leer con la factura en la mano; en el cartel de la esquina
+  // alcanzaba a leerse media frase y la conclusión era "el sistema se confundió".
+  const [errorAlta, setErrorAlta] = useState<{ detalle: string; duplicado: boolean } | null>(null)
+  // Confirmación explícita del aviso "puede que ya esté registrada" (ver PrefillSii).
+  const [avisoRevisado, setAvisoRevisado] = useState(false)
+  const avisoDuda = !prefill && !!prefillSii?.cubeta_detalle
 
   // Compra NACIONAL con detalle de ítems: la factura ES el costo de esos repuestos
   // (neto CLP por ítem; el IVA es crédito fiscal, no capitaliza). El backend valida
@@ -148,8 +201,10 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
 
   const netoN = Number(neto) || 0
   // Con prefill el IVA es el que ya calculó Embarques Pricing (puede ser IVA de
-  // importación sobre el CIF, que no es el 19% del neto de esta línea): se respeta tal cual.
-  const ivaN = prefill ? Math.round(prefill.iva) : (afectoIva ? Math.round(netoN * 0.19) : 0)
+  // importación sobre el CIF, que no es el 19% del neto de esta línea): se respeta tal
+  // cual. Con prefill del Libro SII pasa lo mismo mientras el operador no edite el neto.
+  const ivaN = prefill ? Math.round(prefill.iva)
+    : (ivaSii ?? (afectoIva ? Math.round(netoN * 0.19) : 0))
   const totalN = netoN + ivaN
   const tcN = moneda === 'CLP' ? 1 : (Number(tc) || 0)
   const totalClp = Math.round(totalN * tcN)
@@ -166,6 +221,17 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
     setProveedorId(id)
     const p = catalogos?.proveedores.find(x => x.id === id)
     if (p) { setAcreedor(p.nombre); if (p.moneda) setMoneda(p.moneda) }
+  }
+
+  /** H5 — cerrar el formulario pre-llenado del Libro SII pregunta antes: los datos del
+   *  documento no se pueden volver a pedir con el botón "Registrar compra" del
+   *  encabezado (ese abre uno vacío). El aviso de la página los conserva para reabrirlo. */
+  const cerrar = () => {
+    if (prefillSii && !prefill && !confirm(
+      '¿Cerrar el formulario? Se pierde lo que hayas escrito.\n\n' +
+      'Los datos del Libro SII no se pierden: puedes volver a abrir el formulario ' +
+      'desde el aviso que queda arriba de esta página.')) return
+    onClose()
   }
 
   const submit = async () => {
@@ -198,7 +264,7 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
       })
     }
 
-    setSaving(true)
+    setSaving(true); setErrorAlta(null)
     try {
       await comprasContabAPI.crear({
         tipo_gasto: tipoGasto, categoria: categoria || undefined,
@@ -208,7 +274,9 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
         fecha, referencia: referencia || undefined, descripcion: descripcion || undefined,
         numero_documento: numDoc || undefined, tipo_doc: tipoDoc,
         moneda, tc: tcN, monto_neto: netoN,
-        ...(prefill ? { iva: ivaN } : { afecto_iva: afectoIva }),
+        // El IVA del documento SII (si sigue vigente) viaja explícito, igual que el de
+        // embarque: es el número del documento, no un recálculo al 19%.
+        ...(prefill ? { iva: ivaN } : ivaSii != null ? { iva: ivaSii } : { afecto_iva: afectoIva }),
         condicion_pago: condicion, plazo_dias: condicion === 'credito' && plazo ? Number(plazo) : undefined,
         // Llave del gasto de pricing: sin ella el dedup del backend es inalcanzable.
         ...(prefill ? { emb_pricing_gasto_id: prefill.emb_pricing_gasto_id, embarque_id: prefill.embarque_id } : {}),
@@ -219,11 +287,50 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
           : undefined,
       })
       toast.success('Compra registrada'); onDone(); onClose()
-    } catch (e: any) { toast.error(e?.response?.data?.detail || 'No se pudo registrar la compra') } finally { setSaving(false) }
+    } catch (e: any) {
+      // H7 — al recuadro del modal, no al toast. TODOS los 409 del alta de compras son
+      // de la familia "esto ya está registrado" (folio+RUT exacto, folio blando, gasto
+      // de embarque repetido, factura sin N° del mismo acreedor y monto), así que el
+      // 409 se rotula por lo que de verdad es y se acompaña de qué hacer.
+      setErrorAlta({
+        detalle: String(e?.response?.data?.detail || 'No se pudo registrar la compra. Revisa los datos e inténtalo de nuevo.'),
+        duplicado: e?.response?.status === 409,
+      })
+    } finally { setSaving(false) }
   }
 
   return (
-    <Modal title={prefill ? `Registrar costo de embarque${prefill.referencia ? ` · ${prefill.referencia}` : ''}` : 'Registrar compra / gasto'} wide onClose={onClose}>
+    <Modal title={prefill ? `Registrar costo de embarque${prefill.referencia ? ` · ${prefill.referencia}` : ''}`
+      : prefillSii ? `Registrar compra · doc SII${prefillSii.numero_documento ? ` ${prefillSii.numero_documento}` : ''}`
+      : 'Registrar compra / gasto'} wide onClose={cerrar} bloquearFondo={!!prefillSii && !prefill}>
+      {prefillSii && !prefill && (
+        <div className="text-xs rounded-xl px-3 py-2 space-y-1.5" style={{ color: 'var(--text-muted)', backgroundColor: 'var(--surface-200)' }}>
+          <p>
+            <BookOpenCheck className="w-3.5 h-3.5 inline mr-1.5 text-brand-400" />
+            Datos traídos del <b style={{ color: 'var(--text-primary)' }}>Libro de Compras SII</b> (RUT, N°, fecha y montos del documento).
+            Revisa el tipo de gasto, la cuenta y la condición de pago. Antes de guardar, revisa
+            también que esta factura no esté ya registrada.
+          </p>
+          {onVolverLibroSii && (
+            <button type="button" onClick={onVolverLibroSii} className="inline-flex items-center gap-1 font-semibold text-brand-400 hover:underline">
+              <ArrowLeft className="w-3 h-3" /> Volver al Libro SII
+            </button>
+          )}
+        </div>
+      )}
+      {/* Aviso del documento dudoso + confirmación obligatoria (ver PrefillSii). */}
+      {avisoDuda && (
+        <div className="text-xs rounded-xl px-3 py-2 border border-amber-400/40 bg-amber-500/10 space-y-1.5">
+          <p className="font-semibold text-amber-500 flex items-start gap-1.5">
+            <AlertTriangle className="w-3.5 h-3.5 mt-px shrink-0" /> Ojo: puede que esta factura ya esté registrada
+          </p>
+          <p style={{ color: 'var(--text-muted)' }}>{prefillSii?.cubeta_detalle}</p>
+          <label className="flex items-start gap-2 font-medium cursor-pointer" style={{ color: 'var(--text-primary)' }}>
+            <input type="checkbox" className="mt-0.5" checked={avisoRevisado} onChange={e => setAvisoRevisado(e.target.checked)} />
+            Ya la busqué en la lista de compras y no está: registrarla de todas formas
+          </label>
+        </div>
+      )}
       {prefill && (
         <p className="text-xs rounded-xl px-3 py-2" style={{ color: 'var(--text-muted)', backgroundColor: 'var(--surface-200)' }}>
           <Ship className="w-3.5 h-3.5 inline mr-1.5 text-cyan-400" />
@@ -316,7 +423,7 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
                 {sumaExcedeNeto ? (
                   <span className="text-red-400 font-semibold flex items-center gap-1"><AlertCircle className="w-3.5 h-3.5" /> Σ supera el neto de la factura</span>
                 ) : (
-                  <button type="button" onClick={() => setNeto(String(Math.round(sumaLineas)))}
+                  <button type="button" onClick={() => { setNeto(String(Math.round(sumaLineas))); setIvaSii(null) }}
                     className="text-[11px] px-2 py-1 rounded-lg border border-brand-400/40 text-brand-400 hover:bg-brand-500/10 transition-colors font-semibold">
                     Usar Σ como neto
                   </button>
@@ -397,7 +504,7 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
             </select>
           </Field>
           {moneda !== 'CLP' && <Field label="Tipo de cambio (a CLP)"><input type="number" className={inputCls} style={inputStyle} value={tc} onChange={e => setTc(e.target.value)} placeholder="950" /></Field>}
-          <Field label={`Monto neto (${moneda})`}><input type="number" className={inputCls} style={inputStyle} value={neto} disabled={!!prefill} onChange={e => setNeto(e.target.value)} /></Field>
+          <Field label={`Monto neto (${moneda})`}><input type="number" className={inputCls} style={inputStyle} value={neto} disabled={!!prefill} onChange={e => { setNeto(e.target.value); setIvaSii(null) }} /></Field>
         </div>
         {prefill ? (
           <p className="mt-2 text-[11px]" style={{ color: 'var(--text-faint)' }}>
@@ -406,7 +513,7 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
           </p>
         ) : (
           <label className="flex items-center gap-2 mt-2 text-xs" style={{ color: 'var(--text-muted)' }}>
-            <input type="checkbox" checked={afectoIva} onChange={e => setAfectoIva(e.target.checked)} /> Afecto a IVA (19%)
+            <input type="checkbox" checked={afectoIva} onChange={e => { setAfectoIva(e.target.checked); setIvaSii(null) }} /> Afecto a IVA (19%)
           </label>
         )}
         <div className="flex flex-wrap gap-x-5 gap-y-1 mt-2 text-xs" style={{ color: 'var(--text-muted)' }}>
@@ -441,7 +548,39 @@ function RegistrarCompraModal({ catalogos, prefill, onClose, onDone }: {
         </div>
       )}
 
-      <button onClick={submit} disabled={saving} className="btn-primary w-full flex items-center justify-center gap-2">
+      {/* H7 — el rechazo se pinta ACÁ, pegado al botón que el operador acaba de apretar
+          (arriba del formulario largo quedaría fuera de pantalla), y se queda hasta que
+          él lo cierre. El texto no insinúa que el remedio sea cambiarle el número: eso
+          es exactamente cómo se fabrica la deuda duplicada que el control impide. */}
+      {errorAlta && (
+        <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2.5 text-xs space-y-1.5">
+          <p className="font-semibold text-red-400 flex items-start gap-1.5">
+            <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
+            {errorAlta.duplicado ? 'Esta factura probablemente YA está registrada' : 'No se pudo registrar la compra'}
+          </p>
+          <p style={{ color: 'var(--text-muted)' }}>{errorAlta.detalle}</p>
+          {errorAlta.duplicado && (
+            <p style={{ color: 'var(--text-muted)' }}>
+              Antes de cambiar nada: anda a ver esa compra en la lista y compárala con la factura
+              en papel. Si es la misma, no la registres de nuevo. Si de verdad es otra factura
+              distinta, avisa a contabilidad antes de forzarla: cambiarle el número para que pase
+              deja la misma deuda cargada dos veces, y después se paga dos veces.
+            </p>
+          )}
+          <div className="flex flex-wrap items-center gap-4 pt-0.5">
+            {errorAlta.duplicado && onBuscarEnLista && acreedor.trim() !== '' && (
+              <button type="button" onClick={() => onBuscarEnLista(acreedor.trim())} className="font-semibold text-red-400 hover:underline">
+                Cerrar y ver las compras de {acreedor.trim()}
+              </button>
+            )}
+            <button type="button" onClick={() => setErrorAlta(null)} className="font-semibold hover:underline" style={{ color: 'var(--text-faint)' }}>
+              Ocultar este aviso
+            </button>
+          </div>
+        </div>
+      )}
+      <button onClick={submit} disabled={saving || (avisoDuda && !avisoRevisado)} className="btn-primary w-full flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+        title={avisoDuda && !avisoRevisado ? 'Primero confirma arriba que fuiste a revisar si ya estaba registrada' : undefined}>
         {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wallet className="w-4 h-4" />} Registrar compra
       </button>
     </Modal>
@@ -777,6 +916,7 @@ function CostosEmbarqueTab({ onRegistrar }: { onRegistrar: (p: Prefill) => void 
 
 // ─── Página ──────────────────────────────────────────────────────────────────
 export default function ComprasContabPage() {
+  const navigate = useNavigate()
   const [tab, setTab] = useState<'compras' | 'embarque'>('compras')
   const [compras, setCompras] = useState<Compra[]>([])
   const [aging, setAging] = useState<Antiguedad | null>(null)
@@ -789,7 +929,14 @@ export default function ComprasContabPage() {
   const [error, setError] = useState('')
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
-  const [modal, setModal] = useState<{ type: 'crear' | 'pago' | 'consolidado'; compra?: Compra; prefill?: Prefill } | null>(null)
+  const [modal, setModal] = useState<{ type: 'crear' | 'pago' | 'consolidado'; compra?: Compra; prefill?: Prefill; prefillSii?: PrefillSii } | null>(null)
+  // H5 — el documento que trajo la bandeja del Libro SII queda vivo EN ESTA PÁGINA (no en
+  // sessionStorage, que se consume al montar para que un refresh no reviva datos viejos):
+  // así el pre-llenado ya no se muere con un clic fuera del modal y siempre queda a la
+  // vista el camino de vuelta. Cuando la compra YA se guardó, el botón de reabrir
+  // DESAPARECE: reabrirlo sería la forma más fácil de registrar dos veces la misma
+  // factura, justo lo que el anti-duplicado existe para impedir.
+  const [docSii, setDocSii] = useState<{ datos: PrefillSii; registrada: boolean } | null>(null)
 
   const PAGE_SIZE = 50
 
@@ -808,6 +955,24 @@ export default function ComprasContabPage() {
   useEffect(() => {
     comprasContabAPI.catalogos().then(({ data }) => setCatalogos(data))
       .catch((e: any) => toast.error(e?.response?.data?.detail || 'No se pudieron cargar los catálogos'))
+  }, [])
+
+  // Prefill del Libro SII: si la bandeja dejó un documento en sessionStorage, se consume
+  // UNA vez (y se borra ANTES de usarlo: un refresh o una vuelta atrás no deben re-abrir
+  // el modal con datos viejos) y se abre el formulario NORMAL de compra pre-llenado.
+  useEffect(() => {
+    const raw = sessionStorage.getItem(PREFILL_COMPRA_SII_KEY)
+    if (!raw) return
+    sessionStorage.removeItem(PREFILL_COMPRA_SII_KEY)
+    try {
+      const datos = JSON.parse(raw) as PrefillSii
+      setDocSii({ datos, registrada: false })
+      setModal({ type: 'crear', prefillSii: datos })
+    } catch {
+      // JSON corrupto (no debería pasar: lo escribe LibroSiiPage): se avisa y el
+      // operador registra a mano — jamás un formulario pre-llenado con basura.
+      toast.error('No se pudieron leer los datos del Libro SII: registra la compra a mano')
+    }
   }, [])
   useEffect(() => { load(q || undefined, estado || undefined, tipo || undefined, 1) }, [estado, tipo])
   const reload = () => load(q || undefined, estado || undefined, tipo || undefined, page)
@@ -828,6 +993,39 @@ export default function ComprasContabPage() {
           <button onClick={reload} className="btn-secondary flex items-center gap-2"><RefreshCw className="w-4 h-4" /></button>
         </div>
       </div>
+
+      {/* H5 — aviso de contexto del documento traído del Libro SII: sobrevive al cierre
+          del modal y al guardado, y es el único lugar donde el operador recupera el
+          pre-llenado o vuelve a la bandeja sin buscar el módulo en el menú otra vez. */}
+      {docSii && (
+        <div className="rounded-2xl border px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm"
+          style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
+          <span className="flex-1 min-w-[240px]">
+            <BookOpenCheck className="w-4 h-4 inline mr-1.5 text-brand-400" />
+            {docSii.registrada ? (
+              <>Compra registrada desde el <b style={{ color: 'var(--text-primary)' }}>Libro de Compras SII</b>
+                {docSii.datos.numero_documento ? <> (documento {docSii.datos.numero_documento})</> : null}.
+                Vuelve al Libro SII para seguir con el siguiente documento.</>
+            ) : (
+              <>Estás registrando el documento
+                {docSii.datos.numero_documento ? <> <b style={{ color: 'var(--text-primary)' }}>{docSii.datos.numero_documento}</b></> : null} del{' '}
+                <b style={{ color: 'var(--text-primary)' }}>Libro de Compras SII</b>. Si cerraste el formulario sin
+                guardar, ábrelo de nuevo con los mismos datos: no hay que teclearlos otra vez.</>
+            )}
+          </span>
+          {!docSii.registrada && (
+            <button onClick={() => setModal({ type: 'crear', prefillSii: docSii.datos })} className="btn-secondary text-xs flex items-center gap-1.5">
+              <Plus className="w-3.5 h-3.5" /> Abrir el formulario con esos datos
+            </button>
+          )}
+          <button onClick={() => navigate('/libro-sii')} className="btn-secondary text-xs flex items-center gap-1.5">
+            <ArrowLeft className="w-3.5 h-3.5" /> Volver al Libro SII
+          </button>
+          <button onClick={() => setDocSii(null)} title="Ocultar este aviso" className="p-1 rounded-lg hover:bg-white/10" style={{ color: 'var(--text-muted)' }}>
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex items-center gap-2 border-b" style={{ borderColor: 'var(--border)' }}>
@@ -950,8 +1148,19 @@ export default function ComprasContabPage() {
           está allá, y al volver a la pestaña de embarque el gasto ya sale "En compras ✓". */}
       {modal?.type === 'crear' && (
         <RegistrarCompraModal catalogos={catalogos} prefill={modal.prefill || null}
+          prefillSii={modal.prefillSii || null}
+          onVolverLibroSii={() => navigate('/libro-sii')}
+          // H7 — "anda a verla antes de tocar nada": la lista queda filtrada por ese
+          // proveedor, que es donde está la compra que el servidor acaba de nombrar.
+          onBuscarEnLista={(texto) => { setModal(null); setTab('compras'); handleSearch(texto) }}
           onClose={() => setModal(null)}
-          onDone={() => { reload(); if (modal.prefill) setTab('compras') }} />
+          onDone={() => {
+            reload()
+            if (modal.prefill) setTab('compras')
+            // H5 — guardada: el aviso pasa de "puedes reabrirlo" a "vuelve por el
+            // siguiente", y deja de ofrecer el formulario pre-llenado.
+            if (modal.prefillSii) setDocSii(d => (d ? { ...d, registrada: true } : d))
+          }} />
       )}
       {modal?.type === 'pago' && modal.compra && <PagoCompraModal compra={modal.compra} onClose={() => setModal(null)} onDone={reload} />}
       {modal?.type === 'consolidado' && <PagoConsolidadoModal onClose={() => setModal(null)} onDone={reload} />}

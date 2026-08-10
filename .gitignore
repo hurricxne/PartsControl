@@ -89,3 +89,8 @@ respaldos-bd/
 *.sql.gz
 machparts_db-*.sql
 monzaparts_db-*.sql
+
+# Configuración local de herramientas de desarrollo (launch.json para levantar el
+# backend/frontend). Lleva rutas ABSOLUTAS de la máquina de cada quien, así que no
+# sirve compartirla: cada desarrollador arma la suya.
+.claude/

@@ -1916,6 +1916,19 @@ def _armar_payload_factura(db: Session, factura, client_id: Optional[int],
         db, factura.despacho_id if not factura.es_anticipo else None, list(factura.items))
     if problema_ajenas:
         problemas.append(problema_ajenas)
+    # CINTURÓN de la FIRMA (mismo criterio que el de líneas, hallazgo del multienjambre
+    # 2026-08-07): el reintento ejecuta un acto SII nuevo e irreversible, así que el
+    # gate de la guía firmada (regla 2026-08-06, _construir_factura) se re-impone
+    # también acá. Una factura pre-candado —o de una vía que no lo aplicó— no puede
+    # re-emitirse citando una guía que el cliente nunca firmó. Fail-closed: el
+    # despacho ausente (borrado/huérfano) también bloquea.
+    if factura.despacho_id and not factura.es_anticipo:
+        desp_firma = db.query(MonzaDespacho).filter(
+            MonzaDespacho.id == factura.despacho_id).first()
+        if not desp_firma or not getattr(desp_firma, "guia_firmada", 0):
+            problemas.append(
+                "La guía de esta factura no está FIRMADA por el cliente: márcala en "
+                "Despachos (foto/PDF + fecha de la firma) antes de emitir/reintentar")
     cot = (db.query(MonzaCotizacion)
            .filter(MonzaCotizacion.id == factura.cotizacion_id).first()
            if factura.cotizacion_id else None)

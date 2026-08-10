@@ -15,7 +15,7 @@ from database import get_db
 from auth import get_current_user
 from empresa_guard import require_empresa
 from monza_models import (
-    MonzaCotizacion, MonzaCotizacionItem, MonzaOcProveedor, MonzaReclamo,
+    MonzaCotizacion, MonzaCotizacionItem, MonzaOcProveedor, MonzaReclamo, MonzaCliente,
     MonzaEmbarque, MonzaEmbarqueItem, MonzaRecepcion, MonzaRecepcionItem, MonzaDocumento,
     MonzaDespacho, MonzaDespachoItem,
 )
@@ -96,19 +96,92 @@ def embarques_a_recibir(db: Session = Depends(get_db), _=Depends(get_current_use
 
 
 # ── Historial de embarques recepcionados (Fase 4 espejo GA) ───────────────────
+
+def _cond_token_historial(tok: str, con_colapsado: bool = False):
+    """Condición OR de un token sobre el EMBARQUE recepcionado: sus campos propios
+    (numero / awb / tracking / forwarder) + EXISTS a los ítems que trajo (n° de
+    parte, repuesto, COT, OC del cliente) — sin esto un embarque viejo era
+    inencontrable pasadas 100 recepciones y el buscador de la caja única mentiría
+    en esta pestaña. Mismo contrato que el resto (spec buscadores 2026-08-05)."""
+    from monza_router_despachos import _patron, _variantes_q, _colapsar_q, _np_colapsado_sql
+    from sqlalchemy import or_ as _or, and_ as _and, exists as _exists
+    ors = []
+    for v in _variantes_q(tok):
+        p = _patron(v)
+        ors += [
+            MonzaEmbarque.numero.like(p, escape="\\"),
+            MonzaEmbarque.awb.like(p, escape="\\"),
+            MonzaEmbarque.tracking.like(p, escape="\\"),
+            MonzaEmbarque.forwarder.like(p, escape="\\"),
+            _exists().where(_and(
+                MonzaEmbarqueItem.embarque_id == MonzaEmbarque.id,
+                MonzaCotizacionItem.id == MonzaEmbarqueItem.item_id,
+                _or(MonzaCotizacionItem.numero_parte.like(p, escape="\\"),
+                    MonzaCotizacionItem.descripcion.like(p, escape="\\")),
+            )),
+            _exists().where(_and(
+                MonzaEmbarqueItem.embarque_id == MonzaEmbarque.id,
+                MonzaCotizacionItem.id == MonzaEmbarqueItem.item_id,
+                MonzaCotizacion.id == MonzaCotizacionItem.cotizacion_id,
+                _or(MonzaCotizacion.numero.like(p, escape="\\"),
+                    MonzaCotizacion.oc_cliente.like(p, escape="\\")),
+            )),
+        ]
+    if con_colapsado and any(ch.isdigit() for ch in tok):
+        cc = _colapsar_q(tok)
+        if cc:
+            ors.append(_exists().where(_and(
+                MonzaEmbarqueItem.embarque_id == MonzaEmbarque.id,
+                MonzaCotizacionItem.id == MonzaEmbarqueItem.item_id,
+                _np_colapsado_sql().like(_patron(cc), escape="\\"),
+            )))
+    return _or(*ors)
+
+
 @router.get("/embarques/historial")
-def embarques_recepcionados(db: Session = Depends(get_db), _=Depends(get_current_user)):
+def embarques_recepcionados(
+    q: Optional[str] = Query(None),
+    # page=None conserva la respuesta LEGADA (array pelado, tope 100): la esperan
+    # el frontend desplegado y monza_tests/test_avance_despachos. Con page llega
+    # el sobre {items,total,...} y el tope de 100 deja de ser un truncado mudo.
+    page: Optional[int] = Query(None, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user),
+):
     """Embarques con recepción CERRADA (el listado principal los oculta). El criterio
     es la recepción cerrada, NO MonzaEmbarque.estado=='en_bodega' (ese estado puede
     coexistir con una recepción aún abierta)."""
-    filas = (
+    from monza_router_despachos import _normalizar_q, _q_tiene_digitos, _match_de_candidatos
+    base = (
         db.query(MonzaRecepcion, MonzaEmbarque)
         .join(MonzaEmbarque, MonzaEmbarque.id == MonzaRecepcion.embarque_id)
         .filter(MonzaRecepcion.estado == "cerrada")
-        .order_by(MonzaRecepcion.fecha_cierre.desc())
-        .limit(100)
-        .all()
     )
+    nq = _normalizar_q(q)
+    normalizado = False
+    total = None
+    if nq["activo"]:
+        con_q = base
+        for tok in nq["tokens"]:
+            con_q = con_q.filter(_cond_token_historial(tok))
+        total = con_q.count()
+        if total == 0 and _q_tiene_digitos(nq):
+            normalizado = True
+            con_q = base
+            for tok in nq["tokens"]:
+                con_q = con_q.filter(_cond_token_historial(tok, con_colapsado=True))
+            total = con_q.count()
+        base = con_q
+    # Desempate determinista por id (dos cierres el mismo instante + OFFSET
+    # podían repetir/perder una fila entre páginas).
+    base = base.order_by(MonzaRecepcion.fecha_cierre.desc(), MonzaRecepcion.id.desc())
+    if page is not None:
+        if total is None:
+            total = base.count()
+        filas = base.offset((page - 1) * page_size).limit(page_size).all()
+    else:
+        filas = base.limit(100).all()
     emb_ids = [e.id for _r, e in filas]
     counts = {}
     if emb_ids:
@@ -117,9 +190,26 @@ def embarques_recepcionados(db: Session = Depends(get_db), _=Depends(get_current
             .filter(MonzaEmbarqueItem.embarque_id.in_(emb_ids))
             .group_by(MonzaEmbarqueItem.embarque_id).all()
         )
+    # Candidatos de la insignia de motivo, en LOTE sobre la página: los ítems que
+    # vinieron en estos embarques (n° parte / repuesto / COT / OC). Solo con q.
+    cand_items: dict = {}
+    if nq["activo"] and emb_ids:
+        for emb_id, np, desc, cot_num, oc in (
+            db.query(MonzaEmbarqueItem.embarque_id, MonzaCotizacionItem.numero_parte,
+                     MonzaCotizacionItem.descripcion, MonzaCotizacion.numero,
+                     MonzaCotizacion.oc_cliente)
+            .join(MonzaCotizacionItem, MonzaCotizacionItem.id == MonzaEmbarqueItem.item_id)
+            .join(MonzaCotizacion, MonzaCotizacion.id == MonzaCotizacionItem.cotizacion_id)
+            .filter(MonzaEmbarqueItem.embarque_id.in_(emb_ids))
+            .all()
+        ):
+            cand_items.setdefault(emb_id, []).extend([
+                ("numero_parte", np), ("repuesto", desc),
+                ("cotizacion", cot_num), ("oc_cliente", oc),
+            ])
     out = []
     for r, e in filas:
-        out.append({
+        fila = {
             "id": e.id, "numero": e.numero, "estado": e.estado, "awb": e.awb,
             "forwarder": e.forwarder, "tracking": e.tracking,
             # String(30) libre en el modelo: tal cual, sin parseo
@@ -130,8 +220,23 @@ def embarques_recepcionados(db: Session = Depends(get_db), _=Depends(get_current
                 "fecha_cierre": r.fecha_cierre.isoformat() if r.fecha_cierre else None,
                 "usuario_email": r.usuario_email,
             },
-        })
-    return out
+        }
+        if nq["activo"]:
+            cands = [("embarque", e.numero), ("awb", e.awb), ("tracking", e.tracking),
+                     ("forwarder", e.forwarder)] + cand_items.get(e.id, [])
+            fila["match"] = _match_de_candidatos(cands, nq, normalizado)
+        out.append(fila)
+    if page is None:
+        # Respuesta LEGADA (array pelado): frontend viejo y test_avance_despachos.
+        return out
+    return {
+        "items": out,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "q_efectivo": nq["q"] if nq["activo"] else "",
+        "normalizado": normalizado,
+    }
 
 
 # ── Iniciar recepcion ─────────────────────────────────────────────────────────
@@ -456,18 +561,178 @@ def _notificar_ventas_listas(db: Session, item_ids: list):
         crear_notif(db, titulo, mensaje, tipo, "/monzaparts/despachos", "cotizacion", cot.id)
 
 
+# ── Buscador de operador (spec buscadores 2026-08-05) ─────────────────────────
+# Los helpers del contrato (_normalizar_q, _patron, variantes, colapsado, match)
+# viven en monza_router_despachos y se importan LOCAL (misma dirección de
+# dependencia que ya usa cerrar_recepcion: bodega → despachos). Cada router arma
+# su PROPIO or_ porque la entidad listada es otra (aquí el ÍTEM, allá la venta).
+
+def _cond_token_item(tok: str, con_colapsado: bool = False):
+    """Condición OR de un token sobre el ÍTEM en bodega y sus tablas vecinas.
+
+    Campos del placeholder ("N° parte, repuesto, COT, OC, embarque o guía…"), más
+    vehículo/VIN/cliente por SIMETRÍA con Despachos (si Bodega y Despachos
+    responden distinto ante el mismo texto, el operador pierde la confianza).
+    Tablas hijas SIEMPRE por EXISTS correlacionado, nunca join (regla del
+    contrato: un join a la colección infla count() y rompe la paginación).
+    Requiere que el llamador haya joineado MonzaCotizacion Y el cliente."""
+    from monza_router_despachos import _patron, _variantes_q, _colapsar_q, _np_colapsado_sql
+    from sqlalchemy import or_ as _or, and_ as _and, exists as _exists
+    from monza_recepcion_nacional.models import MonzaRecepcionNacional, MonzaRecepcionNacionalItem
+    ors = []
+    for v in _variantes_q(tok):
+        p = _patron(v)
+        ors += [
+            MonzaCotizacionItem.numero_parte.like(p, escape="\\"),
+            MonzaCotizacionItem.descripcion.like(p, escape="\\"),
+            MonzaCotizacionItem.marca.like(p, escape="\\"),
+            MonzaCotizacion.numero.like(p, escape="\\"),
+            # AQUÍ Monza le gana a MachParts: la OC del cliente es COLUMNA de la
+            # cotización (cero joins nuevos); en GA es tabla aparte.
+            MonzaCotizacion.oc_cliente.like(p, escape="\\"),
+            MonzaCotizacion.vehiculo.like(p, escape="\\"),
+            MonzaCotizacion.vin.like(p, escape="\\"),
+            MonzaCliente.nombre.like(p, escape="\\"),
+            # EXISTS a OCP (vínculo Integer suelto sin FK; el caché _ocp sirve
+            # para MOSTRAR pero no para FILTRAR)
+            _exists().where(_and(
+                MonzaOcProveedor.id == MonzaCotizacionItem.oc_proveedor_id,
+                _or(MonzaOcProveedor.numero.like(p, escape="\\"),
+                    MonzaOcProveedor.numero_oc.like(p, escape="\\")),
+            )),
+            # EXISTS a embarque. OJO asimetría de marcas: en Monza `awb` guarda EL
+            # NÚMERO (monza_router_logistica lo escribe como texto); en MachParts
+            # `awb` es el NOMBRE DEL ARCHIVO — los buscadores NO son copiables.
+            _exists().where(_and(
+                MonzaEmbarqueItem.item_id == MonzaCotizacionItem.id,
+                MonzaEmbarque.id == MonzaEmbarqueItem.embarque_id,
+                _or(MonzaEmbarque.numero.like(p, escape="\\"),
+                    MonzaEmbarque.awb.like(p, escape="\\"),
+                    MonzaEmbarque.tracking.like(p, escape="\\"),
+                    MonzaEmbarque.forwarder.like(p, escape="\\")),
+            )),
+            # EXISTS a recepción NACIONAL: esos ítems JAMÁS pasan por embarque —
+            # su identificador es la guía del proveedor (numero_guia_proveedor).
+            _exists().where(_and(
+                MonzaRecepcionNacionalItem.item_cotizacion_id == MonzaCotizacionItem.id,
+                MonzaRecepcionNacional.id == MonzaRecepcionNacionalItem.recepcion_id,
+                MonzaRecepcionNacional.numero_guia_proveedor.like(p, escape="\\"),
+            )),
+        ]
+    if con_colapsado and any(ch.isdigit() for ch in tok):
+        cc = _colapsar_q(tok)
+        if cc:
+            # Pasada B (red de seguridad): numero_parte COLAPSADO, columna directa
+            # de la entidad listada — sin EXISTS.
+            ors.append(_np_colapsado_sql().like(_patron(cc), escape="\\"))
+    return _or(*ors)
+
+
+def _enriquecer_busqueda(db, items, nq, normalizado, cache_ocp):
+    """Claves nuevas de la salida del buscador, en LOTE sobre la página:
+    oc_cliente / embarque / guia_nacional (para que el operador VEA por qué la
+    fila coincidió) + match (insignia de motivo, calculada por el backend).
+    Devuelve (emb_por_item, guia_nac_por_item, match_por_item)."""
+    from monza_router_despachos import _match_de_candidatos
+    from monza_recepcion_nacional.models import MonzaRecepcionNacional, MonzaRecepcionNacionalItem
+    ids = [i.id for i in items]
+    emb_por_item, guia_por_item = {}, {}
+    if ids:
+        for iid, e in (
+            db.query(MonzaEmbarqueItem.item_id, MonzaEmbarque)
+            .join(MonzaEmbarque, MonzaEmbarque.id == MonzaEmbarqueItem.embarque_id)
+            .filter(MonzaEmbarqueItem.item_id.in_(ids))
+            .order_by(MonzaEmbarque.id.asc())
+            .all()
+        ):
+            emb_por_item[iid] = e  # con envíos parciales queda el MÁS reciente
+        for iid, guia in (
+            db.query(MonzaRecepcionNacionalItem.item_cotizacion_id,
+                     MonzaRecepcionNacional.numero_guia_proveedor)
+            .join(MonzaRecepcionNacional,
+                  MonzaRecepcionNacional.id == MonzaRecepcionNacionalItem.recepcion_id)
+            .filter(MonzaRecepcionNacionalItem.item_cotizacion_id.in_(ids))
+            .all()
+        ):
+            if guia:
+                guia_por_item[iid] = guia
+    match_por_item = {}
+    if nq["activo"]:
+        for it in items:
+            cot = it.cotizacion
+            ocp = _ocp(db, it.oc_proveedor_id, cache_ocp)
+            e = emb_por_item.get(it.id)
+            cands = [
+                ("numero_parte", it.numero_parte), ("repuesto", it.descripcion),
+                ("marca", it.marca),
+                ("cotizacion", cot.numero if cot else None),
+                ("oc_cliente", cot.oc_cliente if cot else None),
+                ("vehiculo", cot.vehiculo if cot else None),
+                ("vin", cot.vin if cot else None),
+                ("cliente", cot.cliente.nombre if cot and cot.cliente else None),
+                ("ocp", (ocp.numero_oc or ocp.numero) if ocp else None),
+            ]
+            if e:
+                cands += [("embarque", e.numero), ("awb", e.awb),
+                          ("tracking", e.tracking), ("forwarder", e.forwarder)]
+            if guia_por_item.get(it.id):
+                cands.append(("guia_nacional", guia_por_item[it.id]))
+            match_por_item[it.id] = _match_de_candidatos(cands, nq, normalizado)
+    return emb_por_item, guia_por_item, match_por_item
+
+
 # ── Items en bodega (listos para despacho) ────────────────────────────────────
 @router.get("/en-bodega")
-def en_bodega(q: Optional[str] = Query(None), db: Session = Depends(get_db), _=Depends(get_current_user)):
+def en_bodega(
+    q: Optional[str] = Query(None),
+    # page=None conserva la respuesta LEGADA (array pelado): la esperan el
+    # frontend desplegado y monza_tests/test_aud_pipeline (_fila_en_bodega). Con
+    # page llega el sobre nuevo {items,total,...} del contrato del buscador.
+    page: Optional[int] = Query(None, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    _=Depends(get_current_user),
+):
+    # Import LOCAL (dirección bodega → despachos, la misma de cerrar_recepcion).
+    from monza_router_despachos import _normalizar_q, _q_tiene_digitos
     query = (
         db.query(MonzaCotizacionItem)
         .join(MonzaCotizacion, MonzaCotizacionItem.cotizacion_id == MonzaCotizacion.id)
         .options(joinedload(MonzaCotizacionItem.cotizacion).joinedload(MonzaCotizacion.cliente))
         .filter(MonzaCotizacionItem.estado_linea == "en_bodega")
     )
-    if q:
-        query = query.filter((MonzaCotizacionItem.descripcion.ilike(f"%{q}%")) | (MonzaCotizacion.numero.ilike(f"%{q}%")))
-    items = query.order_by(MonzaCotizacionItem.id.desc()).all()
+    # El q viejo (descripcion + numero, con ilike) era código MUERTO y PARCIAL: el
+    # frontend nunca lo mandaba y tecleár un n° de parte devolvía VACÍO — que el
+    # bodeguero lee como "el ítem no está en bodega" (el error caro). El or_ se
+    # amplía en el MISMO commit en que se cablea el input (regla de la spec).
+    nq = _normalizar_q(q)
+    normalizado = False
+    total = None
+    if nq["activo"]:
+        # join explícito al cliente: el joinedload de arriba es carga ansiosa con
+        # alias anónimo y NO habilita filtrar (mismo join que usa Despachos :151).
+        query = query.join(MonzaCotizacion.cliente, isouter=True)
+        con_q = query
+        for tok in nq["tokens"]:
+            con_q = con_q.filter(_cond_token_item(tok))
+        total = con_q.count()
+        if total == 0 and _q_tiene_digitos(nq):
+            # Pasada B: comparación colapsada de numero_parte (7T-1997 ↔ 7T1997).
+            # Full scan reconocido: SOLO como red de seguridad y siempre bajo el
+            # filtro de estado_linea que la acota.
+            normalizado = True
+            con_q = query
+            for tok in nq["tokens"]:
+                con_q = con_q.filter(_cond_token_item(tok, con_colapsado=True))
+            total = con_q.count()
+        query = con_q
+    query = query.order_by(MonzaCotizacionItem.id.desc())
+    if page is not None:
+        if total is None:
+            total = query.count()
+        items = query.offset((page - 1) * page_size).limit(page_size).all()
+    else:
+        items = query.all()
 
     # Hallazgo #10: "cantidad" es lo VENDIDO, no lo recibido. En una llegada parcial
     # (vendido 10, recibido 4 + reclamo por 6) el bodeguero leía "10 en bodega" y
@@ -492,6 +757,12 @@ def en_bodega(q: Optional[str] = Query(None), db: Session = Depends(get_db), _=D
             ya[item_id] = ya.get(item_id, 0) + (qty or 0)
 
     cache = {}
+    # Claves nuevas del buscador (oc_cliente / embarque / guía nacional / match)
+    # agregadas al dict DEL LISTADO, no dentro de _item_dict: ese helper lo
+    # comparte el panel de recepción y no hay que alterarlo. Sin esto el operador
+    # filtra por una OC, ve 3 filas y no tiene cómo verificar por qué coincidieron.
+    emb_por_item, guia_por_item, match_por_item = _enriquecer_busqueda(
+        db, items, nq, normalizado, cache)
     out = []
     for it in items:
         d = _item_dict(it, it.cotizacion, _ocp(db, it.oc_proveedor_id, cache))
@@ -499,8 +770,27 @@ def en_bodega(q: Optional[str] = Query(None), db: Session = Depends(get_db), _=D
         # dato legado / carga manual, que a propósito no se acota (igual que _tope_fisico).
         d["qty_recibida"] = recibidos.get(it.id)
         d["qty_disponible"] = max(_tope_fisico(it, recibidos) - ya.get(it.id, 0), 0)
+        d["oc_cliente"] = it.cotizacion.oc_cliente if it.cotizacion else None
+        e = emb_por_item.get(it.id)
+        d["embarque"] = e.numero if e else None
+        d["embarque_awb"] = e.awb if e else None
+        # La compra NACIONAL no pasa por embarques: su identificador es la guía
+        # del proveedor y la pantalla lo dice ("Guía prov. X (nacional)").
+        d["guia_nacional"] = guia_por_item.get(it.id)
+        if nq["activo"]:
+            d["match"] = match_por_item.get(it.id, [])
         out.append(d)
-    return out
+    if page is None:
+        # Respuesta LEGADA (array pelado): frontend viejo y test_aud_pipeline.
+        return out
+    return {
+        "items": out,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "q_efectivo": nq["q"] if nq["activo"] else "",
+        "normalizado": normalizado,
+    }
 
 
 # ── Reclamos ──────────────────────────────────────────────────────────────────

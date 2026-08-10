@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, type ReactNode } from "react";
 import { Search, Truck, RefreshCw, ChevronDown, ChevronRight, Upload, Download, FileText, CheckCircle, X, Package, Ship, ClipboardList, Receipt, AlertTriangle, Clock, Send, Loader2, KeyRound } from "lucide-react";
+import { useSearchParams } from "react-router-dom";
 import { monzaDespachosAPI, monzaCotizacionesAPI, monzaWasabilAPI } from "../services/monzaApi";
 import type { MonzaDteInfo } from "../services/monzaApi";
 // Confirmación de folio COMPARTIDA con Facturas (DTE 33): una sola implementación de
@@ -10,6 +11,96 @@ import MonzaRegistrarFolioModal from "./MonzaRegistrarFolioModal";
 import api from "../services/api";
 import { useMonzaTheme } from "./MonzaLayout";
 import toast from "react-hot-toast";
+
+// ─── Buscador de operador (spec buscadores 2026-08-05) ────────────────────────
+// Helpers LOCALES de esta página (regla de la casa: helpers por página; el gemelo
+// de Bodega duplica la forma a propósito — se comparte el contrato, no el código).
+
+interface MatchInfo { campo: string; valor?: string | null }
+
+const MATCH_LBL: Record<string, string> = {
+  numero_parte: "n° parte", numero_parte_sin_guiones: "n° parte (sin guiones)",
+  repuesto: "repuesto", marca: "marca", cotizacion: "cotización", oc_cliente: "OC cliente",
+  vehiculo: "vehículo", vin: "VIN", cliente: "cliente", rut: "RUT", factura: "factura",
+  ocp: "OCP", embarque: "embarque", awb: "AWB", tracking: "tracking", forwarder: "forwarder",
+  despacho: "N° despacho", guia: "guía", expedicion: "expedición",
+  transportista: "transportista", destinatario: "destinatario",
+};
+// Si el campo que coincidió NO es columna visible, la insignia lleva el VALOR
+// (spec, decisión 5): "embarque EMB-2026-0007" en vez de releer la fila entera.
+const MATCH_CON_VALOR = new Set([
+  "numero_parte", "numero_parte_sin_guiones", "repuesto", "marca", "oc_cliente", "ocp",
+  "embarque", "awb", "tracking", "forwarder", "despacho", "guia", "expedicion",
+  "transportista", "destinatario",
+]);
+
+/** minúsculas + sin tildes: espejo cliente de la collation _ci del servidor */
+function plegar(s: string): string {
+  return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
+/** Normalización espejo del backend: strip + colapsar espacios; <2 chars = sin filtro */
+function normalizarQ(s: string): string {
+  const t = s.replace(/\s+/g, " ").trim();
+  return t.length >= 2 ? t : "";
+}
+
+/** ¿el match del backend incluye alguno de estos campos? (decide dónde va el <mark>) */
+function campoMatcheado(match: MatchInfo[] | undefined, ...campos: string[]): boolean {
+  return !!match?.some((m) => campos.includes(m.campo));
+}
+
+/** <mark> SOLO sobre el fragmento que coincidió, partiendo el string en React —
+ *  PROHIBIDO dangerouslySetInnerHTML (el repo tiene 0 usos: que siga así). */
+function Resaltar({ texto, q, todo }: { texto?: string | null; q: string; todo?: boolean }) {
+  const { dark } = useMonzaTheme();
+  const markStyle = { background: dark ? "rgba(245,158,11,0.35)" : "#FDE68A", color: "inherit", padding: 0, borderRadius: 2 };
+  if (texto === null || texto === undefined || texto === "") return null;
+  const t = String(texto);
+  if (todo) return <mark style={markStyle}>{t}</mark>;
+  const chars = Array.from(t);
+  const plano = chars.map((c) => { const f = plegar(c); return f.length === 1 ? f : c.toLowerCase(); }).join("");
+  const toks = plegar(q).split(" ").filter(Boolean).slice(0, 4).sort((a, b) => b.length - a.length);
+  const rangos: Array<[number, number]> = [];
+  for (const tok of toks) {
+    let idx = plano.indexOf(tok);
+    while (idx !== -1) {
+      const fin = idx + tok.length;
+      if (!rangos.some(([a, b]) => idx < b && fin > a)) rangos.push([idx, fin]);
+      idx = plano.indexOf(tok, idx + 1);
+    }
+  }
+  if (rangos.length === 0) return <>{t}</>;
+  rangos.sort((a, b) => a[0] - b[0]);
+  const out: ReactNode[] = [];
+  let pos = 0;
+  rangos.forEach(([a, b], i) => {
+    if (a > pos) out.push(chars.slice(pos, a).join(""));
+    out.push(<mark key={i} style={markStyle}>{chars.slice(a, b).join("")}</mark>);
+    pos = b;
+  });
+  if (pos < chars.length) out.push(chars.slice(pos).join(""));
+  return <>{out}</>;
+}
+
+/** Insignia del motivo: máx 2 + "+N" (spec, decisión 5) */
+function MatchBadges({ match }: { match?: MatchInfo[] }) {
+  const { dark } = useMonzaTheme();
+  if (!match || match.length === 0) return null;
+  const vis = match.slice(0, 2);
+  const resto = match.length - vis.length;
+  const st = { fontSize: 10, background: dark ? "rgba(59,130,246,0.2)" : "#DBEAFE", color: dark ? "#93c5fd" : "#1D4ED8", padding: "1px 7px", borderRadius: 8, fontWeight: 700 as const, whiteSpace: "nowrap" as const };
+  return (
+    <span style={{ display: "inline-flex", gap: 4, flexWrap: "wrap" }}>
+      {vis.map((m, i) => (
+        <span key={i} style={st}>
+          {MATCH_LBL[m.campo] || m.campo}{MATCH_CON_VALOR.has(m.campo) && m.valor ? ` ${m.valor}` : ""}
+        </span>
+      ))}
+      {resto > 0 && <span style={st}>+{resto}</span>}
+    </span>
+  );
+}
 
 // ── Panel "Listos para despachar" (ítems en bodega) ───────────────────────────
 interface ListoItem { id: number; descripcion: string; numero_parte?: string; cantidad: number; qty_disponible: number; }
@@ -133,7 +224,7 @@ function ListosPanel() {
 }
 
 // ── Panel "Despachos en curso" (entidades con ciclo de vida) ──────────────────
-interface DespachoEnt { id: number; numero?: string; cotizacion_numero?: string; cliente_nombre?: string; numero_guia?: string; fecha_guia?: string | null; transportista?: string; numero_expedicion?: string; destinatario?: string; direccion_entrega?: string; observaciones?: string; estado: string; items_count?: number; fecha?: string; fecha_despacho?: string; }
+interface DespachoEnt { id: number; numero?: string; cotizacion_numero?: string; cliente_nombre?: string; numero_guia?: string; fecha_guia?: string | null; transportista?: string; numero_expedicion?: string; destinatario?: string; direccion_entrega?: string; observaciones?: string; estado: string; items_count?: number; fecha?: string; fecha_despacho?: string; guia_firmada?: boolean; fecha_firma?: string | null; guia_firmada_archivo?: string | null; }
 
 const DSP_EST: Record<string, { bg: string; color: string; label: string }> = {
   en_preparacion: { bg: "#FEF3C7", color: "#B45309", label: "En preparación" },
@@ -589,12 +680,26 @@ function EmitirGuiaSIIModal({ despacho, onClose, onDone }: { despacho: DespachoE
   );
 }
 
+// Filas visibles del panel: borradores y cerrados con la guía SIN FIRMAR siempre
+// completos — ambos exigen acción (confirmar / marcar la firma, sin la cual NO se
+// factura, regla 2026-08-06) y no pueden desaparecer del único panel que la permite
+// (hallazgo HIGH del multienjambre: el corte de 30 escondía justo las guías que
+// llevaban semanas esperando la firma). Los firmados recientes rellenan el resto.
+// Espejo del criterio del backend (GET /entidades trae completos los dos grupos).
+function visiblesDe(list: DespachoEnt[]): DespachoEnt[] {
+  const abiertos = list.filter((d) => d.estado === "en_preparacion");
+  const sinFirmar = list.filter((d) => d.estado === "despachado" && !d.guia_firmada);
+  const firmados = list.filter((d) => d.estado === "despachado" && d.guia_firmada);
+  return [...abiertos, ...sinFirmar, ...firmados].slice(0, Math.max(30, abiertos.length + sinFirmar.length));
+}
+
 function DespachosEnCursoPanel() {
   const { dark } = useMonzaTheme();
   const [ents, setEnts] = useState<DespachoEnt[]>([]);
   const [editar, setEditar] = useState<DespachoEnt | null>(null);
   const [emitir, setEmitir] = useState<DespachoEnt | null>(null);
   const [folioDe, setFolioDe] = useState<DespachoEnt | null>(null);
+  const [firmar, setFirmar] = useState<DespachoEnt | null>(null);
   // Estado de las guías electrónicas (Wasabil) de los despachos visibles — solo
   // BD, en LOTE (jamás una llamada de red por despacho por render). dtesListos es
   // el espejo del isSuccess de GA, FAIL-CLOSED: mientras la consulta no resuelva
@@ -608,16 +713,27 @@ function DespachosEnCursoPanel() {
       const r = await monzaDespachosAPI.entidades();
       const list: DespachoEnt[] = Array.isArray(r.data) ? r.data : [];
       setEnts(list);
-      // Mismos despachos que pinta la tabla (borradores + cerrados hasta el corte):
-      // solo esos ids viajan al estado-batch (con 0 ids no hay llamada de red).
-      const abiertos = list.filter((d) => d.estado === "en_preparacion");
-      const cerrados = list.filter((d) => d.estado === "despachado");
-      const ids = [...abiertos, ...cerrados].slice(0, Math.max(30, abiertos.length)).map((d) => d.id);
+      // Mismos despachos que pinta la tabla (ver visiblesDe): solo esos ids viajan
+      // al estado-batch (con 0 ids no hay llamada de red).
+      const ids = visiblesDe(list).map((d) => d.id);
       if (ids.length === 0) { setDtes({}); setDtesListos(true); return; }
       setDtesListos(false);
       try {
-        const rb = await monzaWasabilAPI.estadoBatch(ids);
-        setDtes(rb.data || {});
+        // EN TANDAS de 200: el endpoint rechaza más de 200 ids por consulta (400).
+        // Desde que los cerrados SIN FIRMAR se muestran completos, la lista puede
+        // pasar ese tope y la consulta entera caía → fail-closed global: TODOS los
+        // badges SII desaparecían y el candado del folio quedaba pegado en
+        // "Verificando…". Se parte en tandas en vez de RECORTAR los ids: con ids
+        // recortados las filas sobrantes quedarían sin estado y folioParaModal las
+        // trataría como "sin guía electrónica" — fail-OPEN sobre el folio del SII,
+        // que es peor que no tener candado.
+        const CHUNK = 200;
+        const acumulado: Record<number, MonzaDteInfo> = {};
+        for (let i = 0; i < ids.length; i += CHUNK) {
+          const rb = await monzaWasabilAPI.estadoBatch(ids.slice(i, i + CHUNK));
+          Object.assign(acumulado, rb.data || {});
+        }
+        setDtes(acumulado);
         setDtesListos(true);
       } catch { /* fail-closed: sin éxito el candado del folio queda puesto */ }
     } catch { /* panel opcional */ }
@@ -647,21 +763,17 @@ function DespachosEnCursoPanel() {
     catch (e: unknown) { toast.error((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || "Error al anular"); }
   };
 
-  // Los borradores (en_preparacion) SIEMPRE visibles — son los que exigen acción;
-  // los cerrados recientes rellenan hasta el corte.
-  const abiertos = ents.filter((d) => d.estado === "en_preparacion");
-  const cerrados = ents.filter((d) => d.estado === "despachado");
-  const visibles = [...abiertos, ...cerrados].slice(0, Math.max(30, abiertos.length));
+  const visibles = visiblesDe(ents);
   if (visibles.length === 0) return null;
   return (
     <div style={{ background: bg, border: `1px solid ${bd}`, borderRadius: 12, padding: "14px 18px", marginBottom: 20 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
         <Truck size={16} className="monza-ic" />
         <span style={{ fontWeight: 700, fontSize: 14, color: txt }}>Despachos en curso</span>
-        <span style={{ fontSize: 11, color: sub }}>· confirma el borrador para registrar la salida</span>
+        <span style={{ fontSize: 11, color: sub }}>· confirma el borrador para registrar la salida; con la entrega hecha, marca la guía firmada — sin eso no se puede facturar</span>
       </div>
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-        <thead><tr style={{ borderBottom: `1px solid ${bd}` }}>{["N°", "Venta", "Cliente", "Ítems", "N° Guía", "Transportista", "Estado", "Acciones"].map((h) => <th key={h} style={{ padding: "7px 10px", textAlign: "left", fontWeight: 600, fontSize: 11, color: sub, textTransform: "uppercase" as const }}>{h}</th>)}</tr></thead>
+        <thead><tr style={{ borderBottom: `1px solid ${bd}` }}>{["N°", "Venta", "Cliente", "Ítems", "N° Guía", "Transportista", "Estado", "Guía firmada", "Acciones"].map((h) => <th key={h} style={{ padding: "7px 10px", textAlign: "left", fontWeight: 600, fontSize: 11, color: sub, textTransform: "uppercase" as const }}>{h}</th>)}</tr></thead>
         <tbody>{visibles.map((d) => {
           const es = DSP_EST[d.estado] || DSP_EST.despachado;
           const dte = dtes[d.id];
@@ -708,6 +820,39 @@ function DespachosEnCursoPanel() {
                   </span>
                 )}
               </div>
+            </td>
+            {/* Guía FIRMADA por el cliente — desde 2026-08-06 es REQUISITO para poder
+                facturar este despacho en Contabilidad (el gate vive en el backend;
+                acá está la única puerta para marcarla). Solo aplica a confirmados:
+                un borrador todavía no entregó nada que el cliente pueda firmar. */}
+            <td style={{ padding: "7px 10px" }}>
+              {d.estado !== "despachado" ? (
+                <span style={{ color: sub, fontSize: 12 }}>—</span>
+              ) : d.guia_firmada ? (
+                <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 11, background: "#DCFCE7", color: "#15803D", padding: "3px 10px", borderRadius: 10, fontWeight: 700, display: "inline-flex", alignItems: "center", gap: 4, whiteSpace: "nowrap" }}>
+                    <CheckCircle size={11} /> Firmada{d.fecha_firma ? ` · ${d.fecha_firma.slice(0, 10).split("-").reverse().join("-")}` : ""}
+                  </span>
+                  {d.guia_firmada_archivo && (
+                    <button onClick={() => monzaDespachosAPI.abrirGuiaFirmada(d.guia_firmada_archivo!).catch(() => toast.error("No se pudo abrir la guía firmada"))}
+                      title="Ver la foto/PDF de la guía firmada"
+                      style={{ padding: "3px 7px", background: "rgba(59,130,246,0.10)", border: "none", borderRadius: 6, color: "#3B82F6", cursor: "pointer", fontSize: 10, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 3 }}>
+                      <FileText size={10} /> Ver
+                    </button>
+                  )}
+                  <button onClick={() => setFirmar(d)}
+                    title="Corregir la firma (reemplaza la foto/PDF y la fecha)"
+                    style={{ padding: "3px 7px", border: `1px solid ${bd}`, borderRadius: 6, background: "transparent", color: sub, cursor: "pointer", fontSize: 10, fontWeight: 600 }}>
+                    Corregir
+                  </button>
+                </div>
+              ) : (
+                <button onClick={() => setFirmar(d)}
+                  title="Subir la foto/PDF de la guía firmada por el cliente y registrar la fecha de la firma. Sin esto, Contabilidad no puede facturar este despacho."
+                  style={{ padding: "4px 10px", background: "rgba(16,185,129,0.15)", border: "none", borderRadius: 6, color: "#059669", cursor: "pointer", fontSize: 11, fontWeight: 700, display: "inline-flex", alignItems: "center", gap: 4, whiteSpace: "nowrap" }}>
+                  <CheckCircle size={11} /> Marcar guía firmada
+                </button>
+              )}
             </td>
             <td style={{ padding: "7px 10px" }}>
               <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
@@ -782,6 +927,119 @@ function DespachosEnCursoPanel() {
             load();
           }} />
       )}
+      {firmar && (
+        <FirmarGuiaModal
+          d={firmar}
+          // Mismo candado del N° de guía que EditarCabeceraModal (fail-closed): con
+          // guía electrónica el N° es (o será) el folio del SII y no se teclea a mano.
+          dteFolio={folioParaModal(dtesListos, dtes[firmar.id])}
+          onClose={() => setFirmar(null)}
+          onDone={() => { setFirmar(null); load(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Modal: marcar guía firmada (foto/PDF + fecha de la firma) ─────────────────
+// Espejo del FirmarGuiaModal de GA (DespachosPage.tsx) con el multipart de Monza:
+// acá el archivo y la fecha viajan JUNTOS a POST /despachos/entidades/{id}/firmar
+// (Monza no tiene upload genérico propio y el de compras de GA exige 'mineria').
+// La fecha de la firma es OBLIGATORIA — es el dato que ordena la cobranza después
+// (OC + factura + guía firmada) — y el backend la re-valida (formato, no futura,
+// no anterior a la emisión de la guía).
+function FirmarGuiaModal({ d, dteFolio, onClose, onDone }: { d: DespachoEnt; dteFolio?: string | null; onClose: () => void; onDone: () => void }) {
+  const { dark } = useMonzaTheme();
+  const [file, setFile] = useState<File | null>(null);
+  const [numeroGuia, setNumeroGuia] = useState("");
+  // Hoy en CHILE y no toISOString(): en UTC-3/-4 la fecha UTC ya es "mañana" pasadas
+  // las ~21:00 y la firma quedaría con fecha futura (el backend la rechazaría).
+  const hoyChile = new Date().toLocaleDateString("en-CA", { timeZone: "America/Santiago" });
+  const [fecha, setFecha] = useState(hoyChile);
+  const [saving, setSaving] = useState(false);
+  const bg = dark ? "#131b3e" : "white"; const bd = dark ? "#1e2a4a" : "#E2E8F0"; const txt = dark ? "white" : "#1E293B"; const sub = dark ? "#8899cc" : "#64748B";
+  const IS = { width: "100%", padding: "8px 10px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: dark ? "#0d1321" : "#F8FAFC", color: txt };
+  // Con guía electrónica emitida/en proceso (o consulta sin resolver), el N° es (o
+  // será) el folio del SII: la firma funciona igual, pero sin tocar el N° a mano.
+  const folioBloqueado = dteFolio !== null && dteFolio !== undefined;
+
+  const submit = async () => {
+    if (!file) { toast.error("Sube la foto o PDF de la guía firmada"); return; }
+    if (!fecha) { toast.error("Indica la fecha en que el cliente firmó la guía"); return; }
+    setSaving(true);
+    try {
+      await monzaDespachosAPI.firmarEntidad(d.id, file, fecha, folioBloqueado ? undefined : (numeroGuia.trim() || undefined));
+      toast.success("Guía firmada — ya se puede facturar en Contabilidad");
+      onDone();
+    } catch (e: unknown) {
+      toast.error((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || "Error al firmar la guía");
+    } finally { setSaving(false); }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div style={{ background: bg, border: `1px solid ${bd}`, borderRadius: 14, width: "100%", maxWidth: 460 }}>
+        <div style={{ background: dark ? "#0a0e1f" : "#F8FAFC", borderBottom: `1px solid ${bd}`, padding: "14px 20px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontWeight: 700, fontSize: 15, color: txt }}>Marcar guía firmada · {d.numero || `#${d.id}`}</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: sub }}><X size={18} /></button>
+        </div>
+        <div style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ fontSize: 12, color: sub, lineHeight: 1.5 }}>
+            Sube la <b style={{ color: txt }}>foto o PDF de la guía firmada</b> por el cliente y registra la{" "}
+            <b style={{ color: txt }}>fecha de la firma</b>. Sin esta marca, Contabilidad no puede facturar este despacho
+            (la cobranza se ordena con OC + factura + guía firmada).
+          </div>
+          {/* Contexto de la guía: N° y fecha de EMISIÓN (viene de antes: del DTE 52 si
+              fue electrónica, o tecleada en Editar si fue en papel). NO se edita acá. */}
+          <div style={{ fontSize: 12, color: sub, background: dark ? "#0d1321" : "#F8FAFC", border: `1px solid ${bd}`, borderRadius: 8, padding: "8px 12px" }}>
+            Guía: <b style={{ color: txt }}>{d.numero_guia || "sin N° registrado"}</b>
+            {d.fecha_guia ? <> · emitida el <b style={{ color: txt }}>{d.fecha_guia.slice(0, 10).split("-").reverse().join("-")}</b></> : null}
+            {d.guia_firmada && <span style={{ color: "#D97706" }}> · ya estaba firmada: guardar REEMPLAZA la foto y la fecha</span>}
+          </div>
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Foto / PDF de la guía firmada</label>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", border: `1px dashed ${bd}`, borderRadius: 8, cursor: "pointer", color: file ? txt : sub, fontSize: 13 }}>
+              <Upload size={14} />
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{file ? file.name : "Seleccionar archivo…"}</span>
+              <input type="file" accept="image/*,application/pdf" onChange={(e) => setFile(e.target.files?.[0] || null)} style={{ display: "none" }} />
+            </label>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div>
+              <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>Fecha de la firma</label>
+              {/* min = fecha de emisión de la guía: nadie firma una guía que aún no
+                  existía. El backend re-valida lo mismo (no confiar solo en el picker). */}
+              <input type="date" min={d.fecha_guia ? d.fecha_guia.slice(0, 10) : undefined} max={hoyChile}
+                value={fecha} onChange={(e) => setFecha(e.target.value)} style={IS} />
+            </div>
+            <div>
+              <label style={{ fontSize: 12, fontWeight: 600, color: sub, display: "block", marginBottom: 4 }}>N° Guía (si falta)</label>
+              <input
+                value={folioBloqueado && dteFolio !== "verificando" && dteFolio !== "en_emision" && dteFolio !== "sin_folio" ? dteFolio! : numeroGuia}
+                onChange={(e) => setNumeroGuia(e.target.value)}
+                disabled={folioBloqueado}
+                placeholder={d.numero_guia || "Opcional"}
+                style={{ ...IS, opacity: folioBloqueado ? 0.6 : 1, cursor: folioBloqueado ? "not-allowed" : undefined }}
+              />
+              {folioBloqueado && (
+                <div style={{ fontSize: 10, color: "#D97706", marginTop: 3 }}>
+                  {dteFolio === "verificando" ? "Verificando la guía electrónica…"
+                    : dteFolio === "en_emision" ? "Guía electrónica en emisión: el N° lo fija el folio del SII."
+                      : dteFolio === "sin_folio" ? "Guía SII sin folio en el sistema: regístralo con «Registrar folio del SII»."
+                        : `Guía electrónica emitida (folio ${dteFolio}): el N° no se edita a mano.`}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+        <div style={{ padding: "12px 20px", borderTop: `1px solid ${bd}`, background: dark ? "#0a0e1f" : "#F8FAFC", display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          <button onClick={onClose} style={{ padding: "8px 18px", border: `1px solid ${bd}`, borderRadius: 8, background: "transparent", color: sub, cursor: "pointer", fontSize: 13 }}>Cancelar</button>
+          <button onClick={submit} disabled={saving || !file}
+            style={{ padding: "8px 20px", background: "#10B981", border: "none", borderRadius: 8, color: "white", cursor: saving || !file ? "not-allowed" : "pointer", opacity: saving || !file ? 0.6 : 1, fontWeight: 700, fontSize: 13, display: "inline-flex", alignItems: "center", gap: 6 }}>
+            {saving ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle size={14} />} Confirmar firma
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -809,6 +1067,8 @@ interface AvanceCard {
   items_con_cupo?: number | null;
   // Días HÁBILES restantes calculados en backend (feriados chilenos incluidos)
   dias_restantes?: number | null;
+  // Insignia del motivo de coincidencia (la calcula el backend sobre la página)
+  match?: MatchInfo[];
 }
 interface AvanceItem { id: number; descripcion: string; numero_parte?: string | null; cantidad: number; estado_linea: string; bucket: keyof ProgresoEstados; qty_despachada: number; qty_disponible: number; }
 interface AvanceDespacho { id: number; numero?: string | null; numero_guia?: string | null; transportista?: string | null; estado: string; fecha?: string | null; fecha_despacho?: string | null; items_count?: number; }
@@ -959,29 +1219,71 @@ function AvanceDetalleView({ det }: { det: AvanceDetalle }) {
 
 function AvanceVentasPanel() {
   const { dark } = useMonzaTheme();
-  const [tab, setTab] = useState<"listas" | "en_curso" | "historial">("listas");
-  const [q, setQ] = useState("");
-  const [qDeb, setQDeb] = useState("");
+  // El estado vive en la URL (?tab= y ?aq= de este panel; el ?q= es del
+  // histórico): la página se recarga sola (window.location.reload tras crear un
+  // despacho) y sin URL se perdían la pestaña y el término (spec, decisión 6).
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tabURL = searchParams.get("tab");
+  const [tab, setTab] = useState<"listas" | "en_curso" | "historial">(
+    tabURL === "en_curso" || tabURL === "historial" ? tabURL : "listas");
+  const [q, setQ] = useState(() => searchParams.get("aq") || "");
+  const [qDeb, setQDeb] = useState(() => normalizarQ(searchParams.get("aq") || ""));
   const [cards, setCards] = useState<AvanceCard[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  // Conteo cruzado de pestañas (viene en el sobre del backend): "dónde está esto"
+  const [tabsCount, setTabsCount] = useState<{ listas: number; en_curso: number; historial: number } | null>(null);
+  const [normalizado, setNormalizado] = useState(false);
   const [counts, setCounts] = useState<AvanceCounts | null>(null);
   const [loading, setLoading] = useState(true);
   const [expandido, setExpandido] = useState<number | null>(null);
   const [detalles, setDetalles] = useState<Record<number, AvanceDetalle>>({});
   const [loadingDet, setLoadingDet] = useState<number | null>(null);
+  // Guardia de secuencia (id monótono): una respuesta fuera de orden se ignora
+  const seqRef = useRef(0);
   const bg = dark ? "#131b3e" : "white"; const bd = dark ? "#1e2a4a" : "#E2E8F0"; const txt = dark ? "white" : "#1E293B"; const sub = dark ? "#8899cc" : "#64748B";
 
-  // Debounce del buscador: el filtro corre en el BACKEND (numero/cliente/OC/vehículo)
-  useEffect(() => { const t = setTimeout(() => setQDeb(q), 300); return () => clearTimeout(t); }, [q]);
+  // Debounce del buscador: el filtro corre en el BACKEND. 350 ms (antes 300: se
+  // sube por consistencia con todas las cajas del encargo — spec, decisión 3).
+  useEffect(() => { const t = setTimeout(() => setQDeb(normalizarQ(q)), 350); return () => clearTimeout(t); }, [q]);
+  // replaceState mientras se escribe (que Atrás no retroceda carácter por carácter)
+  useEffect(() => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (q) next.set("aq", q); else next.delete("aq");
+      return next;
+    }, { replace: true });
+  }, [q, setSearchParams]);
+  // push (no replace) al cambiar de pestaña
+  const cambiarTab = (k: typeof tab) => {
+    setTab(k); setExpandido(null);
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (k === "listas") next.delete("tab"); else next.set("tab", k);
+      return next;
+    });
+  };
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (pageN: number, append: boolean) => {
+    const id = ++seqRef.current;
+    if (!append) setLoading(true);
     try {
-      const r = await api.get("/monza/despachos/avance", { params: { tab, q: qDeb || undefined } });
-      setCards(Array.isArray(r.data) ? r.data : []);
+      const r = await api.get("/monza/despachos/avance", { params: { tab, q: qDeb || undefined, page: pageN, page_size: 50 } });
+      if (id !== seqRef.current) return;
+      const d = r.data;
+      if (Array.isArray(d)) {
+        // backend previo sin el sobre {items,total,...}: degrada al array pelado
+        setCards(d); setTotal(d.length); setTabsCount(null); setNormalizado(false);
+      } else {
+        setCards((prev) => (append ? [...prev, ...(d.items || [])] : (d.items || [])));
+        setTotal(d.total ?? 0); setTabsCount(d.tabs || null); setNormalizado(!!d.normalizado);
+      }
     } catch { /* backend previo sin el endpoint: el tablero degrada a vacío sin tumbar la página */ }
-    finally { setLoading(false); }
+    finally { if (id === seqRef.current) setLoading(false); }
   }, [tab, qDeb]);
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { setPage(1); load(1, false); }, [load]);
+  // Los KPI quedan FUERA del camino del buscador (spec): son 4 agregaciones que
+  // ni dependen del texto — antes cada tecla disparaba también esta consulta.
   useEffect(() => { api.get("/monza/despachos/counts").then((r) => setCounts(r.data)).catch(() => {}); }, []);
 
   const toggle = async (id: number) => {
@@ -997,6 +1299,8 @@ function AvanceVentasPanel() {
   };
 
   const TABS: Array<[typeof tab, string]> = [["listas", "Listas"], ["en_curso", "En curso"], ["historial", "Historial"]];
+  const TAB_LBL: Record<typeof tab, string> = { listas: "Listas", en_curso: "En curso", historial: "Historial" };
+  const otros = TABS.filter(([k]) => k !== tab && qDeb && (tabsCount?.[k] ?? 0) > 0);
   return (
     <div style={{ background: bg, border: `1px solid ${bd}`, borderRadius: 12, padding: "14px 18px", marginBottom: 20 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
@@ -1011,23 +1315,68 @@ function AvanceVentasPanel() {
       <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
         <div style={{ display: "flex", gap: 4, borderBottom: `1px solid ${bd}` }}>
           {TABS.map(([k, l]) => (
-            <button key={k} onClick={() => { setTab(k); setExpandido(null); }}
-              style={{ padding: "7px 14px", border: "none", background: "transparent", cursor: "pointer", fontSize: 13, fontWeight: 600, color: tab === k ? "var(--monza-accent)" : sub, borderBottom: `2px solid ${tab === k ? "var(--monza-accent)" : "transparent"}`, marginBottom: -1 }}>{l}</button>
+            <button key={k} onClick={() => cambiarTab(k)}
+              style={{ padding: "7px 14px", border: "none", background: "transparent", cursor: "pointer", fontSize: 13, fontWeight: 600, color: tab === k ? "var(--monza-accent)" : sub, borderBottom: `2px solid ${tab === k ? "var(--monza-accent)" : "transparent"}`, marginBottom: -1 }}>
+              {l}{qDeb && tabsCount ? ` (${tabsCount[k]})` : ""}
+            </button>
           ))}
         </div>
         <div style={{ position: "relative", flex: 1, minWidth: 220 }}>
           <Search size={13} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "#94A3B8" }} />
-          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="N° COT, cliente, OC, vehículo..."
-            style={{ width: "100%", padding: "7px 10px 7px 30px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 12, boxSizing: "border-box" as const, background: dark ? "#0d1321" : "white", color: txt }} />
+          {/* El placeholder es un CONTRATO: cada palabra es un campo que la
+              consulta toca (spec, decisión 7). */}
+          <input value={q} onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") setQDeb(normalizarQ(q));     // Enter saltea la espera
+              if (e.key === "Escape") { setQ(""); setQDeb(""); }  // Esc limpia
+            }}
+            placeholder="N° parte, repuesto, COT, OC, cliente, embarque, N° despacho o guía…"
+            style={{ width: "100%", padding: "7px 28px 7px 30px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 12, boxSizing: "border-box" as const, background: dark ? "#0d1321" : "white", color: txt }} />
+          {q && (
+            <button onClick={() => { setQ(""); setQDeb(""); }} title="Limpiar búsqueda"
+              style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", color: sub, padding: 2, display: "flex" }}>
+              <X size={13} />
+            </button>
+          )}
         </div>
       </div>
+      {qDeb && normalizado && (
+        <div style={{ fontSize: 11, color: sub, marginTop: -6, marginBottom: 10 }}>
+          Buscaste {qDeb}; también busqué {qDeb.split(" ").map((t) => t.replace(/-/g, "")).join(" ")}.
+        </div>
+      )}
       {loading ? <div style={{ padding: 24, textAlign: "center", color: "#94A3B8", fontSize: 13 }}>Cargando avance...</div>
       : cards.length === 0 ? (
         <div style={{ padding: 24, textAlign: "center", color: "#94A3B8", fontSize: 13 }}>
-          {tab === "listas" ? "No hay ventas con ítems en bodega." : tab === "en_curso" ? "No hay ventas con despachos en preparación." : "No hay ventas con despachos cerrados."}
+          {/* Vacíos DIFERENCIADOS + conteo cruzado con salto de un clic (spec, dec. 4) */}
+          {qDeb ? (
+            <>
+              <div>Sin resultados para «{qDeb}» en {TAB_LBL[tab]}.</div>
+              {otros.length > 0 && (
+                <div style={{ marginTop: 8, fontSize: 12 }}>
+                  Hay {otros.map(([k, l], i) => (
+                    <span key={k}>
+                      {i > 0 && " · "}
+                      <button onClick={() => cambiarTab(k)}
+                        style={{ background: "none", border: "none", cursor: "pointer", color: "var(--monza-accent)", fontWeight: 700, fontSize: 12, padding: 0 }}>
+                        {tabsCount?.[k] ?? 0} en {l}
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </>
+          ) : tab === "listas" ? "No hay ventas con ítems en bodega." : tab === "en_curso" ? "No hay ventas con despachos en preparación." : "No hay ventas con despachos cerrados."}
         </div>
       ) : cards.map((c) => {
         const est = AVANCE_EST[c.estado] || AVANCE_EST.pendiente;
+        // Cobertura parcial (spec «Listo · 3 de 7»): que se vea que SE PUEDE
+        // despachar pero NO es la orden completa. items_con_cupo ya viaja desde
+        // el backend (cupos en lote, hallazgo #17) — con cupo completo o sin el
+        // dato precalculado, la etiqueta clásica se conserva.
+        const estLabel = c.estado === "listo" && c.items_con_cupo != null && c.total_items > 0 && c.items_con_cupo < c.total_items
+          ? `Listo · ${c.items_con_cupo} de ${c.total_items} ítems`
+          : est.label;
         const abierto = expandido === c.id;
         const det = detalles[c.id];
         return (
@@ -1036,15 +1385,21 @@ function AvanceVentasPanel() {
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, flexWrap: "wrap" }}>
                   {abierto ? <ChevronDown size={14} color="#94A3B8" /> : <ChevronRight size={14} color="#94A3B8" />}
-                  <span style={{ fontWeight: 800, fontSize: 13, color: "var(--monza-accent)" }}>{c.numero}</span>
-                  <span style={{ fontSize: 12, color: txt, fontWeight: 600 }}>{c.cliente?.nombre || "—"}</span>
-                  {c.vehiculo && <span style={{ fontSize: 11, color: sub }}>{c.vehiculo}</span>}
-                  {c.oc_cliente && <span style={{ fontSize: 11, color: sub }}>OC {c.oc_cliente}</span>}
+                  {/* <mark> SOLO en el campo que coincidió (spec, decisión 5) */}
+                  <span style={{ fontWeight: 800, fontSize: 13, color: "var(--monza-accent)" }}>
+                    {campoMatcheado(c.match, "cotizacion") ? <Resaltar texto={c.numero} q={qDeb} /> : c.numero}
+                  </span>
+                  <span style={{ fontSize: 12, color: txt, fontWeight: 600 }}>
+                    {c.cliente?.nombre ? (campoMatcheado(c.match, "cliente") ? <Resaltar texto={c.cliente.nombre} q={qDeb} /> : c.cliente.nombre) : "—"}
+                  </span>
+                  {c.vehiculo && <span style={{ fontSize: 11, color: sub }}>{campoMatcheado(c.match, "vehiculo") ? <Resaltar texto={c.vehiculo} q={qDeb} /> : c.vehiculo}</span>}
+                  {c.oc_cliente && <span style={{ fontSize: 11, color: sub }}>OC {campoMatcheado(c.match, "oc_cliente") ? <Resaltar texto={c.oc_cliente} q={qDeb} /> : c.oc_cliente}</span>}
+                  {qDeb && <MatchBadges match={c.match} />}
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                   {c.fecha_entrega_est && <span style={{ fontSize: 11, color: sub }}>Entrega {fmtDate(c.fecha_entrega_est)}</span>}
                   <DiasRestantesBadge dias={c.dias_restantes} />
-                  <span style={{ fontSize: 11, background: est.bg, color: est.color, padding: "3px 10px", borderRadius: 10, fontWeight: 700 }}>{est.label}</span>
+                  <span style={{ fontSize: 11, background: est.bg, color: est.color, padding: "3px 10px", borderRadius: 10, fontWeight: 700 }}>{estLabel}</span>
                 </div>
               </div>
               <PipelineProgress card={c} />
@@ -1055,6 +1410,19 @@ function AvanceVentasPanel() {
           </div>
         );
       })}
+      {/* Pie honesto: nunca truncar en silencio (spec, decisión 4) */}
+      {!loading && cards.length > 0 && total > cards.length && (
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 12, color: sub, paddingTop: 8 }}>
+          <span>
+            Mostrando {cards.length} de {total} coincidencia(s) — afiná la búsqueda
+            {total > 200 ? " · Demasiadas coincidencias: agregá el N° de cotización o el cliente." : ""}
+          </span>
+          <button onClick={() => { const p = page + 1; setPage(p); load(p, true); }}
+            style={{ padding: "5px 12px", border: `1px solid ${bd}`, borderRadius: 6, background: "transparent", color: "var(--monza-accent)", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>
+            Ver más (+50)
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1069,6 +1437,8 @@ interface Despacho {
   fecha_creacion: string;
   cliente?: { nombre: string; rut?: string };
   lead_numero?: string;
+  // Insignia del motivo de coincidencia (la calcula el backend sobre la página)
+  match?: MatchInfo[];
 }
 interface KPIs { total_despachados: number; despachados_mes: number; monto_mes: number; sin_documento: number; }
 interface CotItem { id: number; descripcion: string; numero_parte?: string; marca?: string; cantidad: number; precio_unitario_clp?: number; subtotal_clp?: number; plazo_entrega?: string; calidad?: string; }
@@ -1165,38 +1535,68 @@ function UploadModal({ cotId, cotNumero, onClose, onUploaded }: { cotId: number;
 
 export default function MonzaDespachosPage() {
   const { dark } = useMonzaTheme();
+  // El término del histórico vive en la URL (?q=; el panel de avance usa ?tab= y
+  // ?aq=): la página se recarga sola tras crear/confirmar un despacho y sin URL
+  // el término se borraba bajo los pies del operador (spec, decisión 6).
+  const [searchParams, setSearchParams] = useSearchParams();
   const [items, setItems] = useState<Despacho[]>([]);
   const [total, setTotal] = useState(0);
   const [kpis, setKpis] = useState<KPIs | null>(null);
   const [loading, setLoading] = useState(true);
-  const [q, setQ] = useState("");
+  const [q, setQ] = useState(() => searchParams.get("q") || "");
+  const [qDeb, setQDeb] = useState(() => normalizarQ(searchParams.get("q") || ""));
+  const [page, setPage] = useState(1);
+  const [normalizado, setNormalizado] = useState(false);
   const [desde, setDesde] = useState("");
   const [hasta, setHasta] = useState("");
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [details, setDetails] = useState<Record<number, CotDetail>>({});
   const [loadingDetail, setLoadingDetail] = useState<number | null>(null);
   const [uploadModal, setUploadModal] = useState<{ id: number; numero: string } | null>(null);
+  // Guardia de secuencia (id monótono): una respuesta fuera de orden se ignora —
+  // el clearTimeout del debounce no alcanza con axios crudo.
+  const seqRef = useRef(0);
 
   const bg = dark ? "#131b3e" : "white";
   const bd = dark ? "#1e2a4a" : "#E2E8F0";
   const txt = dark ? "white" : "#1E293B";
   const sub = dark ? "#8899cc" : "#64748B";
 
-  const fetchAll = useCallback(async () => {
-    setLoading(true);
-    try {
-      const [listRes, kpisRes] = await Promise.all([
-        monzaDespachosAPI.list({ q: q || undefined, desde: desde || undefined, hasta: hasta || undefined }),
-        monzaDespachosAPI.kpis(),
-      ]);
-      setItems(listRes.data.items);
-      setTotal(listRes.data.total);
-      setKpis(kpisRes.data);
-    } catch { toast.error("Error al cargar despachos"); }
-    finally { setLoading(false); }
-  }, [q, desde, hasta]);
+  // Debounce 350 ms (spec, decisión 3): antes NO había — cada tecla disparaba
+  // DOS requests (listado + KPIs). Enter saltea la espera, Esc limpia.
+  useEffect(() => { const t = setTimeout(() => setQDeb(normalizarQ(q)), 350); return () => clearTimeout(t); }, [q]);
+  // replaceState mientras se escribe (que Atrás no retroceda carácter por carácter)
+  useEffect(() => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (q) next.set("q", q); else next.delete("q");
+      return next;
+    }, { replace: true });
+  }, [q, setSearchParams]);
 
-  useEffect(() => { fetchAll(); }, [fetchAll]);
+  const fetchList = useCallback(async (pageN: number, append: boolean) => {
+    const id = ++seqRef.current;
+    if (!append) setLoading(true);
+    try {
+      const r = await monzaDespachosAPI.list({
+        q: qDeb || undefined, desde: desde || undefined, hasta: hasta || undefined,
+        page: pageN, page_size: 50,
+      });
+      if (id !== seqRef.current) return;
+      setItems((prev) => (append ? [...prev, ...(r.data.items || [])] : (r.data.items || [])));
+      setTotal(r.data.total ?? 0);
+      setNormalizado(!!r.data.normalizado);
+    } catch { toast.error("Error al cargar despachos"); }
+    finally { if (id === seqRef.current) setLoading(false); }
+  }, [qDeb, desde, hasta]);
+  useEffect(() => { setPage(1); fetchList(1, false); }, [fetchList]);
+
+  // KPIs FUERA del camino del buscador (spec): no dependen del texto — se cargan
+  // una vez y con el botón de refresco, no en cada tecla.
+  const fetchKpis = useCallback(() => { monzaDespachosAPI.kpis().then((r) => setKpis(r.data)).catch(() => {}); }, []);
+  useEffect(() => { fetchKpis(); }, [fetchKpis]);
+
+  const recargar = () => { setPage(1); fetchList(1, false); fetchKpis(); };
 
   const toggleExpand = async (id: number) => {
     const next = new Set(expanded);
@@ -1234,7 +1634,7 @@ export default function MonzaDespachosPage() {
           cotId={uploadModal.id}
           cotNumero={uploadModal.numero}
           onClose={() => setUploadModal(null)}
-          onUploaded={() => { setUploadModal(null); fetchAll(); setDetails({}); }}
+          onUploaded={() => { setUploadModal(null); recargar(); setDetails({}); }}
         />
       )}
 
@@ -1274,9 +1674,21 @@ export default function MonzaDespachosPage() {
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <div style={{ position: "relative", flex: 1, minWidth: 280 }}>
             <Search size={14} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "#94A3B8" }} />
+            {/* El placeholder es un CONTRATO: cada palabra es un campo que la
+                consulta toca (spec, decisión 7). */}
             <input value={q} onChange={(e) => setQ(e.target.value)}
-              placeholder="Cliente, N° COT, N° factura, vehículo..."
-              style={{ width: "100%", padding: "8px 10px 8px 32px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: dark ? "#0d1321" : "white", color: txt }} />
+              onKeyDown={(e) => {
+                if (e.key === "Enter") setQDeb(normalizarQ(q));     // Enter saltea la espera
+                if (e.key === "Escape") { setQ(""); setQDeb(""); }  // Esc limpia
+              }}
+              placeholder="N° parte, repuesto, COT, OC, cliente, embarque, N° despacho o guía…"
+              style={{ width: "100%", padding: "8px 30px 8px 32px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: dark ? "#0d1321" : "white", color: txt }} />
+            {q && (
+              <button onClick={() => { setQ(""); setQDeb(""); }} title="Limpiar búsqueda"
+                style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", color: sub, padding: 2, display: "flex" }}>
+                <X size={14} />
+              </button>
+            )}
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: sub }}>
             Despacho desde:
@@ -1286,10 +1698,16 @@ export default function MonzaDespachosPage() {
             <input type="date" value={hasta} onChange={(e) => setHasta(e.target.value)}
               style={{ padding: "6px 8px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 12, background: dark ? "#0d1321" : "white", color: txt, colorScheme: dark ? "dark" : "light" as const }} />
           </div>
-          <button onClick={fetchAll} style={{ padding: "7px 10px", border: `1px solid ${bd}`, borderRadius: 6, background: bg, cursor: "pointer", color: sub }}>
+          <button onClick={recargar} style={{ padding: "7px 10px", border: `1px solid ${bd}`, borderRadius: 6, background: bg, cursor: "pointer", color: sub }}>
             <RefreshCw size={13} />
           </button>
         </div>
+        {/* Si el acierto vino de la pasada colapsada (sin guiones), se dice */}
+        {qDeb && normalizado && (
+          <div style={{ fontSize: 11, color: sub, marginTop: 8 }}>
+            Buscaste {qDeb}; también busqué {qDeb.split(" ").map((t) => t.replace(/-/g, "")).join(" ")}.
+          </div>
+        )}
       </div>
 
       {/* Table */}
@@ -1308,8 +1726,14 @@ export default function MonzaDespachosPage() {
               ? <tr><td colSpan={10} style={{ padding: 40, textAlign: "center", color: "#94A3B8" }}>Cargando...</td></tr>
               : items.length === 0
                 ? <tr><td colSpan={10} style={{ padding: 48, textAlign: "center", color: "#94A3B8" }}>
-                    <Truck size={32} color="#E2E8F0" style={{ display: "block", margin: "0 auto 8px" }} />
-                    No hay despachos registrados aún.
+                    {/* Vacíos DIFERENCIADOS: "no hay nada" ≠ "no coincide" (spec, dec. 4) */}
+                    {qDeb ? <>
+                      <Search size={32} color="#E2E8F0" style={{ display: "block", margin: "0 auto 8px" }} />
+                      Sin resultados para «{qDeb}» en el histórico de despachos.
+                    </> : <>
+                      <Truck size={32} color="#E2E8F0" style={{ display: "block", margin: "0 auto 8px" }} />
+                      No hay despachos registrados aún.
+                    </>}
                   </td></tr>
                 : items.flatMap((d) => {
                   const lc = d.linea ? LINEA_CONFIG[d.linea] : null;
@@ -1325,26 +1749,36 @@ export default function MonzaDespachosPage() {
                         </button>
                       </td>
                       <td style={{ padding: "10px 12px" }}>
-                        <div style={{ fontWeight: 700, fontSize: 12, color: "var(--monza-accent)" }}>{d.numero}</div>
+                        {/* <mark> SOLO en el campo que coincidió + insignia del
+                            motivo (spec, decisión 5): "1234" puede ser COT, parte
+                            u OC — sin la insignia el operador relee la fila. */}
+                        <div style={{ fontWeight: 700, fontSize: 12, color: "var(--monza-accent)" }}>
+                          {campoMatcheado(d.match, "cotizacion") ? <Resaltar texto={d.numero} q={qDeb} /> : d.numero}
+                        </div>
                         {d.lead_numero && <div style={{ fontSize: 10, color: "#94A3B8" }}>Lead {d.lead_numero}</div>}
                         {lc && d.linea && <span style={{ fontSize: 10, background: lc.bg, color: lc.color, padding: "1px 6px", borderRadius: 6, fontWeight: 600 }}>{d.linea}</span>}
+                        {qDeb && <div style={{ marginTop: 3 }}><MatchBadges match={d.match} /></div>}
                       </td>
                       <td style={{ padding: "10px 12px" }}>
                         <div style={{ fontWeight: 600, color: txt }}>{fmtDate(d.fecha_despacho)}</div>
                         {d.fecha_venta && <div style={{ fontSize: 11, color: sub }}>Vendida {fmtDate(d.fecha_venta)}</div>}
                       </td>
                       <td style={{ padding: "10px 12px" }}>
-                        <div style={{ fontWeight: 500, color: txt }}>{d.cliente?.nombre || "—"}</div>
-                        {d.cliente?.rut && <div style={{ fontSize: 11, color: sub }}>{d.cliente.rut}</div>}
+                        <div style={{ fontWeight: 500, color: txt }}>
+                          {d.cliente?.nombre ? (campoMatcheado(d.match, "cliente") ? <Resaltar texto={d.cliente.nombre} q={qDeb} /> : d.cliente.nombre) : "—"}
+                        </div>
+                        {d.cliente?.rut && <div style={{ fontSize: 11, color: sub }}>{campoMatcheado(d.match, "rut") ? <Resaltar texto={d.cliente.rut} q={qDeb} /> : d.cliente.rut}</div>}
                       </td>
                       <td style={{ padding: "10px 12px", color: sub, fontSize: 12 }}>
-                        {d.vehiculo || "—"}
-                        {d.vin && <div style={{ fontSize: 10, color: "#94A3B8" }}>VIN: {d.vin}</div>}
+                        {d.vehiculo ? (campoMatcheado(d.match, "vehiculo") ? <Resaltar texto={d.vehiculo} q={qDeb} /> : d.vehiculo) : "—"}
+                        {d.vin && <div style={{ fontSize: 10, color: "#94A3B8" }}>VIN: {campoMatcheado(d.match, "vin") ? <Resaltar texto={d.vin} q={qDeb} /> : d.vin}</div>}
                       </td>
                       <td style={{ padding: "10px 12px" }}>
                         {d.numero_factura ? (
                           <div>
-                            <div style={{ fontWeight: 600, color: txt, fontSize: 12 }}>{d.numero_factura}</div>
+                            <div style={{ fontWeight: 600, color: txt, fontSize: 12 }}>
+                              {campoMatcheado(d.match, "factura") ? <Resaltar texto={d.numero_factura} q={qDeb} /> : d.numero_factura}
+                            </div>
                             {d.tipo_documento && <div style={{ fontSize: 10, color: sub }}>{d.tipo_documento.charAt(0).toUpperCase() + d.tipo_documento.slice(1)}</div>}
                           </div>
                         ) : <span style={{ color: "#94A3B8", fontSize: 12 }}>Sin número</span>}
@@ -1441,8 +1875,21 @@ export default function MonzaDespachosPage() {
           </tbody>
         </table>
         {total > 0 && (
-          <div style={{ padding: "10px 16px", borderTop: `1px solid ${bd}`, fontSize: 12, color: "#94A3B8" }}>
-            {total} despacho{total !== 1 ? "s" : ""} en total
+          // Pie HONESTO (spec, decisión 4): antes decía "{total} en total"
+          // mientras el backend cortaba en 25 y el frontend nunca mandaba page —
+          // 25 filas bajo un cartel que decía 120. Nunca truncar en silencio.
+          <div style={{ padding: "10px 16px", borderTop: `1px solid ${bd}`, fontSize: 12, color: "#94A3B8", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <span>
+              Mostrando {items.length} de {total} despacho{total !== 1 ? "s" : ""}
+              {total > items.length && qDeb ? " — afiná la búsqueda" : ""}
+              {qDeb && total > 200 ? " · Demasiadas coincidencias: agregá el N° de cotización o el cliente." : ""}
+            </span>
+            {total > items.length && (
+              <button onClick={() => { const p = page + 1; setPage(p); fetchList(p, true); }}
+                style={{ padding: "5px 12px", border: `1px solid ${bd}`, borderRadius: 6, background: "transparent", color: "var(--monza-accent)", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>
+                Ver más (+50)
+              </button>
+            )}
           </div>
         )}
       </div>

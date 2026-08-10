@@ -4,10 +4,11 @@ import re
 from datetime import datetime, date, timedelta
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
+from sqlalchemy import and_, exists, func, or_
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, contains_eager
 from pydantic import BaseModel
 
 from database import get_db
@@ -89,6 +90,141 @@ def _item_deadline(item: ItemCotizacion, cot: Cotizacion, oc: OcCliente) -> Opti
     if oc.fecha_entrega:
         return oc.fecha_entrega
     return None
+
+
+# ── Buscador de operador (contrato común, 2026-08-05) ─────────────────────────
+# Helpers PROPIOS de MachParts (docs/spec-buscadores-bodega-despachos-2026-08-05.md):
+# la duplicación entre marcas es deliberada — se comparte la FORMA, no el código.
+# Bodega (routers/bodega.py) los importa localmente, igual que ya hace con
+# _qty_recibida_utilizable (patrón probado bodega→despachos, sin ciclo).
+#
+# Contrato del parámetro `q`:
+#   · strip + colapsar espacios internos + truncar a 64 (pegados de Excel);
+#   · menos de 2 caracteres = se ignora el filtro por completo;
+#   · tokenizar por espacio, máximo 4 tokens: AND entre tokens, OR entre campos;
+#   · por token, variante cruda + variante sin prefijo conocido — la UI imprime
+#     "COT-2026-0001" en 8 pantallas pero la base guarda "2026-0001";
+#   · escape de % y _ SIEMPRE: '_' tecleado es un guion bajo LITERAL (sin esto
+#     '100_4567' matchea '100-4567' Y '100X4567' — dos partes distintas);
+#   · .like() y NO .ilike(): las columnas son utf8mb4_unicode_ci (ya insensibles
+#     a mayúsculas y tildes) y lower(col) anularía cualquier índice.
+
+_Q_PREFIJOS_UI = ("COT-", "OC-", "OCP-", "EMB-", "DSP-", "N°", "Nº", "#")
+_Q_MAX_LARGO = 64
+_Q_MIN_LARGO = 2
+_Q_MAX_TOKENS = 4
+
+
+def _normalizar_q(q: Optional[str]) -> List[str]:
+    """Término del operador → tokens normalizados (lista vacía = no filtrar)."""
+    limpio = re.sub(r"\s+", " ", (q or "").strip())[:_Q_MAX_LARGO]
+    if len(limpio) < _Q_MIN_LARGO:
+        return []
+    return limpio.split(" ")[:_Q_MAX_TOKENS]
+
+
+def _variantes_token(tok: str) -> List[str]:
+    """[cruda, sin prefijo conocido]: el operador copia lo que la pantalla imprime."""
+    variantes = [tok]
+    mayus = tok.upper()
+    for pref in _Q_PREFIJOS_UI:
+        if mayus.startswith(pref.upper()) and len(tok) > len(pref):
+            resto = tok[len(pref):].strip()
+            if len(resto) >= _Q_MIN_LARGO:
+                variantes.append(resto)
+            break
+    return variantes
+
+
+def _patron(v: str) -> str:
+    """Patrón LIKE infijo con comodines escapados. Usar SIEMPRE como
+    col.like(_patron(tok), escape="\\\\") — no es inyección SQL (el valor viaja
+    bindeado), es comportamiento: sin escape, '_' devuelve la tabla entera."""
+    for c in ("\\", "%", "_"):
+        v = v.replace(c, "\\" + c)
+    return f"%{v}%"
+
+
+def _colapsar(tok: str) -> str:
+    """Forma colapsada del número de parte: sin guiones ni espacios, mayúsculas.
+    7T1997 y 7T-1997 conviven como filas distintas en la base (excel_service solo
+    recorta), así que la pasada B compara ambas formas colapsadas."""
+    return re.sub(r"[-\s]", "", tok).upper()
+
+
+def _np_colapsado_sql(col):
+    """Columna número de parte en forma colapsada (para la pasada B). Es un full
+    scan reconocido: corre SOLO como red de seguridad cuando la pasada A dio 0."""
+    return func.replace(func.replace(func.upper(col), "-", ""), " ", "")
+
+
+def _matchea(valor, variantes_por_token) -> bool:
+    """¿Algún token (en alguna de sus variantes) aparece en `valor`? Para la
+    insignia de motivo, calculada SOLO sobre la página ya paginada (≤50 filas)."""
+    v = (valor or "").lower()
+    if not v:
+        return False
+    return any(any(x.lower() in v for x in vs) for vs in variantes_por_token)
+
+
+def _filtro_q_oc_clientes(query, tokens: List[str], con_colapsado: bool = False):
+    """Aplica `q` al listado de OC-Cliente EN SQL. Todo campo que vive en una
+    tabla HIJA (ítems, embarques, despachos) entra como EXISTS correlacionado,
+    NUNCA como .join(): un join a la colección multiplica la fila de la cabecera,
+    infla query.count() y el LIMIT se come los cupos con duplicados."""
+    for tok in tokens:
+        conds = []
+        for v in _variantes_token(tok):
+            pat = _patron(v)
+            conds += [
+                OcCliente.numero_oc.like(pat, escape="\\"),
+                Cotizacion.numero.like(pat, escape="\\"),
+                Cotizacion.cliente.like(pat, escape="\\"),
+                Cotizacion.rut_cliente.like(pat, escape="\\"),
+                # Ítems de la cotización: n° de parte y el nombre que la pantalla
+                # imprime (descripcion or nombre_cat — hay que mirar LAS DOS).
+                exists().where(and_(
+                    ItemCotizacion.cotizacion_id == Cotizacion.id,
+                    or_(
+                        ItemCotizacion.numero_parte.like(pat, escape="\\"),
+                        ItemCotizacion.descripcion.like(pat, escape="\\"),
+                        ItemCotizacion.nombre_cat.like(pat, escape="\\"),
+                        ItemCotizacion.marca.like(pat, escape="\\"),
+                    ),
+                )),
+                # Embarque que trajo los ítems. NUNCA Embarque.awb: guarda el
+                # NOMBRE DEL ARCHIVO adjunto; el número real es awb_numero
+                # (models/models.py:220-221 lo dice literal).
+                exists().where(and_(
+                    ItemCotizacion.cotizacion_id == Cotizacion.id,
+                    EmbarqueItem.item_cotizacion_id == ItemCotizacion.id,
+                    Embarque.id == EmbarqueItem.embarque_id,
+                    or_(
+                        Embarque.numero.like(pat, escape="\\"),
+                        Embarque.awb_numero.like(pat, escape="\\"),
+                    ),
+                )),
+                # Despachos de la OC: el N° de guía es el papel que el cliente
+                # cita por teléfono y antes era imposible de buscar.
+                exists().where(and_(
+                    Despacho.oc_cliente_id == OcCliente.id,
+                    or_(
+                        Despacho.numero_despacho.like(pat, escape="\\"),
+                        Despacho.numero_guia.like(pat, escape="\\"),
+                        Despacho.numero_expedicion.like(pat, escape="\\"),
+                        Despacho.transportista.like(pat, escape="\\"),
+                    ),
+                )),
+            ]
+        if con_colapsado and any(ch.isdigit() for ch in tok):
+            # Pasada B: comparación colapsada del número de parte (sin guiones).
+            conds.append(exists().where(and_(
+                ItemCotizacion.cotizacion_id == Cotizacion.id,
+                _np_colapsado_sql(ItemCotizacion.numero_parte)
+                .like(_patron(_colapsar(tok)), escape="\\"),
+            )))
+        query = query.filter(or_(*conds))
+    return query
 
 
 # --- Schemas ---
@@ -550,15 +686,78 @@ def counts(db: Session = Depends(get_db), current_user: User = Depends(get_curre
 def oc_clientes(
     tab: str = "listas",
     q: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """List OCs by tab: listas | en_curso | historial"""
-    ocs = db.query(OcCliente).join(OcCliente.cotizacion).all()
+    """List OCs by tab: listas | en_curso | historial
 
-    # Precarga en LOTE (antes: hasta 3 queries por OC dentro del loop):
-    # ítems por cotización, fichas de cliente por RUT y qué OCs tienen
-    # despachos abiertos (en_preparacion) o cerrados (despachado).
+    Buscador de operador (2026-08-05): la pestaña y `q` bajan a SQL (antes se
+    serializaban TODAS las cards por tecla y el filtro corría en Python sobre un
+    haystack concatenado), con paginación honesta y orden determinista. La
+    respuesta pasa de array pelado al sobre {items, total, page, page_size,
+    q_efectivo, normalizado}; el único consumidor (DespachosPage.tsx) migra en
+    el mismo commit. Cada card lleva `match: [{campo, valor}]` — el motivo de la
+    coincidencia lo calcula el backend sobre la página, no el frontend.
+    """
+    if tab not in ("listas", "en_curso", "historial"):
+        raise HTTPException(400, f"tab inválido: {tab}")
+
+    # contains_eager: el join de siempre FILTRA pero no PUEBLA, y `cotizacion`
+    # es lazy — sin esto, cada card de la página dispararía un SELECT extra.
+    base = (
+        db.query(OcCliente)
+        .join(OcCliente.cotizacion)
+        .options(contains_eager(OcCliente.cotizacion))
+    )
+    if tab == "listas":
+        # Ítems en bodega > 0. (Un ítem 'en_bodega' implica despachados < total,
+        # así que el descarte de estado == 'completado' del código anterior queda
+        # cubierto por el mismo EXISTS: no se descartan filas después de paginar.)
+        base = base.filter(exists().where(and_(
+            ItemCotizacion.cotizacion_id == Cotizacion.id,
+            ItemCotizacion.estado_item == "en_bodega",
+        )))
+    elif tab == "en_curso":
+        base = base.filter(exists().where(and_(
+            Despacho.oc_cliente_id == OcCliente.id,
+            Despacho.estado == "en_preparacion",
+        )))
+    else:  # historial
+        base = base.filter(exists().where(and_(
+            Despacho.oc_cliente_id == OcCliente.id,
+            Despacho.estado == "despachado",
+        )))
+
+    tokens = _normalizar_q(q)
+    normalizado = False
+    query = _filtro_q_oc_clientes(base, tokens) if tokens else base
+    total = query.count()
+    if tokens and total == 0 and any(any(c.isdigit() for c in t) for t in tokens):
+        # Pasada B (solo si A dio 0 y hay dígitos): número de parte colapsado.
+        query = _filtro_q_oc_clientes(base, tokens, con_colapsado=True)
+        total = query.count()
+        normalizado = total > 0
+
+    # Sort by fecha_entrega ascending (urgent first), nulls last — ahora en SQL,
+    # con desempate por id DESC: sin desempate, con OFFSET, MySQL puede repetir
+    # una fila en la página 1 y perderla en la 2.
+    ocs = (
+        query.order_by(
+            OcCliente.fecha_entrega.is_(None),
+            OcCliente.fecha_entrega.asc(),
+            OcCliente.id.desc(),
+        )
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    # Precarga en LOTE, SOLO sobre la página (antes: hasta 3 queries por OC
+    # dentro del loop, sobre el histórico completo): ítems por cotización y
+    # fichas de cliente por RUT. El filtro de pestaña por estado de despacho
+    # ya bajó al WHERE (EXISTS), así que su precarga desapareció.
     cot_ids = [oc.cotizacion_id for oc in ocs if oc.cotizacion_id]
     items_por_cot: dict = {}
     if cot_ids:
@@ -573,19 +772,83 @@ def oc_clientes(
     if ruts:
         for cli in db.query(Cliente).filter(Cliente.rut.in_(ruts)).all():
             clientes_por_rut[cli.rut] = cli
-    oc_ids = [oc.id for oc in ocs]
-    ocs_con_abierto, ocs_con_cerrado = set(), set()
-    if oc_ids:
-        estados_despacho = (
-            db.query(Despacho.oc_cliente_id, Despacho.estado)
-            .filter(
-                Despacho.oc_cliente_id.in_(oc_ids),
-                Despacho.estado.in_(("en_preparacion", "despachado")),
-            )
-            .all()
-        )
-        for oc_id, estado in estados_despacho:
-            (ocs_con_abierto if estado == "en_preparacion" else ocs_con_cerrado).add(oc_id)
+
+    # Insignia de motivo: lote de embarques y despachos SOLO de la página.
+    variantes_por_token = [_variantes_token(t) for t in tokens]
+    colapsados = [_colapsar(t) for t in tokens if any(c.isdigit() for c in t)]
+    emb_por_cot: dict = {}
+    desp_por_oc: dict = {}
+    if tokens:
+        cot_por_item = {it.id: cid for cid, its in items_por_cot.items() for it in its}
+        if cot_por_item:
+            for item_id, emb_num, emb_awb_num in (
+                db.query(EmbarqueItem.item_cotizacion_id, Embarque.numero, Embarque.awb_numero)
+                .join(Embarque, Embarque.id == EmbarqueItem.embarque_id)
+                .filter(EmbarqueItem.item_cotizacion_id.in_(list(cot_por_item)))
+                .all()
+            ):
+                cot_id = cot_por_item.get(item_id)
+                if cot_id is not None:
+                    emb_por_cot.setdefault(cot_id, []).append((emb_num, emb_awb_num))
+        oc_ids = [oc.id for oc in ocs]
+        if oc_ids:
+            for oc_id, d_num, d_guia, d_exp, d_transp in (
+                db.query(Despacho.oc_cliente_id, Despacho.numero_despacho,
+                         Despacho.numero_guia, Despacho.numero_expedicion,
+                         Despacho.transportista)
+                .filter(Despacho.oc_cliente_id.in_(oc_ids))
+                .all()
+            ):
+                desp_por_oc.setdefault(oc_id, []).append((d_num, d_guia, d_exp, d_transp))
+
+    def _match_de_card(oc) -> list:
+        """[{campo, valor}] deduplicado por campo (primer valor gana)."""
+        if not tokens:
+            return []
+        cot = oc.cotizacion
+        encontrados: dict = {}
+
+        def _agregar(campo, valor):
+            if valor and campo not in encontrados:
+                encontrados[campo] = valor
+
+        if _matchea(oc.numero_oc, variantes_por_token):
+            _agregar("oc_cliente", oc.numero_oc)
+        if cot is not None:
+            if _matchea(cot.numero, variantes_por_token):
+                _agregar("cotizacion", cot.numero)
+            if _matchea(cot.cliente, variantes_por_token):
+                _agregar("cliente", cot.cliente)
+            if _matchea(cot.rut_cliente, variantes_por_token):
+                _agregar("rut", cot.rut_cliente)
+            for it in items_por_cot.get(cot.id, []):
+                if _matchea(it.numero_parte, variantes_por_token):
+                    _agregar("numero_parte", it.numero_parte)
+                if _matchea(it.descripcion, variantes_por_token) or \
+                        _matchea(it.nombre_cat, variantes_por_token):
+                    _agregar("repuesto", it.descripcion or it.nombre_cat)
+                if _matchea(it.marca, variantes_por_token):
+                    _agregar("marca", it.marca)
+                # Acierto de la pasada colapsada: se declara aparte porque no se
+                # puede mapear 6003113721 sobre 600-311-3721 carácter a carácter.
+                if normalizado and it.numero_parte and any(
+                        c in _colapsar(it.numero_parte) for c in colapsados):
+                    _agregar("numero_parte_colapsado", it.numero_parte)
+            for emb_num, emb_awb_num in emb_por_cot.get(cot.id, []):
+                if _matchea(emb_num, variantes_por_token):
+                    _agregar("embarque", emb_num)
+                if _matchea(emb_awb_num, variantes_por_token):
+                    _agregar("awb", emb_awb_num)
+        for d_num, d_guia, d_exp, d_transp in desp_por_oc.get(oc.id, []):
+            if _matchea(d_num, variantes_por_token):
+                _agregar("despacho", d_num)
+            if _matchea(d_guia, variantes_por_token):
+                _agregar("guia", d_guia)
+            if _matchea(d_exp, variantes_por_token):
+                _agregar("expedicion", d_exp)
+            if _matchea(d_transp, variantes_por_token):
+                _agregar("transportista", d_transp)
+        return [{"campo": c, "valor": v} for c, v in encontrados.items()]
 
     result = []
     for oc in ocs:
@@ -596,38 +859,17 @@ def oc_clientes(
         )
         if not card:
             continue
-
-        if tab == "listas":
-            if card["items_en_bodega"] == 0:
-                continue
-            if card["estado"] == "completado":
-                continue
-        elif tab == "en_curso":
-            if oc.id not in ocs_con_abierto:
-                continue
-        elif tab == "historial":
-            if oc.id not in ocs_con_cerrado:
-                continue
-        else:
-            raise HTTPException(400, f"tab inválido: {tab}")
-
-        if q:
-            ql = q.lower()
-            haystack = " ".join(
-                [
-                    card.get("cliente") or "",
-                    card.get("numero_oc") or "",
-                    card.get("numero_cotizacion") or "",
-                    card.get("rut_cliente") or "",
-                ]
-            ).lower()
-            if ql not in haystack:
-                continue
-
+        card["match"] = _match_de_card(oc)
         result.append(card)
-    # Sort by fecha_entrega ascending (urgent first), nulls last
-    result.sort(key=lambda c: (c.get("fecha_entrega") is None, c.get("fecha_entrega") or ""))
-    return result
+
+    return {
+        "items": result,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "q_efectivo": " ".join(tokens),
+        "normalizado": normalizado,
+    }
 
 
 @router.get("/oc-clientes/{oc_id}")

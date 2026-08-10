@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { despachosAPI, cotizacionesAPI, cotizadorAPI, comprasAPI, wasabilAPI, abrirDocumento } from '../services/api'
+import api, { despachosAPI, cotizacionesAPI, cotizadorAPI, comprasAPI, wasabilAPI, abrirDocumento } from '../services/api'
 import {
   Truck, Package, CheckCircle2, AlertCircle, Search, X,
   ChevronRight, ChevronDown, Plus, Trash2, Send,
@@ -148,9 +149,144 @@ const estadoLabel: Record<string, { label: string; color: string }> = {
   pendiente: { label: 'Pendiente bodega', color: 'bg-slate-500/15 text-slate-500' },
 }
 
+// ── Buscador de operador (contrato común, 2026-08-05) ─────────────────────────
+
+interface MatchMotivo {
+  campo: string
+  valor: string
+}
+
+/** Sobre del listado /despachos/oc-clientes (antes era un array pelado). */
+interface OcListResponse {
+  items: (OcCard & { match?: MatchMotivo[] })[]
+  total: number
+  page: number
+  page_size: number
+  q_efectivo: string
+  normalizado: boolean
+}
+
+const DEBOUNCE_BUSQUEDA_MS = 350   // este usuario escribe a tirones y con guantes
+const MIN_CARACTERES_BUSQUEDA = 2  // por debajo no se llama al servidor
+const PAGE_SIZE_INICIAL = 50
+const PAGE_SIZE_MAX = 200          // tope del backend (le=200)
+
+// Espejo (solo para RESALTAR en cliente) de los prefijos que el backend descarta:
+// la UI imprime "COT-2026-0001" pero la base guarda "2026-0001".
+const PREFIJOS_UI = ['COT-', 'OC-', 'OCP-', 'EMB-', 'DSP-', 'N°', 'Nº', '#']
+
+function variantesToken(tok: string): string[] {
+  const variantes = [tok]
+  const mayus = tok.toUpperCase()
+  for (const pref of PREFIJOS_UI) {
+    if (mayus.startsWith(pref.toUpperCase()) && tok.length > pref.length) {
+      const resto = tok.slice(pref.length).trim()
+      if (resto.length >= MIN_CARACTERES_BUSQUEDA) variantes.push(resto)
+      break
+    }
+  }
+  return variantes
+}
+
+function tokensDe(q: string): string[] {
+  const limpio = q.trim().replace(/\s+/g, ' ').slice(0, 64)
+  if (limpio.length < MIN_CARACTERES_BUSQUEDA) return []
+  return limpio.split(' ').slice(0, 4)
+}
+
+/** Resalta el primer fragmento coincidente partiendo el string EN REACT —
+ *  PROHIBIDO dangerouslySetInnerHTML (el repo tiene 0 usos: que siga así). */
+function Resaltado({ texto, tokens }: { texto?: string | null; tokens: string[] }) {
+  if (!texto || tokens.length === 0) return <>{texto ?? ''}</>
+  const lower = texto.toLowerCase()
+  let idx = -1
+  let len = 0
+  for (const t of tokens) {
+    for (const v of variantesToken(t)) {
+      const i = lower.indexOf(v.toLowerCase())
+      if (i >= 0 && (idx === -1 || i < idx)) {
+        idx = i
+        len = v.length
+      }
+    }
+  }
+  if (idx < 0) return <>{texto}</>
+  return (
+    <>
+      {texto.slice(0, idx)}
+      <mark
+        className="rounded px-0.5"
+        style={{ backgroundColor: 'rgba(245, 158, 11, 0.35)', color: 'inherit' }}
+      >
+        {texto.slice(idx, idx + len)}
+      </mark>
+      {texto.slice(idx + len)}
+    </>
+  )
+}
+
+const MATCH_LABELS: Record<string, string> = {
+  numero_parte: 'n° parte',
+  numero_parte_colapsado: 'n° parte (sin guiones)',
+  repuesto: 'repuesto',
+  marca: 'marca',
+  cotizacion: 'cotización',
+  cliente: 'cliente',
+  rut: 'RUT',
+  oc_cliente: 'OC cliente',
+  embarque: 'embarque',
+  awb: 'AWB',
+  guia_nacional: 'guía prov.',
+  despacho: 'N° despacho',
+  guia: 'guía',
+  expedicion: 'N° expedición',
+  transportista: 'transportista',
+}
+
+// Campos que la card YA muestra: la insignia lleva solo la etiqueta. Si el campo
+// NO es columna visible, la insignia lleva el VALOR ("embarque EMB-2026-0007").
+const CAMPOS_VISIBLES_CARD = new Set(['cliente', 'cotizacion', 'oc_cliente'])
+
+/** Insignia de motivo: por qué salió la fila. Máximo 2, luego "+N". */
+function MatchBadges({ match }: { match?: MatchMotivo[] }) {
+  if (!match || match.length === 0) return null
+  const mostrar = match.slice(0, 2)
+  const extra = match.length - mostrar.length
+  return (
+    <>
+      {mostrar.map(m => (
+        <span
+          key={m.campo}
+          className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold bg-amber-500/15 text-amber-600 dark:text-amber-400"
+          title={`Coincidió por ${MATCH_LABELS[m.campo] ?? m.campo}: ${m.valor}`}
+        >
+          {MATCH_LABELS[m.campo] ?? m.campo}
+          {CAMPOS_VISIBLES_CARD.has(m.campo) ? '' : ` ${m.valor}`}
+        </span>
+      ))}
+      {extra > 0 && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold bg-slate-500/15 text-slate-500">
+          +{extra}
+        </span>
+      )}
+    </>
+  )
+}
+
 export default function DespachosPage() {
-  const [tab, setTab] = useState<Tab>('listas')
-  const [search, setSearch] = useState('')
+  // El estado del buscador vive en la URL (?q=&tab=), no en localStorage: la app
+  // se recarga sola bajo los pies del operador y "andá a buscar esto" pasa a ser
+  // un enlace. Un término que sobrevive del turno de ayer sería peor que nada.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const tabParam = searchParams.get('tab')
+  const [tab, setTabState] = useState<Tab>(
+    tabParam === 'en_curso' || tabParam === 'historial' ? tabParam : 'listas'
+  )
+  const [search, setSearch] = useState(searchParams.get('q') ?? '')
+  // Término EFECTIVO (debounce 350 ms): es el que entra a la queryKey. OJO: meter
+  // `search` crudo en la queryKey re-ejecutaba el barrido completo por CADA tecla.
+  const [searchQ, setSearchQ] = useState((searchParams.get('q') ?? '').trim())
+  const [pageSize, setPageSize] = useState(PAGE_SIZE_INICIAL)
   const [expandedOc, setExpandedOc] = useState<number | null>(null)
   const [modalOc, setModalOc] = useState<OcDetail | null>(null)
   const [firmarId, setFirmarId] = useState<number | null>(null)
@@ -160,16 +296,69 @@ export default function DespachosPage() {
   const [emitirGuia, setEmitirGuia] = useState<DespachoRow | null>(null)
   const qc = useQueryClient()
 
+  // Debounce 350 ms del término (Enter lo saltea, ver onKeyDown de la caja).
+  useEffect(() => {
+    const t = setTimeout(() => setSearchQ(search.trim()), DEBOUNCE_BUSQUEDA_MS)
+    return () => clearTimeout(t)
+  }, [search])
+
+  // replaceState mientras se escribe: que Atrás no retroceda carácter por carácter.
+  // Guardia anti-bucle: setSearchParams cambia de identidad en cada navegación
+  // (react-router 6), así que solo se navega si la URL realmente difiere.
+  useEffect(() => {
+    if ((searchParams.get('q') ?? '') === search) return
+    setSearchParams(
+      prev => {
+        const p = new URLSearchParams(prev)
+        if (search) p.set('q', search)
+        else p.delete('q')
+        return p
+      },
+      { replace: true }
+    )
+  }, [search, searchParams, setSearchParams])
+
+  // Mínimo 2 caracteres: por debajo no se filtra (ni acá ni en el servidor).
+  const qEfectivo = searchQ.length >= MIN_CARACTERES_BUSQUEDA ? searchQ : ''
+  const qTokens = useMemo(() => tokensDe(qEfectivo), [qEfectivo])
+
+  // Al cambiar el término se vuelve a la primera "página" (Ver más reinicia).
+  useEffect(() => {
+    setPageSize(PAGE_SIZE_INICIAL)
+  }, [qEfectivo])
+
+  const setTab = (t: Tab) => {
+    setTabState(t)
+    setPageSize(PAGE_SIZE_INICIAL)
+    // push (no replace) al cambiar de pestaña: Atrás vuelve a la pestaña anterior.
+    setSearchParams(prev => {
+      const p = new URLSearchParams(prev)
+      if (t === 'listas') p.delete('tab')
+      else p.set('tab', t)
+      return p
+    })
+  }
+
   const { data: counts } = useQuery({
     queryKey: ['despachos', 'counts'],
     queryFn: despachosAPI.getCounts,
     refetchInterval: 60000,
   })
 
-  const { data: ocs = [], isLoading } = useQuery({
-    queryKey: ['despachos', 'oc-clientes', tab, search],
-    queryFn: () => despachosAPI.listOcClientes(tab, search),
+  // La guardia de secuencia contra respuestas fuera de orden la da React Query:
+  // cada combinación tab+q+page_size es una queryKey distinta y solo se pinta la
+  // del estado vigente (por eso el debounce va ANTES de la queryKey, no después).
+  const { data: ocResp, isLoading } = useQuery<OcListResponse>({
+    queryKey: ['despachos', 'oc-clientes', tab, qEfectivo, pageSize],
+    queryFn: () =>
+      api
+        .get('/despachos/oc-clientes', {
+          params: { tab, q: qEfectivo || undefined, page_size: pageSize },
+        })
+        .then(r => r.data),
   })
+  const ocs = ocResp?.items ?? []
+  const totalOcs = ocResp?.total ?? 0
 
   const { data: ocDetail } = useQuery({
     queryKey: ['despachos', 'oc-detail', expandedOc],
@@ -229,6 +418,42 @@ export default function DespachosPage() {
         />
       </div>
 
+      {/* Search — UNA caja, ARRIBA de las pestañas: el operador tiene UN número
+          en la mano y no sabe clasificarlo. El placeholder es un CONTRATO: cada
+          palabra es un campo que la consulta realmente toca. */}
+      <div className="relative">
+        <Search
+          className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2"
+          style={{ color: 'var(--text-faint)' }}
+        />
+        <input
+          type="text"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter') setSearchQ(search.trim()) // saltea el debounce
+            if (e.key === 'Escape') {
+              setSearch('')
+              setSearchQ('')
+            }
+          }}
+          placeholder="N° parte, repuesto, COT, OC, cliente, embarque, N° despacho o guía…"
+          className="input pl-10 pr-10"
+        />
+        {search && (
+          <button
+            onClick={() => {
+              setSearch('')
+              setSearchQ('')
+            }}
+            className="absolute right-3 top-1/2 -translate-y-1/2 hover:opacity-100 opacity-60"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            <X className="w-4 h-4" />
+          </button>
+        )}
+      </div>
+
       {/* Tabs */}
       <div className="flex gap-2">
         <TabBtn active={tab === 'listas'} onClick={() => setTab('listas')}>
@@ -242,45 +467,43 @@ export default function DespachosPage() {
         </TabBtn>
       </div>
 
-      {/* Search */}
-      <div className="relative">
-        <Search
-          className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2"
-          style={{ color: 'var(--text-faint)' }}
-        />
-        <input
-          type="text"
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-          placeholder="Buscar por cliente, N° COT u OC..."
-          className="input pl-10 pr-10"
-        />
-        {search && (
-          <button
-            onClick={() => setSearch('')}
-            className="absolute right-3 top-1/2 -translate-y-1/2 hover:opacity-100 opacity-60"
-            style={{ color: 'var(--text-muted)' }}
-          >
-            <X className="w-4 h-4" />
-          </button>
-        )}
-      </div>
-
       {/* List */}
       {isLoading ? (
         <div className="text-center py-12" style={{ color: 'var(--text-faint)' }}>
           Cargando...
         </div>
       ) : ocs.length === 0 ? (
-        <div className="text-center py-12" style={{ color: 'var(--text-faint)' }}>
-          No hay OCs {tab === 'listas' ? 'listas para despacho' : tab === 'en_curso' ? 'con despachos en curso' : 'en historial'}
-        </div>
+        // Vacíos DIFERENCIADOS: "no coincide nada" ≠ "no hay nada cargado".
+        qEfectivo ? (
+          <div className="text-center py-12" style={{ color: 'var(--text-faint)' }}>
+            Sin resultados para «{qEfectivo}» en{' '}
+            {tab === 'listas' ? 'OC-Clientes Listas' : tab === 'en_curso' ? 'Despachos en Curso' : 'Historial'}.
+            <div className="text-xs mt-1">Probá en las otras pestañas o afiná el término.</div>
+          </div>
+        ) : (
+          <div className="text-center py-12" style={{ color: 'var(--text-faint)' }}>
+            No hay OCs {tab === 'listas' ? 'listas para despacho' : tab === 'en_curso' ? 'con despachos en curso' : 'en historial'}
+          </div>
+        )
       ) : (
         <div className="space-y-2">
+          {/* Encabezado HONESTO: nunca truncar en silencio */}
+          {totalOcs > ocs.length && (
+            <div className="text-xs px-1" style={{ color: 'var(--text-muted)' }}>
+              Mostrando {ocs.length} de {totalOcs}{' '}
+              {qEfectivo ? 'coincidencias — afiná la búsqueda' : 'OCs'}
+            </div>
+          )}
+          {ocResp?.normalizado && (
+            <div className="text-xs px-1" style={{ color: 'var(--text-faint)' }}>
+              Buscaste «{qEfectivo}»; también busqué «{qEfectivo.replace(/[-\s]/g, '')}» (sin guiones).
+            </div>
+          )}
           {ocs.map((oc: OcCard) => (
             <OcRow
               key={oc.id}
               oc={oc}
+              qTokens={qTokens}
               expanded={expandedOc === oc.id}
               onExpand={() => setExpandedOc(expandedOc === oc.id ? null : oc.id)}
               detail={expandedOc === oc.id ? (ocDetail as OcDetail | undefined) : undefined}
@@ -306,6 +529,21 @@ export default function DespachosPage() {
               onEmitirGuia={(d: DespachoRow) => setEmitirGuia(d)}
             />
           ))}
+          {/* Nada de paginador numérico: el operador no navega páginas, achica */}
+          {totalOcs > ocs.length && pageSize < PAGE_SIZE_MAX && (
+            <button
+              onClick={() => setPageSize(s => Math.min(s + 50, PAGE_SIZE_MAX))}
+              className="w-full py-2 text-sm rounded-xl border hover:bg-[var(--surface-200)] transition-colors"
+              style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}
+            >
+              Ver más (+50)
+            </button>
+          )}
+          {totalOcs > PAGE_SIZE_MAX && pageSize >= PAGE_SIZE_MAX && (
+            <div className="text-xs text-center py-2" style={{ color: 'var(--text-faint)' }}>
+              Demasiadas coincidencias. Agregá el N° de cotización o el cliente.
+            </div>
+          )}
         </div>
       )}
 
@@ -426,6 +664,7 @@ function folioParaModal(dtesListos: boolean, dte: any): string | null {
 
 function OcRow({
   oc,
+  qTokens = [],
   expanded,
   onExpand,
   detail,
@@ -459,18 +698,27 @@ function OcRow({
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1 flex-wrap">
-            <span className="text-xs text-brand-500 font-mono font-semibold">OC-{oc.numero_oc}</span>
+            <span className="text-xs text-brand-500 font-mono font-semibold">
+              OC-<Resaltado texto={oc.numero_oc} tokens={qTokens} />
+            </span>
             <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${badge.color}`}>
               {badge.label}
+              {/* Cobertura REAL de la tarjeta: "Listo · 3 de 7 ítems" — con los
+                  campos que el endpoint ya devuelve (encargo del dueño). */}
+              {oc.estado === 'listo' && oc.total_items > 0 &&
+                ` · ${oc.items_en_bodega} de ${oc.total_items} ítems`}
             </span>
+            <MatchBadges match={oc.match} />
             <DiasRestantesBadge
               dias={oc.dias_restantes_critico ?? oc.dias_restantes_oc ?? null}
               label="entrega"
             />
           </div>
-          <div className="font-semibold truncate" style={{ color: 'var(--text-primary)' }}>{oc.cliente}</div>
+          <div className="font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+            <Resaltado texto={oc.cliente} tokens={qTokens} />
+          </div>
           <div className="text-xs truncate" style={{ color: 'var(--text-muted)' }}>
-            {oc.numero_cotizacion} · OC #{oc.numero_oc}
+            <Resaltado texto={oc.numero_cotizacion} tokens={qTokens} /> · OC #{oc.numero_oc}
             {oc.fecha_oc && ` · ${oc.fecha_oc}`}
             {oc.cond_pago && ` · ${oc.cond_pago}`}
             {oc.fecha_entrega && ` · Entrega: ${oc.fecha_entrega}`}

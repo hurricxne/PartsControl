@@ -125,6 +125,10 @@ def _venta_dict(c: MonzaCotizacion) -> dict:
         "linea": c.linea,
         "vehiculo": c.vehiculo,
         "oc_cliente": c.oc_cliente,
+        # Venta a cliente particular: la "OC" es el N° de esta cotización (ver
+        # monza_models.MonzaCotizacion.cliente_sin_oc). Viaja para que la pantalla lo
+        # marque como tal en vez de mostrarlo como una OC del cliente.
+        "cliente_sin_oc": bool(c.cliente_sin_oc),
         "fecha_venta": c.fecha_venta.isoformat() if c.fecha_venta else None,
         "fecha_entrega_est": c.fecha_entrega_est.isoformat() if c.fecha_entrega_est else None,
         "total_bruto": c.total_bruto,

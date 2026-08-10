@@ -28,7 +28,9 @@ from collections import Counter
 from datetime import date, datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import (
+    APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form,
+)
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
@@ -96,6 +98,40 @@ PAGE_SIZE_MAX = 500
 # y evita que un archivo gigante agote la memoria del parser).
 MAX_CARTOLA_BYTES = 10 * 1024 * 1024
 EXTENSIONES_CARTOLA = (".csv", ".xlsx")
+
+
+def _correr_matcher_post_cartola(usuario_id: Optional[int]) -> None:
+    """Corrida del matcher banco↔libro DESPUÉS de responder la importación de cartola.
+
+    Hallazgo #4 (revisión 2026-08-08): esto corría EN LÍNEA dentro del POST. El motor
+    arma el contexto completo DOS veces (todos los movimientos CLP sin cota de fecha,
+    todos los docs activos, todos los egresos con detalle), re-verifica confirmados,
+    caduca zombis y escribe propuestas con un commit por propuesta — «minutos de trabajo
+    pesado», palabras del propio autor cuando lo sacó del job de alertas por la misma
+    razón. El operador pagaba esa espera mirando el spinner (en Monza, sin timeout de
+    cliente, girando indefinidamente). Peor: el endpoint es `async def` con Session
+    SÍNCRONA, así que la corrida bloqueaba el EVENT LOOP — no demoraba solo al que
+    importaba, congelaba todas las peticiones del proceso. Y el costo crece para
+    siempre: la tabla de movimientos solo engorda.
+
+    Como BackgroundTask, Starlette la corre en el threadpool DESPUÉS de mandar la
+    respuesta: el operador ve su cartola al instante y el motor trabaja igual. Sesión
+    PROPIA (molde `scheduler._matcher_post_barrido_monza`): la del request ya está
+    cerrada cuando esto corre. Todo atrapado adentro: un fallo del motor JAMÁS toca una
+    importación ya commiteada, y queda en el log y en la bitácora de corridas que el
+    tablero del Libro SII muestra.
+    """
+    try:
+        from database import SessionLocal
+        from monza_wasabil_compras.matcher import correr_matcher
+        db = SessionLocal()
+        try:
+            correr_matcher(db, origen="post_cartola", usuario_id=usuario_id)
+        finally:
+            db.close()
+    except Exception as e:  # noqa: BLE001 — incluye MatcherEnCurso e ImportError
+        logger.warning("El matcher del libro SII no corrió tras la importación de "
+                       "cartola: %s: %s", type(e).__name__, e)
 
 # Estados de cotización que cuentan como VENTA. Mantener en sync con
 # monza_contabilidad/router.py (ESTADOS_VENTA).
@@ -247,6 +283,66 @@ def _solo_cuentas_clp(cuenta) -> None:
     if cuenta is not None and (cuenta.moneda or "CLP") != "CLP":
         raise HTTPException(400, f"La cuenta está en {cuenta.moneda}: la conciliación automática "
                                  "solo está disponible para cuentas en CLP (fase futura)")
+
+
+def _match_libro_confirmado(db, mov_ids):
+    """Hallazgo #9 (revisión matcher 2026-08-06): un match confirmado del libro SII
+    'vive' sobre el flag mov.conciliado, pero desconciliar/eliminar solo miraban el
+    flag — apagarlo dejaba el match confirmado huérfano: el mov reaparecía en
+    pendientes y la MISMA plata podía explicar un doc del libro Y otra conciliación,
+    o el DELETE dejaba (FK SET NULL) un match confirmado sin movimiento, rompiendo
+    el '409 con match vivo' de la regla 5. Devuelve el id del primer match
+    CONFIRMADO vivo de esos movimientos, o None. Espejo de tesoreria/router.py (GA).
+
+    ImportError → None (paquete del libro no desplegado: no puede existir un match).
+    ProgrammingError (tabla sin migrar) → None por la MISMA razón: sin tabla no hay
+    matches que proteger — no es un fail-open."""
+    if not mov_ids:
+        return None
+    try:
+        from monza_wasabil_compras.models import MonzaSiiLibroMatch
+    except ImportError:
+        # AUSENTE vs ROTO — la distinción es todo (lente de ciclo de vida 2026-08-08).
+        # Si el paquete no está desplegado, no puede haber matches y devolver None es
+        # correcto. Pero si el paquete SÍ está y su import revienta (un deploy a medias,
+        # una dependencia que faltó), los matches EXISTEN en la base y este guard estaría
+        # diciendo «no hay nada que proteger» sin haber mirado: eso es fallar ABIERTO, y
+        # un guard que falla abierto es peor que no tener guard — deja borrar el
+        # movimiento que sostiene un match confirmado y rompe la cadena entera.
+        # Ante la duda se BLOQUEA y se pide un humano, nunca se adivina.
+        import importlib.util
+        try:
+            presente = importlib.util.find_spec("monza_wasabil_compras") is not None
+        except Exception:            # noqa: BLE001 — si ni eso se puede saber, se bloquea
+            presente = True
+        if not presente:
+            return None
+        raise HTTPException(503, (
+            "El módulo del Libro SII está instalado pero no se pudo cargar, así que no "
+            "se puede comprobar si este movimiento sostiene una conciliación con el "
+            "libro. No se borra nada hasta que alguien de sistemas lo revise."))
+    from sqlalchemy.exc import ProgrammingError
+    try:
+        fila = (db.query(MonzaSiiLibroMatch.id)
+                .filter(MonzaSiiLibroMatch.movimiento_id.in_(list(mov_ids)),
+                        MonzaSiiLibroMatch.estado == "confirmado").first())
+    except ProgrammingError as e:
+        db.rollback()
+        # AUSENTE vs ROTO otra vez, ahora del lado del esquema. Si la TABLA no existe
+        # (MySQL 1146: falta correr el init_db del libro) no puede haber ni un match, y
+        # devolver None es la respuesta correcta. Cualquier OTRO error de esquema —el
+        # caso tipico es 1054, columna desconocida tras una migracion a medias— significa
+        # que la tabla SI esta, con filas adentro, y que no pudimos mirarlas: devolver
+        # None ahi seria fallar ABIERTO y dejar borrar el movimiento que sostiene un cruce
+        # confirmado. Ante un dato que no se pudo leer, se BLOQUEA y se pide un humano.
+        detalle = str(getattr(e, "orig", None) or e).lower()
+        if "1146" in detalle or "doesn't exist" in detalle or "does not exist" in detalle:
+            return None
+        raise HTTPException(503, (
+            "No se pudo comprobar si este movimiento sostiene una conciliacion con el "
+            "libro del SII (la consulta al cruce fallo). No se borra nada hasta que "
+            "alguien de sistemas lo revise."))
+    return fila[0] if fila else None
 
 
 def _destinos_for_movs(db, movs) -> dict:
@@ -703,6 +799,7 @@ def eliminar_cuenta(cuenta_id: int, db: Session = Depends(get_db),
 # ─── Cartolas (import) ─────────────────────────────────────────────────────────
 @router.post("/cartolas/importar")
 async def importar_cartola(
+    background: BackgroundTasks,
     cuenta_id: int = Form(...), nombre: Optional[str] = Form(None),
     file: UploadFile = File(...), db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -773,6 +870,14 @@ async def importar_cartola(
             monto=m["monto"], referencia=m.get("referencia"), saldo=m.get("saldo")))
     db.commit()
     db.refresh(cartola)
+    # Hallazgos #10 y #16 (revisión matcher 2026-08-06): la spec §5 del matcher
+    # banco↔libro exige que el motor corra «tras cada importación de cartola» — solo
+    # existía el botón manual y las sugerencias nacían recién con un click humano.
+    # Hallazgo #4 (revisión 2026-08-08): la corrida se agenda, NO se espera — el porqué
+    # completo está en `_correr_matcher_post_cartola`. El operador recibe su cartola de
+    # inmediato; el motor corre después, con su propia sesión.
+    background.add_task(_correr_matcher_post_cartola,
+                        getattr(current_user, "id", None))
     return {"cartola": serialize_cartola(cartola), "headers_detectados": parsed["headers_detectados"],
             "warnings": warnings, "n_importados": len(nuevos), "n_duplicados": n_duplicados}
 
@@ -797,6 +902,21 @@ def eliminar_cartola(cartola_id: int, db: Session = Depends(get_db),
                     MonzaTesMovimiento.conciliado.is_(True)).scalar())
     if conc:
         raise HTTPException(409, f"La cartola tiene {conc} movimiento(s) conciliado(s); desconcílielos antes de borrarla")
+    # Hallazgo #9 (revisión matcher 2026-08-06): el conteo de conciliados no basta —
+    # un mov con match del libro SII confirmado pero flag apagado (desconciliar
+    # histórico) pasaría, y el borrado dejaría matches CONFIRMADOS sin movimiento.
+    mov_ids_cartola = [r[0] for r in db.query(MonzaTesMovimiento.id)
+                       .filter(MonzaTesMovimiento.cartola_id == cartola.id).all()]
+    match_id = _match_libro_confirmado(db, mov_ids_cartola)
+    if match_id is not None:
+        raise HTTPException(
+            # H2: el texto viejo («descártelo en la bandeja del Libro SII») mandaba a una
+            # bandeja que NO listaba los confirmados: el operador iba, no encontraba nada
+            # y quedaba en un punto muerto. Ahora se nombra el camino exacto que existe.
+            409, "La cartola tiene movimiento(s) con un cruce CONFIRMADO con el libro de "
+                 f"compras del SII (N° {match_id}). Antes de borrarla: entre a Libro SII "
+                 f"→ Conciliación bancaria → pestaña «Conciliados», busque el N° "
+                 f"{match_id} y use «Deshacer conciliación».")
     # Solo se borran los NO conciliados: si una conciliación concurrente se coló entre
     # el chequeo de arriba y este DELETE, ese movimiento sobrevive (no queda un destino
     # conciliado huérfano) y la cartola se rechaza en el re-chequeo de abajo.
@@ -878,6 +998,18 @@ def crear_movimiento(payload: MovimientoIn, db: Session = Depends(get_db),
 def eliminar_movimiento(mov_id: int, db: Session = Depends(get_db),
                         current_user: User = Depends(get_current_user)):
     mov = _mov_or_404(db, mov_id, lock=True)
+    # Hallazgo #9 (revisión matcher 2026-08-06): el flag no basta — un desconciliar
+    # histórico pudo apagarlo con el match del libro SII aún confirmado, y el DELETE
+    # dejaría (FK SET NULL) un match CONFIRMADO sin movimiento: exactamente el
+    # 'borrar mov con match vivo = 409' que promete la regla 5.
+    match_id = _match_libro_confirmado(db, [mov.id])
+    if match_id is not None:
+        raise HTTPException(
+            # H2: el camino concreto, no una bandeja donde ese cruce no aparecía.
+            409, f"El movimiento tiene el cruce N° {match_id} CONFIRMADO con el libro de "
+                 "compras del SII. Antes de borrarlo: entre a Libro SII → Conciliación "
+                 f"bancaria → pestaña «Conciliados», busque el N° {match_id} y use "
+                 "«Deshacer conciliación».")
     if mov.conciliado:
         raise HTTPException(409, "El movimiento está conciliado; desconcílielo antes de borrarlo")
     if mov.cartola_id is not None:
@@ -1103,6 +1235,19 @@ def desconciliar(mov_id: int, db: Session = Depends(get_db),
     mov = _mov_or_404(db, mov_id, lock=True)
     if not mov.conciliado:
         raise HTTPException(400, "El movimiento no está conciliado")
+    # Hallazgo #9 (revisión matcher 2026-08-06): si el flag lo sostiene un match
+    # CONFIRMADO del libro SII, desconciliar lo dejaría 'confirmado' con el mov
+    # libre — la misma plata podría explicar el doc del libro Y otro egreso. El
+    # camino es descartar el match en la bandeja del Libro SII (eso libera el flag
+    # vía _liberar_conciliado_si_es_del_match) y recién ahí desconciliar.
+    match_id = _match_libro_confirmado(db, [mov.id])
+    if match_id is not None:
+        raise HTTPException(
+            # H2: el camino concreto, no una bandeja donde ese cruce no aparecía.
+            409, f"El movimiento tiene el cruce N° {match_id} CONFIRMADO con el libro de "
+                 "compras del SII. Primero entre a Libro SII → Conciliación bancaria → "
+                 f"pestaña «Conciliados», busque el N° {match_id}, use «Deshacer "
+                 "conciliación» y reintente.")
     for link in list(mov.conciliaciones):
         if link.egreso_id:
             eg = (db.query(MonzaContEgreso)

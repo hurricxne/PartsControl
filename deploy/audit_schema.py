@@ -66,15 +66,21 @@ MODULOS = (
     ("monza_embarques_pricing.models", "costo landed Monza (monza_emb_pricing_*)"),
     ("monza_recepcion_nacional.models", "compras nacionales Monza (router montado SIEMPRE)"),
     ("monza_wasabil_dte.models",       "DTE al SII Monza (monza_wasabil_dte)"),
+    ("wasabil_compras.models",         "libro de compras del SII GA (sii_libro_*)"),
+    ("monza_wasabil_compras.models",   "libro de compras del SII Monza (monza_sii_libro_*)"),
 )
 
 # Tablas que SOLO existen con `MONZA_CONTAB_ENABLED=true`: apagado el flag, `main.py` ni
-# importa esos routers, `create_all` no crea sus 18 tablas y en PROD su ausencia es lo
+# importa esos routers, `create_all` no crea sus 25 tablas y en PROD su ausencia es lo
 # ESPERADO (decisión del cliente 2026-07-15). Se informan como AVISO, nunca como problema:
 # si contaran como problema, el operador aprendería a ignorar la salida del auditor.
 # OJO con el prefijo `monza_emb_`: NO matchea `monza_embarques` / `monza_embarque_items`
 # (logística del núcleo Monza, obligatorias siempre), solo `monza_emb_pricing*`.
-PREFIJOS_SOLO_CON_GATE = ("monza_cont", "monza_tes", "monza_emb_")
+# `monza_sii_` (las 7 del Libro de compras del SII de Monza) entró el 2026-08-08, cuando
+# ese router pasó a obedecer el mismo flag que su pantalla y su Tesorería: hasta entonces
+# se montaba SIEMPRE, así que sus tablas nacían con el gate apagado —y de paso arrastraban
+# a la metadata las 18 contables, por el cierre del grafo de FKs de su models.py.
+PREFIJOS_SOLO_CON_GATE = ("monza_cont", "monza_tes", "monza_emb_", "monza_sii_")
 
 NIVEL_PROBLEMA = "PROBLEMA"
 NIVEL_AVISO = "AVISO"
@@ -211,7 +217,7 @@ def auditar(Base, insp, gate_monza: bool) -> List[Tuple[str, str, str]]:
     hallazgos: List[Tuple[str, str, str]] = []
 
     for nombre, tabla in sorted(Base.metadata.tables.items()):
-        # Apagado el gate de Monza, sus 18 tablas contables NO deben existir: su ausencia
+        # Apagado el gate de Monza, sus 25 tablas contables NO deben existir: su ausencia
         # es la configuración correcta de PROD, no una desalineación.
         nivel = NIVEL_AVISO if (_solo_con_gate(nombre) and not gate_monza) else NIVEL_PROBLEMA
 
@@ -302,7 +308,7 @@ def autoprueba(backend: Path) -> int:
     # MODULOS): si a MODULOS le falta una línea, acá se nota.
     #
     # El nivel esperado depende del flag, y esto es lo que hace que la autoprueba sirva
-    # igual en PROD: con `MONZA_CONTAB_ENABLED=false` las 18 tablas monza-contab NO deben
+    # igual en PROD: con `MONZA_CONTAB_ENABLED=false` las 25 tablas monza-contab NO deben
     # existir, así que su desalineación es un AVISO a propósito. Exigir PROBLEMA ahí
     # pondría la autoprueba roja en PROD por la configuración correcta.
     esperados: List[Tuple[str, str, str, str]] = []  # (descripción, tabla, marca, nivel)

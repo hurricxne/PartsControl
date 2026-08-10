@@ -305,6 +305,12 @@ class Proveedor(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     nombre = Column(String(255), nullable=False)
+    # RUT CANÓNICO ('76513680-6': sin puntos, con guión, DV mayúscula — ver
+    # wasabil_compras/rut.py). Es la llave de cruce contra el libro de compras del SII:
+    # sin ella, el informe «existe en el SII y no en el ERP» acusa falsos faltantes y el
+    # operador re-carga facturas que ya están (el doble conteo que se quiere evitar).
+    # NULL en proveedores extranjeros (no tienen RUT) y en los legados sin backfill.
+    rut = Column(String(20), nullable=True, index=True)
     pais = Column(String(100))
     moneda = Column(String(20))
     contacto = Column(String(255))

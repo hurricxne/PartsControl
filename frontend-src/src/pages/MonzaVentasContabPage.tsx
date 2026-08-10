@@ -2,6 +2,7 @@
 // vendida/despachada (solo lectura) y, al expandir, muestra ítems, guías y facturas.
 // Consume monzaContabilidadAPI. El alta de facturas vive en MonzaFacturasPage.
 import { useState, useEffect, useCallback } from "react";
+import { Link } from "react-router-dom";
 import { fmtClp } from "../utils/format";
 import {
   TrendingUp, Search, DollarSign, CreditCard, CheckCircle2, AlertCircle,
@@ -54,7 +55,7 @@ interface VentaRow {
   // chip lo lee de acá primero para no depender del estado del adelanto.
   factura_anticipo_folio?: string | null;
 }
-interface GuiaRef { numero_guia: string | null; numero_despacho: string; estado: string; qty_despachada: number; guia_firmada?: boolean; despacho_id?: number; guia_firmada_archivo?: string | null }
+interface GuiaRef { numero_guia: string | null; numero_despacho: string; estado: string; qty_despachada: number; guia_firmada?: boolean; fecha_firma?: string | null; despacho_id?: number; guia_firmada_archivo?: string | null }
 // `cantidad` = cantidad del ítem cubierta por ESA factura (tandas parciales). El
 // backend YA la envía; sin declararla, qtyPendiente daría la cantidad completa
 // EN SILENCIO (TS no avisa por campo ausente en un objeto que llega por red).
@@ -713,16 +714,16 @@ function VentaCard({ venta, onChanged }: { venta: VentaRow; onChanged: () => voi
   // Se recarga también si falta la OC: si esa llamada falló la vez anterior, al volver a
   // abrir la tarjeta se reintenta (si no, la fecha de la OC quedaba en "—" para siempre).
   const toggle = async () => { const next = !open; setOpen(next); if (next && (!detalle || !oc)) await fetchDetalle(); };
-  const toggleFirma = async (despachoId: number, firmada: boolean) => {
-    try { await monzaContabilidadAPI.marcarGuiaFirmada(despachoId, { firmada }); await fetchDetalle(); }
-    catch { /* la firma es opcional: si falla, no bloquea nada */ }
-  };
+  // El toggle de firma se ELIMINÓ (2026-08-06): la firma ahora GATEA la facturación y
+  // se marca donde ocurre la entrega — Despachos ("Marcar guía firmada", con foto/PDF
+  // + fecha). Acá la firma solo se MUESTRA (chips de solo lectura más abajo).
   // Folio de la factura de ANTICIPO (vía B) de esta venta. Se lee de la RAÍZ de la fila
   // y, si el backend todavía no la publica ahí, del adelanto. NO cuelga del estado del
   // adelanto: con el anticipo emitido antes de que Tesorería apruebe, el documento
   // existe y la pantalla no lo mencionaba nunca.
   const folioAnticipo = venta.factura_anticipo_folio || venta.adelanto?.factura_anticipo_folio || null;
-  // Guías distintas de la venta (deduplicadas por despacho) para registrar la firma.
+  // Guías distintas de la venta (deduplicadas por despacho) para MOSTRAR el estado de
+  // la firma — SOLO LECTURA: se marca en Despachos (regla 2026-08-06).
   const guiasVenta: GuiaRef[] = detalle
     ? Array.from(new Map(detalle.items.flatMap(it => it.guias).filter(g => g.despacho_id != null).map(g => [g.despacho_id, g])).values())
     : [];
@@ -757,7 +758,20 @@ function VentaCard({ venta, onChanged }: { venta: VentaRow; onChanged: () => voi
               </span>
             )}
           </div>
-          <p style={{ fontWeight: 600, fontSize: 14, color: text, margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{venta.cliente || "—"}</p>
+          {/* ACCESO DIRECTO a la ficha del cliente: los errores de facturación y de
+              emisión de guía mandan "corrígelo en la ficha del cliente" (RUT o razón
+              social malos bloquean el DTE), y hasta ahora eso era texto muerto — había
+              que ir a Configuración y buscarlo a mano. Se filtra por RUT, que es único;
+              si falta —justo el caso que hay que ir a arreglar— cae al nombre.
+              Contabilidad sirve el cliente como texto (no hay cliente_id en el payload),
+              así que el enlace usa el buscador en vez de un id. */}
+          <Link to={`/monzaparts/configuracion?tab=clientes&cliente=${encodeURIComponent(venta.rut_cliente || venta.cliente || "")}`}
+            title="Abrir la ficha del cliente (corregir RUT o razón social)"
+            style={{ fontWeight: 600, fontSize: 14, color: text, margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block", textDecoration: "none" }}
+            onMouseEnter={(e) => { e.currentTarget.style.textDecoration = "underline"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.textDecoration = "none"; }}>
+            {venta.cliente || "—"}
+          </Link>
           <p style={{ fontSize: 12, color: muted, margin: "2px 0 0" }}>
             {venta.rut_cliente && <span>{venta.rut_cliente} · </span>}
             {venta.vehiculo && <span>{venta.vehiculo} · </span>}
@@ -827,16 +841,20 @@ function VentaCard({ venta, onChanged }: { venta: VentaRow; onChanged: () => voi
               <ItemsPlegables items={detalle.items} />
               {guiasVenta.length > 0 && (
                 <div style={{ padding: "10px 18px", display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", borderTop: `1px solid ${dark ? "#1e2a4a" : "#E2E8F0"}` }}>
-                  <span style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, color: muted }}>Guías (firma opcional):</span>
+                  {/* SOLO LECTURA: la firma se marca en Despachos (con la foto/PDF y la
+                      fecha) y sin ella la guía NO se puede facturar (regla 2026-08-06). */}
+                  <span style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, color: muted }}>Guías:</span>
                   {guiasVenta.map(g => (
-                    <button key={g.despacho_id} onClick={() => toggleFirma(g.despacho_id!, !g.guia_firmada)}
-                      title={g.guia_firmada ? "Quitar marca de firmada" : "Marcar guía como firmada por el cliente"}
-                      style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, fontWeight: 600, padding: "3px 10px", borderRadius: 999, cursor: "pointer", fontFamily: "inherit",
-                        border: `1px solid ${g.guia_firmada ? "#15803D" : (dark ? "#1e2a4a" : "#E2E8F0")}`,
-                        background: g.guia_firmada ? "#DCFCE7" : "transparent",
-                        color: g.guia_firmada ? "#15803D" : muted }}>
-                      {g.numero_guia || g.numero_despacho} · {g.guia_firmada ? "firmada ✓" : "marcar firmada"}
-                    </button>
+                    <span key={g.despacho_id}
+                      title={g.guia_firmada
+                        ? `Guía firmada por el cliente${g.fecha_firma ? ` el ${g.fecha_firma.slice(0, 10).split("-").reverse().join("-")}` : ""}`
+                        : "Guía SIN firmar: sin la firma no se puede facturar este despacho. Márcala en Despachos → Marcar guía firmada."}
+                      style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, fontWeight: 600, padding: "3px 10px", borderRadius: 999, fontFamily: "inherit",
+                        border: `1px solid ${g.guia_firmada ? "#15803D" : "#D97706"}`,
+                        background: g.guia_firmada ? "#DCFCE7" : "rgba(245,158,11,0.10)",
+                        color: g.guia_firmada ? "#15803D" : "#B45309" }}>
+                      {g.numero_guia || g.numero_despacho} · {g.guia_firmada ? `firmada ✓${g.fecha_firma ? ` ${g.fecha_firma.slice(0, 10).split("-").reverse().join("-")}` : ""}` : "sin firmar (se marca en Despachos)"}
+                    </span>
                   ))}
                 </div>
               )}

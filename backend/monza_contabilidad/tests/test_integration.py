@@ -20,6 +20,9 @@ from database import SessionLocal  # noqa: E402
 from auth import get_current_user  # noqa: E402
 import monza_models as mm  # noqa: E402
 from monza_contabilidad.router import router  # noqa: E402
+# Router de DESPACHOS: desde 2026-08-06 la firma de la guía (que gatea la facturación)
+# se marca allá — el check anti-IDOR de la firma pega a ese router, así que se monta.
+from monza_router_despachos import router as router_despachos  # noqa: E402
 from monza_contabilidad.models import (  # noqa: E402
     MonzaContFacturaCliente, MonzaContCobranza, MonzaContFactoring, MonzaContFacturaClienteItem,
     MonzaContAdelanto,
@@ -35,6 +38,7 @@ from database import get_db  # noqa: E402
 
 app = FastAPI()
 app.include_router(router)
+app.include_router(router_despachos)
 # Auth REALISTA: además de devolver el usuario, hace una lectura en la MISMA sesión del
 # request, igual que auth.get_current_user en producción. Ese SELECT abre el read view de
 # MySQL (REPEATABLE READ) ANTES de cualquier with_for_update(), que es la condición real
@@ -43,7 +47,10 @@ app.include_router(router)
 # invisibles para los tests.
 def _cu(db: Session = Depends(get_db)):
     db.execute(text("SELECT 1"))
-    return SimpleNamespace(id=CURRENT["id"], empresa=CURRENT["empresa"])
+    # email incluido: el router de despachos (montado desde 2026-08-06 por la firma)
+    # escribe MonzaLog con current_user.email, igual que el User real de producción.
+    return SimpleNamespace(id=CURRENT["id"], empresa=CURRENT["empresa"],
+                           email=f"test-{MARK}@monza.test")
 
 
 app.dependency_overrides[get_current_user] = _cu
@@ -60,6 +67,21 @@ def check(name, cond, extra=""):
     print(("OK   " if cond else "FAIL") + " | " + name + ("" if cond else f"  -> {extra}"))
     if not cond:
         _fails.append(name)
+
+
+def _limpiar_doc(resp):
+    """Borra de uploads/docs el archivo que subió un firmar e2e (la suite deja el
+    disco como lo encontró; el gate lee guia_firmada en BD, no el archivo)."""
+    try:
+        filename = resp.json().get("guia_firmada_archivo")
+    except Exception:  # noqa: BLE001 — respuesta sin JSON: nada que limpiar
+        return
+    if not filename:
+        return
+    from monza_router_despachos import _DOCS_DIR
+    ruta = os.path.join(_DOCS_DIR, filename)
+    if os.path.isfile(ruta):
+        os.remove(ruta)
 
 
 def seed():
@@ -82,6 +104,7 @@ def seed():
         desp = mm.MonzaDespacho(
             numero=f"{MARK}-DSP", cotizacion_id=cot.id, estado="despachado",
             numero_guia="G-001", cliente_nombre=cli.nombre,
+            guia_firmada=1,  # regla 2026-08-06: sin firma no se factura (gate con suite propia)
         )
         db.add(desp); db.flush()
         di = mm.MonzaDespachoItem(despacho_id=desp.id, item_id=item.id, qty_despachada=10)
@@ -98,7 +121,9 @@ def seed():
             cantidad=1, precio_unitario_clp=100000, subtotal_clp=100000, estado_linea="despachado",
         )
         db.add(item2); db.flush()
-        desp2 = mm.MonzaDespacho(numero=f"{MARK}-DSP2", cotizacion_id=cot2.id, estado="despachado", numero_guia="G-002")
+        desp2 = mm.MonzaDespacho(numero=f"{MARK}-DSP2", cotizacion_id=cot2.id, estado="despachado", numero_guia="G-002",
+                                 # regla 2026-08-06: sin firma no se factura (gate con suite propia)
+                                 guia_firmada=1)
         db.add(desp2); db.flush()
         di2 = mm.MonzaDespachoItem(despacho_id=desp2.id, item_id=item2.id, qty_despachada=1)
         db.add(di2); db.flush()
@@ -149,6 +174,10 @@ def cleanup():
             db.query(mm.MonzaCotizacion).filter(mm.MonzaCotizacion.id == cid).delete()
         if _seed["cli_id"]:
             db.query(mm.MonzaCliente).filter(mm.MonzaCliente.id == _seed["cli_id"]).delete()
+        # El firmar e2e (endpoint de Despachos) deja MonzaLog con el email del
+        # usuario simulado: se barre por email, igual que monza_tests/*.
+        db.query(mm.MonzaLog).filter(mm.MonzaLog.user_email == f"test-{MARK}@monza.test").delete(
+            synchronize_session=False)
         db.commit()
         print("Cleanup OK")
     except Exception as e:  # noqa: BLE001
@@ -176,15 +205,30 @@ def run():
     check("1 guia facturable", len(facturables) == 1, facturables)
     check("facturable = 10", facturables and facturables[0]["facturable"] == 10, facturables)
 
-    # ── Marca guía firmada (opcional) — no debe afectar facturación ──
-    rf = client.patch(f"/api/monza/contabilidad/ventas/despachos/{desp_id}/guia-firmada", json={"firmada": True})
+    # ── Marca guía firmada por el ENDPOINT NUEVO de Despachos (2026-08-06) ──
+    # El seed ya nace firmado (el gate de facturación tiene suite propia); acá se
+    # ejercita el RE-firmado que corrige (reemplaza foto y fecha) y que la fecha
+    # viaja de vuelta. El archivo subido se borra al final (_limpiar_doc).
+    rf = client.post(
+        f"/api/monza/despachos/entidades/{desp_id}/firmar",
+        files={"file": ("guia-firmada.jpg", b"foto-firmada", "image/jpeg")},
+        data={"fecha_firma": "2026-08-01"},
+    )
     check("marcar guia firmada 200", rf.status_code == 200 and rf.json()["guia_firmada"] is True, rf.text)
+    check("fecha de la firma guardada", rf.status_code == 200 and (rf.json().get("fecha_firma") or "").startswith("2026-08-01"), rf.text)
+    _limpiar_doc(rf)
     # IDOR: un despacho huérfano (sin venta válida) NO se puede marcar
     dbx = SessionLocal()
     orphan = mm.MonzaDespacho(numero=f"{MARK}-ORPH", cotizacion_id=999999999, estado="despachado", numero_guia="G-ORPH")
     dbx.add(orphan); dbx.commit(); _seed["orphan_id"] = orphan.id; dbx.close()
-    rorph = client.patch(f"/api/monza/contabilidad/ventas/despachos/{_seed['orphan_id']}/guia-firmada", json={"firmada": True})
-    check("IDOR: despacho sin venta -> 404", rorph.status_code == 404, rorph.text)
+    # El PATCH viejo de contabilidad se eliminó (2026-08-06): la firma vive en el
+    # router de DESPACHOS, que heredó esta misma defensa anti-IDOR. Se prueba allá.
+    rorph = client.post(
+        f"/api/monza/despachos/entidades/{_seed['orphan_id']}/firmar",
+        files={"file": ("guia.jpg", b"foto-firmada", "image/jpeg")},
+        data={"fecha_firma": "2026-08-01"},
+    )
+    check("IDOR: firmar despacho sin venta -> 404", rorph.status_code == 404, rorph.text)
 
     # ── Facturación PARCIAL por ítems (4 de 10) ──
     r = client.post("/api/monza/contabilidad/facturas", json={
