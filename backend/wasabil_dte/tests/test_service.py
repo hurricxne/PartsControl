@@ -95,6 +95,9 @@ def test_armar_lineas_feliz():
     assert lineas[0]["code"] == "1R-0716"
     assert lineas[1]["name"] == "Sello de polvo"      # nombre = descripción
     assert lineas[1]["code"] == "6I-2503"             # la parte viaja en code
+    # guia: N de parte al frente de la descripcion (reconocible en el impreso)
+    assert lineas[0]["description"] == "1R-0716 - Filtro de aceite motor"
+    assert lineas[1]["description"] == "6I-2503 - Sello de polvo"
 
 
 def test_armar_lineas_sin_precio_bloquea():

@@ -119,6 +119,17 @@ def cuadratura(neto: float) -> Tuple[int, int, int]:
     return int(neto_d), int(iva_d), int(neto_d + iva_d)
 
 
+def _desc_con_parte(numero_parte: Optional[str], descripcion: Optional[str]) -> Optional[str]:
+    """Descripcion de linea de la GUIA con el N de parte al frente, para que sea
+    reconocible en el impreso (el campo `code` no se imprime visible). Tope 255.
+    El nombre (<=25) NO se toca: la correccion del folio 136 sigue vigente.
+    Solo la guia usa esto; la factura mantiene la descripcion sola."""
+    parte = (numero_parte or "").strip()
+    desc = (descripcion or "").strip()
+    combo = f"{parte} - {desc}" if (parte and desc) else (parte or desc)
+    return combo[:DESCRIPCION_MAX].rstrip() or None
+
+
 def armar_lineas(despacho_items: list, precios_por_item: dict) -> Tuple[List[dict], List[str]]:
     """Convierte los ítems del despacho en líneas del DTE.
 
@@ -150,7 +161,7 @@ def armar_lineas(despacho_items: list, precios_por_item: dict) -> Tuple[List[dic
             continue
         lineas.append({
             "name": acortar_nombre(it.numero_parte, it.descripcion),
-            "description": (it.descripcion or "").strip()[:DESCRIPCION_MAX] or None,
+            "description": _desc_con_parte(it.numero_parte, it.descripcion),
             "code": (it.numero_parte or "").strip() or None,
             # externalId = despacho_item_id: identidad ÚNICA de la línea (permite que la
             # factura tome el precio congelado de ESTA guía con match 1:1, sin depender
