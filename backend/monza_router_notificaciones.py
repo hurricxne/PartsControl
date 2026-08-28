@@ -6,9 +6,14 @@ from datetime import datetime
 
 from database import get_db
 from auth import get_current_user
+from empresa_guard import require_empresa
 from monza_models import MonzaNotificacion
 
-router = APIRouter(prefix="/api/monza/notificaciones", tags=["monza-notificaciones"])
+router = APIRouter(prefix="/api/monza/notificaciones", tags=["monza-notificaciones"],
+    # Candado de empresa (hallazgo del equipo de testing 2026-08-27).
+    # Los títulos de las notificaciones llevan números de documento y nombres de cliente.
+    dependencies=[Depends(require_empresa("automotriz"))],
+)
 
 
 def _dict(n: MonzaNotificacion) -> dict:

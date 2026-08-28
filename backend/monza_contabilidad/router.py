@@ -1728,6 +1728,23 @@ class _ProblemasFactura:
         self.items.append(mensaje)
 
 
+# ── Cortafuego de ADELANTO SIN VERIFICAR en las puertas de SALIDA (2026-08-22) ──
+# El predicado es el MISMO que frena la OC de proveedor en Abastecimiento
+# (monza_router_abastecimiento.py): una venta que exige adelanto (pct_adelanto > 0,
+# incluido el Contado = 100%) y cuyo pago Tesorería todavía no verificó.
+#
+# POR QUÉ TAMBIÉN ACÁ: hasta ahora solo se frenaba la COMPRA, y el resto quedaba
+# cubierto DE REBOTE por el camino físico (sin compra no hay mercadería que despachar).
+# Pero mercadería que llega a bodega por otra vía —una reposición, el remanente de otra
+# línea— podía salir despachada, con guía al SII y facturada, con el pago pendiente.
+# Se replica el helper en cada módulo (patrón ESTADOS_VENTA de la casa) en vez de
+# importarlo: acoplar los módulos aislados por un predicado de 3 líneas sale más caro
+# que mantener las copias con este comentario.
+def _adelanto_sin_verificar(cot) -> bool:
+    return (int(getattr(cot, "pct_adelanto", 0) or 0) > 0
+            and not int(getattr(cot, "adelanto_verificado", 0) or 0))
+
+
 def _cargar_venta(db: Session, cotizacion_id: int, lock: bool = True) -> MonzaCotizacion:
     """Venta (cotización) facturable. Con `lock=True` la lee BLOQUEANTE: serializa la
     facturación concurrente de la misma venta (dos requests no pueden leer el mismo
@@ -1799,6 +1816,26 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
 
     # 'Retiro en oficina' (sin_guia) factura el SALDO de la venta: es EXCLUYENTE con
     # despacho e ítems explícitos (evita estados ambiguos / modos mezclados).
+    # ── Cortafuego de adelanto SIN VERIFICAR — solo en el canal RETIRO ────────
+    # POR QUÉ SOLO ACÁ y no en toda factura: facturar antes de cobrar es el flujo
+    # NORMAL y diseñado del canal con guía (el cliente necesita la factura para
+    # pagar, y Tesorería aplica el adelanto retroactivamente cuando el depósito
+    # llega — ver monza_tests/test_viaje_de_la_plata). Bloquear eso sería circular.
+    # El RETIRO EN OFICINA es distinto: no hay despacho ni guía que frenar porque la
+    # mercadería sale del mostrador EN ESE ACTO, así que esta factura es su única
+    # puerta. Sin este guard, marcar «retiro» era el bypass de los otros dos
+    # cortafuegos (la lección del gate de la guía firmada: el canal sin_guia es la
+    # puerta de servicio).
+    if (payload.sin_guia and _adelanto_sin_verificar(cot)
+            and not getattr(payload, "confirmar_retiro_sin_adelanto", False)):
+        raise HTTPException(
+            409,
+            f"Adelanto no verificado por Tesorería en {cot.numero} "
+            f"(adelanto {int(cot.pct_adelanto or 0)}%): no se entrega mercadería en "
+            f"retiro con el pago pendiente. Tesorería debe registrar el pago recibido; "
+            f"si el cliente acaba de pagar y hay respaldo, marca «retirar sin esperar la "
+            f"verificación» para dejarlo registrado.",
+        )
     modo_ambiguo = payload.sin_guia and (payload.despacho_id is not None or payload.items is not None)
     if modo_ambiguo:
         probs.add(400, "Retiro en oficina (sin guía) factura el saldo de la venta: no indique despacho ni ítems")
@@ -2411,6 +2448,12 @@ def _persistir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
     cli = cot.cliente
     # Trazabilidad: marca el retiro en oficina si el usuario no puso observación propia.
     observaciones = payload.observaciones or ("Retiro en oficina (sin guía)" if payload.sin_guia else None)
+    # La puerta de emergencia deja RASTRO en el documento: quién retiró con el adelanto
+    # pendiente tiene que poder reconstruirse después sin adivinar.
+    if (payload.sin_guia and getattr(payload, "confirmar_retiro_sin_adelanto", False)
+            and _adelanto_sin_verificar(cot)):
+        observaciones = ((observaciones + " · ") if observaciones else "") + \
+            "Retiro autorizado con adelanto AÚN NO verificado por Tesorería"
     es_anticipo = bool(getattr(payload, "es_anticipo", False))
 
     factura = MonzaContFacturaCliente(

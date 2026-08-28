@@ -214,7 +214,7 @@ def _bloque_plata_ya_aplicada():
     dos (si no, el invariante monto_aplicado == Σ cobranzas 'adelanto' se rompe)."""
     cot = _S["cots"]["APL"]
     r = client.post(f"{CONTAB}/facturas", json={
-        "cotizacion_id": cot, "sin_guia": True, "numero_factura": f"{MARK}-FAPL"})
+        "cotizacion_id": cot, "sin_guia": True, "confirmar_retiro_sin_adelanto": True, "numero_factura": f"{MARK}-FAPL"})
     check("APL: factura previa -> 200", r.status_code == 200, r.text[:200])
     r = _post_contab("APL", {"monto": 59500})
     check("APL: verificar (se aplica retroactivo) -> 200", r.status_code == 200, r.text[:200])

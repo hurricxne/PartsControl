@@ -13,9 +13,19 @@ from typing import Optional, List
 
 from database import get_db
 from auth import get_current_user
+from empresa_guard import require_empresa
 from monza_models import MonzaLead, MonzaLeadItem, MonzaConfig
 
-router = APIRouter(prefix="/api/monza/cotizador", tags=["monza-cotizador"])
+# CANDADO DE EMPRESA a nivel de ROUTER (2026-08-22): el CRM de MonzaParts estaba
+# abierto a cualquier usuario autenticado —incluidos los de minería— mientras
+# Despachos, Bodega y el PATCH de Cotizaciones ya lo tenían desde la auditoría F6.
+# Router COMPLETO (lecturas incluidas): candar solo las escrituras deja la lectura
+# de los datos del cliente como puerta del costado. Ver monza_router_leads.py.
+router = APIRouter(
+    prefix="/api/monza/cotizador",
+    tags=["monza-cotizador"],
+    dependencies=[Depends(require_empresa("automotriz"))],
+)
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -175,6 +185,38 @@ def _calcular_precio(costo: float, moneda: str, peso_kg: float, markup_pct: floa
     }
 
 
+def _fila_recalculada(item: MonzaLeadItem, ap: "AplicarPrecioItem") -> bool:
+    """¿ESTA corrida recalculó el precio de la fila? Decide si su estampa de flete se mueve.
+
+    handleAplicar manda TODAS las filas seleccionadas, incluidas preexistentes cuyo precio
+    salió de una corrida ANTERIOR con otro flete. Estampar incondicionalmente escribiría
+    una foto FALSA (flete de hoy sobre un precio de ayer) que la siembra del modal después
+    "conservaría" — la clase de mentira que la tarifa congelada existe para impedir.
+
+    Se decide 100% server-side comparando el body contra lo GUARDADO (jamás con un flag del
+    cliente, misma disciplina que tc_aplicado): si precio, costo, moneda, peso o margen
+    difieren, la fila se recalculó en esta corrida. Tolerancia relativa chica por el
+    round-trip FLOAT de MySQL. `ap.costo is None` = pantalla vieja sin parámetros: no hay
+    con qué comparar y la estampa NO se toca (tri-estado, igual que el guardado de abajo).
+    """
+    if ap.costo is None:
+        return False
+
+    def _difiere(a, b) -> bool:
+        if a is None or b is None:
+            return (a is None) != (b is None)
+        a, b = float(a), float(b)
+        return abs(a - b) > max(1e-6, 1e-6 * max(abs(a), abs(b)))
+
+    return (
+        _difiere(ap.precio_clp, item.precio_clp)
+        or _difiere(ap.costo, item.costo)
+        or (ap.moneda or "").upper() != (item.moneda or "").upper()
+        or _difiere(ap.peso_kg, item.peso_kg)
+        or _difiere(ap.markup_pct, item.markup_pct)
+    )
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 
@@ -286,6 +328,9 @@ def aplicar_precios(body: AplicarBody, db: Session = Depends(get_db), current_us
             MonzaLeadItem.lead_id == body.lead_id,
         ).first()
         if item:
+            # La decisión de la estampa se toma ANTES de mutar: compara el body contra lo
+            # que la fila tenía al entrar a esta corrida (después ya son iguales siempre).
+            recalculada = _fila_recalculada(item, ap)
             item.precio_clp = ap.precio_clp
             item.calidad = ap.calidad
             if ap.marca:
@@ -312,9 +357,21 @@ def aplicar_precios(body: AplicarBody, db: Session = Depends(get_db), current_us
             # TC con que se convirtió ESTE costo: se resuelve SERVER-side desde la
             # moneda del ítem, jamás se acepta del cliente (misma disciplina que el
             # congelado de MonzaCotizacionItem en monza_router_cotizaciones.py).
-            _mon = (item.moneda or "").upper()
-            item.tc_aplicado = (cfg.tc_eur_clp if _mon == "EUR"
-                                else cfg.tc_usd_clp if _mon == "USD" else 1.0)
+            # ── Foto de la corrida, CONDICIONAL (TC + flete juntos) ───────────────
+            # Solo las filas que ESTA corrida recalculó reciben el TC de hoy y el
+            # flete de ESTA corrida; una preexistente que viajó sin cambios conserva
+            # su foto completa (precio ↔ costo ↔ TC ↔ flete de la MISMA corrida).
+            # Antes el tc_aplicado se refrescaba incondicional: si el TC global
+            # cambiaba entre corridas por subconjunto, la fila sin tocar quedaba con
+            # un TC que jamás produjo su precio — la misma mentira que la estampa
+            # condicional cierra para el flete (hallazgo del veedor backend).
+            # Contrato completo en MonzaLeadItem (monza_models.py).
+            if recalculada:
+                _mon = (item.moneda or "").upper()
+                item.tc_aplicado = (cfg.tc_eur_clp if _mon == "EUR"
+                                    else cfg.tc_usd_clp if _mon == "USD" else 1.0)
+                item.moneda_tarifa = mon_tarifa
+                item.tarifa_aerea = tarifa_kg
 
     asesor_nombre = current_user.email.split("@")[0].title()
     db.add(MonzaLeadActividad(

@@ -507,6 +507,19 @@ class Despacho(Base):
     fecha_firma = Column(DateTime(timezone=True), nullable=True)
     usuario_firma_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     guia_firmada_archivo = Column(String(255), nullable=True)   # foto/PDF de la guía firmada (archivo en uploads/docs)
+    # Motivo del FALTANTE declarado al firmar la guía (un motivo por firma, cabecera):
+    # ítems que la guía dice que viajaron pero el cliente NO recibió (perdidos en la
+    # entrega). Solo existe cuando alguna línea quedó con qty_firmada < qty_despachada.
+    # El faltante NO se factura por esta guía y NO vuelve a bodega ni libera cupo: la
+    # reposición se pide en una cotización NUEVA (decisión del dueño, 2026-08-22).
+    faltante_motivo = Column(Text, nullable=True)
+    # N° de BULTO (caja) del envío en que viaja este despacho, asignado a mano por el
+    # operador mientras empaca (picking/packing). Texto libre a propósito («1», «B2»,
+    # «Cajas 2-3»: un despacho grande puede ocupar dos cajas y un entero no lo expresa).
+    # Rotulado logístico puro: no participa en ningún cálculo ni cruce contable. Alimenta
+    # el reparto de bultos por OC para el mail al transportista. NULL/"" = sin asignar.
+    # Migración: migrations/despacho_bulto_numero.py (ANTES de reiniciar — 1054 si falta).
+    bulto_numero = Column(String(50), nullable=True)
 
     oc_cliente = relationship("OcCliente")
     usuario_creacion = relationship("User", foreign_keys=[usuario_creacion_id])
@@ -521,6 +534,12 @@ class DespachoItem(Base):
     despacho_id = Column(Integer, ForeignKey("despachos.id", ondelete="CASCADE"))
     item_cotizacion_id = Column(Integer, ForeignKey("items_cotizacion.id"))
     qty_despachada = Column(Float, default=0)
+    # Cantidad que el cliente FIRMÓ como recibida (firma parcial de la guía).
+    # NULL = firma completa (todo lo despachado llegó); un número = lo firmado.
+    # La FACTURACIÓN se acota a coalesce(qty_firmada, qty_despachada) — ver los
+    # topes de routers/contabilidad.py. qty_despachada NO se toca: es la verdad
+    # física de lo que salió de bodega y el espejo de la guía emitida al SII.
+    qty_firmada = Column(Float, nullable=True)
 
     despacho = relationship("Despacho", back_populates="items")
     item_cotizacion = relationship("ItemCotizacion")

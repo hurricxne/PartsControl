@@ -120,3 +120,89 @@ suficiente, y rehacer una cotización no es costoso en ese flujo de trabajo.
 otro momento del flujo y con otra semántica. Portarlo duplicaría la lógica. Falta escribir
 `docs/monza-tc-congelado.md` explicando esa diferencia — `docs/tc-congelado-cotizacion.md` hoy
 solo dice "MonzaParts ya congela por su cuenta" sin decir dónde ni cómo.
+
+---
+
+## 3 · Firma parcial de la guía: pendientes de la entrega GA (2026-08-22)
+
+**Contexto:** la firma parcial (commit `72b66d7` + afinado posterior) permite declarar
+FALTANTE al firmar una guía — lo no entregado no se factura y la reposición va SIEMPRE
+por cotización nueva (regla cerrada del dueño, con sonda: declarar faltante NO libera
+cupo de despacho). Doc de la feature: `docs/firma-parcial-guia-despachos-ga.md`.
+
+### 3.a · Espejo MonzaParts — PENDIENTE (siguiente tanda natural)
+
+MachParts tiene la firma parcial; Monza solo la firma por despacho completo (su gate
+«sin guía FIRMADA no se factura» es de 2026-08-06). El espejo requiere las mismas
+piezas adaptadas al dominio Monza: qty_firmada en `monza_despacho_items`, el gate por
+firmada efectiva en su facturación (que además tiene CANAL guía/retiro — cuidado con el
+tope `min(firmado − facturado_canal_guía, vendido − facturado_total)`), y el modal.
+
+### 3.b · Alerta «guías cerradas sin firmar hace N días» — decisión del dueño
+
+La pérdida TOTAL (no llegó nada) es irrepresentable a propósito (nadie firma recibir
+cero: Σ firmada > 0). Un despacho jamás firmado hoy no suena en ninguna alerta. La
+salida barata es una regla más en el scheduler. El dueño no la confirmó cuando se le
+ofreció (2026-08-22).
+
+### 3.c · Castigo contable de la pérdida definitiva — decisión del dueño
+
+Si el faltante no se repone nunca, el camino contable es merma/castigo con respaldo
+(el experto tributario del panel: faltante sin respaldo = venta presunta con IVA,
+art. 8 letra d DL 825). El sistema ya registra motivo + evidencia + usuario/fecha (la
+materia prima); el asiento de castigo y el reporte mensual de faltantes quedan para
+cuando el contador lo pida.
+
+## 4 · Picking & Packing: espejo MonzaParts — PENDIENTE (entrega GA 2026-08-25)
+
+El dueño acotó la entrega de picking & packing a MachParts («esto es para machparts»).
+Lo construido en GA y diferido en Monza:
+
+### 4.a · Formato v4 de las líneas DTE — ⚠️ HACERLO ANTES de la 1ª emisión real de Monza
+
+`monza_wasabil_dte/service.py` sigue con el formato viejo: `name` = descripción[:25]
+(NOMBRE_MAX=25 autoimpuesto), la parte solo en `code`, sin sanitización Latin-1 y con el
+`externalId` camelCase que Wasabil descarta. Con ≥6 líneas el PDF de Wasabil imprime SOLO
+`name` (evidencia: PDFs reales GA folios 233 vs 234/235, 2026-08-25), así que la primera
+guía real de Monza saldría SIN números de parte, igual que le pasaba a GA. El espejo es
+mecánico: copiar el formato v4 de `wasabil_dte/service.py` (name = «PARTE Descripción» a
+80 con corte en palabra, `sanitizar_latin1`, `external_id` snake_case, advertencia >10
+ítems de la vía SII gratuito) con sus tests. Monza aún no emite real: la ventana sigue
+abierta, pero se cierra con el primer clic del dueño en esa marca.
+
+### 4.b · Buscador de picking + bultos en despachos Monza
+
+El modal `DespacharModal` de Monza tiene la semántica INVERTIDA respecto de GA (todo nace
+pre-marcado al cupo completo; bajar a 0 excluye — un clic y sale todo): el espejo NO es
+copiar el modal GA, sino (decisión ya arbitrada con el dueño para cuando se haga): caja de
+búsqueda aditiva con la misma normalización colapsada + contador «Se despacharán X ítems ·
+Z unidades (N ocultos por el filtro)» — sin el contador, el filtro esconde líneas que
+IGUAL se despachan (hallazgo del certificador). Bultos: agregar «monza_despachos» al dict
+TABLAS de `migrations/despacho_bulto_numero.py` y re-correrlo (idempotente), declarar la
+columna en `monza_models.py`, espejo de campo/chip/reparto por cotización.
+
+## 5 · Visibilidad Despachos + selector de facturas — deudas de la entrega GA 2026-08-26
+
+### 5.a · Espejo MonzaParts
+
+Igual que §4: la entrega es solo MachParts. Monza tiene los mismos dos `<select>` eternos
+en su página de facturas (`MonzaFacturasPage.tsx`) y su listado de despachos sin cifra
+de cupo real. La receta del port es la misma de GA: helpers batch compartidos +
+endpoint liviano `/opciones` + componente selector; jamás re-implementar las fórmulas.
+
+### 5.b · Varias guías de la MISMA OC en una factura — decisión del dueño
+
+Hoy el sistema factura UNA guía por factura (el selector de guías elige una). El experto
+en facturación anticipó que juntar 2-3 guías de la misma OC en un solo DTE 33 será
+pedido pronto. NO es trivial: toca las referencias 52 del DTE (una por guía), el
+descuento de anticipos y los precios congelados por guía. Se hace cuando el dueño lo
+pida, como pieza propia.
+
+### 5.c · Menores anotados
+
+- Monto «por facturar» por fila del selector: excluido a propósito (exige el motor de
+  precios que el endpoint liviano elimina; el monto real lo da el preview al elegir).
+- Combobox con búsqueda de servidor (`q`/`limit` en /opciones): cuando la historia pase
+  de ~2.000 ventas. El contrato ya lo permite de forma aditiva.
+- Endpoint liviano de opciones para los OTROS consumidores de `listar_ventas`
+  (VentasContab/CierreVenta siguen en el pesado porque necesitan sus montos).

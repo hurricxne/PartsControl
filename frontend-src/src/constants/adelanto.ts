@@ -28,7 +28,15 @@ export interface PagoOpcion {
 }
 
 export const PAGO_OPCIONES: PagoOpcion[] = [
-  { id: "contado", label: "Contado", pct: 0, forma: "Contado" },
+  // CONTADO = adelanto del 100% (arreglos del equipo 2026-08-21): «cuando un cliente
+  // paga al contado, no se pide verificación de Tesorería — debería pedirse». Con pct
+  // 100 la maquinaria EXISTENTE del adelanto se activa sola: la venta entra a la cola
+  // de Tesorería por el total, y el cortafuego de Abastecimiento frena la OC de
+  // proveedor hasta que el pago se verifique. Antes pct era 0 y contado compraba sin
+  // confirmar que la plata llegó. Ventas viejas (forma "Contado", pct 0): ver el caso
+  // legado de opcionDeVenta en MonzaCotizacionesPage — el re-cierre sube a 100 CON
+  // aviso en pantalla (freeze-forward deliberado, no silencioso).
+  { id: "contado", label: "Contado", pct: 100, forma: "Contado" },
   { id: "adelanto50", label: "50% adelanto (personas naturales)", pct: ADELANTO_PCT_DEFECTO, forma: "50% adelanto" },
   { id: PAGO_ADELANTO_LIBRE_ID, label: "Otro adelanto (% libre o monto exacto)", pct: 0, forma: "adelanto", pctLibre: true },
   { id: "credito", label: "Crédito (30 días contra factura)", pct: 0, forma: "30 días contra factura" },

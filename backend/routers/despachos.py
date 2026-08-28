@@ -1,7 +1,7 @@
 """Despachos module - cliente delivery from warehouse"""
 import os
 import re
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -24,7 +24,9 @@ from routers.compras import business_days_remaining, add_business_days
 from wasabil_dte.models import (
     WasabilDte, STATUS_EMITIDO, STATUS_PROCESANDO, STATUS_PENDIENTE,
 )
-from wasabil_dte.service import TIPO_DOC_GUIA, claim_vigente, hoy_chile
+from wasabil_dte.service import (
+    TIPO_DOC_GUIA, MAX_LINEAS_SII_GRATUITO, claim_vigente, hoy_chile, TZ_CHILE,
+)
 
 # Despachos es data 100% Grupo AM (la tabla no tiene columna empresa): candado
 # 'mineria' a nivel de router, igual que contabilidad y wasabil_dte.
@@ -53,6 +55,80 @@ def _exists_in_docs(value: str) -> bool:
     if not candidate.startswith(_DOCS_DIR + os.sep):
         return False
     return os.path.isfile(candidate)
+
+
+# Tolerancia para comparar CANTIDADES (unidades) en la firma parcial. Mismo valor que
+# TOL_QTY de routers/contabilidad.py (no se importa a nivel de módulo para no acoplar
+# los routers en el import; la facturación usa el suyo).
+_TOL_QTY = 0.001
+
+
+def _firmada_efectiva_di(di: DespachoItem) -> float:
+    """coalesce(qty_firmada, qty_despachada): lo que el cliente FIRMÓ como recibido.
+    NULL = firma completa (todo lo despachado)."""
+    if di.qty_firmada is not None:
+        return float(di.qty_firmada or 0.0)
+    return float(di.qty_despachada or 0.0)
+
+
+def _faltante_total_despacho(d: Despacho) -> float:
+    """Σ (qty_despachada − firmada efectiva) de las líneas del despacho. Solo puede ser
+    > 0 después de una firma PARCIAL (qty_firmada NULL = firma completa = faltante 0)."""
+    total = 0.0
+    for di in d.items:
+        total += max(float(di.qty_despachada or 0.0) - _firmada_efectiva_di(di), 0.0)
+    return round(total, 4)
+
+
+def _cerrado_hoy(fecha_despacho: Optional[datetime]) -> bool:
+    """¿El despacho se CERRÓ hoy, medido en el día de CHILE?
+
+    POR QUÉ EL VEREDICTO NACE ACÁ Y NO EN LA PANTALLA
+      Regla de la casa: «el hoy del negocio es el de Chile» y se calcula en el
+      backend; el frontend solo pinta. El reparto de bultos lo decidía en el
+      NAVEGADOR, comparando `fecha_despacho.slice(0,10)` contra el día del PC.
+      Dos capas de error encadenadas:
+        1. `fecha_despacho` se estampa con `datetime.now()` NAIVE (ver
+           _cerrar_despacho_tx) y el server de producción corre en UTC (lo declara
+           routers/contabilidad.py:_hoy_chile). MySQL devuelve el valor sin
+           offset, así que el ISO que viaja NO lleva zona: el navegador leía un
+           día UTC creyendo que era un día de Chile.
+        2. Ese día UTC se comparaba contra el «hoy» de Chile del navegador.
+
+      Escenario real: el bodeguero cierra el despacho a las 20:30 de Chile → se
+      guarda 2026-08-28T00:30 (UTC) → la pantalla concluía «no salió hoy», mandaba
+      la caja a la sección «YA DESPACHADO — no viaja en este reparto» y la
+      descontaba de los totales: el mail al transportista, escrito a las 20:35,
+      ESCONDÍA la caja de hoy. A la mañana siguiente pasaba lo inverso: todo lo
+      cerrado después de las 20:00 de ayer se colaba como «por salir». Ventana
+      diaria de 3-4 horas, todos los días.
+
+    LA CONVERSIÓN VIVE EN UN SOLO LUGAR: esta función. Los dos serializers de
+    despacho (la fila de oc_cliente_detail y get_despacho) emiten el booleano ya
+    resuelto y nadie más vuelve a comparar fechas.
+
+    CÓMO SE CONVIERTE: el instante guardado es UTC naive — misma convención que
+    monza_fechas.py («las columnas se escriben naive; el offset lo resuelve
+    zoneinfo»). Se le DECLARA la zona (UTC) y recién ahí se lleva a Chile, con la
+    TZ_CHILE única del sistema: verano (-03) e invierno (-04) salen solos, sin un
+    número mágico. Si algún día la columna llegara aware (otro motor de BD), se
+    respeta su offset en vez de pisarlo.
+
+    DEUDA ANOTADA (deliberadamente NO se toca en este arreglo): el estampado de
+    _cerrar_despacho_tx usa `datetime.now()` en vez de un UTC explícito. Ese dato
+    lo leen otros consumidores (listado, mail, suites), así que moverlo es una
+    decisión aparte; mientras el server corra en UTC, `now()` == UTC y esta
+    conversión es exacta.
+
+    fecha_despacho nulo (despacho aún en preparación, o anulado sin cierre) →
+    False: sin instante de cierre no se puede AFIRMAR que salió hoy.
+    """
+    if not fecha_despacho:
+        return False
+    momento = fecha_despacho
+    if momento.tzinfo is None:
+        momento = momento.replace(tzinfo=timezone.utc)
+    return momento.astimezone(TZ_CHILE).date() == hoy_chile()
 
 
 # Pipeline state buckets for the dispatch progress bar
@@ -238,6 +314,9 @@ class DespachoCreate(BaseModel):
     numero_guia: Optional[str] = None
     transportista: Optional[str] = None
     numero_expedicion: Optional[str] = None   # N° de expedición de la guía (todos sus ítems lo comparten)
+    # N° de BULTO (caja): rotulado logístico puro que el operador escribe a mano
+    # («1», «B2», «Cajas 2-3») — por eso texto libre y no numérico. Cero cálculos.
+    bulto_numero: Optional[str] = None
     contacto_destinatario: Optional[str] = None
     direccion_entrega: Optional[str] = None
     observaciones: Optional[str] = None
@@ -252,18 +331,54 @@ class DespachoUpdate(BaseModel):
     fecha_guia: Optional[str] = None
     transportista: Optional[str] = None
     numero_expedicion: Optional[str] = None
+    # N° de bulto editable en todo estado salvo anulado: el operador rotula la caja
+    # DESPUÉS de crear el despacho tantas veces como reempaque (gemelo de expedición).
+    bulto_numero: Optional[str] = None
     contacto_destinatario: Optional[str] = None
     direccion_entrega: Optional[str] = None
     observaciones: Optional[str] = None
+
+
+class FirmarItemIn(BaseModel):
+    """Cantidad FIRMADA como recibida para UNA línea del despacho (firma parcial)."""
+    despacho_item_id: int
+    qty_firmada: float
 
 
 class FirmarIn(BaseModel):
     fecha_firma: Optional[str] = None   # YYYY-MM-DD; por defecto hoy
     numero_guia: Optional[str] = None   # opcional: setear/confirmar el N° de guía al firmar
     archivo: Optional[str] = None       # nombre del archivo (foto/PDF) de la guía firmada, ya subido vía POST /api/compras/docs/upload
+    # FIRMA PARCIAL: cantidades por ítem. None u omitido = TODO firmado completo
+    # (byte-igual al comportamiento histórico). Cada llamada a firmar declara el
+    # estado COMPLETO de la firma (semántica de reemplazo): una línea no listada
+    # queda firmada completa. Lo firmado va a facturación; el faltante queda
+    # registrado con motivo y NO es facturable por esta guía. La reposición NO
+    # vuelve por esta venta (cotización nueva): cero cupo, cero estados, cero bodega.
+    items: Optional[List[FirmarItemIn]] = None
+    # OBLIGATORIO ⇔ hay algún faltante (Σ firmada < Σ despachada); 5-300 caracteres.
+    motivo_faltante: Optional[str] = None
 
 
 # --- Helpers ---
+# Tope de largo del N° de bulto: espejo del VARCHAR(50) de la columna. Se valida
+# aquí y no se deja llegar a la BD porque el DataError del commit es críptico para
+# el operador; un 400 con mensaje claro le dice exactamente qué corregir.
+_BULTO_MAX_LARGO = 50
+
+
+def _normalizar_bulto(valor: Optional[str]) -> Optional[str]:
+    """Trim + ""→None + guard de largo, compartido por crear y editar.
+
+    "" y puros espacios se guardan como NULL (no string vacío): así el frontend
+    distingue «sin bulto» con un solo chequeo y el chip no pinta vacíos fantasma.
+    """
+    limpio = (valor or "").strip() or None
+    if limpio is not None and len(limpio) > _BULTO_MAX_LARGO:
+        raise HTTPException(400, "El N° de bulto no puede superar 50 caracteres")
+    return limpio
+
+
 # Antigüedad máxima aceptada para la fecha de emisión de una guía tecleada a mano. No es
 # una regla del SII: es una malla ANCHA contra el dedazo grueso (un 2019 en vez de un
 # 2026), y 2 años deja pasar cualquier regularización real.
@@ -376,6 +491,44 @@ def _qty_already_dispatched(db: Session, oc_id: int, con_lock: bool = False):
     return result
 
 
+def _qty_already_dispatched_por_ocs(db: Session, oc_ids, con_estado: bool = False):
+    """Variante BATCH multi-OC de _qty_already_dispatched: {item_cotizacion_id:
+    Σ qty_despachada} para TODAS las OCs pedidas en 1 sola query.
+
+    MISMOS filtros que la versión por-OC (abiertos + cerrados consumen cupo por
+    igual; solo 'anulado' lo devuelve) y SIN lock a propósito: es para LECTURAS
+    de listado/panel/counts — el guard de creación sigue usando la versión
+    por-OC con con_lock=True, que es la que cierra la carrera de despachos
+    simultáneos. Los item_cotizacion_id son únicos GLOBALMENTE (cada línea
+    pertenece a una sola cotización→OC), así que el dict plano no puede mezclar
+    cantidades de OCs distintas.
+
+    `con_estado=True` devuelve la TUPLA (total, abiertos) con el MISMO barrido y
+    CERO queries extra: `total` es el dict de siempre (semántica intacta para los
+    callers actuales, que siguen llamando sin el flag) y `abiertos` cuenta solo
+    los despachos 'en_preparacion'. Existe para explicar POR QUÉ una línea quedó
+    sin cupo, nunca para calcularlo: un despacho CERRADO consume cupo igual que
+    uno abierto, pero solo el abierto se puede cerrar o anular — decirle al
+    operador «ciérralos o anúlalos» sobre un despacho cerrado (con su guía 52 ya
+    emitida) lo manda a buscar algo inanulable."""
+    if not oc_ids:
+        return ({}, {}) if con_estado else {}
+    rows = (
+        db.query(DespachoItem.item_cotizacion_id, DespachoItem.qty_despachada,
+                 Despacho.estado)
+        .join(Despacho, Despacho.id == DespachoItem.despacho_id)
+        .filter(Despacho.oc_cliente_id.in_(oc_ids), Despacho.estado != "anulado")
+        .all()
+    )
+    result: dict = {}
+    abiertos: dict = {}
+    for item_id, qty, estado in rows:
+        result[item_id] = result.get(item_id, 0) + (qty or 0)
+        if estado == "en_preparacion":
+            abiertos[item_id] = abiertos.get(item_id, 0) + (qty or 0)
+    return (result, abiertos) if con_estado else result
+
+
 def _qty_dispatched_closed(db: Session, oc_id: int, con_lock: bool = False):
     """Σ qty por ítem SOLO de despachos CERRADOS ('despachado').
 
@@ -469,6 +622,116 @@ def _tope_fisico(item: ItemCotizacion, recibidos: dict) -> float:
     if item.id in recibidos:
         return min(cant, recibidos[item.id])
     return cant
+
+
+def _disponibles_por_item(items, recibidos: dict, qty_already: dict) -> dict:
+    """{item_cotizacion_id: qty disponible para despachar} — LA fórmula del cupo.
+
+    MOVIMIENTO TEXTUAL de la lógica que vivía solo en el detalle de OC, ahora
+    fuente única compartida por detalle, listado (pestaña listas), /counts, el
+    panel /listo-para-despachar y el guard de creación: disponible = 0 si la
+    línea no está 'en_bodega'; si no, max(_tope_fisico − ya despachado, 0).
+
+    CENTINELA DE PERTENENCIA (no tocar): _tope_fisico decide por `item.id in
+    recibidos` — un ítem SIN registro de recepción (flujo antiguo o carga manual
+    a bodega) NO se acota y su disponible es la cantidad vendida completa.
+    Cambiar esa pertenencia por `.get(id, 0)` colapsaría a 0 el disponible de
+    todo el histórico sin recepción (sonda S2 de test_listo_para_despachar.py).
+
+    `recibidos` viene de _qty_recibida_utilizable y `qty_already` de
+    _qty_already_dispatched (por OC, con o sin lock) o de la variante batch
+    _qty_already_dispatched_por_ocs: se reciben como parámetros para que cada
+    caller elija su granularidad y su lock sin duplicar la fórmula.
+
+    EL RESIDUO SE COLAPSA ACÁ (no en cada vista): si el resultado no es
+    `_es_despachable` (≤ 0.001) la fórmula devuelve 0 pelado. Antes cada
+    consumidor decidía por su cuenta y divergían: las tres vistas de resumen
+    filtraban con _es_despachable y el DETALLE emitía el crudo, así que con
+    0.9 − (0.2 + 0.7) = 1.11e-16 el listado decía «0 despachable» mientras el
+    modal de picking ofrecía la línea, imprimía «1.1102230246251565e-16» y dejaba
+    crear un despacho que la guía SII no puede emitir («El despacho no tiene
+    cantidades a despachar»). Colapsando en la fuente, detalle, listado, /counts,
+    panel, buscador de Bodega y el guard quedan de acuerdo POR CONSTRUCCIÓN."""
+    disponibles: dict = {}
+    for it in items:
+        disponible = 0
+        if it.estado_item == "en_bodega":
+            disponible = max(_tope_fisico(it, recibidos) - qty_already.get(it.id, 0), 0)
+            if not _es_despachable(disponible):
+                disponible = 0
+        disponibles[it.id] = disponible
+    return disponibles
+
+
+def _es_despachable(disponible) -> bool:
+    """Cupo VISIBLE: True solo si el disponible supera _TOL_QTY (0.001) — la MISMA
+    tolerancia con la que el guard de creación compara cantidades.
+
+    Por qué existe: la resta del cupo es aritmética de floats y puede dejar un
+    residuo del orden de 1e-7 (p.ej. tras despachar 0.3 en tandas de 0.1). Ese
+    residuo NO es mercadería, pero `> 0` lo contaba: el panel ofrecía una línea
+    con «0.0000001 disponible», la insignia del listado sumaba un ítem
+    despachable fantasma y /counts lo contaba.
+
+    DÓNDE SE APLICA: la tolerancia vive DENTRO de _disponibles_por_item, que ya
+    devuelve 0 cuando el residuo no la supera — ningún consumidor necesita
+    filtrar de nuevo (los que lo hacen son idempotentes y se conservan como
+    documentación del criterio). El guard de crear despacho tampoco puede
+    contradecir a las pantallas: rechaza por su lado las cantidades ≤ _TOL_QTY
+    del payload (un 7e-9 pedido por API creaba un despacho zombi aunque el
+    disponible fuera 0) y luego compara `qty > disponible + 0.001` contra ESTE
+    mismo disponible ya colapsado."""
+    return disponible > _TOL_QTY
+
+
+# Motivos por los que una OC de la pestaña 'listas' puede tener 0 unidades
+# despachables. Son la CAUSA, no el cálculo: el cupo lo sigue decidiendo
+# _disponibles_por_item. El frontend elige texto y tooltip por este valor y no
+# re-deduce nada (antes la pantalla asumía «hay despachos abiertos» y mandaba a
+# anular documentos que no existen o que ya no se pueden anular).
+MOTIVO_EN_PREPARACION = "en_preparacion"   # lo tomó un despacho ABIERTO (recuperable)
+MOTIVO_SIN_STOCK = "sin_stock"             # llegó MENOS de lo vendido (falta / reclamo)
+MOTIVO_DESPACHADO = "despachado"           # llegó todo y lo consumieron despachos CERRADOS
+
+
+def _motivo_sin_cupo(items, recibidos: dict, qty_already: dict, abiertos: dict):
+    """Por qué esta OC no tiene NADA despachable hoy, o None si no aplica.
+
+    Solo mira las líneas 'en_bodega' con disponible 0 (las únicas candidatas: el
+    resto ni siquiera es despachable por estado). Precedencia explícita, de la
+    causa más accionable a la menos:
+
+      1. MOTIVO_EN_PREPARACION — hay un despacho ABIERTO que se llevó el cupo. Es
+         el ÚNICO caso que autoriza el consejo «ciérralos o anúlalos».
+      2. MOTIVO_SIN_STOCK — el tope FÍSICO quedó POR DEBAJO de lo vendido: llegó
+         menos de lo que se vendió (recepción parcial 4 de 10 con reclamo al
+         proveedor, o recepción registrada en 0). Acá no hay nada que anular y la
+         reposición se pide en cotización nueva — mandar a «liberar cupo» de
+         mercadería inexistente es justo lo que la regla de la casa prohíbe.
+      3. MOTIVO_DESPACHADO — llegó TODO lo vendido y se lo comieron despachos ya
+         CERRADOS. Un cerrado NO se anula (probablemente tiene guía 52 y
+         factura): el texto no puede ofrecerlo.
+
+    El criterio del punto 2 es `tope físico < cantidad vendida`, no `tope == 0`:
+    el caso de papel que motivó esto es recepción 'faltante' 4 de 10 → la línea
+    sigue 'en_bodega' (4 + 0.001 < 10, _cerrar_despacho_tx no la voltea), se
+    despachan las 4 y se CIERRA el despacho. Con `tope == 0` esa OC caería en
+    'despachado' y se perdería el dato que el operador necesita: faltan 6 por
+    llegar. La card decía «En despachos abiertos · ciérralos para completar el
+    despacho, o anúlalos para liberar cupo» y las DOS mitades eran falsas,
+    durante todas las semanas que dure el reclamo al proveedor."""
+    candidatos = [it for it in items if it.estado_item == "en_bodega"]
+    if not candidatos:
+        return None
+    disponibles = _disponibles_por_item(candidatos, recibidos, qty_already)
+    if any(_es_despachable(disponibles.get(it.id, 0)) for it in candidatos):
+        return None  # queda algo despachable: la card no muestra motivo
+    if any(abiertos.get(it.id, 0) > 0 for it in candidatos):
+        return MOTIVO_EN_PREPARACION
+    if any(_tope_fisico(it, recibidos) + _TOL_QTY < (it.cantidad or 0)
+           for it in candidatos):
+        return MOTIVO_SIN_STOCK
+    return MOTIVO_DESPACHADO
 
 
 def _guia_electronica_activa(db: Session, despacho_id: int, con_lock: bool = False,
@@ -675,11 +938,152 @@ def counts(db: Session = Depends(get_db), current_user: User = Depends(get_curre
             ocs_listas += 1
         items_listos += en_b
         items_despachados += desp
+
+    # ── Campos ADITIVOS (cupo REAL capado) ────────────────────────────────────
+    # Diferencia semántica: ocs_listas/items_listos cuentan LÍNEAS 'en_bodega'
+    # sin capar — mienten cuando el cupo ya está tomado por despachos abiertos o
+    # la recepción fue parcial. ocs_con_disponible/unidades_despachables usan la
+    # MISMA fórmula del detalle/panel (_disponibles_por_item) sobre el MISMO
+    # universo (OCs con ≥1 ítem en_bodega): unidades reales despachables HOY.
+    # Los campos viejos se conservan tal cual (otros consumidores los leen).
+    ocs_bodega = [
+        oc for oc in ocs
+        if oc.cotizacion and any(
+            e == "en_bodega" for e in estados_por_cot.get(oc.cotizacion_id, []))
+    ]
+    ocs_con_disponible = 0
+    unidades_despachables = 0.0
+    if ocs_bodega:
+        cot_ids_bodega = list({oc.cotizacion_id for oc in ocs_bodega})
+        items_por_cot: dict = {}
+        for it in (
+            db.query(ItemCotizacion)
+            .filter(ItemCotizacion.cotizacion_id.in_(cot_ids_bodega))
+            .all()
+        ):
+            items_por_cot.setdefault(it.cotizacion_id, []).append(it)
+        item_ids = [it.id for its in items_por_cot.values() for it in its]
+        qty_already = _qty_already_dispatched_por_ocs(db, [oc.id for oc in ocs_bodega])
+        recibidos = _qty_recibida_utilizable(db, item_ids)
+        for oc in ocs_bodega:
+            disponibles = _disponibles_por_item(
+                items_por_cot.get(oc.cotizacion_id, []), recibidos, qty_already)
+            # _es_despachable (no `> 0`): un residuo flotante 1e-7 no es una
+            # unidad despachable ni debe sumar una OC «con disponible».
+            suma = float(sum(v for v in disponibles.values() if _es_despachable(v)))
+            if suma > 0:
+                ocs_con_disponible += 1
+                unidades_despachables += suma
+
     return {
         "ocs_listas": ocs_listas,
         "items_listos": items_listos,
         "items_despachados": items_despachados,
+        "ocs_con_disponible": ocs_con_disponible,
+        "unidades_despachables": unidades_despachables,
     }
+
+
+# POSICIÓN OBLIGATORIA: este endpoint DEBE declararse ANTES de GET /{despacho_id}
+# (más abajo en este archivo). FastAPI matchea rutas en orden de registro:
+# declarado después, `{despacho_id:int}` capturaría "listo-para-despachar", la
+# conversión a int fallaría y el panel devolvería 422 PERMANENTE (sonda S1 de
+# test_listo_para_despachar.py pinza este orden). Va junto a /counts y
+# /oc-clientes, sus hermanos de listado.
+@router.get("/listo-para-despachar")
+def listo_para_despachar(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Panel «listo para despachar»: qué se puede despachar HOY con cupo REAL.
+
+    Universo: OCs con ≥1 ítem en_bodega (el MISMO EXISTS de la pestaña 'listas'
+    del listado), pero cada línea capada por el disponible verdadero
+    (_disponibles_por_item): recepción parcial y despachos abiertos/cerrados no
+    anulados descuentan cupo. Las líneas con disponible 0 y los grupos que
+    quedan vacíos van FUERA: una OC de 'listas' con todo el cupo tomado por un
+    despacho abierto no aparece aquí (y reaparece al anularlo)."""
+    # Mismo orden que la pestaña 'listas': urgencia ascendente, sin fecha al
+    # final, desempate por id DESC (determinista).
+    ocs = (
+        db.query(OcCliente)
+        .join(OcCliente.cotizacion)
+        .options(contains_eager(OcCliente.cotizacion))
+        .filter(exists().where(and_(
+            ItemCotizacion.cotizacion_id == Cotizacion.id,
+            ItemCotizacion.estado_item == "en_bodega",
+        )))
+        .order_by(
+            OcCliente.fecha_entrega.is_(None),
+            OcCliente.fecha_entrega.asc(),
+            OcCliente.id.desc(),
+        )
+        .all()
+    )
+
+    # Precarga en LOTE (patrón del listado): ítems por cotización y fichas de
+    # cliente por RUT — con esto _serialize_oc_card no vuelve a tocar la BD.
+    cot_ids = [oc.cotizacion_id for oc in ocs if oc.cotizacion_id]
+    items_por_cot: dict = {}
+    if cot_ids:
+        for it in (
+            db.query(ItemCotizacion)
+            .filter(ItemCotizacion.cotizacion_id.in_(cot_ids))
+            .all()
+        ):
+            items_por_cot.setdefault(it.cotizacion_id, []).append(it)
+    ruts = {oc.cotizacion.rut_cliente for oc in ocs
+            if oc.cotizacion and oc.cotizacion.rut_cliente}
+    clientes_por_rut: dict = {}
+    if ruts:
+        for cli in db.query(Cliente).filter(Cliente.rut.in_(ruts)).all():
+            clientes_por_rut[cli.rut] = cli
+
+    # Cupo con los MISMOS helpers del detalle/listado — cero re-implementación.
+    todos_item_ids = [it.id for its in items_por_cot.values() for it in its]
+    qty_already = _qty_already_dispatched_por_ocs(db, [oc.id for oc in ocs])
+    recibidos = _qty_recibida_utilizable(db, todos_item_ids)
+
+    grupos = []
+    for oc in ocs:
+        items = items_por_cot.get(oc.cotizacion_id, [])
+        disponibles = _disponibles_por_item(items, recibidos, qty_already)
+        items_data = []
+        total_unidades = 0.0
+        for it in items:
+            disp = disponibles.get(it.id, 0)
+            # _es_despachable (no `<= 0`): el residuo flotante de la resta del
+            # cupo (1e-7) contaba como línea despachable — misma tolerancia que
+            # el guard de crear, que no cambia.
+            if not _es_despachable(disp):
+                continue  # línea sin cupo real: fuera del panel
+            total_unidades += float(disp)
+            items_data.append({
+                "numero_parte": it.numero_parte,
+                "descripcion": it.descripcion,
+                "qty_disponible": disp,
+                "cantidad": it.cantidad or 0,
+            })
+        if not items_data:
+            continue  # grupo vacío (cupo tomado por despachos vivos): fuera
+        # _serialize_oc_card con las precargas no consulta la BD: se reusa su
+        # cálculo de urgencia (dias_restantes_critico) en vez de re-implementarlo.
+        card = _serialize_oc_card(db, oc, items=items, clientes_por_rut=clientes_por_rut)
+        if not card:
+            continue
+        grupos.append({
+            "oc_cliente_id": oc.id,
+            "numero_oc": oc.numero_oc,
+            "cliente": card["cliente"],
+            "dias_restantes_critico": card["dias_restantes_critico"],
+            "fecha_entrega": card["fecha_entrega"],
+            "total_unidades": total_unidades,
+            "items": items_data,
+        })
+
+    # El «hoy» del negocio es el de Chile (convención de la casa; hoy_chile ya
+    # está importado para las guías): dice contra qué fecha se midió la urgencia.
+    return {"hoy": hoy_chile().isoformat(), "grupos": grupos}
 
 
 @router.get("/oc-clientes")
@@ -773,6 +1177,26 @@ def oc_clientes(
         for cli in db.query(Cliente).filter(Cliente.rut.in_(ruts)).all():
             clientes_por_rut[cli.rut] = cli
 
+    # «Listo para despachar» a nivel de card — SOLO pestaña 'listas': el conteo
+    # de ítems en_bodega de la card MIENTE cuando el cupo ya está tomado por
+    # despachos abiertos o la recepción fue parcial; aquí se calcula el
+    # disponible REAL capado con los helpers batch (3 queries por página: 1 de
+    # despachos multi-OC + las 2 de _qty_recibida_utilizable). En
+    # en_curso/historial NO se calcula: serían queries muertas, esas pestañas
+    # no ofrecen despachar.
+    qty_already_pag: dict = {}
+    abiertos_pag: dict = {}
+    recibidos_pag: dict = {}
+    if tab == "listas" and ocs:
+        page_item_ids = [it.id for its in items_por_cot.values() for it in its]
+        # con_estado=True: el MISMO barrido devuelve además el cupo tomado por
+        # despachos ABIERTOS, que es lo único que permite decir la verdad sobre
+        # POR QUÉ una card quedó sin unidades (ver _motivo_sin_cupo). Cero queries
+        # extra: es el mismo SELECT con una columna más.
+        qty_already_pag, abiertos_pag = _qty_already_dispatched_por_ocs(
+            db, [oc.id for oc in ocs], con_estado=True)
+        recibidos_pag = _qty_recibida_utilizable(db, page_item_ids)
+
     # Insignia de motivo: lote de embarques y despachos SOLO de la página.
     variantes_por_token = [_variantes_token(t) for t in tokens]
     colapsados = [_colapsar(t) for t in tokens if any(c.isdigit() for c in t)]
@@ -860,6 +1284,27 @@ def oc_clientes(
         if not card:
             continue
         card["match"] = _match_de_card(oc)
+        if tab == "listas":
+            # Se ADJUNTA al dict DESPUÉS de _serialize_oc_card: el detalle de OC
+            # usa el mismo serializer y su firma/salida no debe cambiar (allí el
+            # disponible ya viaja por ítem en items_data).
+            items_oc = items_por_cot.get(oc.cotizacion_id, [])
+            disponibles = _disponibles_por_item(items_oc, recibidos_pag, qty_already_pag)
+            # _es_despachable en conteo Y suma: el residuo flotante (1e-7) no es
+            # un ítem despachable ni aporta unidades — la insignia debe decir lo
+            # mismo que el panel (que filtra con el mismo helper).
+            card["items_despachables"] = sum(
+                1 for v in disponibles.values() if _es_despachable(v))
+            card["unidades_despachables"] = float(
+                sum(v for v in disponibles.values() if _es_despachable(v)))
+            # CONTRATO con la insignia gris del frontend: el MOTIVO nace acá,
+            # donde vive LA fórmula del cupo, y la pantalla solo elige texto. Va
+            # únicamente cuando no hay NADA despachable (con cupo > 0 no hay nada
+            # que explicar) y vale 'en_preparacion' | 'sin_stock' | 'despachado'.
+            card["motivo_sin_cupo"] = (
+                _motivo_sin_cupo(items_oc, recibidos_pag, qty_already_pag, abiertos_pag)
+                if card["unidades_despachables"] == 0 else None
+            )
         result.append(card)
 
     return {
@@ -894,6 +1339,9 @@ def oc_cliente_detail(
     # Tope físico: lo realmente RECIBIDO en bodega (una recepción parcial deja
     # despachable solo lo que llegó, no la cantidad completa de la venta)
     recibidos = _qty_recibida_utilizable(db, [it.id for it in items])
+    # La fórmula del disponible ahora vive en _disponibles_por_item (compartida
+    # con listado, panel, /counts y el guard de creación): misma salida exacta.
+    disponibles = _disponibles_por_item(items, recibidos, qty_already)
 
     cot = oc.cotizacion
     items_data = []
@@ -908,9 +1356,11 @@ def oc_cliente_detail(
         )
         cant = it.cantidad or 0
         qty_d = qty_already.get(it.id, 0)
-        disponible = 0
-        if it.estado_item == "en_bodega":
-            disponible = max(_tope_fisico(it, recibidos) - qty_d, 0)
+        # Ya viene colapsado con _es_despachable desde _disponibles_por_item: la
+        # pantalla de picking NO puede ofrecer una línea que el listado y el panel
+        # dan por agotada (antes imprimía «1.1102230246251565e-16» y dejaba crear
+        # un despacho que la guía SII rechaza). NO re-serializar el crudo acá.
+        disponible = disponibles.get(it.id, 0)
 
         # Per-item deadline & days remaining
         deadline = _item_deadline(it, cot, oc) if cot else None
@@ -956,12 +1406,21 @@ def oc_cliente_detail(
                 "transportista": d.transportista,
                 "estado": d.estado,
                 "numero_expedicion": d.numero_expedicion,
+                # Chip de bulto en la fila del despacho (reparto de bultos por OC)
+                "bulto_numero": d.bulto_numero,
                 "guia_firmada": bool(d.guia_firmada),
                 "fecha_firma": d.fecha_firma.isoformat() if d.fecha_firma else None,
                 "guia_firmada_archivo": d.guia_firmada_archivo,
                 "fecha_creacion": d.fecha_creacion.isoformat() if d.fecha_creacion else None,
                 "fecha_despacho": d.fecha_despacho.isoformat() if d.fecha_despacho else None,
+                # ADITIVO: el veredicto «salió hoy» del reparto de bultos. Viaja
+                # resuelto porque `fecha_despacho` es UTC naive y el navegador la
+                # comparaba contra el día de Chile (ver _cerrado_hoy: la caja
+                # cerrada a las 20:30 desaparecía del mail al transportista).
+                "cerrado_hoy": _cerrado_hoy(d.fecha_despacho),
                 "items_count": len(d.items),
+                # badge de la tarjeta: unidades declaradas como NO recibidas al firmar
+                "faltante_total": _faltante_total_despacho(d),
             }
         )
 
@@ -1027,6 +1486,14 @@ def oc_cliente_detail(
     card["items"] = items_data
     card["despachos"] = despachos_data
     card["embarques"] = embarques_data
+    # AVISO ANTICIPADO del tope de la vía SII gratuito (>10 ítems por documento).
+    # POR QUÉ acá: esta respuesta es la que arma el picking, el ÚNICO momento en
+    # que dividir todavía es gratis. Cuando el aviso salía recién al emitir, la
+    # caja ya estaba rotulada: dividir costaba anular el despacho (guía) o era
+    # imposible (factura, que sale de una 52 irreversible). El valor se LEE de
+    # wasabil_dte.service — una sola definición; hardcodear 10 en el TSX crearía
+    # la segunda copia el día que la cuenta migre a CAF propio y el tope muera.
+    card["max_lineas_sii_gratuito"] = MAX_LINEAS_SII_GRATUITO
     return card
 
 
@@ -1093,6 +1560,12 @@ def _crear_despacho(db: Session, payload: DespachoCreate, current_user: User):
     qty_already = _qty_already_dispatched(db, oc.id, con_lock=True)
     # Tope físico por lo RECIBIDO en bodega (recepción parcial ⇒ solo lo que llegó)
     recibidos = _qty_recibida_utilizable(db, item_ids)
+    # El guard valida contra LA MISMA fórmula que pintan detalle/listado/panel
+    # (_disponibles_por_item): si alguien la toca, el tope real y lo que ven las
+    # pantallas se mueven JUNTOS — una copia local divergiría en silencio (sonda
+    # S3 de test_listo_para_despachar.py). El estado ≠ en_bodega se sigue
+    # validando antes, con su mensaje propio; para esas líneas el helper ya trae 0.
+    disponibles = _disponibles_por_item(items_db, recibidos, qty_already)
 
     for item_in in payload.items:
         it = items_by_id.get(item_in.item_cotizacion_id)
@@ -1105,9 +1578,27 @@ def _crear_despacho(db: Session, payload: DespachoCreate, current_user: User):
             )
         if item_in.qty_despachada <= 0:
             raise HTTPException(400, f"Cantidad inválida para {it.numero_parte}")
-        tope = _tope_fisico(it, recibidos)
-        disponible = tope - qty_already.get(it.id, 0)
+        if item_in.qty_despachada <= _TOL_QTY:
+            # MISMA tolerancia que el cupo visible y que armar_lineas del DTE. Sin
+            # esto, un payload de 7e-9 pasaba (`> 0` y `> disponible + 0.001` es
+            # False con disponible 0) y creaba un DESPACHO ZOMBI: la guía SII lo
+            # rechaza con «El despacho no tiene cantidades a despachar» (el
+            # armador descarta la línea por qty <= TOL) y hay que anularlo a mano.
+            # Mensaje PROPIO, no «Cantidad inválida»: el operador no tipeó mal.
+            # El texto dice «mayor que», no «el mínimo es»: la condición es
+            # `<= _TOL_QTY`, así que 0.001 EXACTO también se rechaza. Con la
+            # redacción anterior el operador reintentaba justo el valor que el
+            # guard no acepta y el sistema parecía roto.
+            raise HTTPException(
+                400,
+                f"Cantidad demasiado pequeña para despachar {it.numero_parte} "
+                f"({item_in.qty_despachada}): debe ser mayor que {_TOL_QTY}",
+            )
+        disponible = disponibles.get(it.id, 0)
         if item_in.qty_despachada > disponible + 0.001:
+            # El tope se recalcula SOLO para elegir el mensaje (recibido parcial
+            # vs cupo consumido) — la decisión de bloquear ya la tomó el helper.
+            tope = _tope_fisico(it, recibidos)
             if tope < (it.cantidad or 0):
                 raise HTTPException(
                     400,
@@ -1125,6 +1616,9 @@ def _crear_despacho(db: Session, payload: DespachoCreate, current_user: User):
         numero_guia=payload.numero_guia,
         transportista=payload.transportista,
         numero_expedicion=payload.numero_expedicion,
+        # Normalizado al entrar (trim, ""→None, tope 50): el operador empaca
+        # MIENTRAS crea el despacho, así que el bulto puede venir desde el inicio.
+        bulto_numero=_normalizar_bulto(payload.bulto_numero),
         contacto_destinatario=payload.contacto_destinatario,
         direccion_entrega=payload.direccion_entrega,
         observaciones=payload.observaciones,
@@ -1160,6 +1654,13 @@ def get_despacho(
     oc = d.oc_cliente
     cot = oc.cotizacion if oc else None
 
+    # Σ facturado por despacho_item_id (para que el modal de firma parcial muestre el
+    # piso editable de cada línea). Import local: mismo patrón que firmar_despacho.
+    fact_di: dict = {}
+    if d.oc_cliente_id:
+        from routers.contabilidad import _qty_facturada_por_despacho_item
+        fact_di = _qty_facturada_por_despacho_item(db, d.oc_cliente_id)
+
     items_data = []
     for di in d.items:
         it = di.item_cotizacion
@@ -1171,6 +1672,9 @@ def get_despacho(
                 "descripcion": it.descripcion if it else None,
                 "marca": it.marca if it else None,
                 "qty_despachada": di.qty_despachada,
+                # null = firma completa (o guía aún sin firmar); número = firma parcial
+                "qty_firmada": di.qty_firmada,
+                "facturado": round(fact_di.get(di.id, 0.0), 4),
             }
         )
 
@@ -1188,11 +1692,19 @@ def get_despacho(
         "observaciones": d.observaciones,
         "estado": d.estado,
         "numero_expedicion": d.numero_expedicion,
+        "bulto_numero": d.bulto_numero,
         "guia_firmada": bool(d.guia_firmada),
         "fecha_firma": d.fecha_firma.isoformat() if d.fecha_firma else None,
         "guia_firmada_archivo": d.guia_firmada_archivo,
         "fecha_creacion": d.fecha_creacion.isoformat() if d.fecha_creacion else None,
         "fecha_despacho": d.fecha_despacho.isoformat() if d.fecha_despacho else None,
+        # ADITIVO, mismo campo y misma fórmula que la fila de oc_cliente_detail:
+        # el modal del reparto lee el DETALLE (con la fila como respaldo), así que
+        # el veredicto tiene que estar en los dos serializers o el fallback por
+        # índice volvería a calcularlo en el navegador. Ver _cerrado_hoy.
+        "cerrado_hoy": _cerrado_hoy(d.fecha_despacho),
+        "faltante_total": _faltante_total_despacho(d),
+        "faltante_motivo": d.faltante_motivo,
         "items": items_data,
     }
 
@@ -1221,6 +1733,13 @@ def update_despacho(
     # que el bucle de abajo no la pise con el valor sin parsear.
     if "fecha_guia" in data:
         d.fecha_guia = _parse_fecha_guia(data.pop("fecha_guia"))
+    # bulto_numero se normaliza ANTES del setattr genérico (trim, ""→None, guard de
+    # largo con 400): si llegara crudo, un texto de 51 chars recién reventaría en el
+    # commit con un DataError críptico. La edición vale en todo estado salvo anulado
+    # (el guard de arriba ya lo bloquea): el rotulado de la caja se corrige incluso
+    # con el despacho cerrado, igual que el N° de expedición.
+    if "bulto_numero" in data:
+        data["bulto_numero"] = _normalizar_bulto(data["bulto_numero"])
     for field, value in data.items():
         setattr(d, field, value)
     db.commit()
@@ -1279,6 +1798,12 @@ def _cerrar_despacho_tx(db: Session, despacho_id: int):
     # (incluido este). Sin esto, la última tanda nunca voltearía la línea; y contar
     # abiertos (bug G16) marcaba 'despachado' prematuro con tandas en preparación.
     d.estado = "despachado"
+    # DEUDA (anotada, no tocada acá): `datetime.now()` deja un instante NAIVE con
+    # el reloj del server — en producción UTC, en un equipo local hora de Chile.
+    # Ese dato lo leen varios consumidores (listado, mail, suites), así que pasarlo
+    # a UTC explícito es una decisión aparte. Quien necesite el DÍA del negocio NO
+    # debe interpretar esta columna por su cuenta: usa _cerrado_hoy(), que hace la
+    # conversión a hora de Chile en UN solo lugar.
     d.fecha_despacho = datetime.now()
     db.flush()
 
@@ -1354,8 +1879,32 @@ def firmar_despacho(
     current_user: User = Depends(get_current_user),
 ):
     """Marca la guía de despacho como FIRMADA (entregada y firmada por el cliente).
-    Solo con la guía firmada Contabilidad puede emitir la factura de esos ítems."""
-    d = db.query(Despacho).filter(Despacho.id == despacho_id).first()
+    Solo con la guía firmada Contabilidad puede emitir la factura de esos ítems.
+
+    FIRMA PARCIAL (payload.items): el operador ajusta CANTIDADES por ítem cuando la
+    guía viajó con mercadería que el cliente NO recibió (perdida en la entrega). Lo
+    firmado va a facturación; el faltante queda registrado con motivo y NO es
+    facturable por esta guía. La reposición NO vuelve por esta venta (el dueño la
+    pide en una cotización nueva): cero liberación de cupo, cero cambios de estado
+    de línea, cero bodega. RE-FIRMA editable: se puede volver a llamar (el courier
+    encontró la caja) mientras ninguna línea baje de lo YA FACTURADO por esa guía."""
+    # Orden GLOBAL de locks de la casa: OC → despacho (igual que crear_factura y
+    # eliminar_factura en contabilidad.py). Firmar corre contra crear_factura por la
+    # misma venta: sin serializar por la OC, una re-firma a la baja y una factura
+    # simultáneas podían leer el mismo "ya facturado" y dejar qty_firmada bajo lo
+    # facturado (estado imposible). Hoy además firmar no tomaba NINGÚN lock.
+    ref = db.query(Despacho).filter(Despacho.id == despacho_id).first()
+    if not ref:
+        raise HTTPException(404, "Despacho no encontrado")
+    if ref.oc_cliente_id:
+        db.query(OcCliente).filter(OcCliente.id == ref.oc_cliente_id).with_for_update().first()
+    d = (
+        db.query(Despacho)
+        .filter(Despacho.id == despacho_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
     if not d:
         raise HTTPException(404, "Despacho no encontrado")
     if d.estado != "despachado":
@@ -1373,19 +1922,177 @@ def firmar_despacho(
             fecha = None
     # La guía firmada (foto/PDF) es OBLIGATORIA: es el respaldo de la entrega y
     # la condición para que Contabilidad pueda facturar esos ítems.
+    # RE-FIRMA sin archivo nuevo (revisión adversarial H1): se CONSERVA el que ya
+    # está — el flujo «Editar firma» (el courier encontró la caja, corregir un tick
+    # o el motivo) no obliga a re-subir la misma foto. En la PRIMERA firma sigue
+    # siendo obligatoria.
     if not payload.archivo:
-        raise HTTPException(400, "Debes adjuntar la guía de despacho firmada por el cliente")
-    if not _exists_in_docs(payload.archivo):
+        if not (d.guia_firmada and d.guia_firmada_archivo):
+            raise HTTPException(400, "Debes adjuntar la guía de despacho firmada por el cliente")
+    elif not _exists_in_docs(payload.archivo):
         raise HTTPException(400, "El documento de la guía firmada no existe (súbalo primero)")
-    d.guia_firmada_archivo = payload.archivo
+
+    # ── Firma parcial: validar y calcular las cantidades firmadas ──────────────
+    # `nuevas`: despacho_item_id -> qty firmada declarada. Cada llamada declara el
+    # estado COMPLETO de la firma (reemplazo): línea no listada = firmada completa.
+    nuevas: dict = {}
+    if payload.items is not None:
+        di_map = {di.id: di for di in d.items}
+        for entrada in payload.items:
+            di = di_map.get(entrada.despacho_item_id)
+            if di is None:
+                raise HTTPException(
+                    404, f"El ítem de despacho {entrada.despacho_item_id} no pertenece a este despacho")
+            if entrada.despacho_item_id in nuevas:
+                raise HTTPException(
+                    400, f"El ítem de despacho {entrada.despacho_item_id} viene repetido en la firma")
+            q = float(entrada.qty_firmada)
+            qd = float(di.qty_despachada or 0.0)
+            # `not (0 <= q <= qd)` también ataja NaN (toda comparación con NaN es falsa).
+            if not (0.0 <= q <= qd + _TOL_QTY):
+                it = di.item_cotizacion
+                nombre = (it.numero_parte if it else None) or f"ítem {di.id}"
+                raise HTTPException(
+                    400, f"{nombre}: la cantidad firmada debe estar entre 0 y lo "
+                         f"despachado ({qd:g}); llegó {entrada.qty_firmada}")
+            nuevas[di.id] = min(q, qd)
+
+    # Σ firmada EFECTIVA sobre TODAS las líneas (no listada = completa) y faltante.
+    suma_firmada = 0.0
+    suma_despachada = 0.0
+    for di in d.items:
+        qd = float(di.qty_despachada or 0.0)
+        suma_despachada += qd
+        suma_firmada += nuevas.get(di.id, qd) if payload.items is not None else qd
+    if payload.items is not None and suma_firmada <= _TOL_QTY:
+        raise HTTPException(
+            400, "Una guía firmada donde no llegó nada no es una firma: si el cliente "
+                 "no recibió ningún ítem, no marques la guía como firmada (gestiona la "
+                 "entrega o anula la guía con Contabilidad)")
+    faltante = max(suma_despachada - suma_firmada, 0.0)
+    hay_faltante = faltante > _TOL_QTY
+
+    # Motivo OBLIGATORIO ⇔ hay faltante (y solo entonces: un motivo sin faltante
+    # dejaría registrada una explicación de algo que no pasó).
+    motivo = (payload.motivo_faltante or "").strip()
+    if hay_faltante:
+        if len(motivo) < 5 or len(motivo) > 300:
+            raise HTTPException(
+                400, "Declara el motivo del faltante (5 a 300 caracteres): qué ítems no "
+                     "llegaron y por qué (ej. caja perdida por el courier)")
+    elif motivo:
+        raise HTTPException(400, "No hay faltante declarado: no corresponde un motivo de faltante")
+
+    # RE-FIRMA editable: ninguna línea puede quedar firmada por DEBAJO de lo ya
+    # FACTURADO por ese despacho_item_id (la factura emitida es un documento vivo).
+    # Import local para no acoplar los routers a nivel de módulo (mismo patrón que
+    # wasabil_dte/router.py con routers.contabilidad).
+    if payload.items is not None:
+        from routers.contabilidad import (
+            _qty_facturada_por_despacho_item, _qty_facturada_por_item,
+        )
+        fact_di = _qty_facturada_por_despacho_item(db, d.oc_cliente_id) if d.oc_cliente_id else {}
+        for di in d.items:
+            efectiva = nuevas.get(di.id, float(di.qty_despachada or 0.0))
+            facturado = fact_di.get(di.id, 0.0)
+            if efectiva + _TOL_QTY < facturado:
+                it = di.item_cotizacion
+                nombre = (it.numero_parte if it else None) or f"ítem {di.id}"
+                raise HTTPException(
+                    409, f"{nombre}: no puedes firmar {efectiva:g} porque esa guía ya "
+                         f"tiene {facturado:g} facturado(s) de esa línea; elimina o "
+                         "corrige la factura primero")
+        # SEGUNDA CAPA por ÍTEM FÍSICO (revisión adversarial M1): las líneas de
+        # factura con despacho_item_id NULL — que crear_factura persiste HOY cuando
+        # se factura por ítems sueltos sin declarar guía — no aparecen en fact_di,
+        # y con la sola capa de arriba una re-firma podía dejar «faltante» declarado
+        # sobre unidades YA facturadas (facturado > firmado, el estado imposible).
+        # Acá se compara por item_cotizacion_id contra TODO lo facturado de la
+        # venta, que sí ve las líneas NULL. No es el agujero «legado» que decía el
+        # comentario anterior: es alcanzable hoy sin carrera.
+        if d.oc_cliente_id:
+            fact_item = _qty_facturada_por_item(db, d.oc_cliente_id)
+            firmada_oc: dict = {}
+            despachos_oc = (db.query(Despacho)
+                            .filter(Despacho.oc_cliente_id == d.oc_cliente_id,
+                                    Despacho.estado == "despachado",
+                                    Despacho.guia_firmada == 1)
+                            .all())
+            for desp in despachos_oc:
+                for odi in desp.items:
+                    if desp.id == d.id:
+                        ef = nuevas.get(odi.id, float(odi.qty_despachada or 0.0))
+                    else:
+                        ef = _firmada_efectiva_di(odi)
+                    firmada_oc[odi.item_cotizacion_id] = (
+                        firmada_oc.get(odi.item_cotizacion_id, 0.0) + ef)
+            ids_de_este = {di.item_cotizacion_id for di in d.items}
+            for iid, facturado_it in fact_item.items():
+                if firmada_oc.get(iid, 0.0) + _TOL_QTY < facturado_it                         and iid in ids_de_este:
+                    it_nombre = next(
+                        ((di.item_cotizacion.numero_parte
+                          if di.item_cotizacion else None) or f"ítem {di.id}"
+                         for di in d.items if di.item_cotizacion_id == iid),
+                        f"ítem {iid}")
+                    raise HTTPException(
+                        409, f"{it_nombre}: no puedes dejar firmado menos de lo que "
+                             f"la venta ya tiene facturado de esa parte "
+                             f"({facturado_it:g}): elimina o corrige la factura "
+                             "primero")
+
+    # Aplicar. NULL = firma completa (canónico): se guarda número solo si es parcial.
+    for di in d.items:
+        if payload.items is None:
+            di.qty_firmada = None
+        else:
+            q = nuevas.get(di.id)
+            qd = float(di.qty_despachada or 0.0)
+            di.qty_firmada = None if (q is None or q >= qd - _TOL_QTY) else q
+    d.faltante_motivo = motivo if hay_faltante else None
+
+    if payload.archivo:
+        # Sin archivo nuevo en la RE-firma, se conserva el actual (H1): pisar con
+        # None borraba el respaldo legal de la entrega en silencio.
+        d.guia_firmada_archivo = payload.archivo
     d.guia_firmada = 1
     d.fecha_firma = fecha or datetime.now()
     d.usuario_firma_id = getattr(current_user, "id", None)
     db.commit()
-    return {
+
+    # Notificación POST-commit (la firma ya está a salvo: un fallo acá no la revierte).
+    if hay_faltante:
+        try:
+            unidades = f"{faltante:g}"
+            crear_notificacion(
+                db,
+                rol="contabilidad",
+                severidad="warning",
+                titulo=f"Guía {d.numero_guia or d.numero_despacho}: faltante en la entrega",
+                mensaje=(f"Guía {d.numero_guia or d.numero_despacho}: faltante de "
+                         f"{unidades} unidad(es) — {motivo}"),
+                entidad_tipo="despacho",
+                entidad_id=d.id,
+                link=f"/despachos?id={d.id}",
+                # La regla lleva la CANTIDAD (revisión L4): la dedup de 24 h es por
+                # regla, y una re-firma que corrige el faltante el mismo día debe
+                # re-avisar el número nuevo a contabilidad, no quedar muda.
+                regla=f"firma_parcial_faltante_{d.id}_{unidades}",
+            )
+            db.commit()
+        except Exception:
+            # la notificación jamás voltea una firma ya comprometida
+            db.rollback()
+
+    resp = {
         "ok": True, "guia_firmada": True, "numero_guia": d.numero_guia,
         "guia_firmada_archivo": d.guia_firmada_archivo,
     }
+    if payload.items is not None:
+        # Solo la vía nueva agrega campos: la firma completa (sin items) responde
+        # byte-igual a como respondía siempre.
+        resp["faltante_total"] = round(faltante, 4)
+        resp["faltante_motivo"] = d.faltante_motivo
+    return resp
 
 
 @router.delete("/{despacho_id}")

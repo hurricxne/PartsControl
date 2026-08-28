@@ -7,14 +7,17 @@ OJO (hallazgo #9 de la auditoria): 'en_transito' NO es un estado de linea que el
 pipeline escriba nunca; el tramo "volando" son 'preparado' y 'embarcado'.
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
 from pydantic import BaseModel, Field
 from typing import Optional, List
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from database import get_db
+from monza_correlativos import siguiente_secuencia
+from monza_fechas import _is_chile_holiday, add_business_days, hoy_chile
 from auth import get_current_user
 from monza_notif import crear_notif
 from monza_models import (
@@ -39,19 +42,17 @@ def _log(db, user_email, accion, entidad, entidad_id=None, entidad_ref=None, det
 
 
 def _gen_numero_ocp(db: Session) -> str:
-    anio = datetime.utcnow().year
-    last = (
-        db.query(MonzaOcProveedor)
-        .filter(MonzaOcProveedor.numero.like(f"OCP-{anio}-%"))
-        .order_by(MonzaOcProveedor.id.desc())
-        .first()
-    )
-    n = int(last.numero.split("-")[-1]) + 1 if last and last.numero else 1
+    # El año es el de CHILE: entre las 21:00 y la medianoche del 31 de diciembre, UTC
+    # ya está en el año siguiente y el correlativo saltaba de golpe (misma regla que
+    # monza_correlativos, donde vive la versión de referencia).
+    anio = hoy_chile().year
+    # MÁXIMO de la serie, no «la fila con id más alto» (ver monza_correlativos).
+    n = siguiente_secuencia(db, MonzaOcProveedor.numero, f"OCP-{anio}-")
     return f"OCP-{anio}-{n:04d}"
 
 
 def _item_dict(it: MonzaCotizacionItem, cot: MonzaCotizacion) -> dict:
-    return {
+    d = {
         "id": it.id,
         "cotizacion_id": cot.id,
         "cot_numero": cot.numero,
@@ -75,6 +76,165 @@ def _item_dict(it: MonzaCotizacionItem, cot: MonzaCotizacion) -> dict:
         "pct_adelanto": int(getattr(cot, "pct_adelanto", 0) or 0),
         "requiere_adelanto": int(getattr(cot, "pct_adelanto", 0) or 0) > 0,
         "pago_verificado": bool(getattr(cot, "adelanto_verificado", 0)),
+    }
+    # Contrato de agrupación por proveedor (2026-08-17), claves ADITIVAS: costo y
+    # moneda ya vivían acá con la misma semántica (la del ÍTEM) y quedan byte-iguales;
+    # peso/fob totales se calculan en el BACKEND (regla 4 del contrato).
+    d.update(_claves_plata_peso(it))
+    return d
+
+
+# ── Agrupación por proveedor en Logística/Seguimiento (contrato 2026-08-17) ──────
+# Helpers COMPARTIDOS por este router y monza_router_logistica (los dos son Monza).
+# Viven acá porque la dirección de import ya existente es logística → abastecimiento
+# (ver _crear_embarque_tx en logística); la inversa no existe y así no nace ciclo.
+
+# Tope de cordura del plazo, copia espejo de scheduler.MAX_PLAZO_DIAS (no se importa
+# scheduler desde un router: arrastraría el stack del job y modelos de la otra marca).
+# Sin este corte, un plazo_dias basura tipo 99999999 (ComprarBody no lo acota) haría
+# que add_business_days avance día por día y COLGARA el request del listado.
+_MAX_PLAZO_DIAS_SEMAFORO = 3650
+
+# Umbral del amarillo: transcurridos >= 80% del plazo (contrato). Entero, sin floats.
+_SEMAFORO_AMARILLO_NUM, _SEMAFORO_AMARILLO_DEN = 4, 5
+
+
+def _claves_plata_peso(it: MonzaCotizacionItem) -> dict:
+    """Claves de plata/peso de la LÍNEA para la agrupación: la moneda es la del
+    ÍTEM (una OC puede venir mixta), costo NULL → fob_total null (JAMÁS 0 mudo)
+    y peso_kg 0/null se preserva. round(4) solo mata el ruido binario del float
+    (0.1×3 = 0.30000000000000004), no redondea plata real."""
+    # cantidad NULL (columna nullable, dato legado) → totales NULL, no 0 mudo
+    # (revisión adversarial H8): un 0 fabricado se suma en silencio en la barra;
+    # un null se cuenta como «sin dato» y se dice.
+    cant = it.cantidad
+    return {
+        "costo": it.costo,
+        "moneda": it.moneda,
+        "peso_kg": it.peso_kg,
+        "peso_total_kg": None if (it.peso_kg is None or cant is None)
+        else round(it.peso_kg * cant, 4),
+        "fob_total": None if (it.costo is None or cant is None)
+        else round(it.costo * cant, 4),
+    }
+
+
+def _hoy_chile() -> date:
+    """La fecha de HOY del NEGOCIO = hoy en Chile (revisión adversarial H1). El servidor
+    corre en UTC: a las 21:30 de Santiago, `date.today()` ya devuelve MAÑANA y el
+    semáforo declaraba vencida una OC una noche antes que la alerta de las 06:00
+    (que usa esta misma regla). Es el bug que scheduler._hoy_chile documenta con
+    nombre y apellido: nada de date.today() crudo para fechas de negocio."""
+    return datetime.now(ZoneInfo("America/Santiago")).date()
+
+
+def _dias_habiles_entre(desde: date, hasta: date) -> int:
+    """Días hábiles Chile entre dos fechas, con signo. Cuenta con la convención
+    (desde, hasta] — el día `desde` NO se cuenta, el día `hasta` sí (si es hábil).
+    OJO: scheduler._dias_habiles_chile usa la convención opuesta [desde, hasta);
+    para `transcurridos` esta es la correcta (el día del vencimiento da exactamente
+    transcurridos == plazo, cosa que la del scheduler no garantiza), y el ATRASO de
+    una OC vencida se calcula aparte con la convención del scheduler para que el
+    número que ve el operador COINCIDA con el de la campana (revisión adversarial
+    H2 — mismo motivo del no-import de arriba). Reusa el calendario de
+    `monza_fechas`, fuente única de los feriados chilenos."""
+    if desde == hasta:
+        return 0
+    signo, a, b = (1, desde, hasta) if hasta > desde else (-1, hasta, desde)
+    n, cursor = 0, a
+    while cursor < b:
+        cursor += timedelta(days=1)
+        if cursor.weekday() < 5 and not _is_chile_holiday(cursor):
+            n += 1
+    return signo * n
+
+
+def _semaforo_ocp(ocp: MonzaOcProveedor, hoy: Optional[date] = None) -> dict:
+    """Semáforo de la OC en días HÁBILES Chile — LA MISMA regla de la alerta de las
+    06:00 (scheduler._monza_ocp_plazo_vencido): ancla `created_at`, fecha comprometida
+    `add_business_days(created_at, plazo_dias)`, vencida solo si hoy la PASÓ. Jamás
+    días corridos. `plazo_dias` se lee VIVO (es editable ex-post). `hoy` es inyectable
+    solo para que la suite lo pinze con fechas controladas."""
+    hoy = hoy or _hoy_chile()
+    plazo = ocp.plazo_dias
+    if not ocp.created_at:
+        # Histórico sin fecha: no se inventa un ancla.
+        return {"dias_habiles": None, "plazo_dias": plazo,
+                "estado": "sin_fecha", "dias_habiles_restantes": None}
+    creado = ocp.created_at.date() if isinstance(ocp.created_at, datetime) else ocp.created_at
+    transcurridos = _dias_habiles_entre(creado, hoy)
+    if plazo is None or plazo < 0 or plazo > _MAX_PLAZO_DIAS_SEMAFORO:
+        # Sin plazo (o dato imposible, mismo corte que el scheduler): la edad de la OC
+        # se informa igual, pero no hay contra qué vencer.
+        return {"dias_habiles": transcurridos, "plazo_dias": plazo,
+                "estado": "sin_plazo", "dias_habiles_restantes": None}
+    plazo = int(plazo)
+    fecha_esperada = add_business_days(creado, plazo)
+    if hoy > fecha_esperada:
+        estado = "rojo"
+        # ATRASO con la convención de la CAMPANA ([a, b): el día comprometido cuenta,
+        # el hoy no) para que «vencida hace N» diga el MISMO número que la alerta de
+        # las 06:00 incluso mirado en fin de semana (revisión H2: con (a, b], una OC
+        # comprometida el viernes decía «hace 0» el sábado mientras la campana decía
+        # «1 día hábil de atraso»). El truco del corrimiento: (a−1, b−1] ≡ [a, b).
+        restantes = -_dias_habiles_entre(fecha_esperada - timedelta(days=1),
+                                         hoy - timedelta(days=1))
+    else:
+        restantes = _dias_habiles_entre(hoy, fecha_esperada)
+        if transcurridos * _SEMAFORO_AMARILLO_DEN >= plazo * _SEMAFORO_AMARILLO_NUM:
+            estado = "amarillo"
+        else:
+            estado = "verde"
+    return {"dias_habiles": transcurridos, "plazo_dias": plazo,
+            "estado": estado, "dias_habiles_restantes": restantes}
+
+
+def _ocp_contexto_agrupacion(db: Session, items) -> tuple:
+    """Contexto de agrupación para un listado de líneas: TODAS las OCs en UNA query
+    `id IN (...)` → dict (molde scheduler.py:537-541; el caché-por-OC en loop es el
+    N+1 documentado que este contrato prohíbe) y la completitud de TODAS en UNA query
+    GROUP BY (oc_proveedor_id, estado_linea). Devuelve (ocps_by_id, conteos_by_ocp)."""
+    ids = sorted({it.oc_proveedor_id for it in items if it.oc_proveedor_id})
+    if not ids:
+        return {}, {}
+    ocps = {o.id: o for o in db.query(MonzaOcProveedor)
+            .filter(MonzaOcProveedor.id.in_(ids)).all()}
+    conteos = {}
+    filas = (
+        db.query(MonzaCotizacionItem.oc_proveedor_id,
+                 MonzaCotizacionItem.estado_linea,
+                 func.count(MonzaCotizacionItem.id))
+        .filter(MonzaCotizacionItem.oc_proveedor_id.in_(ids))
+        .group_by(MonzaCotizacionItem.oc_proveedor_id,
+                  MonzaCotizacionItem.estado_linea)
+        .all()
+    )
+    for oc_id, est, n in filas:
+        # Mismo coalescido que _item_dict: estado_linea NULL se cuenta como 'cotizado'.
+        conteos.setdefault(oc_id, {})[est or "cotizado"] = int(n)
+    return ocps, conteos
+
+
+def _ocp_dict_agrupacion(ocp: MonzaOcProveedor, por_estado: Optional[dict]) -> dict:
+    """El objeto `ocp` del contrato — UNA sola forma normalizada para los dos
+    endpoints: `numero` (correlativo interno) y `numero_oc` (N° manual del proveedor)
+    van SEPARADOS y explícitos; `tipo_origen` ya coalescido; `fecha_emision` es
+    created_at en ISO date (null si legado)."""
+    por_estado = por_estado or {}
+    return {
+        "id": ocp.id,
+        "numero": ocp.numero,
+        "numero_oc": ocp.numero_oc,
+        "proveedor_nombre": ocp.proveedor_nombre,
+        "pais": ocp.pais,
+        "moneda": ocp.moneda,
+        "tipo_origen": ocp.tipo_origen or "internacional",
+        "plazo_dias": ocp.plazo_dias,
+        "awb": ocp.awb,
+        "tracking": ocp.tracking,
+        "fecha_emision": ocp.created_at.date().isoformat() if ocp.created_at else None,
+        "semaforo": _semaforo_ocp(ocp),
+        "completitud": {"total": sum(por_estado.values()), "por_estado": por_estado},
     }
 
 
@@ -150,16 +310,19 @@ def seguimiento(
         )
     items = query.order_by(MonzaCotizacionItem.id.desc()).all()
 
-    ocp_cache = {}
+    # Agrupación por proveedor (contrato 2026-08-17): el caché-por-OC en loop que
+    # vivía acá era el N+1 documentado — ahora las OCs llegan en UNA query IN y la
+    # completitud en UNA query GROUP BY. Las claves ocp_* planas siguen byte-iguales
+    # (tienen consumidores vivos); cada ítem GANA el objeto `ocp` normalizado (o null).
+    ocps, conteos = _ocp_contexto_agrupacion(db, items)
+    ocp_json = {i: _ocp_dict_agrupacion(o, conteos.get(i)) for i, o in ocps.items()}
+
     out = []
     for it in items:
         d = _item_dict(it, it.cotizacion)
+        d["ocp"] = ocp_json.get(it.oc_proveedor_id)
         if it.oc_proveedor_id:
-            if it.oc_proveedor_id not in ocp_cache:
-                ocp_cache[it.oc_proveedor_id] = db.query(MonzaOcProveedor).filter(
-                    MonzaOcProveedor.id == it.oc_proveedor_id
-                ).first()
-            ocp = ocp_cache[it.oc_proveedor_id]
+            ocp = ocps.get(it.oc_proveedor_id)
             if ocp:
                 d["ocp_numero"] = ocp.numero
                 d["ocp_proveedor"] = ocp.proveedor_nombre
@@ -226,6 +389,17 @@ def comprar(body: ComprarBody, db: Session = Depends(get_db), current_user=Depen
         for _ in range(3):
             try:
                 return _comprar_parcial_tx(db, body, current_user)
+            except IntegrityError as e:
+                db.rollback()
+                # Choque del CORRELATIVO: desde 2026-08-27 `numero` tiene índice UNIQUE
+                # (migrations/monza_unique_correlativos), así que dos creaciones
+                # simultáneas ya no generan el número duplicado EN SILENCIO — chocan.
+                # Este bucle, que hasta ahora solo reintentaba deadlocks, recalcula y
+                # vuelve a intentar; sin esta rama el UNIQUE convertiría la corrupción
+                # callada en un 500. Cualquier otra violación se propaga: reintentarla
+                # escondería un error real.
+                if "numero" not in str(getattr(e, "orig", e)):
+                    raise
             except OperationalError as e:
                 db.rollback()
                 code = getattr(getattr(e, "orig", None), "args", [None])[0]
@@ -468,8 +642,11 @@ def _clonar_item_remanente(db: Session, it: MonzaCotizacionItem, remanente: int,
          10 en 6+4 dejando el subtotal de 10 lo multiplica por 1,67) y monta ese
          número inflado en el "total_venta_clp" que publica Contabilidad.
       3. Los otros 6 campos de la foto son UNITARIOS y se copian SIN DIVIDIR:
-         tc_aplicado, tarifa_aerea, markup_pct, costo, moneda, peso_kg (Embarques
-         Pricing los lee como "peso_unit" / costo unitario).
+         tc_aplicado, tarifa_aerea, markup_pct, costo, moneda, peso_kg. Embarques
+         Pricing lee costo/moneda/peso_kg ("peso_unit" / costo unitario);
+         tarifa_aerea es foto de auditoría/reproducibilidad — hoy nadie computa con
+         ella (verificado 2026-08-21) y desde los arreglos del equipo es la del
+         FLETE DE LA CORRIDA que calculó la línea, no necesariamente la de cabecera.
       4. `oc_proveedor_id` se COPIA cuando `copiar_oc=True` (default, los callers
          históricos llaman posicional y quedan intactos): es el análogo funcional
          del clon de OcProveedorItem que hace GA. Sin él el clon pierde su OC y
@@ -501,6 +678,9 @@ def _clonar_item_remanente(db: Session, it: MonzaCotizacionItem, remanente: int,
         peso_kg=it.peso_kg,
         tc_aplicado=it.tc_aplicado,
         tarifa_aerea=it.tarifa_aerea,
+        # La tarifa viaja CON su moneda (columna nueva 2026-08-22): un clon sin ella
+        # dejaría la foto ambigua justo en las cotizaciones de corridas mixtas.
+        moneda_tarifa=it.moneda_tarifa,
         markup_pct=it.markup_pct,
         # Precio unitario IDÉNTICO (regla 1); subtotal RECALCULADO (regla 2).
         # El None se PRESERVA: una línea sin subtotal guardado (dato legado o carga

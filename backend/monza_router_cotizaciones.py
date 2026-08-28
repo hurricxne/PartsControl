@@ -7,12 +7,15 @@ from fastapi import Request, APIRouter, Depends, HTTPException, Query, UploadFil
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import or_, func
+from sqlalchemy.exc import IntegrityError, OperationalError
 from pydantic import BaseModel, Field
 
 from database import get_db
 from auth import get_current_user
 from empresa_guard import require_empresa
 from role_guard import require_rol
+from monza_correlativos import siguiente_secuencia, reintentar_carrera
+from monza_fechas import hoy_chile, rango_utc
 from monza_notif import crear_notif
 from monza_models import (
     MonzaCotizacion, MonzaCotizacionItem, MonzaCliente,
@@ -20,7 +23,16 @@ from monza_models import (
     MonzaCotizacionCierre,
 )
 
-router = APIRouter(prefix="/api/monza/cotizaciones", tags=["monza-cotizaciones"])
+# CANDADO DE EMPRESA a nivel de ROUTER (2026-08-22): el PATCH ya lo tenía en su
+# firma, pero el resto del router —incluida la LISTA con nombre, RUT y teléfono de
+# cada cliente, y el PDF de la cotización— quedaba legible para un usuario de
+# minería. Candar 4 de los 5 routers del CRM y dejar este abierto era cerrar la
+# puerta y dejar la ventana. El require_rol del PATCH se conserva en su firma.
+router = APIRouter(
+    prefix="/api/monza/cotizaciones",
+    tags=["monza-cotizaciones"],
+    dependencies=[Depends(require_empresa("automotriz"))],
+)
 
 RESULTS_DIR = "/var/www/machparts.bigcode.cl/backend/results"
 
@@ -52,6 +64,12 @@ class CotItemIn(BaseModel):
     precio_unitario_clp: Optional[float] = None
     subtotal_clp: Optional[float] = None
     plazo_entrega: Optional[str] = None
+    # ID del ítem del LEAD del que nace esta línea. Es un ID, no un valor de plata: con
+    # él create_cotizacion lee EN LA BASE la estampa de flete de la corrida que calculó
+    # ese precio (monza_lead_items.moneda_tarifa/tarifa_aerea) — la foto sigue saliendo
+    # del servidor, jamás del body. None (pantalla vieja / cotización a mano) = la
+    # tarifa de cabecera, comportamiento de siempre.
+    lead_item_id: Optional[int] = None
 
 class CotCreate(BaseModel):
     lead_id: Optional[int] = None
@@ -157,28 +175,123 @@ def _registrar_reversion(db: Session, cot, nuevo_estado: str, usuario_id=None,
         vigente.revertido_a_estado = nuevo_estado
         vigente.motivo = (motivo or "").strip() or None
 
-    if (cot.estado or "") == "despachado" and cot.lead_id:
+    # El cliente del LTV es el FACTURADO (cot.cliente_id), no el del lead: con «Cotizar
+    # a» (arreglos del equipo 2026-08-21) pueden divergir, y la resta tiene que salir de
+    # la MISMA ficha donde la suma del despacho entró — asimétrico deja residuo que el
+    # max(...,0) esconde. SIN gate por `lead_id`, igual que en la suma: la resta tiene
+    # que poder salir aunque el lead ya no exista.
+    if (cot.estado or "") == "despachado" and cot.cliente_id:
+    # LOCK sobre la ficha: `ltv` y `vendidos_total` se leen, se modifican y se escriben,
+    # y sin él dos ventas del MISMO cliente despachadas a la vez se pisan — la segunda
+    # lee el valor viejo y guarda su suma encima de la otra. Reproducido: dos ventas
+    # simultáneas dejaban el LTV en el monto de UNA sola. La plata desaparecía de la
+    # ficha en silencio, sin error ni rastro. `populate_existing` obliga a leer lo
+    # COMMITEADO y no el snapshot que la sesión ya tenía en memoria.
+        c = (db.query(MonzaCliente)
+                 .filter(MonzaCliente.id == cot.cliente_id)
+                 .populate_existing().with_for_update().first())
+        if c:
+            # El total de la versión que se está revirtiendo; si no hay versión
+            # registrada (venta anterior a esta entrega) se cae al total vivo, que es
+            # lo mejor disponible.
+            monto = (vigente.total_bruto if vigente and vigente.total_bruto is not None
+                     else cot.total_bruto) or 0
+            c.ltv = max((c.ltv or 0) - monto, 0)
+
+
+def aplicar_efectos_venta_despachada(db: Session, cot) -> None:
+    """Efectos de que una venta pase a DESPACHADA: cierra el lead y suma el LTV.
+
+    EL BUG QUE CIERRA (2026-08-22). Estos efectos vivían inline en el PATCH
+    administrativo, así que solo ocurrían por esa puerta. Pero el camino NORMAL de la
+    operación es otro: cuando el encargado cierra el último despacho, `cerrar_despacho`
+    voltea la venta a 'despachado' por su cuenta — y ahí no se sumaba nada. Peor: como
+    la venta YA quedaba en 'despachado', un PATCH posterior calculaba
+    `es_despacho_nuevo = False` y tampoco los aplicaba. Resultado: el LTV de los
+    clientes —la plata que la ficha muestra y que el Portal va a publicar— casi nunca
+    se sumaba.
+
+    IDEMPOTENCIA: quien llama decide, y lo hace por la TRANSICIÓN de estado (la venta
+    NO estaba en 'despachado' y ahora sí), evaluada bajo el mismo lock que escribe el
+    estado. Así los dos caminos son excluyentes por construcción: el que llega segundo
+    ve la venta ya despachada y no vuelve a sumar.
+
+    ALCANCE DELIBERADO — espejo LITERAL de lo que hacía el PATCH, ni un efecto más:
+      · lead → 'cerrado' (jamás 'vendido': que un automatismo marque leads vendidos es
+        una decisión de negocio aparte, con su propio camino);
+      · LTV al cliente FACTURADO (`cot.cliente_id`), que con «Cotizar a» puede no ser el
+        del lead — la plata es de quien compró;
+      · `vendidos_total` NO se toca (es del ciclo del lead, lo mueve el asesor);
+      · notificaciones y logs quedan en cada llamador: los dos ya tienen los suyos y
+        centralizarlos acá los duplicaría.
+    SIN gate por `lead_id`: una venta despachada suma LTV tenga lead o no — el lead solo
+    manda en el cierre del lead. El porqué está en el comentario de abajo, y no es un
+    detalle: mientras la plata colgó del lead, borrar el lead apagaba la RESTA.
+    """
+    if not cot:
+        return
+    # DOS efectos con DOS llaves distintas, y la diferencia importa:
+    #   · cerrar el LEAD necesita el lead (obvio);
+    #   · sumar el LTV necesita el CLIENTE de la venta — y nada más.
+    # Estaban juntos bajo `if cot.lead_id`, así que borrar el lead (que solo desvincula
+    # las cotizaciones) apagaba también la RESTA: el LTV quedaba inflado para siempre y
+    # ninguna pantalla podía devolverlo. La plata no puede depender de un dato del CRM
+    # que la pantalla permite borrar.
+    if cot.lead_id:
         lead = db.query(MonzaLead).filter(MonzaLead.id == cot.lead_id).first()
-        if lead and lead.cliente_id:
-            c = db.query(MonzaCliente).filter(MonzaCliente.id == lead.cliente_id).first()
-            if c:
-                # El total de la versión que se está revirtiendo; si no hay versión
-                # registrada (venta anterior a esta entrega) se cae al total vivo, que es
-                # lo mejor disponible.
-                monto = (vigente.total_bruto if vigente and vigente.total_bruto is not None
-                         else cot.total_bruto) or 0
-                c.ltv = max((c.ltv or 0) - monto, 0)
+        if lead:
+            lead.estado = "cerrado"
+            lead.fecha_actualizacion = datetime.utcnow()
+    if cot.cliente_id:
+    # LOCK sobre la ficha: `ltv` y `vendidos_total` se leen, se modifican y se escriben,
+    # y sin él dos ventas del MISMO cliente despachadas a la vez se pisan — la segunda
+    # lee el valor viejo y guarda su suma encima de la otra. Reproducido: dos ventas
+    # simultáneas dejaban el LTV en el monto de UNA sola. La plata desaparecía de la
+    # ficha en silencio, sin error ni rastro. `populate_existing` obliga a leer lo
+    # COMMITEADO y no el snapshot que la sesión ya tenía en memoria.
+        c = (db.query(MonzaCliente)
+                 .filter(MonzaCliente.id == cot.cliente_id)
+                 .populate_existing().with_for_update().first())
+        if c:
+            c.ltv = (c.ltv or 0) + (cot.total_bruto or 0)
+
+
+def revertir_efectos_venta_despachada(db: Session, cot) -> None:
+    """Deshace el LTV cuando una venta SALE de 'despachado' (espejo exacto de la suma).
+
+    Simétrico con `aplicar_efectos_venta_despachada`: misma llave (solo el cliente
+    FACTURADO, sin lead) y el clamp en 0 para que un dato viejo no deje el LTV negativo.
+    El lead NO se reabre: quedó cerrado y su rastro vive en la Actividad — reabrirlo
+    inventaría un lead "en proceso" que nadie está trabajando.
+
+    CUÁNDO llamarlo: SOLO en la transición efectiva 'despachado' → 'vendida', nunca en
+    los barridos de reparación que recorren ventas ya en 'vendida' (restarían plata que
+    jamás entró). El monto es `total_bruto` vivo, el mismo que usó la suma.
+    """
+    # MISMA llave que la suma (solo el cliente): si la resta pidiera además el lead,
+    # una venta cuyo lead se borró sumaría y nunca devolvería.
+    if not cot or not cot.cliente_id:
+        return
+    # LOCK sobre la ficha: `ltv` y `vendidos_total` se leen, se modifican y se escriben,
+    # y sin él dos ventas del MISMO cliente despachadas a la vez se pisan — la segunda
+    # lee el valor viejo y guarda su suma encima de la otra. Reproducido: dos ventas
+    # simultáneas dejaban el LTV en el monto de UNA sola. La plata desaparecía de la
+    # ficha en silencio, sin error ni rastro. `populate_existing` obliga a leer lo
+    # COMMITEADO y no el snapshot que la sesión ya tenía en memoria.
+    c = (db.query(MonzaCliente)
+                 .filter(MonzaCliente.id == cot.cliente_id)
+                 .populate_existing().with_for_update().first())
+    if c:
+        c.ltv = max((c.ltv or 0) - (cot.total_bruto or 0), 0)
 
 
 def _gen_numero_cot(db: Session) -> str:
-    anio = datetime.utcnow().year
-    last = (
-        db.query(MonzaCotizacion)
-        .filter(MonzaCotizacion.numero.like(f"COT-{anio}-%"))
-        .order_by(MonzaCotizacion.id.desc())
-        .first()
-    )
-    n = int(last.numero.split("-")[-1]) + 1 if last else 1
+    # El año es el de CHILE: entre las 21:00 y la medianoche del 31 de diciembre, UTC
+    # ya está en el año siguiente y el correlativo saltaba de golpe (misma regla que
+    # monza_correlativos, donde vive la versión de referencia).
+    anio = hoy_chile().year
+    # MÁXIMO de la serie, no «la fila con id más alto» (ver monza_correlativos).
+    n = siguiente_secuencia(db, MonzaCotizacion.numero, f"COT-{anio}-")
     return f"COT-{anio}-{n:06d}"
 
 
@@ -346,6 +459,8 @@ def _cot_detail(c: MonzaCotizacion, db: Session = None) -> dict:
             # Foto por ítem (freeze-forward): TC y tarifa con que se calculó la línea.
             "tc_aplicado": it.tc_aplicado,
             "tarifa_aerea": it.tarifa_aerea,
+            # Su MONEDA (NULL en líneas pre-2026-08-22 = la de la cabecera).
+            "moneda_tarifa": it.moneda_tarifa,
             "markup_pct": it.markup_pct,
             "precio_unitario_clp": it.precio_unitario_clp,
             "subtotal_clp": it.subtotal_clp,
@@ -434,10 +549,13 @@ def list_cotizaciones(
         query = query.filter(MonzaCotizacion.estado == estado)
     if asesor_id:
         query = query.filter(MonzaCotizacion.asesor_id == asesor_id)
-    if desde:
-        query = query.filter(MonzaCotizacion.fecha_creacion >= datetime.fromisoformat(desde))
-    if hasta:
-        query = query.filter(MonzaCotizacion.fecha_creacion <= datetime.fromisoformat(hasta))
+    # Días de Chile → rango semiabierto en UTC (monza_fechas): el gemelo del mismo
+    # defecto que Ventas y Leads tenían — el día `hasta` quedaba fuera entero.
+    desde_utc, hasta_utc = rango_utc(desde, hasta)
+    if desde_utc:
+        query = query.filter(MonzaCotizacion.fecha_creacion >= desde_utc)
+    if hasta_utc:
+        query = query.filter(MonzaCotizacion.fecha_creacion < hasta_utc)
 
     total = query.count()
     items = query.order_by(MonzaCotizacion.fecha_creacion.desc()).offset((page - 1) * page_size).limit(page_size).all()
@@ -448,6 +566,24 @@ def list_cotizaciones(
 
 @router.post("", status_code=201)
 def create_cotizacion(body: CotCreate, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    """Crea una cotización, reintentando si dos se crean a la vez.
+
+    Misma enfermedad —y mismo remedio— que el correlativo de leads: `_gen_numero_cot`
+    lee el último número y le suma 1 sin lock, así que dos vendedores cotizando al mismo
+    tiempo (el escenario normal de una mañana) calculaban el mismo 'COT-2026-000N'.
+    `numero` es UNIQUE, así que la segunda moría con un 500 sin capturar y la cotización
+    se perdía ENTERA, con todos sus ítems y sus precios ya calculados — y la cotización
+    es el documento que después se convierte en la venta. Medido: 2 de 4 simultáneas.
+
+    El reintento envuelve la operación completa (no solo el número) porque un choque
+    entre dos cotizaciones DEL MISMO CLIENTE llega como deadlock, no como violación del
+    UNIQUE, y un deadlock deshace la transacción entera. Ver monza_correlativos.
+    """
+    return reintentar_carrera(db, lambda: _crear_cotizacion_tx(body, db, current_user),
+                              que="cotizaciones")
+
+
+def _crear_cotizacion_tx(body: CotCreate, db: Session, current_user):
     cfg = _get_config(db)
 
     cliente = db.query(MonzaCliente).filter(MonzaCliente.id == body.cliente_id).first()
@@ -472,6 +608,33 @@ def create_cotizacion(body: CotCreate, db: Session = Depends(get_db), current_us
                     or cfg.moneda_tarifa or "EUR").upper()
     tarifa_flete = (lead_flete.tarifa_aerea if lead_flete and lead_flete.tarifa_aerea is not None
                     else _tarifa_configurada(cfg, moneda_flete))
+
+    # ── Estampas de flete POR ÍTEM del lead (arreglos del equipo 2026-08-21) ──────
+    # Con corridas por subconjunto, el par del LEAD retrata solo la ÚLTIMA corrida.
+    # Cada línea congela el flete de SU corrida: la estampa del MonzaLeadItem, leída
+    # por `lead_item_id` en UNA query y validando pertenencia al lead de la cotización
+    # (fail-closed: un id ajeno o inexistente simplemente se ignora — jamás 500, jamás
+    # una estampa de otro lead). Solo entran al dict las estampas COMPLETAS.
+    estampas: dict = {}
+    _ids_lead_items = [it.lead_item_id for it in body.items if it.lead_item_id]
+    if body.lead_id and _ids_lead_items:
+        _filas = (
+            db.query(MonzaLeadItem)
+            .filter(MonzaLeadItem.id.in_(_ids_lead_items),
+                    MonzaLeadItem.lead_id == body.lead_id)
+            .all()
+        )
+        estampas = {li.id: ((li.moneda_tarifa or "").upper(), float(li.tarifa_aerea))
+                    for li in _filas
+                    if li.moneda_tarifa and li.tarifa_aerea is not None}
+    # Cabecera: si las estampas del subconjunto EMITIDO son uniformes (ignorando los
+    # ítems sin estampa, misma regla que la siembra del cotizador), la cabecera retrata
+    # ese par — no el del lead, que puede ser de una corrida posterior a estos precios.
+    # Mixtas → cabecera del lead como siempre; cada línea queda reproducible por su
+    # propia estampa y la pantalla avisa la mezcla (no la bloquea).
+    _pares = set(estampas.values())
+    if len(_pares) == 1:
+        moneda_flete, tarifa_flete = next(iter(_pares))
 
     cot = MonzaCotizacion(
         numero=_gen_numero_cot(db),
@@ -525,9 +688,17 @@ def create_cotizacion(body: CotCreate, db: Session = Depends(get_db), current_us
             moneda=it.moneda,
             peso_kg=it.peso_kg,
             tc_aplicado=tc_item,
-            # MISMA tarifa que la cabecera (la del lead): Embarques Pricing la lee por
-            # ítem, y si difiriera de la cabecera habría dos fletes para la misma venta.
-            tarifa_aerea=tarifa_flete,
+            # El flete de la CORRIDA que calculó esta línea (estampa del ítem del lead);
+            # sin estampa, la tarifa de cabecera como siempre. Es foto de auditoría y
+            # reproducibilidad: hoy NADIE computa con ella (Embarques Pricing lee
+            # costo/moneda/peso_kg, nunca esta columna — verificado 2026-08-21), pero la
+            # API la sirve como "tarifa con que se calculó la línea" y el split de
+            # Abastecimiento la clona: tiene que decir la verdad. La tarifa viaja CON su
+            # moneda — en una emisión mixta el número solo no dice de qué moneda es.
+            tarifa_aerea=(estampas[it.lead_item_id][1]
+                          if it.lead_item_id in estampas else tarifa_flete),
+            moneda_tarifa=(estampas[it.lead_item_id][0]
+                           if it.lead_item_id in estampas else moneda_flete),
             markup_pct=it.markup_pct / 100 if it.markup_pct > 1 else it.markup_pct,
             precio_unitario_clp=precio_unit,
             subtotal_clp=subtotal,
@@ -554,10 +725,18 @@ def create_cotizacion(body: CotCreate, db: Session = Depends(get_db), current_us
             lead.total_estimado = cot.total_bruto
             lead.fecha_actualizacion = datetime.utcnow()
 
+    # El log va DENTRO de la transacción, antes del commit — igual que en POST /leads.
+    # Escrito después quedaba bajo el bucle de reintento pero fuera de lo que el rollback
+    # deshace, y un error transitorio ahí rehacía la creación entera (ya guardada): una
+    # sola petición devolvía un 201 habiendo creado DOS cotizaciones, cada una con sus
+    # ítems y sus precios. `reintentar_carrera` tiene además un candado que corta el
+    # reintento en cuanto detecta un commit, pero el orden correcto es esta línea.
+    from monza_models import MonzaLog
+    db.add(MonzaLog(user_email=current_user.email, accion="CREATE", entidad="cotizacion",
+                    entidad_id=cot.id, entidad_ref=cot.numero,
+                    detalle=f"Cotización {cot.numero} emitida"))
     db.commit()
     db.refresh(cot)
-    _log(db, current_user.email, "CREATE", "cotizacion",
-         cot.id, cot.numero, f"Cotización {cot.numero} emitida")
     return _cot_dict(cot, db)
 
 
@@ -838,6 +1017,40 @@ def update_cotizacion(
                 f"Revierta el adelanto en Contabilidad/Tesorería primero.",
             )
 
+    # ── Contado ⇒ 100% (arreglos del equipo 2026-08-21, cinturón backend) ─────────
+    # La regla vive en el frontend (constants/adelanto.ts manda pct 100 con la forma
+    # "Contado"), pero un build VIEJO en caché justo después del deploy —o una llamada
+    # directa al API— dejaría una venta "Contado" con pct < 100 saltándose la cola de
+    # Tesorería y el cortafuego de Abastecimiento: exactamente el agujero que el pedido
+    # #8 vino a cerrar. Falla CERRADO con el mensaje que destraba al operador. Match
+    # EXACTO con "Contado" (el único texto que la constante escribió siempre, también
+    # en las ventas viejas): un texto libre distinto no es la condición contado de la
+    # casa y este guard no policía texto libre. Corre bajo el FOR UPDATE del PATCH.
+    #
+    # El gate cubre DOS puertas (ronda escéptica 2026-08-22, hallazgo ALT1 confirmado
+    # empíricamente): (a) el CIERRE (body.estado == 'vendida'); y (b) la EDICIÓN
+    # post-cierre — un PATCH sin `estado` que toque forma_pago o pct_adelanto sobre una
+    # venta ya cerrada ({pct_adelanto: 0} apagaba el cortafuego con 200, y
+    # {forma_pago: 'Contado'} dejaba Contado+50 sin pasar por ningún guard). El
+    # invariante es de la VENTA CERRADA, no del verbo que la tocó. Bajar el pct
+    # cambiando también la forma (corregir un cierre mal hecho a crédito) sigue
+    # permitido: la forma efectiva deja de ser "Contado".
+    _toca_condicion = body.forma_pago is not None or body.pct_adelanto is not None
+    _estado_efectivo = body.estado if body.estado is not None else (cot.estado or "")
+    if (body.estado == "vendida"
+            or (_toca_condicion and _estado_efectivo in ("vendida", "despachado"))):
+        _forma_efectiva = (body.forma_pago if body.forma_pago is not None
+                           else cot.forma_pago) or ""
+        _pct_efectivo = int(body.pct_adelanto if body.pct_adelanto is not None
+                            else (cot.pct_adelanto or 0))
+        if _forma_efectiva == "Contado" and _pct_efectivo < 100:
+            raise HTTPException(
+                409,
+                "Contado exige verificación de Tesorería: la venta debe quedar con el "
+                "100% de adelanto informado. Si la pantalla no lo mandó sola, está "
+                "desactualizada — recarga la página (o elige otra condición de pago).",
+            )
+
     for field, value in body.model_dump(exclude_none=True).items():
         if field in _CAMPOS_NO_PERSISTENTES:
             continue
@@ -848,6 +1061,73 @@ def update_cotizacion(
         for _it in cot.items:
             if (_it.estado_linea or "cotizado") == "cotizado":
                 _it.estado_linea = "por_comprar"
+        # El LEAD de una venta cerrada pasa a 'vendido' (2026-08-22). Antes, el único
+        # camino era el clic del asesor en el detalle del lead: si se le olvidaba —y se
+        # le olvidaba— el lead quedaba 'en_proceso' para siempre, inflaba el contador de
+        # «sin contactar» y el embudo mostraba como abiertos leads que ya se habían
+        # vendido. IDEMPOTENTE y sin pisar hacia atrás: solo mueve leads que aún están
+        # abiertos ('pendiente'/'en_proceso'), así un lead ya 'vendido' a mano o
+        # 'cerrado' por el despacho se queda como está. `vendidos_total` SÍ se suma acá
+        # (ver el comentario de la línea que lo hace): el PATCH del asesor ya no ocurre
+        # porque el cierre marca el lead solo, y el contador se quedaba en cero.
+        if cot.lead_id:
+            # LOCK sobre la fila del LEAD, igual que en el PATCH del asesor: los DOS
+            # caminos deciden con `_lead.estado` si esta venta ya se contó, así que los
+            # dos tienen que bloquear la fila donde vive esa evidencia. Con el lock en
+            # uno solo, un cierre y un PATCH simultáneos —o dos cierres— leían ambos el
+            # mismo estado abierto y la ficha terminaba con DOS ventas donde hubo una:
+            # reproducido 3 de 5 rondas, con 200 en las dos peticiones (silencioso).
+            _lead = (db.query(MonzaLead).filter(MonzaLead.id == cot.lead_id)
+                     .populate_existing().with_for_update().first())
+            # 'rechazado' entra en la lista: cerrar la venta es la evidencia MÁS fuerte de
+            # que ese lead no estaba rechazado (el cliente volvió y compró). Sin él, el
+            # lead se quedaba en 'rechazado', el contador de ventas de la ficha nunca
+            # sumaba, y la tarjeta del cliente terminaba mostrando «Vendidos: 0» junto a
+            # un LTV con la plata de esa misma venta: dos números de la misma tarjeta
+            # contradiciéndose. Los que NO entran siguen siendo 'vendido' y 'cerrado',
+            # donde esta venta YA se contó.
+            if _lead and (_lead.estado or "pendiente") in ("pendiente", "en_proceso", "rechazado"):
+                _lead.estado = "vendido"
+                _lead.fecha_actualizacion = datetime.utcnow()
+                # `vendidos_total` de la ficha lo sumaba el PATCH del asesor al marcar
+                # el lead vendido a mano. Como ahora el cierre lo marca solo, ese PATCH
+                # ya no ocurre y el contador se quedaba en cero para siempre: se suma
+                # ACÁ, en la MISMA transición (de abierto a vendido), así el número no
+                # se duplica si después alguien re-marca a mano: el PATCH exige que el
+                # estado cambie Y que no venga de 'vendido'/'cerrado', que son los dos
+                # estados donde esta venta YA se contó. (Sin esa segunda condición el
+                # equipo de testing reprodujo el doble conteo: cerrar la venta suma, el
+                # despacho deja el lead en 'cerrado', y el asesor que ve un lead cerrado
+                # y lo marca «vendido» —lo natural— sumaba de nuevo.) Va al cliente del
+                # LEAD, que es de quien habla este contador (el LTV, que es plata, va al
+                # cliente facturado).
+                # …y solo si esta venta NO se contó ya antes. La transición del lead no
+                # alcanza como evidencia: cerrar → revertir la venta → reabrir el lead a
+                # mano → volver a cerrar es un camino permitido (los tres pasos devuelven
+                # 200) y sumaba una SEGUNDA venta donde hubo una sola. La evidencia
+                # correcta ya está en la base: si esta cotización tiene versiones de
+                # cierre previas, es un RE-cierre y su venta ya está contada. Restar en la
+                # reversión sería peor —el lead queda en 'vendido', el re-cierre ya no
+                # sumaría por el gate de arriba, y la venta terminaría con el contador en
+                # cero: se cambiaría un sobre-conteo por un sub-conteo.
+                _es_recierre = (db.query(func.count(MonzaCotizacionCierre.id))
+                                .filter(MonzaCotizacionCierre.cotizacion_id == cot.id)
+                                .scalar() or 0) > 0
+                if _lead.cliente_id and not _es_recierre:
+                    # Mismo lock que el LTV: el contador también es
+                    # lectura-modificación-escritura.
+                    _c_lead = (db.query(MonzaCliente)
+                               .filter(MonzaCliente.id == _lead.cliente_id)
+                               .populate_existing().with_for_update().first())
+                    if _c_lead:
+                        _c_lead.vendidos_total = (_c_lead.vendidos_total or 0) + 1
+                db.add(MonzaLeadActividad(
+                    lead_id=_lead.id,
+                    tipo="cambio_estado",
+                    descripcion=f"Lead marcado como vendido por el cierre de {cot.numero}",
+                    usuario=current_user.email.split("@")[0].title(),
+                    usuario_id=getattr(current_user, "id", None),
+                ))
         # La foto del cierre se toma DESPUÉS del volcado: tiene que retratar los datos con
         # que la venta quedó cerrada, no los que tenía antes. Si esta es la segunda o
         # tercera vez que se cierra, queda como una versión nueva y las anteriores siguen
@@ -856,23 +1136,17 @@ def update_cotizacion(
                           usuario_id=getattr(current_user, "id", None),
                           usuario_email=current_user.email)
     if body.estado == "despachado" and not cot.fecha_despacho:
-        cot.fecha_despacho = datetime.utcnow().date()
+        # Día de CHILE (ver monza_fechas): columna civil, no puede llevar el día UTC.
+        cot.fecha_despacho = hoy_chile()
     if body.estado == "despachado":
         for _it in cot.items:
             if (_it.estado_linea or "cotizado") != "despachado":
                 _it.estado_linea = "despachado"
-        # Actualizar lead SOLO en el despacho NUEVO: el re-PATCH no debe volver a
-        # sumar el LTV (bug de plata) ni re-cerrar el lead.
-        if es_despacho_nuevo and cot.lead_id:
-            lead = db.query(MonzaLead).filter(MonzaLead.id == cot.lead_id).first()
-            if lead:
-                lead.estado = "cerrado"
-                lead.fecha_actualizacion = datetime.utcnow()
-                # ltv cliente
-                if lead.cliente_id:
-                    c = db.query(MonzaCliente).filter(MonzaCliente.id == lead.cliente_id).first()
-                    if c:
-                        c.ltv = (c.ltv or 0) + cot.total_bruto
+        # Efectos SOLO en el despacho NUEVO (la transición manda): el re-PATCH no debe
+        # volver a sumar el LTV ni re-cerrar el lead. El MISMO helper lo llama
+        # cerrar_despacho, que es el camino real de la operación.
+        if es_despacho_nuevo:
+            aplicar_efectos_venta_despachada(db, cot)
     db.commit()
     db.refresh(cot)
     # Log/notif de VENTA solo en el cierre NUEVO: re-enviar 'vendida' (edición de la
@@ -909,17 +1183,45 @@ async def upload_documento(
     cot = db.query(MonzaCotizacion).filter(MonzaCotizacion.id == cot_id).first()
     if not cot:
         raise HTTPException(status_code=404, detail="Cotización no encontrada")
-    ext = os.path.splitext(file.filename)[1] if file.filename else ".pdf"
+    # Mismas tres defensas que el repositorio de adjuntos (monza_router_documentos), que
+    # es su gemelo: esta puerta se había quedado sin ninguna. Las constantes se importan
+    # ahí dentro para no arriesgar un ciclo de imports a nivel de módulo.
+    from monza_router_documentos import _EXT_PERMITIDAS, _MAX_DOC_BYTES
+    ext = (os.path.splitext(file.filename)[1] if file.filename else ".pdf").lower()
+    # (1) Lista blanca: fuera lo que un navegador ejecutaría.
+    if ext not in _EXT_PERMITIDAS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Tipo de archivo no permitido: '{ext or 'sin extensión'}'. "
+                   "Acepta PDF, imágenes, Excel, Word, CSV, TXT y comprimidos.",
+        )
+    # (2) Tope de tamaño ANTES de materializar el archivo en memoria (`file.size` lo
+    #     cuenta starlette del lado del servidor: no es un dato del cliente).
+    if (file.size or 0) > _MAX_DOC_BYTES:
+        raise HTTPException(status_code=400, detail="Archivo demasiado grande (máximo 20 MB)")
     filename = f"despacho_{cot_id}_{int(datetime.utcnow().timestamp())}{ext}"
     dest_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "despachos")
     os.makedirs(dest_dir, exist_ok=True)
     dest = os.path.join(dest_dir, filename)
     content_bytes = await file.read()
+    if not content_bytes:
+        raise HTTPException(status_code=400, detail="El archivo llegó vacío: súbelo de nuevo")
+    if len(content_bytes) > _MAX_DOC_BYTES:
+        raise HTTPException(status_code=400, detail="Archivo demasiado grande (máximo 20 MB)")
     with open(dest, "wb") as f:
         f.write(content_bytes)
     cot.documento_path = filename
     cot.tipo_documento = tipo
-    db.commit()
+    # (3) Si el commit falla, el archivo no queda plantado en disco para siempre.
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        raise
     _log(db, _.email if hasattr(_, "email") else "sistema", "UPLOAD", "cotizacion",
          cot.id, cot.numero, f"Documento {tipo}: {filename}")
     return {"ok": True, "filename": filename}
@@ -1138,17 +1440,23 @@ def _generar_pdf(cot, cfg) -> bytes:
     story.append(Spacer(1, 8))
 
     # ── TABLA ÍTEMS ───────────────────────────────────────────────────────────
-    # A=Repuesto | B=Marca | C=N°parte | D=Cant | E=PrecioUnit | F=TOTAL | G=Plazo
-    col_ws = [5.4*cm, 2.3*cm, 2.5*cm, 1.8*cm, 2.9*cm, 3.1*cm]
-    # Total = 18.0 cm ✓
+    # 8 columnas (arreglos del equipo 2026-08-21: el PDF no mostraba calidad ni plazo):
+    # Repuesto 4.1 | Marca 2.0 | Procedencia 2.2 | Calidad 2.0 | Cant. 1.1 |
+    # Precio Unit. 2.2 | TOTAL 2.4 | Plazo entrega 2.0  → Σ = 18.0 cm ✓
+    # Anchos MEDIDOS (stringWidth Helvetica-Bold 9 + padding 4pt/lado): la cabecera
+    # «Procedencia» exige ≥2.2, «Aftermarket» ≥2.0 y «Cantidad» no cabe — va «Cant.»
+    # (vocabulario ya usado en Abastecimiento). No angostar sin re-medir.
+    col_ws = [4.1*cm, 2.0*cm, 2.2*cm, 2.0*cm, 1.1*cm, 2.2*cm, 2.4*cm, 2.0*cm]
 
     thead = [
-        Paragraph("<b>Repuesto</b>",     hdr_l),
-        Paragraph("<b>Marca</b>",        hdr_c),
-        Paragraph("<b>Procedencia</b>",  hdr_c),
-        Paragraph("<b>Cantidad</b>",     hdr_c),
-        Paragraph("<b>Precio Unit.</b>", hdr_r),
-        Paragraph("<b>TOTAL</b>",        hdr_r),
+        Paragraph("<b>Repuesto</b>",      hdr_l),
+        Paragraph("<b>Marca</b>",         hdr_c),
+        Paragraph("<b>Procedencia</b>",   hdr_c),
+        Paragraph("<b>Calidad</b>",       hdr_c),
+        Paragraph("<b>Cant.</b>",         hdr_c),
+        Paragraph("<b>Precio Unit.</b>",  hdr_r),
+        Paragraph("<b>TOTAL</b>",         hdr_r),
+        Paragraph("<b>Plazo entrega</b>", hdr_c),
     ]
 
     def fmt_clp(n):
@@ -1156,15 +1464,33 @@ def _generar_pdf(cot, cfg) -> bytes:
             return "—"
         return "$" + f"{int(n):,}".replace(",", ".")
 
+    # La calidad se guarda en minúsculas (la calculadora la baja al aplicar); el PDF la
+    # imprime con la etiqueta de la pantalla. 'sin_calificar'/NULL = "—"; un valor libre
+    # (Remanufacturado, Usado) pasa capitalizado tal cual.
+    _CALIDAD_PDF = {"genuine": "Genuine", "oem": "OEM", "aftermarket": "Aftermarket"}
+
+    def fmt_calidad(c):
+        # strip().lower(): 'sin_calificar' puede venir con mayúsculas o espacios por
+        # ItemUpdate/CotItemIn (texto libre) — el guion no debe esquivarse por casing.
+        if not c or c.strip().lower() == "sin_calificar":
+            return "—"
+        c = c.strip()
+        return _CALIDAD_PDF.get(c.lower(), c[:1].upper() + c[1:])
+
     irows = [thead]
     for it in cot.items:
         irows.append([
             Paragraph(it.descripcion or "", it_l),
             Paragraph(it.marca or "", it_c),
             Paragraph(it.procedencia or "—", it_c),
+            Paragraph(fmt_calidad(it.calidad), it_c),
             Paragraph(str(it.cantidad), it_c),
             Paragraph(fmt_clp(it.precio_unitario_clp), it_r),
             Paragraph(fmt_clp(it.subtotal_clp), it_r),
+            # plazo_s (8pt centrado) a propósito: «7-10 días hábiles» envuelve en 2.0 cm
+            # con más holgura que a 9pt. El estilo existía huérfano desde que la columna
+            # Plazo se quitó — vuelve a su uso original.
+            Paragraph(it.plazo_entrega or "—", plazo_s),
         ])
 
     n_data = len(irows) - 1
@@ -1173,7 +1499,10 @@ def _generar_pdf(cot, cfg) -> bytes:
         bg = WHITE if i % 2 == 1 else colors.HexColor("#F8F9FA")
         row_bgs.append(("BACKGROUND", (0, i), (-1, i), bg))
 
-    items_tbl = Table(irows, colWidths=col_ws)
+    # repeatRows=1: con 2+ páginas la cabecera se repite — sin esto, las cotizaciones
+    # largas mostraban la página 2 sin rótulos (defecto que las 2 columnas nuevas
+    # volvían visible: quedaban sin nombre justo donde el equipo las pidió).
+    items_tbl = Table(irows, colWidths=col_ws, repeatRows=1)
     items_tbl.setStyle(TableStyle([
         ("FONTSIZE",     (0, 0), (-1, -1), 8),
         ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
@@ -1190,24 +1519,28 @@ def _generar_pdf(cot, cfg) -> bytes:
     story.append(items_tbl)
 
     # ── TOTALES ───────────────────────────────────────────────────────────────
-    empty4 = [""] * 4
+    # Anchos PROPIOS, no col_ws: con 8 columnas de ítems, ninguna pareja de columnas
+    # compartidas aguanta «TOTAL NETO.» (66.7pt en bold 9) ni un total de 9 dígitos sin
+    # partirse en dos líneas. La banda label+valor termina en 10.4+3.0+2.6 = 16.0 cm,
+    # alineada con el borde derecho de la columna TOTAL de la tabla de ítems.
+    tot_col_ws = [10.4 * cm, 3.0 * cm, 2.6 * cm, 2.0 * cm]
     tot_rows = [
-        [*empty4, Paragraph("<b>TOTAL NETO.</b>", tot_lbl), Paragraph(fmt_clp(cot.total_neto), tot_val)],
-        [*empty4, Paragraph("IVA.",               tot_lbl), Paragraph(fmt_clp(cot.iva_monto),  tot_val)],
-        [*empty4, Paragraph("<b>TOTAL.</b>",       grand_lbl),Paragraph(fmt_clp(cot.total_bruto),grand_val)],
+        ["", Paragraph("<b>TOTAL NETO.</b>", tot_lbl), Paragraph(fmt_clp(cot.total_neto), tot_val), ""],
+        ["", Paragraph("IVA.",               tot_lbl), Paragraph(fmt_clp(cot.iva_monto),  tot_val), ""],
+        ["", Paragraph("<b>TOTAL.</b>",       grand_lbl),Paragraph(fmt_clp(cot.total_bruto),grand_val), ""],
     ]
-    tot_tbl = Table(tot_rows, colWidths=col_ws)
+    tot_tbl = Table(tot_rows, colWidths=tot_col_ws)
     tot_tbl.setStyle(TableStyle([
         ("FONTSIZE",     (0, 0), (-1, -1), 9),
         ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
         ("TOPPADDING",   (0, 0), (-1, -1), 3),
         ("BOTTOMPADDING",(0, 0), (-1, -1), 3),
         ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        # Fondo naranja en la fila TOTAL (índice 2)
-        ("BACKGROUND",   (4, 2), (5, 2), TOTAL_BG),
-        # Bordes en columnas E-F
-        ("BOX",          (4, 0), (5, 2), 0.5, LGRAY),
-        ("LINEBELOW",    (4, 0), (5, 1), 0.3, LGRAY),
+        # Fondo naranja en la fila TOTAL (banda label+valor, fila 2)
+        ("BACKGROUND",   (1, 2), (2, 2), TOTAL_BG),
+        # Bordes de la banda de totales
+        ("BOX",          (1, 0), (2, 2), 0.5, LGRAY),
+        ("LINEBELOW",    (1, 0), (2, 1), 0.3, LGRAY),
     ]))
     story.append(tot_tbl)
     story.append(Spacer(1, 12))

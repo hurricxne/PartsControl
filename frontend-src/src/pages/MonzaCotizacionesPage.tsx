@@ -225,6 +225,16 @@ function msgError(e: unknown, fallback: string): string {
  *  opción de % libre: sin esto, un re-cierre bajaría un 30% pactado a 0 en silencio,
  *  que es exactamente el hallazgo #14 que ya se corrigió para el 50%. */
 function opcionDeVenta(formaPago: string | undefined, pct: number): PagoOpcion {
+  // CASO LEGADO (arreglos del equipo 2026-08-21): las ventas cerradas cuando Contado
+  // valía pct 0 tienen forma "Contado" + pct 0, que ya no calza con ninguna opción
+  // (contado ahora es pct 100). Sin esta rama caían preseleccionadas en "Crédito
+  // (30 días)" — una condición que el cliente jamás pactó. Se preselecciona Contado:
+  // el re-cierre enviará pct 100 (la regla nueva aplica freeze-forward al re-cierre,
+  // ES el pedido #8) y el aviso subeAdelanto del modal lo hace visible, no silencioso.
+  if ((formaPago || "") === "Contado" && pct === 0) {
+    const contado = PAGO_OPCIONES.find((o) => o.id === "contado");
+    if (contado) return contado;
+  }
   const porForma = PAGO_OPCIONES.find((o) => !o.pctLibre && o.forma === (formaPago || ""));
   if (porForma && porForma.pct === pct) return porForma;
   const porPct = PAGO_OPCIONES.find((o) => !o.pctLibre && o.pct === pct);
@@ -397,6 +407,13 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
   // Aviso explícito cuando el re-cierre BAJA el adelanto ya acordado (hallazgo #14). Con
   // el adelanto libre a medio teclear el % todavía no significa nada: no se avisa.
   const bajaAdelanto = pctVigente > 0 && pctFinal < pctVigente && !problemaAdelanto;
+  // Espejo del anterior para el caso legado del Contado (pedido #8, 2026-08-21): una
+  // venta vieja "Contado" quedó con pct 0 y re-cerrarla —aunque sea para corregir otra
+  // cosa— enviará 100, encendiendo la verificación de Tesorería y el freno de
+  // Abastecimiento retroactivamente. Es la regla nueva aplicada a propósito, pero el
+  // operador tiene que verla antes de confirmar. Solo en RE-cierres (fecha_venta ya
+  // existe): en un cierre nuevo el aviso genérico del adelanto basta.
+  const subeAdelanto = !!cot.fecha_venta && pctVigente === 0 && pctFinal > 0 && !problemaAdelanto;
   // La fecha mostrada es la CALCULADA (no una acordada antes ni una tecleada a mano):
   // solo en ese caso el "— N días hábiles" describe lo que hay en el campo.
   const fechaEsCalculada = !cot.fecha_entrega_est && !fechaTocada && !cargandoDet;
@@ -561,8 +578,32 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
           )}
           {pctFinal > 0 && !problemaAdelanto && (
             <p style={{ margin: "4px 0 12px", fontSize: 12, color: "#B45309", background: "#FEF3C7", padding: "8px 10px", borderRadius: 8 }}>
-              El cliente paga {pctFinal}% por adelantado
-              {totalBruto > 0 && <> (<b>{fmt(montoFinal)}</b> c/IVA)</>}. Contabilidad deberá <b>verificar el pago</b>; en Abastecimiento aparecerá <b>"pago no verificado"</b> hasta entonces.
+              {/* Texto propio para Contado (pedido #8): el operador que siempre usó
+                  «Contado = sin trámite» tiene que entender que ahora frena la compra
+                  al proveedor hasta que Tesorería verifique la plata. */}
+              {sel === "contado" ? (
+                <>
+                  <b>Contado:</b> el cliente paga el 100%
+                  {totalBruto > 0 && <> (<b>{fmt(montoFinal)}</b> c/IVA)</>} antes de que se
+                  compre al proveedor. <b>Tesorería debe verificar el pago recibido</b>; hasta
+                  entonces la OC de proveedor queda frenada en Abastecimiento.
+                </>
+              ) : (
+                <>
+                  El cliente paga {pctFinal}% por adelantado
+                  {totalBruto > 0 && <> (<b>{fmt(montoFinal)}</b> c/IVA)</>}. Contabilidad deberá <b>verificar el pago</b>; en Abastecimiento aparecerá <b>"pago no verificado"</b> hasta entonces.
+                </>
+              )}
+            </p>
+          )}
+          {/* Caso legado del Contado: re-cierre de una venta vieja (pct 0) que ahora
+              queda con verificación de Tesorería. Visible, nunca silencioso. */}
+          {subeAdelanto && (
+            <p style={{ margin: "4px 0 12px", fontSize: 12, color: "#B45309", background: "#FEF3C7", padding: "8px 10px", borderRadius: 8 }}>
+              Esta venta estaba cerrada <b>sin adelanto</b>: al confirmar, este re-cierre
+              activa la <b>verificación de Tesorería por el {pctFinal}%</b>
+              {totalBruto > 0 && <> ({fmt(montoFinal)} c/IVA)</>} y Abastecimiento no podrá
+              generar OC de proveedor nuevas hasta que se verifique el pago.
             </p>
           )}
           {/* Hallazgo #14: bajar el adelanto apaga el cortafuego que impide comprar sin anticipo,
@@ -612,9 +653,13 @@ function CerrarVentaModal({ cot, detalle, loading, onClose, onConfirm }: {
             <div style={fila}>
               <span>Adelanto</span>
               <b style={{ color: s.text }}>
-                {pctFinal > 0
-                  ? `${pctFinal}%${totalBruto > 0 ? ` · ${fmt(montoFinal)}` : ""}`
-                  : "Sin adelanto"}
+                {/* Contado se nombra como lo que el operador pactó — "Adelanto 100%"
+                    junto a la condición "Contado" parecía un error de pantalla. */}
+                {sel === "contado"
+                  ? `Pago contado (100%)${totalBruto > 0 ? ` · ${fmt(montoFinal)}` : ""}`
+                  : pctFinal > 0
+                    ? `${pctFinal}%${totalBruto > 0 ? ` · ${fmt(montoFinal)}` : ""}`
+                    : "Sin adelanto"}
               </b>
             </div>
             <div style={fila}>

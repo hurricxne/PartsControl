@@ -41,7 +41,7 @@ from database import SessionLocal  # noqa: E402
 from auth import get_current_user  # noqa: E402
 from monza_models import (  # noqa: E402
     MonzaCliente, MonzaCotizacion, MonzaCotizacionItem, MonzaCotizacionCierre,
-    MonzaDespacho, MonzaLead, MonzaLog, MonzaNotificacion,
+    MonzaDespacho, MonzaLead, MonzaLeadActividad, MonzaLog, MonzaNotificacion,
 )
 from monza_router_cotizaciones import router as cotizaciones_router  # noqa: E402
 
@@ -148,7 +148,14 @@ def _limpiar():
             MonzaNotificacion.entidad_id.in_(cot_ids or [0])).delete(synchronize_session=S)
         db.query(MonzaCotizacion).filter(
             MonzaCotizacion.id.in_(cot_ids or [0])).delete(synchronize_session=S)
-        db.query(MonzaLead).filter(MonzaLead.numero.like(f"{LEAD_MARK}%")).delete(
+        # Las ACTIVIDADES van antes que el lead (FK): desde 2026-08-22 el cierre de
+        # venta marca el lead como vendido y deja su rastro en la Actividad, así que
+        # borrar el lead a secas choca con la FK.
+        _lead_ids = [r[0] for r in db.query(MonzaLead.id)
+                     .filter(MonzaLead.numero.like(f"{LEAD_MARK}%")).all()]
+        db.query(MonzaLeadActividad).filter(
+            MonzaLeadActividad.lead_id.in_(_lead_ids or [0])).delete(synchronize_session=S)
+        db.query(MonzaLead).filter(MonzaLead.id.in_(_lead_ids or [0])).delete(
             synchronize_session=S)
         db.query(MonzaLog).filter(MonzaLog.user_email == EMAIL).delete(synchronize_session=S)
         db.query(MonzaCliente).filter(MonzaCliente.nombre.like(f"{MARK}%")).delete(

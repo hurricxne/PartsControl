@@ -14,9 +14,14 @@ from typing import Optional
 
 from database import get_db
 from auth import get_current_user
+from empresa_guard import require_empresa
 from monza_models import MonzaParteCatalogo, MonzaListaPrecios, MonzaProveedor
 
-router = APIRouter(prefix="/api/monza/catalog", tags=["monza-catalog"])
+router = APIRouter(prefix="/api/monza/catalog", tags=["monza-catalog"],
+    # Candado de empresa (hallazgo del equipo de testing 2026-08-27).
+    # El catálogo expone listas de PRECIOS y los markups por cliente de MonzaParts.
+    dependencies=[Depends(require_empresa("automotriz"))],
+)
 
 
 # ── Listas de precios ─────────────────────────────────────────────────────────

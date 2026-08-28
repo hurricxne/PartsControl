@@ -55,6 +55,7 @@ from .service import (
     TIPO_DOC_GUIA, FOLIO_REF_MAX, TIPOS_TRASLADO, TIPO_TRASLADO_DEFAULT,
     armar_lineas, armar_guia, payload_a_rest, parse_fecha_oc, cuadratura,
     total_neto_lineas, serialize_dte, claim_vigente, _folio_dte_valido, _f,
+    advertencia_lineas_sii_gratuito,
 )
 
 # Módulo SOLO MachParts (Grupo AM = 'mineria'): Wasabil emite con el RUT de
@@ -204,6 +205,13 @@ def _preparar_emision(db: Session, despacho_id: int, para_reintento: bool = Fals
     # ── Líneas (cantidades del despacho × precios de la cotización) ──
     lineas, problemas_lineas = armar_lineas(despacho.items, _precios(db, cot))
     problemas.extend(problemas_lineas)
+    # ADVERTENCIA (jamás bloqueo): la vía SII gratuito por la que emite la cuenta
+    # rechaza documentos con más de 10 ítems (los 3 únicos fallidos históricos).
+    # El operador puede dividir el despacho ANTES de emitir — o emitir igual si
+    # la cuenta ya no depende de esa vía (por eso no va en `problemas`).
+    aviso_tope = advertencia_lineas_sii_gratuito(len(lineas), "guía")
+    if aviso_tope:
+        advertencias.append(aviso_tope)
 
     # ── Receptor: ficha del cliente en Wasabil (autocompleta datos ante el SII) ──
     receptor = {
@@ -1801,6 +1809,14 @@ def _preparar_emision_factura(db: Session, payload: FacturaCreate,
         datos = _construir_factura(db, payload, oc, cot, empresa)
     problemas.extend(datos["problemas"])
     advertencias.extend(datos["advertencias"])
+    # ADVERTENCIA (jamás bloqueo): la vía SII gratuito rechaza >10 ítems por documento
+    # (los 3 únicos fallidos históricos de la cuenta). Se cuentan las líneas VALIDADAS
+    # — las que viajan como details del DTE 33 —: los descuentos de anticipo no suman
+    # (van como `discount` porcentual, no como línea) y la factura de anticipo lleva
+    # 1 sola línea, así que nunca gatilla el aviso.
+    aviso_tope = advertencia_lineas_sii_gratuito(len(datos.get("validadas") or []), "factura")
+    if aviso_tope:
+        advertencias.append(aviso_tope)
     # Mismo piso que aplicar_descuento_lineas: sin esto el preview decía "puede emitir"
     # y el emitir moría en 409 DESPUÉS de haber creado la factura local (zombi).
     if datos.get("neto") is not None and 0 <= float(datos["neto"]) < NETO_MINIMO_DTE:

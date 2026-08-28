@@ -1,7 +1,8 @@
 // Página "Facturas y Cobranzas" (cuentas por cobrar): lista facturas + antigüedad de cartera,
 // y concentra las acciones — EMITIR factura (desde una guía firmada), registrar cobranzas y
 // gestionar factoring. Consume contabilidadAPI (/facturas, /kpis, despachos-facturables…).
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useId } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import {
   Receipt, Plus, Search, AlertCircle, CheckCircle2, DollarSign,
   Loader2, RefreshCw, ChevronDown, ChevronUp, CreditCard, Landmark, X, Trash2, FileText,
@@ -10,6 +11,7 @@ import {
 import toast from 'react-hot-toast'
 import { contabilidadAPI, wasabilAPI, abrirDocumento } from '../services/api'
 import { fmtClp, fmtDate, hoyLocal } from '../utils/format'
+import SelectorOcFactura from '../components/SelectorOcFactura'
 
 // ─── Tipos ────────────────────────────────────────────────────────────────────
 interface Cobranza { id: number; fecha: string | null; monto: number; medio: string; es_adelanto?: boolean; banco: string | null; numero_operacion: string | null; observaciones: string | null }
@@ -71,8 +73,51 @@ function errMsg(e: any, fallback: string): string {
   if (typeof d === 'string') return d
   return fallback
 }
+const rotuloCls = 'block text-[11px] font-semibold uppercase tracking-wider mb-1'
+const rotuloStyle = { color: 'var(--text-faint)' } as React.CSSProperties
+
+/** Rótulo + UN control único (input/select). El <label> que envuelve es correcto
+ *  ACÁ y solo acá: con un único descendiente etiquetable, el clic en el rótulo
+ *  enfoca ese control, que es lo que el operador espera. */
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (<label className="block"><span className="block text-[11px] font-semibold uppercase tracking-wider mb-1" style={{ color: 'var(--text-faint)' }}>{label}</span>{children}</label>)
+  return (<label className="block"><span className={rotuloCls} style={rotuloStyle}>{label}</span>{children}</label>)
+}
+
+/**
+ * Gemelo de `Field` con <div> en vez de <label>, para los widgets COMPUESTOS
+ * (selector de OC, lista de guías-radio con su ayuda y sus avisos).
+ *
+ * POR QUÉ existe: un <label> SIN `for` se asocia a su PRIMER descendiente
+ * etiquetable y el navegador dispara un clic sintético sobre él al clickear
+ * cualquier descendiente NO interactivo. Con widgets compuestos eso causaba dos
+ * daños reales, verificados con clics en un navegador:
+ *  · selector de OC: clic en el rótulo o en el texto «OC 4711 — H-E PARTS»
+ *    activaba el botón «cambiar» → onSelect(null) → el formulario a medio
+ *    llenar se vaciaba solo (ocId, guía, RUT, razón social, plazo…).
+ *  · lista de guías: clic en el texto de ayuda o en el aviso «⚠ sin foto de
+ *    respaldo» marcaba la PRIMERA guía aunque el operador tuviera elegida otra
+ *    → el DTE 33, que es IRREVERSIBLE, citaba la guía 52 equivocada.
+ * De paso desaparece el <label> anidado dentro de <label> (HTML inválido).
+ *
+ * La asociación accesible que el <label> daba gratis se repone en el punto de
+ * uso, según lo que el widget sea de verdad:
+ *  · `htmlFor`: el rótulo es un <label for> apuntando al ÚNICO control que
+ *    merece el foco (la caja de búsqueda del selector). Un label CON `for` solo
+ *    reenvía los clics hechos sobre sí mismo — no captura a sus vecinos.
+ *  · `labelId`: el rótulo es un <span id> y el widget se declara grupo
+ *    (role="radiogroup" aria-labelledby) — el caso de la lista de guías.
+ */
+function Campo({ label, htmlFor, labelId, children }: {
+  label: string; htmlFor?: string; labelId?: string; children: React.ReactNode
+}) {
+  return (
+    <div className="block">
+      {htmlFor
+        ? <label htmlFor={htmlFor} className={rotuloCls} style={rotuloStyle}>{label}</label>
+        : <span id={labelId} className={rotuloCls} style={rotuloStyle}>{label}</span>}
+      {children}
+    </div>
+  )
 }
 
 /** Forma mínima de las respuestas que traen avisos NO bloqueantes junto al 200: el
@@ -440,7 +485,6 @@ function EmisionFacturaSII({ payload, facturaId, onDone, onVolver, onCerrar, onB
 // ─── Modal: emitir factura (desde un despacho/guía de una OC) ─────────────────
 // Antes de emitir se PREVISUALIZA lo que se va a facturar (receptor + líneas + neto/IVA/
 // total), se exige el RUT del cliente (campo por llenar si la venta no lo trae) y el folio.
-interface OcOpt { oc_cliente_id: number; numero_oc: string | null; cliente: string; cond_pago: string | null }
 interface PreviewLinea { numero_parte: string | null; descripcion: string | null; cantidad: number; precio_unit_neto: number; total_neto: number }
 interface PreviewData {
   puede_emitir: boolean; problemas: string[]; advertencias?: string[]
@@ -449,10 +493,53 @@ interface PreviewData {
   precio_de_guia?: boolean
 }
 
+/**
+ * Una guía facturable tal como la devuelve
+ * GET /contabilidad/ventas/{oc}/despachos-facturables.
+ *
+ * `fecha` + `fuente` son ADITIVOS y tienen la MISMA forma que ya usa el selector
+ * de OC (facturas/selectorOc.ts · GuiaFacturable): los deriva el backend con la
+ * cascada real de «fecha de la guía facturable» — electrónica emitida al SII
+ * primero, papel después. `fecha_guia` es SOLO la columna de la guía en papel y
+ * por eso no sirve como fuente de verdad: una guía 52 electrónica la deja NULL
+ * (el emisor escribe el folio, nunca esa columna) y toda guía electrónica se
+ * pintaba «(sin fecha ⚠)» acá mientras el chip de arriba, calculado con la
+ * cascada, mostraba su fecha correcta. Se conserva `fecha_guia` para degradar
+ * al comportamiento de siempre si el backend todavía no manda los campos
+ * nuevos (`fecha === undefined`): nada debe reventar.
+ */
+interface DespachoFacturable {
+  id: number; numero_despacho: string; numero_guia: string | null
+  /** Columna PAPEL cruda (fallback de degradación; ver `fechaDeGuia`). */
+  fecha_guia: string | null
+  /** Fecha de la guía por la cascada real (ISO date) o null = falta cargarla. */
+  fecha?: string | null
+  /** 'bloqueada' = guía electrónica trabada ante el SII: no citable en la
+   *  referencia 52 — se resuelve en Despachos antes de poder facturar. */
+  fuente?: 'electronica' | 'papel' | 'bloqueada' | null
+  numero_expedicion: string | null; guia_firmada_archivo: string | null; items_count: number
+}
+
+/** Fecha a mostrar para una guía facturable, con degradación explícita: si el
+ *  backend no manda `fecha` (campo ausente ≠ null), se cae a la columna papel,
+ *  que es exactamente lo que esta pantalla hacía antes. */
+function fechaDeGuia(d: DespachoFacturable): string | null {
+  return d.fecha !== undefined ? d.fecha : d.fecha_guia
+}
+
 function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
-  const [ocs, setOcs] = useState<OcOpt[]>([])
+  const uid = useId()  // ids únicos para asociar rótulos con widgets compuestos (ver Campo)
   const [ocId, setOcId] = useState<number | ''>('')
-  const [despachos, setDespachos] = useState<{ id: number; numero_despacho: string; numero_guia: string | null; fecha_guia: string | null; numero_expedicion: string | null; guia_firmada_archivo: string | null; items_count: number }[]>([])
+  // Condición de pago de la OC elegida: viaja en el onSelect del selector (antes
+  // era un ocs.find sobre la lista completa de ventas, que ya no se carga acá).
+  const [condPagoSel, setCondPagoSel] = useState('')
+  const [despachos, setDespachos] = useState<DespachoFacturable[]>([])
+  // Carga de las guías VISIBLE: sin estos dos estados, el .catch mudo dejaba el
+  // mensaje «Sin despachos…» tanto durante la carga como tras un error de red —
+  // dos mentiras distintas con el mismo texto.
+  const [guiasCargando, setGuiasCargando] = useState(false)
+  const [guiasError, setGuiasError] = useState(false)
+  const [reintentoGuias, setReintentoGuias] = useState(0) // fuerza re-consulta tras un error
   const [despachoId, setDespachoId] = useState<number | ''>('')
   const [folio, setFolio] = useState('')
   const [tipo, setTipo] = useState('factura')
@@ -478,20 +565,26 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
   const [siiPayload, setSiiPayload] = useState<Record<string, any> | null>(null)
   const [siiBusy, setSiiBusy] = useState(false)   // envío en vuelo: el modal no se cierra
 
-  useEffect(() => {
-    contabilidadAPI.listVentas().then(({ data }) =>
-      setOcs(data.map((v: any) => ({ oc_cliente_id: v.oc_cliente_id, numero_oc: v.numero_oc, cliente: v.cliente, cond_pago: v.cond_pago })))
-    ).catch(() => {})
-  }, [])
-
-  const condPagoOc = ocs.find(o => o.oc_cliente_id === Number(ocId))?.cond_pago || ''
+  const condPagoOc = condPagoSel
 
   useEffect(() => {
-    if (!ocId) { setDespachos([]); return }
+    if (!ocId) { setDespachos([]); setGuiasCargando(false); setGuiasError(false); return }
     let vivo = true  // ignora respuestas atrasadas si el usuario ya cambió de OC
+    setGuiasCargando(true)
+    setGuiasError(false)
     contabilidadAPI.despachosFacturables(Number(ocId))
-      .then(({ data }) => { if (vivo) setDespachos(data || []) })
-      .catch(() => { if (vivo) setDespachos([]) })
+      .then(({ data }) => {
+        if (!vivo) return
+        const ds = data || []
+        setDespachos(ds)
+        // UNA sola guía facturable → preseleccionada: el preview se dispara solo
+        // (useEffect de despachoId) y el caso típico queda a un clic de emitir.
+        if (ds.length === 1) setDespachoId(ds[0].id)
+      })
+      // Error VISIBLE con reintento (guiasError pinta el aviso y el botón):
+      // nada de .catch mudo que se disfraza de «no hay guías».
+      .catch(() => { if (vivo) { setDespachos([]); setGuiasError(true) } })
+      .finally(() => { if (vivo) setGuiasCargando(false) })
     // Precargar el plazo desde la condición de pago pactada en la OC ("30 días", "contado"…)
     const cp = (condPagoOc || '').toLowerCase()
     const m = cp.match(/(\d+)/)
@@ -499,7 +592,7 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
     else if (cp.includes('contado') || cp.includes('contra entrega')) setPlazo('0')
     else setPlazo('30')  // cond_pago no reconocida: default 30 (no hereda el de otra OC)
     return () => { vivo = false }
-  }, [ocId])
+  }, [ocId, reintentoGuias])
 
   // El RUT digitado entra al preview con DEBOUNCE (~500ms): así el backend valida el
   // RUT nuevo y desbloquea la emisión (una venta sin RUT se completa AQUÍ), sin
@@ -590,22 +683,106 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
 
   return (
     <Modal title="Emitir factura" onClose={onClose} wide>
-      <Field label="Orden de compra (venta)">
+      {/* Campo (div), NO Field (label): el selector es un widget COMPUESTO — con
+          <label> el clic en el rótulo o en el texto de la OC disparaba «cambiar»
+          y borraba el formulario a medio llenar. El rótulo apunta a la caja de
+          búsqueda por htmlFor. */}
+      <Campo label="Orden de compra (venta)" htmlFor={`${uid}-oc-buscar`}>
         {/* setRutDebounced('') SÍNCRONO: sin esto, el RUT del cliente de la OC anterior
             queda “en vuelo” hasta 500ms y podía filtrarse al preview de la OC nueva */}
-        <select className={inputCls} style={inputStyle} value={ocId} onChange={e => { setOcId(e.target.value ? Number(e.target.value) : ''); setDespachoId(''); setPreview(null); setRut(''); setRutDebounced(''); setRazonSocial(''); setRazonDebounced('') }}>
-          <option value="">Selecciona OC…</option>
-          {ocs.map(o => <option key={o.oc_cliente_id} value={o.oc_cliente_id}>OC {o.numero_oc || o.oc_cliente_id} — {o.cliente}</option>)}
-        </select>
-      </Field>
-      <Field label="Despacho / guía a facturar">
-        <select className={inputCls} style={inputStyle} value={despachoId} onChange={e => { setDespachoId(e.target.value ? Number(e.target.value) : ''); setPreview(null) }} disabled={!ocId}>
-          <option value="">{ocId ? (despachos.length ? 'Selecciona despacho…' : 'Sin despachos cerrados para facturar') : 'Elige una OC primero'}</option>
-          {/* «sin fecha» avisa acá que esa guía en papel no se va a poder emitir al SII:
-              la referencia 52 exige la fecha de emisión de la guía. Se carga en
-              Despachos → Editar. Sin este aviso el bloqueo aparecía recién al emitir. */}
-          {despachos.map(d => <option key={d.id} value={d.id}>{d.numero_despacho}{d.numero_guia ? ` · Guía ${d.numero_guia}${d.fecha_guia ? '' : ' (sin fecha)'}` : ''} ({d.items_count} ítems)</option>)}
-        </select>
+        <SelectorOcFactura contexto="factura" value={ocId} autoFocus inputId={`${uid}-oc-buscar`}
+          onSelect={o => { setOcId(o ? o.oc_cliente_id : ''); setDespachoId(''); setPreview(null); setRut(''); setRutDebounced(''); setRazonSocial(''); setRazonDebounced(''); setCondPagoSel(o?.cond_pago ?? '') }} />
+      </Campo>
+      {/* Campo (div), NO Field (label): TODO este bloque —filas-radio, ayuda,
+          «Exp:…», el botón Reintentar de la rama de error— vivía dentro de un
+          <label> cuyo primer control es el PRIMER radio; un clic en cualquiera
+          de esos textos cambiaba EN SILENCIO qué guía 52 iba a citar un DTE 33
+          irreversible. El grupo se declara con role="radiogroup". */}
+      <Campo label="Despacho / guía a facturar" labelId={`${uid}-guias-rotulo`}>
+        {!ocId ? (
+          <p className="text-xs px-3 py-2 rounded-lg border" style={{ ...inputStyle, color: 'var(--text-faint)' }}>Elige una OC primero</p>
+        ) : guiasCargando ? (
+          <p className="text-xs px-3 py-2 rounded-lg border" style={{ ...inputStyle, color: 'var(--text-faint)' }}>
+            <Loader2 className="w-3.5 h-3.5 animate-spin inline mr-1" /> Cargando guías…
+          </p>
+        ) : guiasError ? (
+          <div className="text-xs px-3 py-2 rounded-lg border space-y-1.5" style={inputStyle}>
+            <p className="text-red-500 flex items-center gap-1.5"><AlertCircle className="w-4 h-4" /> No se pudieron cargar las guías de esta OC</p>
+            <button type="button" onClick={() => setReintentoGuias(n => n + 1)} className="btn-secondary text-xs">Reintentar</button>
+          </div>
+        ) : despachos.length === 0 ? (
+          // SOLO cuando la carga terminó OK y de verdad no hay nada facturable.
+          <p className="text-xs px-3 py-2 rounded-lg border" style={{ ...inputStyle, color: 'var(--text-faint)' }}>Sin despachos cerrados para facturar</p>
+        ) : (
+          /* Filas-radio (2-4 típicas) en vez de <select>: la guía se ve COMPLETA
+             (folio, fecha, ítems) antes de elegir.
+             La FECHA sale de la cascada del backend (`fecha`/`fuente`), la misma
+             que alimenta el chip del selector de arriba — antes esta lista leía
+             la columna papel cruda y toda guía electrónica se pintaba «(sin
+             fecha ⚠)» a 40 píxeles de un chip que mostraba su fecha correcta.
+             Quedan TRES avisos, con remedios distintos — y el tercero existe
+             porque el genérico daba un consejo IMPOSIBLE:
+              · sin fecha (papel)      → guía en papel a la que le falta cargar la
+                fecha; la referencia 52 la exige, se carga en Despachos → Editar.
+              · sin fecha (electrónica)→ el DTE de la guía no trajo documentDate;
+                NO hay nada que cargar en Despachos y la emisión igual funciona.
+              · bloqueada              → guía electrónica trabada ante el SII; NO
+                se arregla tecleando una fecha, hay que resolverla en Despachos.
+             Sin estos avisos el bloqueo aparecía recién al emitir. */
+          <div role="radiogroup" aria-labelledby={`${uid}-guias-rotulo`}
+            className="rounded-lg border overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+            {despachos.map(d => {
+              const fecha = fechaDeGuia(d)
+              return (
+              // Este <label> SÍ es correcto: envuelve UN control (su radio) —
+              // clickear la fila entera marca esa guía, que es lo esperado.
+              <label key={d.id} className="flex items-center flex-wrap gap-x-2 gap-y-0.5 px-3 py-2 text-xs cursor-pointer border-b last:border-b-0 hover:bg-[var(--surface-200)]"
+                style={{ borderColor: 'var(--border)' }}>
+                <input type="radio" name="despacho-a-facturar" checked={despachoId === d.id}
+                  onChange={() => { setDespachoId(d.id); setPreview(null) }} />
+                <span className="font-mono font-semibold" style={{ color: 'var(--text-primary)' }}>{d.numero_despacho}</span>
+                <span style={{ color: 'var(--text-muted)' }}>· Guía {d.numero_guia || '—'}</span>
+                {d.fuente === 'bloqueada' ? (
+                  // Mismo vocabulario que el chip del selector de OC, para que el
+                  // operador reconozca el estado: es el MISMO problema.
+                  <span className="text-amber-500" title="Guía bloqueada en SII — revísala en Despachos antes de facturar">
+                    · ⚠ guía bloqueada en SII
+                  </span>
+                ) : fecha ? (
+                  <span style={{ color: 'var(--text-muted)' }}
+                    title={d.fuente === 'electronica'
+                      ? 'Fecha de emisión de la guía electrónica ante el SII'
+                      : 'Fecha de la guía en papel cargada en Despachos'}>
+                    · {fmtDate(fecha)}
+                    {d.fuente === 'electronica' && (
+                      <span className="ml-1 text-[10px] uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>SII</span>
+                    )}
+                  </span>
+                ) : d.fuente === 'electronica' ? (
+                  /* Guía ELECTRÓNICA cuyo DTE no trajo documentDate: el backend
+                     manda fecha=null con fuente='electronica'. Antes caía en la
+                     rama genérica de abajo y pedía «cárgala en Despachos →
+                     Editar», un remedio IMPOSIBLE: la cascada ya se resolvió por
+                     la rama electrónica, así que escribir la columna papel no
+                     cambia nada — y encima la emisión SÍ funciona (el emisor real
+                     cae a otra fecha). Aviso SOBRIO, sin ámbar y sin instrucción:
+                     un consejo que no arregla nada es peor que ningún consejo. */
+                  <span style={{ color: 'var(--text-faint)' }}
+                    title="La guía electrónica no informa su fecha de emisión. Se puede facturar igual: la fecha de la referencia la resuelve el emisor.">
+                    · sin fecha en el documento
+                    <span className="ml-1 text-[10px] uppercase tracking-wider">SII</span>
+                  </span>
+                ) : (
+                  <span className="text-amber-500" title="La referencia 52 exige la fecha de emisión de la guía: cárgala en Despachos → Editar antes de facturar">
+                    · (sin fecha ⚠)
+                  </span>
+                )}
+                <span style={{ color: 'var(--text-faint)' }}>· {d.items_count} ítem{d.items_count === 1 ? '' : 's'}</span>
+              </label>
+              )
+            })}
+          </div>
+        )}
         <p className="text-[11px] mt-1" style={{ color: 'var(--text-faint)' }}>Solo se listan guías de despacho <b>firmadas</b> (entregadas) y aún no facturadas.</p>
         {despachoId !== '' && (() => {
           const d = despachos.find(x => x.id === Number(despachoId))
@@ -624,7 +801,7 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
             </div>
           )
         })()}
-      </Field>
+      </Campo>
 
       {/* Receptor + RUT (campo por llenar si la venta no lo trae) */}
       {despachoId !== '' && (
@@ -775,7 +952,7 @@ interface AnticipoPrevio { id: number; numero_factura: string | null; monto_brut
 type FacturaDeVenta = { id: number; numero_factura: string | null; monto_bruto: number; es_anticipo?: boolean }
 
 function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
-  const [ocs, setOcs] = useState<OcOpt[]>([])
+  const uid = useId()  // ids únicos para asociar rótulos con widgets compuestos (ver Campo)
   const [ocId, setOcId] = useState<number | ''>('')
   const [adelantos, setAdelantos] = useState<AdelantoVenta[]>([])
   const [adelSel, setAdelSel] = useState<Set<number>>(new Set())
@@ -805,12 +982,6 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
   const [modoSii, setModoSii] = useState(true)
   const [siiPayload, setSiiPayload] = useState<Record<string, any> | null>(null)
   const [siiBusy, setSiiBusy] = useState(false)   // envío en vuelo: el modal no se cierra
-
-  useEffect(() => {
-    contabilidadAPI.listVentas().then(({ data }) =>
-      setOcs(data.map((v: any) => ({ oc_cliente_id: v.oc_cliente_id, numero_oc: v.numero_oc, cliente: v.cliente, cond_pago: v.cond_pago })))
-    ).catch(() => {})
-  }, [])
 
   // Mismo patrón que CrearFacturaModal: el RUT / razón social digitados re-consultan
   // el preview (con debounce) — sin esto, una venta SIN esos datos quedaba
@@ -944,14 +1115,18 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
         Respalda ante el SII un <b>adelanto del cliente</b> antes del despacho. Cuando después factures la guía
         firmada, el sistema le <b>descuenta este anticipo automáticamente</b> para no cobrar dos veces.
       </p>
-      <Field label="Orden de compra (venta)">
+      {/* Campo (div), NO Field (label): mismo widget compuesto que en «Emitir
+          factura» — con <label>, un clic en el rótulo o en el texto de la OC
+          activaba «cambiar» y acá se perdían además el monto neto y los
+          adelantos marcados. */}
+      <Campo label="Orden de compra (venta)" htmlFor={`${uid}-oc-buscar`}>
         {/* setRutDebounced('') SÍNCRONO: sin esto, el RUT de la OC anterior podía
-            quedar "en vuelo" 500ms y filtrarse al preview de la OC nueva */}
-        <select className={inputCls} style={inputStyle} value={ocId} onChange={e => { setOcId(e.target.value ? Number(e.target.value) : ''); setRut(''); setRutDebounced(''); setRazonSocial(''); setRazonDebounced(''); setMontoNeto('') }}>
-          <option value="">Selecciona OC…</option>
-          {ocs.map(o => <option key={o.oc_cliente_id} value={o.oc_cliente_id}>OC {o.numero_oc || o.oc_cliente_id} — {o.cliente}</option>)}
-        </select>
-      </Field>
+            quedar "en vuelo" 500ms y filtrarse al preview de la OC nueva.
+            contexto="anticipo": lista plana SIN semáforo de guías — el anticipo se
+            emite ANTES del despacho, ese semáforo acá sería un dato falso. */}
+        <SelectorOcFactura contexto="anticipo" value={ocId} autoFocus inputId={`${uid}-oc-buscar`}
+          onSelect={o => { setOcId(o ? o.oc_cliente_id : ''); setRut(''); setRutDebounced(''); setRazonSocial(''); setRazonDebounced(''); setMontoNeto('') }} />
+      </Campo>
       {ocId !== '' && adelantos.length > 0 && (
         <div className="rounded-xl border p-3 space-y-1.5" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
           <p className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>Adelantos de esta venta que respalda</p>
@@ -1322,6 +1497,7 @@ function FacturaRow({ f, onChanged, onCobrar, onFactoring, onSii }: { f: Factura
 
 // ─── Página ───────────────────────────────────────────────────────────────────
 export default function FacturasPage() {
+  const qc = useQueryClient()
   const [facturas, setFacturas] = useState<Factura[]>([])
   const [aging, setAging] = useState<Aging | null>(null)
   const [kpis, setKpis] = useState<Kpis | null>(null)
@@ -1346,7 +1522,14 @@ export default function FacturasPage() {
   }, [])
 
   useEffect(() => { load(q || undefined, estado || undefined) }, [estado])
-  const reload = () => load(q || undefined, estado || undefined)
+  // Invalidación CENTRALIZADA del selector de OC: TODOS los onDone/onChanged de la
+  // página pasan por reload (emitir/eliminar factura, cobranzas, factoring, SII),
+  // así que este ÚNICO punto mantiene fresca la caché de /ventas/opciones — tres
+  // invalidaciones dispersas en los modales se desincronizan a la primera refactorización.
+  const reload = () => {
+    qc.invalidateQueries({ queryKey: ['contabilidad', 'ventas-opciones'] })
+    return load(q || undefined, estado || undefined)
+  }
   const handleSearch = (v: string) => { setQ(v); if (v.length === 0 || v.length >= 2) load(v || undefined, estado || undefined) }
 
   return (

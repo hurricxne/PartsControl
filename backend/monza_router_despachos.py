@@ -16,7 +16,8 @@ from monza_models import (
     MonzaCotizacion, MonzaCliente, MonzaCotizacionItem, MonzaDespacho, MonzaDespachoItem,
     MonzaRecepcion, MonzaRecepcionItem, MonzaEmbarque, MonzaEmbarqueItem, MonzaOcProveedor,
 )
-from monza_fechas import business_days_remaining
+from monza_correlativos import siguiente_secuencia
+from monza_fechas import business_days_remaining, hoy_chile, rango_dias
 from pydantic import BaseModel
 from typing import List
 from monza_notif import crear_notif
@@ -459,16 +460,16 @@ def list_despachos(
         .filter(MonzaCotizacion.estado == "despachado")
     )
 
-    if desde:
-        try:
-            query = query.filter(MonzaCotizacion.fecha_despacho >= datetime.fromisoformat(desde).date())
-        except Exception:
-            pass
-    if hasta:
-        try:
-            query = query.filter(MonzaCotizacion.fecha_despacho <= datetime.fromisoformat(hasta).date())
-        except Exception:
-            pass
+    # OJO: fecha_despacho es una columna Date CIVIL (un día, sin hora), así que acá
+    # el `<=` INCLUSIVO es la semántica correcta y NO se aplica el semiabierto UTC de
+    # sus hermanos — copiar aquel patrón rompería un filtro que está sano. Lo único
+    # que cambia es el `except pass` por el 422 de rango_dias: un filtro que el
+    # operador pidió no se ignora en silencio.
+    desde_d, hasta_d = rango_dias(desde, hasta)
+    if desde_d:
+        query = query.filter(MonzaCotizacion.fecha_despacho >= desde_d)
+    if hasta_d:
+        query = query.filter(MonzaCotizacion.fecha_despacho <= hasta_d)
 
     # Buscador con el contrato común (spec 2026-08-05): _filtro_q reemplaza el or_
     # de 5 campos con ilike (que mataba índices y no cubría n° de parte, embarque
@@ -516,10 +517,13 @@ def list_despachos(
 
 @router.get("/kpis")
 def despachos_kpis(db: Session = Depends(get_db), _=Depends(get_current_user)):
-    anio = datetime.utcnow().year
-    mes = datetime.utcnow().month
+    # El mes es el de CHILE: el 31 a las 21:30 de Santiago el servidor (UTC) ya está en
+    # el mes siguiente y las tarjetas «del mes» se vaciaban las últimas 3-4 horas de cada
+    # mes. `fecha_despacho` es una columna Date CIVIL, así que el corte es un `date`
+    # puro y NO `inicio_mes_utc()` — mismo criterio que separa `rango_dias` de `rango_utc`.
     from datetime import date
-    inicio_mes = date(anio, mes, 1)
+    _hoy = hoy_chile()
+    inicio_mes = date(_hoy.year, _hoy.month, 1)
 
     total_count = db.query(func.count(MonzaCotizacion.id)).filter(
         MonzaCotizacion.estado == "despachado"
@@ -572,17 +576,16 @@ def despachos_kpis(db: Session = Depends(get_db), _=Depends(get_current_user)):
 # la cotización ES la venta (no hay OcCliente) y la recepción apunta directo al ítem.
 
 def _gen_num_desp(db):
-    anio = datetime.utcnow().year
-    last = db.query(MonzaDespacho).filter(MonzaDespacho.numero.like(f"DSP-{anio}-%")).order_by(MonzaDespacho.id.desc()).first()
-    n = 0
-    if last and last.numero:
-        # Espejo GA: un sufijo legado no numérico no debe tumbar la creación con 500;
-        # el fallback colisiona con el UNIQUE y el retry lo convierte en 409 controlado.
-        try:
-            n = int(last.numero.split("-")[-1])
-        except (ValueError, TypeError):
-            n = 0
-    return f"DSP-{anio}-{n + 1:04d}"
+    # El año es el de CHILE: entre las 21:00 y la medianoche del 31 de diciembre, UTC
+    # ya está en el año siguiente y el correlativo saltaba de golpe (misma regla que
+    # monza_correlativos, donde vive la versión de referencia).
+    anio = hoy_chile().year
+    # MÁXIMO de la serie, no «la fila con id más alto» (ver monza_correlativos, donde
+    # vive la regla y el porqué). Conserva la tolerancia al sufijo legado no numérico:
+    # el helper ignora esas filas en vez de tumbar la creación con un 500, y el índice
+    # único más el reintento convierten cualquier choque en un 409 controlado.
+    n = siguiente_secuencia(db, MonzaDespacho.numero, f"DSP-{anio}-")
+    return f"DSP-{anio}-{n:04d}"
 
 
 # Estados de recepción cuyas unidades quedan UTILIZABLES en bodega. 'faltante' está
@@ -1336,10 +1339,34 @@ def crear_despacho(body: CrearDespachoBody, db: Session = Depends(get_db), curre
     raise HTTPException(409, "No se pudo crear el despacho (creación simultánea): reintenta")
 
 
+# ── Cortafuego de ADELANTO SIN VERIFICAR en las puertas de SALIDA (2026-08-22) ──
+# El predicado es el MISMO que frena la OC de proveedor en Abastecimiento
+# (monza_router_abastecimiento.py): una venta que exige adelanto (pct_adelanto > 0,
+# incluido el Contado = 100%) y cuyo pago Tesorería todavía no verificó.
+#
+# POR QUÉ TAMBIÉN ACÁ: hasta ahora solo se frenaba la COMPRA, y el resto quedaba
+# cubierto DE REBOTE por el camino físico (sin compra no hay mercadería que despachar).
+# Pero mercadería que llega a bodega por otra vía —una reposición, el remanente de otra
+# línea— podía salir despachada, con guía al SII y facturada, con el pago pendiente.
+# Se replica el helper en cada módulo (patrón ESTADOS_VENTA de la casa) en vez de
+# importarlo: acoplar los módulos aislados por un predicado de 3 líneas sale más caro
+# que mantener las copias con este comentario.
+def _adelanto_sin_verificar(cot) -> bool:
+    return (int(getattr(cot, "pct_adelanto", 0) or 0) > 0
+            and not int(getattr(cot, "adelanto_verificado", 0) or 0))
+
+
 def _crear_despacho_tx(db: Session, body: CrearDespachoBody, current_user):
     cot = db.query(MonzaCotizacion).options(joinedload(MonzaCotizacion.cliente)).filter(MonzaCotizacion.id == body.cotizacion_id).first()
     if not cot:
         raise HTTPException(404, "Cotización no encontrada")
+    if _adelanto_sin_verificar(cot):
+        raise HTTPException(
+            409,
+            f"Adelanto no verificado por Tesorería en {cot.numero} "
+            f"(adelanto {int(cot.pct_adelanto or 0)}%): no se despacha mercadería con el "
+            f"pago pendiente. Tesorería debe registrar el pago recibido.",
+        )
 
     pedidos = body.items if body.items else [CrearDespachoItem(item_id=i) for i in body.item_ids]
     if not pedidos:
@@ -1801,6 +1828,24 @@ def _cerrar_despacho_tx(db: Session, despacho_id: int, current_user):
             .all()
         )
 
+    # ── Cortafuego de adelanto SIN VERIFICAR, también al CERRAR ──────────────────
+    # Crear el despacho es un borrador; CERRARLO es el momento en que la mercadería
+    # sale. Con el guard solo en la creación quedaba una vía real: crear el despacho
+    # con el pago verificado y cerrarlo después de que el adelanto se anulara (o
+    # cerrar un borrador que venía de antes). Se lee con FOR UPDATE porque acá mismo
+    # se decide, más abajo, si la venta pasa a 'despachado' (y con ella el LTV).
+    cot_guard = (db.query(MonzaCotizacion)
+                 .filter(MonzaCotizacion.id == d.cotizacion_id)
+                 .populate_existing().with_for_update().first())
+    if cot_guard is not None and _adelanto_sin_verificar(cot_guard):
+        raise HTTPException(
+            409,
+            f"Adelanto no verificado por Tesorería en {cot_guard.numero} "
+            f"(adelanto {int(cot_guard.pct_adelanto or 0)}%): no se cierra el despacho "
+            f"—la mercadería sale— con el pago pendiente. Tesorería debe registrar el "
+            f"pago recibido.",
+        )
+
     # CERRAR PRIMERO y flush: la cobertura de abajo cuenta SOLO despachos cerrados
     # (incluido este). La línea voltea a 'despachado' únicamente cuando queda
     # cubierta completa — un cierre parcial deja el remanente en bodega.
@@ -1815,13 +1860,37 @@ def _cerrar_despacho_tx(db: Session, despacho_id: int, current_user):
 
     # La VENTA queda 'despachada' solo cuando TODAS sus líneas lo están (igual que
     # el flujo histórico, pero ahora la condición se evalúa al cerrar).
-    cot = db.query(MonzaCotizacion).options(joinedload(MonzaCotizacion.items)).filter(MonzaCotizacion.id == d.cotizacion_id).first()
+    #
+    # FOR UPDATE (2026-08-22): antes se leía sin lock mientras el PATCH administrativo
+    # SÍ la bloquea. Dos caminos concurrentes podían decidir ambos «transición nueva» y
+    # sumar el LTV dos veces — plata real duplicada. Sin joinedload en la query del
+    # lock: un FOR UPDATE con join lockea también las filas de los ítems y ensucia el
+    # orden de locks (los ítems ya están bloqueados más arriba); `cot.items` se resuelve
+    # igual por lazy load.
+    cot = (db.query(MonzaCotizacion)
+           .filter(MonzaCotizacion.id == d.cotizacion_id)
+           .populate_existing().with_for_update().first())
+    venta_recien_despachada = False
     if cot:
         db.flush()
         if cot.items and all(i.estado_linea == "despachado" for i in cot.items):
+            # La TRANSICIÓN es el guard de idempotencia: si la venta ya estaba en
+            # 'despachado' (el PATCH ganó la carrera), no se vuelven a aplicar efectos.
+            venta_recien_despachada = cot.estado != "despachado"
             cot.estado = "despachado"
             if not cot.fecha_despacho:
-                cot.fecha_despacho = datetime.utcnow().date()
+                # Día de CHILE (ver monza_fechas): con utcnow().date() un cierre de
+                # las 21:30 quedaba fechado MAÑANA en una columna civil.
+                cot.fecha_despacho = hoy_chile()
+            if venta_recien_despachada:
+                # LTV al cliente facturado + cierre del lead. Este es el camino REAL de
+                # la operación (el encargado cierra el último despacho): hasta hoy no
+                # aplicaba ningún efecto de venta y el PATCH posterior ya no podía
+                # hacerlo — el LTV casi nunca se sumaba. Import local: monza_router_
+                # cotizaciones importa monza_models, traerlo arriba acoplaría dos
+                # routers en el arranque (patrón de la casa).
+                from monza_router_cotizaciones import aplicar_efectos_venta_despachada
+                aplicar_efectos_venta_despachada(db, cot)
     # UN solo commit con el log adentro (patrón GA): un fallo después del commit
     # dentro de la función reintentada re-entraría la tx, vería el despacho ya
     # cerrado y devolvería un 400 falso por un cierre que SÍ ocurrió.
@@ -1918,9 +1987,20 @@ def _anular_despacho_tx(db: Session, despacho_id: int, current_user):
             if it.estado_linea == "despachado" and qty_total.get(it.id, 0) + 0.001 < (it.cantidad or 0):
                 it.estado_linea = "en_bodega"
         db.flush()
-        cot = db.query(MonzaCotizacion).options(joinedload(MonzaCotizacion.items)).filter(MonzaCotizacion.id == d.cotizacion_id).first()
+        # FOR UPDATE por la misma razón que en cerrar: acá puede DESHACERSE el LTV, y
+        # decidir la transición sobre una lectura sin lock permite que dos caminos
+        # concurrentes la vean ambos y resten dos veces.
+        cot = (db.query(MonzaCotizacion)
+               .filter(MonzaCotizacion.id == d.cotizacion_id)
+               .populate_existing().with_for_update().first())
         if cot and cot.estado == "despachado" and any(i.estado_linea != "despachado" for i in cot.items):
             cot.estado = "vendida"
+            # Reversa SIMÉTRICA del LTV que sumó el cierre. Va acá dentro —en la
+            # TRANSICIÓN efectiva despachado→vendida— y no en el barrido de reparación
+            # de arriba: una venta que ya estaba en 'vendida' nunca sumó nada, y
+            # restarle plata le comería el LTV de sus otras ventas.
+            from monza_router_cotizaciones import revertir_efectos_venta_despachada
+            revertir_efectos_venta_despachada(db, cot)
     # UN solo commit con el log adentro (patrón GA, igual que crear/cerrar).
     from monza_models import MonzaLog
     db.add(MonzaLog(user_email=current_user.email, accion="ANULADO", entidad="despacho", entidad_id=d.id, entidad_ref=d.numero, detalle=f"Despacho {d.numero} anulado (borrador)"))

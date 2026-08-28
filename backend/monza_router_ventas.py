@@ -6,9 +6,28 @@ from datetime import datetime
 
 from database import get_db
 from auth import get_current_user
+from empresa_guard import require_empresa
+from monza_fechas import inicio_mes_utc, rango_utc
 from monza_models import MonzaCotizacion, MonzaCliente
 
-router = APIRouter(prefix="/api/monza/ventas", tags=["monza-ventas"])
+# CANDADO DE EMPRESA a nivel de ROUTER (2026-08-22): el CRM de MonzaParts estaba
+# abierto a cualquier usuario autenticado —incluidos los de minería— mientras
+# Despachos, Bodega y el PATCH de Cotizaciones ya lo tenían desde la auditoría F6.
+# Router COMPLETO (lecturas incluidas): candar solo las escrituras deja la lectura
+# de los datos del cliente como puerta del costado. Ver monza_router_leads.py.
+router = APIRouter(
+    prefix="/api/monza/ventas",
+    tags=["monza-ventas"],
+    dependencies=[Depends(require_empresa("automotriz"))],
+)
+
+# Qué es una VENTA para esta pestaña (arreglos del equipo 2026-08-21): una cotización
+# CERRADA — vendida o ya despachada. Antes el filtro metía propuestas y enviadas (que
+# viven en Cotizaciones) y EXCLUÍA las despachadas, así que una venta desaparecía de la
+# pestaña el día que salía a reparto. Espejo del par de monza_contabilidad/router.py
+# (ESTADOS_VENTA), replicado acá con comentario — patrón de la casa, los routers no se
+# importan entre sí para esto.
+ESTADOS_VENTA = ("vendida", "despachado")
 
 
 @router.get("")
@@ -22,7 +41,8 @@ def list_ventas(
     db: Session = Depends(get_db),
     _=Depends(get_current_user),
 ):
-    # Ventas = cotizaciones vendidas + otras (para seguimiento completo)
+    # Ventas = SOLO cotizaciones cerradas (vendida/despachado); las propuestas y
+    # enviadas se siguen desde la pestaña Cotizaciones. `estado` filtra DENTRO del par.
     query = (
         db.query(MonzaCotizacion)
         .options(
@@ -31,7 +51,7 @@ def list_ventas(
             joinedload(MonzaCotizacion.asesor),
             joinedload(MonzaCotizacion.items),
         )
-        .filter(MonzaCotizacion.estado.in_(["vendida", "propuesta", "enviada"]))
+        .filter(MonzaCotizacion.estado.in_(ESTADOS_VENTA))
     )
 
     if q:
@@ -47,10 +67,21 @@ def list_ventas(
     if estado and estado != "todas":
         query = query.filter(MonzaCotizacion.estado == estado)
 
-    if desde:
-        query = query.filter(MonzaCotizacion.fecha_creacion >= datetime.fromisoformat(desde))
-    if hasta:
-        query = query.filter(MonzaCotizacion.fecha_creacion <= datetime.fromisoformat(hasta))
+    # El operador digita DÍAS DE CHILE y la columna guarda UTC (ver monza_fechas):
+    # rango SEMIABIERTO para que el día `hasta` entre COMPLETO. Antes, «hasta hoy»
+    # comparaba contra la medianoche y escondía todas las ventas del propio día.
+    # Se filtra por `fecha_venta`, NO por `fecha_creacion`: esta pantalla se llama
+    # Ventas, la columna que muestra dice «Vendida» y las tarjetas de arriba cuentan con
+    # fecha_venta. Filtrando por la fecha de la COTIZACIÓN, una venta cotizada en junio y
+    # cerrada en agosto no aparecía al pedir agosto —aparecía al pedir junio, con la
+    # columna diciendo agosto— y el número de la tarjeta no cuadraba con las filas de
+    # abajo. (La lista de Cotizaciones sí debe seguir cortando por fecha_creacion: ahí la
+    # fecha del negocio es cuándo se cotizó.)
+    desde_utc, hasta_utc = rango_utc(desde, hasta)
+    if desde_utc:
+        query = query.filter(MonzaCotizacion.fecha_venta >= desde_utc)
+    if hasta_utc:
+        query = query.filter(MonzaCotizacion.fecha_venta < hasta_utc)
 
     total = query.count()
     items = (
@@ -147,20 +178,26 @@ def _venta_dict(c: MonzaCotizacion) -> dict:
 
 @router.get("/kpis")
 def ventas_kpis(db: Session = Depends(get_db), _=Depends(get_current_user)):
-    anio = datetime.utcnow().year
-    mes = datetime.utcnow().month
-    inicio_mes = datetime(anio, mes, 1)
+    # Mes en curso DE CHILE (monza_fechas): con el corte en UTC, las ventas cerradas
+    # entre las 21:00 y la medianoche del último día caían en el mes siguiente.
+    inicio_mes = inicio_mes_utc()
 
+    # Los DOS KPIs de plata usan el MISMO par que la lista: sin 'despachado', una venta
+    # cerrada y despachada dentro del mes aparecía en la tabla pero no sumaba en las
+    # tarjetas de arriba (ni en el Dashboard, que consume este endpoint). El corte
+    # mensual sigue siendo fecha_venta — despachar no cambia el mes en que se vendió.
     vendidas_mes = db.query(func.count(MonzaCotizacion.id)).filter(
-        MonzaCotizacion.estado == "vendida",
+        MonzaCotizacion.estado.in_(ESTADOS_VENTA),
         MonzaCotizacion.fecha_venta >= inicio_mes,
     ).scalar() or 0
 
     total_mes = db.query(func.sum(MonzaCotizacion.total_bruto)).filter(
-        MonzaCotizacion.estado == "vendida",
+        MonzaCotizacion.estado.in_(ESTADOS_VENTA),
         MonzaCotizacion.fecha_venta >= inicio_mes,
     ).scalar() or 0
 
+    # Solo 'vendida' A PROPÓSITO: el flip a 'despachado' es exactamente lo que saca a
+    # una venta de "pendiente de entrega".
     pendientes_entrega = db.query(func.count(MonzaCotizacion.id)).filter(
         MonzaCotizacion.estado == "vendida",
         MonzaCotizacion.fecha_entrega_est.isnot(None),

@@ -41,6 +41,10 @@ const LINEA_CONFIG: Record<string, { bg: string; color: string; label: string }>
 };
 const ESTADO_COLORS: Record<string, { bg: string; color: string }> = {
   vendida: { bg: "#DCFCE7", color: "#15803D" },
+  // Desde los arreglos del equipo (2026-08-21) la pestaña lista SOLO ventas cerradas
+  // (vendida/despachado): antes las despachadas desaparecían de acá. enviada/propuesta
+  // quedan como respaldo defensivo del chip por si el backend sirviera datos viejos.
+  despachado: { bg: "#E0E7FF", color: "#4338CA" },
   enviada: { bg: "#DBEAFE", color: "#1D4ED8" },
   propuesta: { bg: "#F1F5F9", color: "#475569" },
 };
@@ -158,12 +162,13 @@ export default function MonzaVentasPage() {
               placeholder="Cliente, RUT, OC, N° cotización..."
               style={{ width: "100%", padding: "8px 10px 8px 32px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: dark ? "#0d1321" : "white", color: txt }} />
           </div>
+          {/* Solo estados de VENTA (arreglos del equipo 2026-08-21): propuestas y
+              enviadas viven en la pestaña Cotizaciones, no acá. */}
           <select value={estado} onChange={(e) => setEstado(e.target.value)}
             style={{ padding: "8px 12px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, background: dark ? "#0d1321" : "white", color: txt }}>
-            <option value="todas">Todas</option>
+            <option value="todas">Todas las ventas</option>
             <option value="vendida">Vendida</option>
-            <option value="enviada">Enviada</option>
-            <option value="propuesta">Propuesta</option>
+            <option value="despachado">Despachada</option>
           </select>
           <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: sub }}>
             Desde: <input type="date" value={desde} onChange={(e) => setDesde(e.target.value)}

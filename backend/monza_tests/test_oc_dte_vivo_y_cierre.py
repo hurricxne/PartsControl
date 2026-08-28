@@ -358,12 +358,18 @@ def run():
         original_helper_0 = cot_mod._dte_vivo_de_la_venta
         cot_mod._dte_vivo_de_la_venta = lambda db_, cid: (None, True)
         try:
-            r = _patch(cot_id, oc_cliente="OC-SIN-MODULO-DTE", forma_pago="Contado")
+            # forma_pago "60 días" y no "Contado": desde los arreglos del equipo
+            # (2026-08-21) poner "Contado" a una venta cerrada exige pct 100 (cinturón
+            # Contado⇒100, con suite propia en test_contado_verificacion_e2e). El valor
+            # acá siempre fue incidental — lo que este check pinea es el re-lock.
+            r = _patch(cot_id, oc_cliente="OC-SIN-MODULO-DTE",
+                       forma_pago="60 días contra factura")
             v = _venta_row(cot_id)
             check("5.4 sin la tabla del módulo DTE el PATCH re-toma el lock y termina "
                   "bien (no 500, y el cambio se persiste)",
                   r.status_code == 200 and v["oc"] == "OC-SIN-MODULO-DTE"
-                  and v["forma_pago"] == "Contado", f"{r.status_code} {r.text[:200]} {v}")
+                  and v["forma_pago"] == "60 días contra factura",
+                  f"{r.status_code} {r.text[:200]} {v}")
         finally:
             cot_mod._dte_vivo_de_la_venta = original_helper_0
         _limpiar(db)

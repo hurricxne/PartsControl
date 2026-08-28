@@ -5,10 +5,12 @@ Reglas de negocio clave (aprendidas en producción, ver README):
 - El tipo de traslado lo elige el operador al emitir (TIPOS_TRASLADO; default 1
   "Operación constituye venta"). La guía se valoriza SIEMPRE con IVA y el NETO es
   la cifra ancla (mismos precios que usará la factura después).
-- El nombre de cada línea = la DESCRIPCIÓN limpia recortada a 25 chars (límite
-  SII); el n° de parte va en `code` y la descripción completa aparte (hasta 255).
-  (v2 tras la primera emisión real, folio 136: concatenar parte+descripción
-  duplicaba el dato con `code` y cortaba a media palabra.)
+- El nombre de cada línea (formato v4) = «NUMERO_PARTE Descripción», la parte
+  primero y SIN cortarla jamás, tope 80 (el límite real de NmbItem ante el SII);
+  con ≥6 líneas el PDF de Wasabil imprime SOLO `name` (bota description y code),
+  así que el número de parte tiene que vivir ahí. Historia completa en
+  acortar_nombre. Todo texto de línea pasa por sanitizar_latin1 (el XML del DTE
+  va en ISO-8859-1 y el SII rechaza con «Invalid Character»).
 - La guía SIEMPRE referencia la OC del cliente: tipo 801 con N° OC y FECHA de la
   OC — UNA sola vez: `invoice_reference` lleva SOLO el N° de despacho interno
   (ancla anti doble emisión; Wasabil lo imprime, y con la OC dentro salía
@@ -48,13 +50,25 @@ TIPO_REF_OC = "801"              # referencia SII: Orden de Compra del cliente
 TIPO_REF_GUIA = "52"             # referencia SII: guía de despacho (folio SII de la guía)
 TIPO_REF_ANTICIPO = "33"         # referencia SII: factura (aquí: la de anticipo descontada)
 MAX_REFERENCIAS = 5              # tope de referencias por documento en Wasabil
-NOMBRE_MAX = 25                  # límite del SII para el nombre de línea
+# 80 es el límite REAL de NmbItem ante el SII (Formato DTE v2.5 pág. 37 y XSD
+# maxLength=80). El tope 25 anterior era AUTOIMPUESTO — su comentario decía
+# «límite del SII» y era falso — y salía caro: con ≥6 líneas el PDF de Wasabil
+# entra en modo compacto e imprime SOLO `name` (bota description y code), así
+# que el número de parte desaparecía de la guía impresa.
+NOMBRE_MAX = 80
 DESCRIPCION_MAX = 255            # descripción larga de línea
 REASON_MAX = 90                  # límite del campo reason de una referencia
 CONTACTO_MAX = 80                # receiverContact del DTE
 INVOICE_REF_MAX = 200
 FOLIO_REF_MAX = 18               # límite del SII para el folio de una referencia (N° OC)
 MAX_LINEAS = 60                  # tope de líneas por documento en Wasabil
+# La cuenta emite por la vía SII GRATUITO, que rechaza documentos con más de 10
+# ítems — los 3 únicos documentos fallidos de la historia de la cuenta cayeron
+# exactamente por esto (error real del SII: «Se ha superado la cantidad máxima
+# de detalles/items permitidos... 10 o menos»). Es un tope de la VÍA de emisión,
+# no de Wasabil ni del formato DTE: por eso se AVISA en vez de bloquear (si la
+# cuenta migra a facturación propia con CAF, el tope deja de existir).
+MAX_LINEAS_SII_GRATUITO = 10
 TOL_QTY = 0.001                  # tolerancia de cantidades (unidades)
 NETO_MINIMO_DTE = 1.0            # bajo $1 el neto se emite como $0 y el SII lo rechaza
 
@@ -96,19 +110,110 @@ def parse_fecha_oc(s: Optional[str]) -> Optional[date]:
         return None
 
 
-def acortar_nombre(numero_parte: Optional[str], descripcion: Optional[str]) -> str:
-    """Nombre de línea = la DESCRIPCIÓN limpia, recortada a 25 chars (límite SII).
+# Transliteraciones tipográficas → equivalente latin-1 ANTES del filtro que
+# descarta: son los caracteres «bonitos» que llegan pegados desde Excel/Word en
+# descripciones, y botarlos sin traducir perdería información legible.
+_TRANSLIT_LATIN1 = str.maketrans({
+    "“": '"', "”": '"', "„": '"',   # comillas dobles tipográficas “ ” „
+    "‘": "'", "’": "'", "‚": "'",   # comillas simples tipográficas ‘ ’ ‚
+    "–": "-", "—": "-", "―": "-",   # guiones – — ―
+    "…": "...",                               # puntos suspensivos …
+    "•": "-",                                 # viñeta •
+    "\u00a0": " ",                            # espacio no separable (NBSP, en escape
+                                               # para que ningún editor lo normalice)
+})
 
-    El N° de parte NO se antepone: ya viaja en el campo `code` y se imprime como
-    código en la guía — concatenarlo duplicaba el dato y cortaba la descripción a
-    media palabra (hallazgo de la primera emisión real, folio 136: el nombre salía
-    "ROD-INF-PV351 RODILLO INF"). Sin descripción, el N° de parte es el nombre."""
-    parte = (numero_parte or "").strip()
-    desc = (descripcion or "").strip()
-    if desc:
-        return desc[:NOMBRE_MAX].rstrip()
+
+def sanitizar_latin1(texto: Optional[str]) -> str:
+    """Deja un texto apto para el XML del DTE, que viaja en ISO-8859-1.
+
+    POR QUÉ: el SII rechaza el documento COMPLETO con «Invalid Character» cuando
+    el XML trae un codepoint fuera de ISO-8859-1 (Instructivo de emisión, pág.
+    20) — es la única causa real de rechazo por contenido que está documentada.
+    Primero se transliteran los equivalentes tipográficos (comillas curvas,
+    guiones largos, …) para no perder lo legible; lo que aun así no quepa en
+    latin-1 (emojis, símbolos raros) se DESCARTA, y los espacios repetidos que
+    deje el descarte se colapsan. Las tildes y la ñ SÍ son latin-1 y pasan
+    intactas — esto NO des-acentúa nada.
+
+    REGLA DE SEPARADORES: todo lo que `str.isspace()` reconozca (tabs, saltos,
+    U+000B/U+000C de Word, espacios tipográficos Unicode) se vuelve UN espacio
+    antes de descartar nada — un separador botado en silencio pega palabras en un
+    documento que ya no se corrige. Lo que no es separador ni imprimible (\\x00,
+    \\x01, \\x7f) se descarta SIN espacio."""
+    if not texto:
+        return ""
+    limpio = str(texto).translate(_TRANSLIT_LATIN1)
+    # POR QUÉ ACÁ (ANTES del encode y del filtro de controles): un separador que se
+    # BOTA sin reemplazarlo PEGA dos palabras en un documento IRREVERSIBLE — Word
+    # guarda el Shift+Enter como U+000B y las descripciones se pegan desde Word/PDF
+    # del proveedor, así que «RODILLO\x0bINFERIOR» salía impreso «RODILLOINFERIOR»
+    # en la guía 52 / factura 33 del cliente. Tiene que ir antes del encode porque
+    # `encode('latin-1','ignore')` ya descarta los espacios tipográficos (U+2002
+    # U+2003 U+2009 U+202F U+3000 U+2028) y un filtro posterior nunca los vería.
+    # str.isspace() como predicado cubre la familia completa en UNA regla (C0
+    # \x0b \x0c \x1c-\x1f incluidos) y deja fuera los de ANCHO CERO —U+200B ZWSP,
+    # U+FEFF BOM dan isspace()==False—, que se siguen botando SIN espacio porque
+    # no representan un hueco visual (inyectarlo partiría palabras hoy sanas).
+    limpio = "".join(" " if c.isspace() else c for c in limpio)
+    limpio = limpio.encode("latin-1", "ignore").decode("latin-1")
+    # Resto de controles (\x00-\x1f que NO son separadores, y el DEL \x7f): SON
+    # latin-1 válidos pero ILEGALES en XML 1.0 → el mismo rechazo del SII por otra
+    # puerta. Se descartan sin reemplazo: son basura de control, no huecos. La
+    # excepción de \t\n\r ya no hace falta: llegan acá convertidos en espacio.
+    limpio = "".join(c for c in limpio if 32 <= ord(c) != 127)
+    return " ".join(limpio.split())
+
+
+def _cortar_en_palabra(texto: str, largo: int) -> str:
+    """Recorta `texto` a `largo` sin dejar media palabra: si el corte cae dentro
+    de una palabra, retrocede hasta el espacio anterior. Si el tramo cortado no
+    tiene ningún espacio (una sola palabra más larga que `largo` — caso teórico),
+    corta seco: mejor una palabra trunca que un nombre vacío."""
+    if len(texto) <= largo:
+        return texto
+    cortado = texto[:largo]
+    if texto[largo] != " " and " " in cortado:
+        cortado = cortado.rsplit(" ", 1)[0]
+    return cortado.rstrip()
+
+
+def acortar_nombre(numero_parte: Optional[str], descripcion: Optional[str]) -> str:
+    """Nombre de línea, formato v4: «NUMERO_PARTE Descripción» — la parte va
+    PRIMERO y JAMÁS se corta; si el conjunto excede NOMBRE_MAX (80), se recorta
+    SOLO la descripción, en límite de palabra.
+
+    HISTORIA (cada vuelta salió de papel real):
+      · v1 concatenaba parte+descripción con un tope de 25 y cortaba a media
+        palabra ("ROD-INF-PV351 RODILLO INF" — primera emisión real, folio 136).
+      · v2 movió la parte a `code` y dejó `name` = solo la descripción. Correcto
+        en guías cortas, pero la evidencia de PDFs reales del 2026-08-25 (folio
+        233 vs 234/235) demostró que con ≥6 líneas Wasabil entra en modo
+        compacto e imprime SOLO `name` (bota description y code): las guías
+        salían SIN número de parte, y el dueño lo exige SIEMPRE visible.
+      · v4 vuelve a anteponer la parte, ahora con el tope REAL de NmbItem (80,
+        Formato DTE v2.5 pág. 37 — el 25 era autoimpuesto) y corte limpio.
+
+    La parte se mantiene TAMBIÉN en `code`: el matching del precio congelado y
+    el anti doble emisión no dependen de `name` (usan externalId/code del
+    payload_json local). Ambas piezas pasan por sanitizar_latin1 — el SII
+    rechaza el XML con caracteres fuera de ISO-8859-1."""
+    parte = sanitizar_latin1(numero_parte)
+    desc = sanitizar_latin1(descripcion)
+    if parte and desc:
+        conjunto = f"{parte} {desc}"
+        if len(conjunto) <= NOMBRE_MAX:
+            return conjunto
+        espacio = NOMBRE_MAX - len(parte) - 1   # lo que queda para la descripción
+        if espacio <= 0:
+            # Caso teórico (numero_parte es String(100) en BD): la parte sola ya
+            # llena el tope — la parte manda, la descripción no cabe.
+            return parte[:NOMBRE_MAX].rstrip()
+        return f"{parte} {_cortar_en_palabra(desc, espacio)}".rstrip()
     if parte:
         return parte[:NOMBRE_MAX].rstrip()
+    if desc:
+        return _cortar_en_palabra(desc, NOMBRE_MAX)
     return "ITEM"
 
 
@@ -117,17 +222,6 @@ def cuadratura(neto: float) -> Tuple[int, int, int]:
     neto_d = Decimal(str(neto)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     iva_d = (neto_d * IVA_RATE).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     return int(neto_d), int(iva_d), int(neto_d + iva_d)
-
-
-def _desc_con_parte(numero_parte: Optional[str], descripcion: Optional[str]) -> Optional[str]:
-    """Descripcion de linea de la GUIA con el N de parte al frente, para que sea
-    reconocible en el impreso (el campo `code` no se imprime visible). Tope 255.
-    El nombre (<=25) NO se toca: la correccion del folio 136 sigue vigente.
-    Solo la guia usa esto; la factura mantiene la descripcion sola."""
-    parte = (numero_parte or "").strip()
-    desc = (descripcion or "").strip()
-    combo = f"{parte} - {desc}" if (parte and desc) else (parte or desc)
-    return combo[:DESCRIPCION_MAX].rstrip() or None
 
 
 def armar_lineas(despacho_items: list, precios_por_item: dict) -> Tuple[List[dict], List[str]]:
@@ -161,12 +255,25 @@ def armar_lineas(despacho_items: list, precios_por_item: dict) -> Tuple[List[dic
             continue
         lineas.append({
             "name": acortar_nombre(it.numero_parte, it.descripcion),
-            "description": _desc_con_parte(it.numero_parte, it.descripcion),
-            "code": (it.numero_parte or "").strip() or None,
+            # description también sanitizada: viaja en el mismo XML ISO-8859-1 y un
+            # emoji o comilla tipográfica acá rechaza el DTE igual que en `name`
+            # («Invalid Character»). Mismo tope y misma semántica (None si vacía).
+            "description": sanitizar_latin1(it.descripcion)[:DESCRIPCION_MAX] or None,
+            # code TAMBIÉN sanitizado: un guión largo pegado desde el PDF del proveedor
+            # en el n° de parte rechazaría el DTE completo («Invalid Character») aunque
+            # `name` viaje limpio — misma clase de veneno, otra puerta. El fallback del
+            # precio congelado por n° de parte sanitiza SUS DOS lados (contabilidad.py)
+            # para que payloads viejos (code crudo) y nuevos sigan matcheando.
+            "code": sanitizar_latin1(it.numero_parte) or None,
             # externalId = despacho_item_id: identidad ÚNICA de la línea (permite que la
             # factura tome el precio congelado de ESTA guía con match 1:1, sin depender
             # de que el n° de parte sea único). Wasabil lo acepta como ref del ERP.
             "externalId": str(di.id),
+            # El API REST espera snake_case y DESCARTABA el camelCase en silencio
+            # (verificado 2026-08-25: external_id llegó null en TODOS los documentos
+            # reales). Se mandan AMBOS: el matching local del precio congelado sigue
+            # leyendo `externalId` del payload_json, así que ninguno puede faltar.
+            "external_id": str(di.id),
             "quantity": qty,
             "price": precio,   # precio unitario NETO en CLP (ya redondeado a 2)
         })
@@ -176,6 +283,54 @@ def armar_lineas(despacho_items: list, precios_por_item: dict) -> Tuple[List[dic
         problemas.append(f"El despacho tiene {len(lineas)} líneas y Wasabil acepta máximo "
                          f"{MAX_LINEAS} por documento (divide el despacho)")
     return lineas, problemas
+
+
+def advertencia_lineas_sii_gratuito(n_lineas: int, doc: str = "guía") -> Optional[str]:
+    """Advertencia NO bloqueante cuando el documento lleva más de 10 líneas.
+
+    La cuenta emite por la vía SII GRATUITO y esa vía rechaza documentos con más
+    de 10 ítems: los 3 únicos documentos fallidos de toda la historia de la
+    cuenta cayeron por esto (error real del SII: «Se ha superado la cantidad
+    máxima de detalles/items permitidos... 10 o menos»). Es tope de la VÍA de
+    emisión — no de Wasabil ni del formato DTE —, por eso AVISA en vez de
+    bloquear: si la cuenta migra a facturación propia con CAF, el tope no existe.
+
+    `doc`: "guía" o "factura" (para el mensaje). Devuelve None si no aplica.
+
+    EL CONSEJO DEBE SER EJECUTABLE DESDE DONDE SE LEE. El texto anterior decía
+    «divide el despacho en dos guías / divide la factura en dos documentos» y
+    ninguna de las dos cosas se puede hacer en la pantalla que muestra el aviso:
+      · guía: el operador ya creó el despacho y rotuló la caja; «dividir» significa
+        ANULAR el despacho y rearmar dos — hay que decírselo con esas palabras o,
+        con la caja en la mano, apretará «emitir» igual y quemará el intento.
+      · factura: sale de UNA guía ya emitida e IRREVERSIBLE; no hay ningún control
+        que la divida. Además esta rama solo se alcanza con guía EN PAPEL de más de
+        10 líneas (una 52 electrónica con >10 nunca llegó a tener folio: el SII la
+        rechaza), así que el único camino real es la vía alternativa/manual.
+    El aviso del PICKING (antes de crear el despacho, donde dividir todavía es
+    gratis) lo arma el frontend con `max_lineas_sii_gratuito`, que el detalle de OC
+    expone desde esta misma constante — una sola definición."""
+    if n_lineas <= MAX_LINEAS_SII_GRATUITO:
+        return None
+    if doc == "guía":
+        salida = (
+            "NO EMITAS: cierra esta ventana, anula el despacho (mientras siga en "
+            "preparación y sin guía emitida se puede) y arma dos despachos de máximo "
+            f"{MAX_LINEAS_SII_GRATUITO} líneas cada uno."
+        )
+    else:
+        salida = (
+            "Este documento no cabe en la vía SII gratuito y no se puede dividir "
+            "desde acá (la factura sale de una guía ya emitida). Emítelo por la vía "
+            "alternativa/manual y regístralo en Contabilidad → Facturas con «factura "
+            "ya emitida»."
+        )
+    return (
+        f"La {doc} lleva {n_lineas} líneas y la vía SII gratuito rechaza documentos "
+        f"con más de {MAX_LINEAS_SII_GRATUITO} ítems («Se ha superado la cantidad "
+        "máxima de detalles/items permitidos... 10 o menos» — los únicos rechazos "
+        f"históricos de la cuenta fueron por esto). {salida}"
+    )
 
 
 def armar_guia(*, numero_oc: str, fecha_oc: date, numero_despacho: str,
@@ -234,8 +389,11 @@ def armar_guia(*, numero_oc: str, fecha_oc: date, numero_despacho: str,
     }
     if client_id:
         doc["clientId"] = client_id  # Wasabil autocompleta RUT/razón/giro/dirección/comuna
-    if contacto and contacto.strip():
-        doc["receiverContact"] = contacto.strip()[:CONTACTO_MAX]
+    # Texto libre del operador que viaja en el MISMO XML ISO-8859-1 que las líneas:
+    # un emoji o comilla tipográfica acá rechaza el DTE igual («Invalid Character»).
+    contacto_limpio = sanitizar_latin1(contacto)[:CONTACTO_MAX]
+    if contacto_limpio:
+        doc["receiverContact"] = contacto_limpio
     if receiver_email and receiver_email.strip():
         doc["receiverEmail"] = receiver_email.strip()
         doc["sendEmail"] = True
@@ -581,12 +739,23 @@ def armar_lineas_factura(items: list) -> Tuple[List[dict], List[str]]:
                 f"{it.numero_parte or 'línea ' + str(it.id)}: precio $0 en la factura "
                 "(no debería ocurrir: la emisión se bloquea)")
             continue
+        # Identidad 1:1 de la línea con la factura local (auditoría/cuadratura)
+        ext = str(it.despacho_item_id or f"fi-{it.id}")
         lineas.append({
             "name": acortar_nombre(it.numero_parte, it.descripcion),
-            "description": (it.descripcion or "").strip()[:DESCRIPCION_MAX] or None,
-            "code": (it.numero_parte or "").strip() or None,
-            # Identidad 1:1 de la línea con la factura local (auditoría/cuadratura)
-            "externalId": str(it.despacho_item_id or f"fi-{it.id}"),
+            # description sanitizada: mismo XML ISO-8859-1, mismo riesgo de rechazo
+            # «Invalid Character» que en la guía. Tope y semántica intactos.
+            "description": sanitizar_latin1(it.descripcion)[:DESCRIPCION_MAX] or None,
+            # code TAMBIÉN sanitizado: un guión largo pegado desde el PDF del proveedor
+            # en el n° de parte rechazaría el DTE completo («Invalid Character») aunque
+            # `name` viaje limpio — misma clase de veneno, otra puerta. El fallback del
+            # precio congelado por n° de parte sanitiza SUS DOS lados (contabilidad.py)
+            # para que payloads viejos (code crudo) y nuevos sigan matcheando.
+            "code": sanitizar_latin1(it.numero_parte) or None,
+            "externalId": ext,
+            # AMBAS grafías (ver armar_lineas): el API espera snake_case y botaba el
+            # camelCase en silencio; el matching local sigue leyendo `externalId`.
+            "external_id": ext,
             "quantity": qty,
             "price": precio,
         })

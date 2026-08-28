@@ -39,6 +39,9 @@ interface VentaRow {
   // Total OC − facturado (anticipo incluido). Distinto de por_cobrar_clp, que es
   // el saldo de lo YA facturado. Opcional: tolera respuestas del backend previo.
   por_facturar_clp?: number
+  // Unidades declaradas como faltante de entrega al firmar guías (Σ de la OC).
+  // El backend del listado la emite desde 2026-08-22; opcional para el previo.
+  faltante_declarado?: number
   estado_cobranza: string
   adelantos?: { n: number; por_aprobar: number; aprobado_clp: number; pendiente_aplicar_clp: number }
 }
@@ -66,6 +69,9 @@ interface GuiaRef {
   despacho_id?: number
   despacho_item_id?: number
   guia_firmada?: boolean
+  // Cantidad FIRMADA como recibida (null/ausente = completa). Con firma parcial,
+  // el chip de la guía dice «firmada N de M».
+  qty_firmada?: number | null
   numero_expedicion?: string | null
   guia_firmada_archivo?: string | null
 }
@@ -127,6 +133,10 @@ interface ResumenCobranza {
   // Mercadería físicamente sin facturar (bruto), autoritativa del backend:
   // por_facturar_clp = max(mercaderia_pendiente − anticipo_por_descontar, 0)
   mercaderia_pendiente_clp?: number
+  // Unidades declaradas como FALTANTE de entrega al firmar la(s) guía(s) del
+  // despacho (firma parcial): no se facturan por esas guías. Opcional: tolera
+  // el backend previo que aún no lo manda.
+  faltante_declarado?: number
 }
 interface VentaDetalle {
   oc_cliente_id: number
@@ -293,6 +303,14 @@ function AvanceOc({ detalle }: { detalle: VentaDetalle }) {
         <span><span className="inline-block w-2 h-2 rounded-full bg-emerald-500 mr-1.5" />Cobrado <span style={{ color: 'var(--text-primary)' }}>{fmtClp(cobrado)}</span></span>
         <span><span className="inline-block w-2 h-2 rounded-full bg-blue-400 mr-1.5" />Por cobrar <span style={{ color: 'var(--text-primary)' }}>{fmtClp(r.por_cobrar_clp)}</span></span>
         <span><span className="inline-block w-2 h-2 rounded-full mr-1.5" style={{ backgroundColor: 'var(--surface-300)' }} />Por facturar <span className="text-amber-400">{fmtClp(r.por_facturar_clp)}</span></span>
+        {(r.faltante_declarado || 0) > 0 && (
+          <span
+            className="text-amber-400 font-normal"
+            title="Unidades declaradas como faltante de entrega al firmar la guía: no se facturan por esa guía."
+          >
+            + {r.faltante_declarado} un. faltante declarado
+          </span>
+        )}
         {anticipo > 0 && (
           <span style={{ color: 'var(--text-faint)' }} className="font-normal">
             (mercadería sin facturar {fmtClp(r.mercaderia_pendiente_clp ?? (r.por_facturar_clp || 0) + anticipo)} − anticipo por descontar {fmtClp(anticipo)})
@@ -379,6 +397,14 @@ function PorFacturarSection({ detalle }: { detalle: VentaDetalle }) {
     <div className="px-5 py-3 border-b" style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}>
       <p className="text-[11px] font-semibold uppercase tracking-wider mb-1.5" style={{ color: 'var(--text-faint)' }}>
         Por facturar · <span className="text-amber-400">{fmtClp(r?.por_facturar_clp ?? totalPend)}</span>
+        {(r?.faltante_declarado || 0) > 0 && (
+          <span
+            className="normal-case font-normal text-amber-400"
+            title="Unidades declaradas como faltante de entrega al firmar la guía: no se facturan por esa guía."
+          >
+            {' '}+ {r!.faltante_declarado} un. faltante declarado
+          </span>
+        )}
         {(r?.anticipo_por_descontar_clp || 0) > 0 && (
           <span className="normal-case font-normal" style={{ color: 'var(--text-faint)' }}>
             {' '}(mercadería {fmtClp(r?.mercaderia_pendiente_clp ?? totalPend)} − anticipo {fmtClp(r!.anticipo_por_descontar_clp!)})
@@ -490,7 +516,10 @@ function ItemsPlegables({ items }: { items: VentaItem[] }) {
                       {item.guias.length ? (
                         <span className="inline-flex items-center gap-1">
                           <Truck className="w-3 h-3 text-emerald-400" />
-                          {item.guias.map(g => g.numero_guia || g.numero_despacho).join(', ')}
+                          {item.guias.map(g => (g.numero_guia || g.numero_despacho)
+                            + (g.qty_firmada != null && g.qty_firmada < g.qty_despachada
+                               ? ` (firmada ${g.qty_firmada} de ${g.qty_despachada})` : '')
+                          ).join(', ')}
                         </span>
                       ) : <span className="italic" style={{ color: 'var(--text-faint)' }}>sin despachar</span>}
                     </td>
@@ -553,6 +582,12 @@ function VentaCard({ venta, onUpdated }: { venta: VentaRow; onUpdated: () => voi
               COT-{venta.numero_cotizacion}
             </span>
             <CobranzaBadge estado={venta.estado_cobranza} faltaFacturar={(venta.por_facturar_clp || 0) > 0} />
+            {(venta.faltante_declarado ?? 0) > 0 && (
+              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400"
+                title="Unidades que la guía declaró pero el cliente no recibió (perdidas en la entrega): no se facturan por esa guía. El detalle muestra el motivo.">
+                {venta.faltante_declarado} un. faltante
+              </span>
+            )}
             {venta.adelantos && venta.adelantos.n > 0 && (
               venta.adelantos.por_aprobar > 0
                 ? <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium border bg-amber-500/10 text-amber-400 border-amber-400/20">
