@@ -11,6 +11,8 @@ Bordes: folio manual en el payload (bloquea), receptor incompleto (bloquea),
 anticipo sin folio SII (bloquea), fallo ambiguo → claim → adopción por la
 referencia interna FACT-<id>, fallo del SII → reintento, doble emisión (tope),
 eliminar con DTE emitido (409) / fallido (limpia).
+Tope de la vía SII GRATUITO (>10 ítems): advertencia NO bloqueante que tiene que
+VIAJAR en el payload del preview (sonda conductual, no lectura del fuente).
 
 LIMPIA todo al final. Corre con:
     ./venv/bin/python wasabil_dte/tests/test_facturas_integration.py
@@ -33,6 +35,7 @@ from models.models import (  # noqa: E402
     ContFacturaCliente, ContFacturaClienteItem, ContCobranza, ContAdelanto,
 )
 from wasabil_dte import client as wasabil_client  # noqa: E402
+from wasabil_dte.service import MAX_LINEAS_SII_GRATUITO  # noqa: E402
 from wasabil_dte.models import WasabilDte  # noqa: E402
 from wasabil_dte.router import router as wasabil_router  # noqa: E402
 import wasabil_dte.router as wasabil_router_mod  # noqa: E402
@@ -181,6 +184,50 @@ def _crear_venta(db, *, cantidad=10, precio=10000.0, sufijo="A", con_guia=True,
     db.commit()
     PRECIOS[it.id] = precio
     return cot, oc, desp, it
+
+
+def _crear_venta_n_lineas(db, *, n, sufijo, cantidad=1, precio=10000.0):
+    """Venta de N ítems DISTINTOS en UNA sola guía despachada y firmada.
+
+    `_crear_venta` arma una sola línea y el tope de la vía SII gratuito solo se puede
+    observar contando líneas de verdad: el número que se afirma tiene que salir de
+    mercadería real (N ítems + N ítems de despacho), no de un parámetro del test.
+    """
+    cot = Cotizacion(numero=f"{MARK}-COT-{sufijo}", cliente=f"{MARK} HEPI",
+                     rut_cliente="78.279.030-7")
+    db.add(cot); db.flush()
+    oc = OcCliente(cotizacion_id=cot.id, numero_oc=f"{MARK[:2]}OC-{sufijo}",
+                   fecha_oc="2026-07-01")
+    db.add(oc); db.flush()
+    desp = Despacho(numero_despacho=f"{MARK}-DSP-{oc.id}", oc_cliente_id=oc.id,
+                    estado="despachado", guia_firmada=1, numero_guia=N_GUIA_MANUAL,
+                    # Guía en PAPEL: su fecha de emisión es lo que cita la referencia 52.
+                    fecha_guia=FECHA_GUIA_PAPEL)
+    db.add(desp); db.flush()
+    items = []
+    for k in range(1, n + 1):
+        it = ItemCotizacion(cotizacion_id=cot.id, item_num=k,
+                            numero_parte=f"1R-{k:04d}",
+                            descripcion=f"Filtro de aceite motor {k}",
+                            cantidad=cantidad, estado_item="despachado")
+        db.add(it); db.flush()
+        db.add(DespachoItem(despacho_id=desp.id, item_cotizacion_id=it.id,
+                            qty_despachada=cantidad))
+        PRECIOS[it.id] = precio
+        items.append(it)
+    db.commit()
+    return cot, oc, desp, items
+
+
+def _avisos_tope(preview: dict, canal: str = "advertencias") -> list:
+    """Avisos del tope SII gratuito presentes en `canal` del payload del preview.
+
+    Se busca por «10 ítems» (la constante, no el texto entero): el mensaje se puede
+    reescribir —ya se reescribió una vez para que el consejo fuera ejecutable— sin que
+    la sonda deje de ver el aviso, pero el tope que nombra no puede cambiar en silencio.
+    """
+    return [t for t in (preview.get(canal) or [])
+            if f"{MAX_LINEAS_SII_GRATUITO} ítems" in t]
 
 
 def _limpiar(db):
@@ -496,6 +543,98 @@ def run():
                         json={"oc_cliente_id": oc.id, "despacho_id": desp.id})
         check("6 segunda emisión de la MISMA guía → 409 (nada por facturar)",
               r.status_code == 409, r.text)
+        _limpiar(db)
+
+        # ═══ 7 · TOPE de la vía SII GRATUITO: el aviso VIAJA en el preview de FACTURA ═══
+        # POR QUÉ una sonda CONDUCTUAL: del lado factura este aviso solo estaba pinzado
+        # por `inspect.getsource` — texto fuente, que no ejecuta nada. Envolver el append
+        # en `if False:` dejaba ese check verde y el operador emitía al SII una 33 de 11
+        # ítems que la vía gratuito RECHAZA («Se ha superado la cantidad máxima de
+        # detalles/items permitidos... 10 o menos»): son los 3 únicos documentos fallidos
+        # de toda la historia de la cuenta, y el rechazo llega con el folio YA CONSUMIDO.
+        # Acá se llama al endpoint REAL de preview y se afirma que el aviso llega por el
+        # canal que la pantalla pinta (`advertencias`). Nada se emite: preview no toca el SII.
+
+        # 7.a · 11 líneas VALIDADAS → el aviso llega, y NO bloquea
+        cot, oc, desp, its = _crear_venta_n_lineas(db, n=11, sufijo="G")
+        r = client.post("/api/wasabil/facturas/preview",
+                        json={"oc_cliente_id": oc.id, "despacho_id": desp.id})
+        p = r.json()
+        check("7 preview de una guía de 11 líneas responde 200", r.status_code == 200, r.text)
+        # Si el preview deja de serializar el canal, el aviso existe y NADIE lo ve: el
+        # `.get(...) or []` de más abajo lo leería como "no hay avisos" y callaría el hueco.
+        check("7 el preview SIGUE serializando el canal `advertencias`",
+              isinstance(p.get("advertencias"), list), sorted(p.keys()))
+        check("7 las 11 líneas viajan de verdad (el aviso no es un fantasma)",
+              len(p.get("lineas") or []) == 11, len(p.get("lineas") or []))
+        avisos = _avisos_tope(p)
+        check("7 11 líneas: el aviso del tope LLEGA a advertencias del payload real",
+              len(avisos) == 1, p.get("advertencias"))
+        # El número del aviso tiene que ser el del DOCUMENTO, no un literal ni el largo de
+        # otra colección: si alguien cuenta cualquier otra cosa, acá se ve el número falso.
+        check("7 el aviso nombra el número REAL de líneas del documento",
+              bool(avisos) and "La factura lleva 11 líneas" in avisos[0], avisos)
+        # El consejo tiene que ser el de FACTURA. La factura sale de una guía ya emitida e
+        # irreversible: mandar a «anular el despacho» (el consejo de la guía) es inejecutable
+        # con la mercadería ya entregada y firmada.
+        check("7 el consejo es el de factura (vía manual), no el de guía (anular despacho)",
+              bool(avisos) and "vía alternativa/manual" in avisos[0]
+              and "anula el despacho" not in avisos[0], avisos)
+        check("7 sigue siendo ADVERTENCIA, no bloqueo: puede_emitir True",
+              p["puede_emitir"] is True, p["problemas"])
+        check("7 el aviso NO se cuela en problemas (es tope de la VÍA, no del formato: "
+              "si la cuenta migra a CAF propio deja de existir)",
+              not _avisos_tope(p, "problemas"), p["problemas"])
+        _limpiar(db)
+
+        # 7.b · EL BORDE, sin el cual la sonda no discrimina: con 10 exactas NO avisa.
+        # Acá mueren «avisar siempre» y cualquier tope corrido (>= en vez de >, 20 en vez
+        # de 10): 10 es el máximo que la vía gratuito SÍ acepta.
+        cot, oc, desp, its = _crear_venta_n_lineas(db, n=10, sufijo="H")
+        r = client.post("/api/wasabil/facturas/preview",
+                        json={"oc_cliente_id": oc.id, "despacho_id": desp.id})
+        p = r.json()
+        check("7 10 líneas exactas: NINGÚN aviso de tope", not _avisos_tope(p),
+              p.get("advertencias"))
+        check("7 y son 10 líneas de verdad (el borde se midió donde se dice)",
+              len(p.get("lineas") or []) == 10, len(p.get("lineas") or []))
+        check("7 el caso de 10 sigue pudiendo emitir", p["puede_emitir"] is True, p["problemas"])
+        _limpiar(db)
+
+        # 7.c · LA TRAMPA: 10 líneas de mercadería + descuento de anticipo.
+        # El descuento NO es una línea del DTE —viaja como `discount` porcentual sobre las
+        # positivas, porque el API real rechaza price<0 (ver caso 3)—, pero SÍ es una fila
+        # más en las líneas de DISPLAY del preview. Contar el display en vez de las
+        # VALIDADAS daría 11 y el operador leería «no cabe en la vía gratuito» sobre un
+        # documento que lleva 10 ítems: lo mandaría a la vía manual —trabajo y folio de
+        # otra numeración— por un documento que el SII sí acepta.
+        cot, oc, desp, its = _crear_venta_n_lineas(db, n=10, sufijo="I")
+        ant = ContFacturaCliente(
+            empresa="mineria", oc_cliente_id=oc.id, cotizacion_id=cot.id,
+            es_anticipo=1, fecha_emision=FECHA_GUIA_PAPEL,
+            monto_neto=10000, iva=1900, monto_bruto=11900, saldo=11900)
+        db.add(ant); db.flush()
+        # Folio SII NUMÉRICO (la referencia 33 lo exige) y DERIVADO DEL ID: (empresa,
+        # numero_factura) es UNIQUE en la tabla y esta BD es compartida — un folio fijo
+        # chocaría contra otra corrida o contra datos reales.
+        ant.numero_factura = str(9000000 + ant.id)
+        db.add(ContFacturaClienteItem(factura_id=ant.id, numero_parte="ANTICIPO",
+                                      descripcion="Anticipo OC", cantidad=1,
+                                      precio_unit_neto=10000, total_neto=10000))
+        db.commit()
+        r = client.post("/api/wasabil/facturas/preview",
+                        json={"oc_cliente_id": oc.id, "despacho_id": desp.id})
+        p = r.json()
+        # Esta primera afirmación es la que le da PODER a la siguiente: si el display no
+        # trajera la fila extra, "no avisa" no probaría nada (serían 10 y 10).
+        check("7 con anticipo: el DISPLAY trae 11 filas (10 de mercadería + 1 de descuento)",
+              len(p.get("lineas") or []) == 11 and len(p.get("descuentos") or []) == 1,
+              (len(p.get("lineas") or []), p.get("descuentos")))
+        check("7 pero el DTE lleva 10 ítems: NINGÚN aviso (se cuentan las VALIDADAS, "
+              "el descuento va como `discount` %, no como línea)",
+              not _avisos_tope(p), p.get("advertencias"))
+        check("7 la factura con descuento de anticipo sigue siendo emitible",
+              p["puede_emitir"] is True, p["problemas"])
         _limpiar(db)
 
     finally:

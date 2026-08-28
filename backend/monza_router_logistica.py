@@ -4,21 +4,28 @@ Agrupa items 'preparado' en un Embarque -> 'embarcado'.
 Estados embarque: en_bodega_proveedor -> en_transito -> en_aduana -> en_bodega
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
 
+from monza_correlativos import siguiente_secuencia
+from monza_fechas import hoy_chile
 from database import get_db
 from auth import get_current_user
+from empresa_guard import require_empresa
 from monza_models import (
     MonzaCotizacion, MonzaCotizacionItem, MonzaEmbarque, MonzaEmbarqueItem, MonzaOcProveedor,
 )
 from monza_notif import crear_notif
 
-router = APIRouter(prefix="/api/monza/logistica", tags=["monza-logistica"])
+router = APIRouter(prefix="/api/monza/logistica", tags=["monza-logistica"],
+    # Candado de empresa (hallazgo del equipo de testing 2026-08-27).
+    # Embarques de MonzaParts: mismo dato de negocio que abastecimiento, que ya está candado.
+    dependencies=[Depends(require_empresa("automotriz"))],
+)
 
 ESTADOS_EMB = ["en_bodega_proveedor", "en_transito", "en_aduana", "en_bodega"]
 
@@ -30,21 +37,35 @@ def _log(db, email, accion, entidad, eid=None, ref=None, det=None):
 
 
 def _gen_numero_emb(db):
-    anio = datetime.utcnow().year
-    last = db.query(MonzaEmbarque).filter(MonzaEmbarque.numero.like(f"EMB-{anio}-%")).order_by(MonzaEmbarque.id.desc()).first()
-    n = int(last.numero.split("-")[-1]) + 1 if last and last.numero else 1
+    # El año es el de CHILE: entre las 21:00 y la medianoche del 31 de diciembre, UTC
+    # ya está en el año siguiente y el correlativo saltaba de golpe (misma regla que
+    # monza_correlativos, donde vive la versión de referencia).
+    anio = hoy_chile().year
+    # MÁXIMO de la serie, no «la fila con id más alto» (ver monza_correlativos).
+    n = siguiente_secuencia(db, MonzaEmbarque.numero, f"EMB-{anio}-")
     return f"EMB-{anio}-{n:04d}"
 
 
-def _item_dict(it, cot):
-    ocp = None
-    return {
+def _item_dict(it, cot, ocp=None):
+    # `ocp` es el objeto normalizado del contrato de agrupación (2026-08-17), armado
+    # por el caller con _ocp_dict_agrupacion — o None si la línea no tiene OC (grupo
+    # defensivo "Sin OC" del frontend) o si el caller no agrupa (items de un embarque).
+    # Import LOCAL para no crear ciclo logistica↔abastecimiento a nivel de módulo
+    # (mismo criterio que _crear_embarque_tx; los helpers viven allá porque esta es
+    # la dirección de import que ya existe entre los dos routers).
+    from monza_router_abastecimiento import _claves_plata_peso
+    d = {
         "id": it.id, "cot_numero": cot.numero if cot else None,
         "cliente": cot.cliente.nombre if cot and cot.cliente else None,
         "descripcion": it.descripcion, "numero_parte": it.numero_parte,
         "marca": it.marca, "calidad": it.calidad, "cantidad": it.cantidad,
         "estado_linea": it.estado_linea, "oc_proveedor_id": it.oc_proveedor_id,
+        "ocp": ocp,
     }
+    # Claves ADITIVAS del contrato: plata/peso calculados en el BACKEND, moneda del
+    # ÍTEM, costo NULL → fob_total null (jamás 0 mudo), peso 0/null se preserva.
+    d.update(_claves_plata_peso(it))
+    return d
 
 
 def _emb_dict(db, e: MonzaEmbarque, with_items=False):
@@ -79,7 +100,14 @@ def preparados(q: Optional[str] = Query(None), db: Session = Depends(get_db), _=
     )
     if q:
         query = query.filter((MonzaCotizacionItem.descripcion.ilike(f"%{q}%")) | (MonzaCotizacion.numero.ilike(f"%{q}%")))
-    return [_item_dict(it, it.cotizacion) for it in query.order_by(MonzaCotizacionItem.id).all()]
+    items = query.order_by(MonzaCotizacionItem.id).all()
+    # Agrupación por proveedor (contrato 2026-08-17): OCs en UNA query IN y
+    # completitud en UNA query GROUP BY para todo el listado — nada por-OC en loop.
+    # Import local: ver el comentario de _item_dict.
+    from monza_router_abastecimiento import _ocp_contexto_agrupacion, _ocp_dict_agrupacion
+    ocps, conteos = _ocp_contexto_agrupacion(db, items)
+    ocp_json = {i: _ocp_dict_agrupacion(o, conteos.get(i)) for i, o in ocps.items()}
+    return [_item_dict(it, it.cotizacion, ocp_json.get(it.oc_proveedor_id)) for it in items]
 
 
 # ── KPIs ──────────────────────────────────────────────────────────────────────
@@ -134,6 +162,17 @@ def crear_embarque(body: EmbarqueBody, db: Session = Depends(get_db), current_us
     for _ in range(3):
         try:
             return _crear_embarque_tx(db, body, current_user)
+        except IntegrityError as e:
+            db.rollback()
+            # Choque del CORRELATIVO: desde 2026-08-27 `numero` tiene índice UNIQUE
+            # (migrations/monza_unique_correlativos), así que dos creaciones
+            # simultáneas ya no generan el número duplicado EN SILENCIO — chocan.
+            # Este bucle, que hasta ahora solo reintentaba deadlocks, recalcula y
+            # vuelve a intentar; sin esta rama el UNIQUE convertiría la corrupción
+            # callada en un 500. Cualquier otra violación se propaga: reintentarla
+            # escondería un error real.
+            if "numero" not in str(getattr(e, "orig", e)):
+                raise
         except OperationalError as e:
             db.rollback()
             code = getattr(getattr(e, "orig", None), "args", [None])[0]

@@ -39,6 +39,12 @@ interface LeadItem {
   peso_kg?: number | null;
   markup_pct?: number | null;
   tc_aplicado?: number | null;
+  // Estampa del FLETE de la corrida que calculó este precio (contrato en MonzaLeadItem,
+  // monza_models.py). NULL = ítem nunca recalculado desde que existe la estampa. Con
+  // ella el detalle siembra este modal por subconjunto y acá se detectan las corridas
+  // MIXTAS para avisar antes de que una edición recalcule con el flete equivocado.
+  moneda_tarifa?: string | null;
+  tarifa_aerea?: number | null;
 }
 
 interface CalidadRow {
@@ -230,6 +236,18 @@ export default function MonzaCotizadorModal({ leadId, leadNumero, clienteNombre,
   // al aplicar— para que no puedan divergir.
   const tarifaFlete = cfgEfectivo ? tarifaEfectiva(cfgEfectivo, monedaElegida) : null;
   const faltaTarifa = cfgEfectivo != null && tarifaFlete == null;
+
+  // Corridas MIXTAS: los ítems abiertos traen estampas de flete de corridas distintas
+  // (alemanes en EUR, americanos en USD). Las filas preexistentes conservan su precio,
+  // pero cualquier edición recalcula con el flete de ARRIBA — sin este aviso el precio
+  // se movía por una causa invisible (la lección que el multienjambre 2026-08-08 ya
+  // pagó). Se avisa persistente; la salida limpia es calcular por grupos de flete.
+  const paresEstampa = new Set(
+    items
+      .filter((it) => it.moneda_tarifa && it.tarifa_aerea != null)
+      .map((it) => `${(it.moneda_tarifa || "").toUpperCase()}|${it.tarifa_aerea}`)
+  );
+  const corridasMixtas = paresEstampa.size > 1;
 
   useEffect(() => {
     monzaConfigAPI.get().then((r) => {
@@ -451,6 +469,48 @@ export default function MonzaCotizadorModal({ leadId, leadNumero, clienteNombre,
 
     setApplying(true);
     try {
+      // Las calidades EXTRA nacen primero como ítems PELADOS y entran al MISMO
+      // /aplicar que las demás filas. Antes se creaban por addItem mandando
+      // precio_clp — pero ItemIn no tiene ese campo y Pydantic lo descartaba en
+      // silencio: el ítem "extra" quedaba Sin precio y sin parámetros aunque el
+      // toast dijera lo contrario. /aplicar es la única pluma que persiste precio +
+      // parámetros + estampa de flete, todo resuelto server-side.
+      // Cada addItem lleva SU try/catch: un extra que falle (red, 422) NO puede
+      // impedir que /aplicar corra con lo que sí se construyó — sin esto, los precios
+      // recalculados de los ítems ORIGINALES que el operador ve en pantalla se
+      // perderían por culpa de un extra (hallazgo del veedor frontend). Si /aplicar
+      // fallara después, los extras ya creados quedan visibles como "Sin precio"
+      // (mismo estado del bug viejo) y el toast de error avisa.
+      let extrasFallidos = 0;
+      for (const { ic, cal } of extras) {
+        try {
+          const res = await monzaLeadsAPI.addItem(leadId, {
+            descripcion: ic.item.descripcion,
+            numero_parte: ic.numero_parte || ic.item.numero_parte || undefined,
+            marca: cal.marca || ic.item.marca || undefined,
+            procedencia: cal.procedencia || ic.item.procedencia || undefined,
+            calidad: cal.calidad.toLowerCase(),
+            cantidad: ic.item.cantidad,
+            plazo_entrega: cal.plazo_entrega || undefined,
+          });
+          const creado = res.data as { id: number };
+          payload.push({
+            item_id: creado.id,
+            calidad: cal.calidad.toLowerCase(),
+            marca: cal.marca,
+            procedencia: cal.procedencia,
+            precio_clp: cal.precio_neto || 0,
+            plazo_entrega: cal.plazo_entrega || undefined,
+            numero_parte: ic.numero_parte || undefined,
+            costo: Number(cal.costo) || 0,
+            moneda: cal.moneda,
+            peso_kg: Number(ic.peso_kg) || 0,
+            markup_pct: Number(cal.markup_pct) || 0,
+          });
+        } catch {
+          extrasFallidos += 1;
+        }
+      }
       await monzaCotizadorAPI.aplicar({
         lead_id: leadId, items: payload,
         // El flete elegido para ESTA cotización (uno para todos los ítems): queda
@@ -460,19 +520,11 @@ export default function MonzaCotizadorModal({ leadId, leadNumero, clienteNombre,
         // que un cambio posterior en Configuración no mueva un precio ya ofrecido.
         moneda_tarifa: monedaFlete, tarifa_aerea: tarifaFlete,
       });
-      for (const { ic, cal } of extras) {
-        await monzaLeadsAPI.addItem(leadId, {
-          descripcion: ic.item.descripcion,
-          numero_parte: ic.numero_parte || ic.item.numero_parte || undefined,
-          marca: cal.marca || ic.item.marca || undefined,
-          procedencia: cal.procedencia || ic.item.procedencia || undefined,
-          calidad: cal.calidad.toLowerCase(),
-          cantidad: ic.item.cantidad,
-          precio_clp: cal.precio_neto || 0,
-          plazo_entrega: cal.plazo_entrega || undefined,
-        });
+      if (extrasFallidos > 0) {
+        toast.error(`${extrasFallidos} calidad(es) extra no se pudieron crear — el resto quedó aplicado`);
       }
-      const extraMsg = extras.length > 0 ? ` + ${extras.length} calidad(es) extra creada(s)` : "";
+      const creadas = extras.length - extrasFallidos;
+      const extraMsg = creadas > 0 ? ` + ${creadas} calidad(es) extra creada(s)` : "";
       toast.success(`Precios aplicados al lead${extraMsg}`);
       onApplied();
       onClose();
@@ -533,13 +585,28 @@ export default function MonzaCotizadorModal({ leadId, leadNumero, clienteNombre,
             venta saldría subvaluada sin que se note. Se avisa acá y se bloquea Aplicar
             (el backend además responde 400: el precio de venta lleva dos cinturones). */}
         {faltaTarifa && (
-          <div style={{ padding: "8px 22px", background: "rgba(245,158,11,0.12)", borderBottom: s.cardBd,
-            fontSize: 12, color: "#B45309", display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ padding: "8px 22px", background: s.dark ? "#3f2d0a" : "#FEF3C7", borderBottom: s.cardBd,
+            fontSize: 12, color: s.dark ? "#FDE68A" : "#B45309", display: "flex", alignItems: "center", gap: 8 }}>
             <AlertTriangle size={14} style={{ flexShrink: 0 }} />
             <span>
               No hay <strong>tarifa aérea en {(monedaFlete || "").toUpperCase()}</strong> configurada:
               los precios no se pueden calcular con esta moneda. Cárgala en <strong>Configuración →
               Tarifa aérea por kg ({(monedaFlete || "").toUpperCase()})</strong>, o elige la otra moneda.
+            </span>
+          </div>
+        )}
+
+        {/* Corridas mixtas: aviso persistente (no bloquea). Las filas conservan su
+            precio, pero editar una la recalcula con el flete elegido arriba. */}
+        {corridasMixtas && (
+          <div style={{ padding: "8px 22px", background: s.dark ? "#3f2d0a" : "#FEF3C7", borderBottom: s.cardBd,
+            fontSize: 12, color: s.dark ? "#FDE68A" : "#B45309", display: "flex", alignItems: "center", gap: 8 }}>
+            <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+            <span>
+              Estos ítems se calcularon con <strong>fletes distintos</strong> (corridas por
+              separado). Sus precios se conservan, pero <strong>editar una fila la recalcula
+              con el flete de arriba</strong> ({tarifaFlete ?? "—"} {monedaElegida}/kg). Para
+              re-cotizar sin mezclar, usa «Calcular seleccionados» por grupo de origen.
             </span>
           </div>
         )}

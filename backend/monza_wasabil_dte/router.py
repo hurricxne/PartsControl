@@ -182,6 +182,23 @@ def _estado_dte_bloquea(dte: Optional[MonzaWasabilDte], para_reintento: bool,
             "consulta el estado o resuélvelo en app.wasabil.com")
 
 
+# ── Cortafuego de ADELANTO SIN VERIFICAR en las puertas de SALIDA (2026-08-22) ──
+# El predicado es el MISMO que frena la OC de proveedor en Abastecimiento
+# (monza_router_abastecimiento.py): una venta que exige adelanto (pct_adelanto > 0,
+# incluido el Contado = 100%) y cuyo pago Tesorería todavía no verificó.
+#
+# POR QUÉ TAMBIÉN ACÁ: hasta ahora solo se frenaba la COMPRA, y el resto quedaba
+# cubierto DE REBOTE por el camino físico (sin compra no hay mercadería que despachar).
+# Pero mercadería que llega a bodega por otra vía —una reposición, el remanente de otra
+# línea— podía salir despachada, con guía al SII y facturada, con el pago pendiente.
+# Se replica el helper en cada módulo (patrón ESTADOS_VENTA de la casa) en vez de
+# importarlo: acoplar los módulos aislados por un predicado de 3 líneas sale más caro
+# que mantener las copias con este comentario.
+def _adelanto_sin_verificar(cot) -> bool:
+    return (int(getattr(cot, "pct_adelanto", 0) or 0) > 0
+            and not int(getattr(cot, "adelanto_verificado", 0) or 0))
+
+
 def _preparar_emision(db: Session, despacho_id: int, para_reintento: bool = False) -> dict:
     """Arma y valida TODO lo necesario para emitir (SIN locks: puede llamar a
     Wasabil para resolver la ficha del cliente). Devuelve contexto + `problemas`
@@ -189,6 +206,16 @@ def _preparar_emision(db: Session, despacho_id: int, para_reintento: bool = Fals
     despacho, items_despacho, cot = _cargar_contexto(db, despacho_id)
     problemas: List[str] = []
     advertencias: List[str] = []
+
+    # ── Pago del adelanto (cortafuego de salida) ──
+    # Va entre los `problemas` (bloqueantes) y no como excepción: el preview de la
+    # pantalla los junta todos y el operador ve TODO lo que falta de una vez.
+    if _adelanto_sin_verificar(cot):
+        problemas.append(
+            f"Adelanto no verificado por Tesorería en {cot.numero} "
+            f"(adelanto {int(cot.pct_adelanto or 0)}%): no se emite la guía con el pago "
+            f"pendiente"
+        )
 
     # ── Estado del despacho ──
     if despacho.estado == "anulado":

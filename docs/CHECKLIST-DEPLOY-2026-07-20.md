@@ -24,8 +24,8 @@ idempotentes: correrlos de nuevo no rompe nada (se probó cada uno dos veces).
 > documenta acá, se pone rojo.
 >
 > Y la trampa del `rc=0` —un script que se salta un candado de plata y aun así sale con
-> éxito— quedó documentada para **los 3** scripts a los que les pasa, no solo para
-> tesorería: ver **§1.d-bis** antes de correr §1.e.
+> éxito— quedó documentada para **los 4** scripts a los que les pasa (el 4º entró el
+> 2026-08-27), no solo para tesorería: ver **§1.d-bis** antes de correr §1.e.
 >
 > Actualizado el **2026-08-08**: entraron 3 scripts (`wasabil_compras.init_db`,
 > `monza_wasabil_compras.init_db`, `migrations.monza_cotizacion_cierre`) para las 15 tablas
@@ -37,16 +37,18 @@ idempotentes: correrlos de nuevo no rompe nada (se probó cada uno dos veces).
 ### 1.a · Núcleo y Grupo AM / MachParts — 🔴 SIEMPRE
 
 ```bash
-python -m embarques_pricing.init_db    # 🔴 NUEVO (2026-07-30). Crea configuracion_cotizador.tipo_cambio_eur (+ peso_origen en emb_pricing_item + UNIQUE uq_emb_pricing_gasto_tipo). SIN ESTO: 1054 EN CASCADA — cotizador, ventas, compras, contabilidad, wasabil_dte y pricing leen configuracion_cotizador con SELECT de todas las columnas. Es la línea que más rompe si se salta. ⚠️ LEER LA ÚLTIMA LÍNEA: si emb_pricing_gasto trae líneas duplicadas legadas, el script SALTA el UNIQUE y sale con éxito (rc=0) — ver «Los 3 scripts que pueden saltarse un candado», abajo
+python -m embarques_pricing.init_db    # 🔴 NUEVO (2026-07-30). Crea configuracion_cotizador.tipo_cambio_eur (+ peso_origen en emb_pricing_item + UNIQUE uq_emb_pricing_gasto_tipo). SIN ESTO: 1054 EN CASCADA — cotizador, ventas, compras, contabilidad, wasabil_dte y pricing leen configuracion_cotizador con SELECT de todas las columnas. Es la línea que más rompe si se salta. ⚠️ LEER LA ÚLTIMA LÍNEA: si emb_pricing_gasto trae líneas duplicadas legadas, el script SALTA el UNIQUE y sale con éxito (rc=0) — ver «Los 4 scripts que pueden saltarse un candado», abajo
 python -m recepcion_nacional.init_db   # 🔴 Crea oc_proveedor.tipo_origen + índice (y las 2 tablas de recepción nacional). ⚠️ TRAMPA: las 2 TABLAS se autocrean con create_all, así que el script "parece" opcional — y NO lo es: la COLUMNA no se autocrea, y sin tipo_origen `routers/compras.py` rompe TODA Compras y Seguimiento con 1054
 python -m compras_contab.init_db       # 🔴 cont_compra_item (costeo por ítem) + cont_compra.oc_proveedor_id + FK e índice (vínculo compra ↔ OC de proveedor)
 python -m wasabil_dte.init_db          # 🔴 tabla wasabil_dte (guías 52 + facturas 33) + en_vuelo_desde + UNIQUE por factura y por despacho. Ese UNIQUE es el candado anti DOBLE EMISIÓN al SII: sin él, dos clics pueden emitir dos documentos tributarios reales
-python -m tesoreria.init_db            # 🔴 NUEVO (2026-07-30) el UNIQUE(egreso_id) de conc_conciliacion: respalda en la BD la conciliación 1:1 cargo↔egreso. Trae además conc_* + conciliación de ingresos + adelantos y normaliza cont_factura_cliente.es_anticipo a NOT NULL DEFAULT 0 (con NULLs, MySQL manda el anticipo al final del ORDER BY DESC y la plata del adelanto entraba a la factura equivocada). ⚠️ LEER LA ÚLTIMA LÍNEA: si la tabla trae egresos duplicados legados, el script AVISA, se salta el UNIQUE y sale con éxito (rc=0). Ahí hay que desconciliar el duplicado en Tesorería y volver a correrlo; `deploy/audit_schema.py` lo delata — ver «Los 3 scripts que pueden saltarse un candado», abajo
+python -m tesoreria.init_db            # 🔴 NUEVO (2026-07-30) el UNIQUE(egreso_id) de conc_conciliacion: respalda en la BD la conciliación 1:1 cargo↔egreso. Trae además conc_* + conciliación de ingresos + adelantos y normaliza cont_factura_cliente.es_anticipo a NOT NULL DEFAULT 0 (con NULLs, MySQL manda el anticipo al final del ORDER BY DESC y la plata del adelanto entraba a la factura equivocada). ⚠️ LEER LA ÚLTIMA LÍNEA: si la tabla trae egresos duplicados legados, el script AVISA, se salta el UNIQUE y sale con éxito (rc=0). Ahí hay que desconciliar el duplicado en Tesorería y volver a correrlo; `deploy/audit_schema.py` lo delata — ver «Los 4 scripts que pueden saltarse un candado», abajo
 python migrate_awb_numero.py           # 🔴 columna awb_numero en embarques (N° de AWB escribible y buscable; `awb` guarda el nombre del archivo adjunto, no el número)
 python -m migrations.add_despacho_guia_fields      # 🔴 FALTABA EN ESTE CHECKLIST. guia_firmada + fecha_firma + usuario_firma_id + numero_expedicion en `despachos`. Es LA migración del incidente de julio 2026: venía en el paquete, nadie la corrió, y el 1054 dejó invisibles el detalle de Despachos, su botón "Crear Despacho" y el detalle de Ventas
 python -m migrations.fix_despacho_parcial_estado   # 🔴 repara líneas 'despachado' de despachos parciales legados (si no se corrió antes). No es de esquema: es de DATOS, y sin ella el remanente de una línea parcial queda bloqueado
 python -m migrations.cotizacion_pricing_snapshot   # 🔴 TC congelado: 2 columnas en cotizaciones (sin backfill; ver docs/tc-congelado-cotizacion.md)
 python -m migrations.despacho_fecha_guia           # 🔴 NUEVO (2026-07-30). fecha_guia DATE en `despachos` Y en `monza_despachos` (un solo script, las DOS marcas: no hay que repetirlo en §1.b). Es la fecha de EMISIÓN de la guía en papel, que la factura cita en su referencia 52. SIN ESTO: los modelos ya declaran la columna → SELECT con 1054 «Unknown column despachos.fecha_guia» y se caen la pantalla de Despachos y la emisión de facturas al SII de AMBAS marcas (Bodega NO: sus consultas no leen la entidad despacho completa). Ver docs/fecha-emision-guia-referencia-52.md
+python -m migrations.despacho_qty_firmada          # 🔴 CRÍTICA · NUEVO (2026-08-22). FIRMA PARCIAL de la guía: despacho_items.qty_firmada (FLOAT NULL) + despachos.faltante_motivo (TEXT NULL). Solo Grupo AM. Los modelos ya declaran las columnas → SIN ESTO: cerrar/anular despachos, firmar, FACTURAR y la emisión de guías al SII revientan con 1054 «Unknown column». ⚠️ LA TRAMPA: las bandejas de Despachos y de Bodega SOBREVIVEN (consultan columnas sueltas) — el sistema PARECE sano hasta que alguien cierra un despacho o factura. Idempotente; no toca datos (lo firmado hasta hoy queda NULL = firma completa, que es lo que significaba)
+python -m migrations.despacho_bulto_numero         # 🔴 CRÍTICA · NUEVO (2026-08-25). PICKING & PACKING: despachos.bulto_numero (VARCHAR(50) NULL) — el N° de bulto (caja) en que viaja cada despacho, para el reparto de bultos por OC y el mail al transportista. Solo Grupo AM. El modelo ya declara la columna → SIN ESTO: expandir una OC en Despachos, cerrar, firmar, anular, emitir guías al SII y FACTURAR revientan con 1054 «Unknown column despachos.bulto_numero». ⚠️ MISMA TRAMPA que qty_firmada: el listado de OCs SOBREVIVE (consulta columnas sueltas) — el sistema PARECE sano hasta abrir un detalle o cerrar. Idempotente; no toca datos (los despachos existentes quedan NULL = sin bulto)
 python -m migrations.proveedor_rut                 # 🔴 NUEVO (2026-08-06). proveedores.rut (RUT canónico, llave de cruce del libro de compras del SII) + índice. Los modelos ya declaran la columna → sin esto, cualquier pantalla que lea la entidad Proveedor completa (Compras, Abastecimiento) responde 1054
 python -m wasabil_compras.init_db                  # 🔴 ⛓️ DESPUÉS de tesoreria.init_db (sus FKs apuntan a conc_movimiento; si falta, el script corta con un mensaje en castellano en vez de un errno 150). NUEVO (2026-08-08). Crea las 7 tablas del libro de compras del SII de Grupo AM: sii_libro_doc / sii_libro_sync_run / sii_libro_regla_rut (el espejo) + sii_libro_match / sii_match_run / sii_match_etiqueta_mov / sii_match_config (el matcher banco↔libro). ⚠️ POR QUÉ ES UN SCRIPT Y NO "lo crea el create_all": lo creaba, sí, pero AL REINICIAR — o sea DESPUÉS del §1.e, que corre antes. En el primer deploy el auditor las veía ausentes, salía rc=1 y ordenaba «correr las migraciones», que no existían: un rojo por diseño que enseña a ignorar el rojo. El barrido nocturno corre en su PROPIO job del scheduler (`run_sii_libro_job`, 05:30 America/Santiago — se separó del job de alertas de las 06:00, que no comparte nada con él) y usa el WASABIL_API_TOKEN que ya existe. El matcher corre al importar una cartola y con el botón de la pantalla; DESATENDIDO de noche solo si se prende `SII_MATCHER_NOCTURNO` (§2), que nace APAGADO — igual que la señal RUT-en-glosa en sii_match_config. Ver docs/plan-libro-compras-sii-2026-08-03.md y docs/spec-matcher-banco-libro-2026-08-06.md
 ```
@@ -66,7 +68,7 @@ python -m wasabil_compras.init_db                  # 🔴 ⛓️ DESPUÉS de tes
 > solo consultan columnas que ya existen.
 
 ```bash
-python -m monza_embarques_pricing.init_db          # 🔴 NUEVO (2026-07-30): desconsolidado_clp + bodegaje_clp + costo_agencia_minimo_clp en monza_config (gastos locales por defecto del pricing), más peso_origen en monza_emb_pricing_item y el UNIQUE uq_monza_emb_pricing_gasto_tipo. ⚠️ monza_config es tabla del NÚCLEO Monza: la leen con SELECT de todas las columnas la Configuración, el Cotizador y las Cotizaciones de MonzaParts, y esos 3 routers se montan FUERA del flag → sin esto quedan en 500 CON EL GATE APAGADO. ⚠️ LEER LA ÚLTIMA LÍNEA: si monza_emb_pricing_gasto trae líneas duplicadas legadas, el script SALTA el UNIQUE y sale con éxito (rc=0), y acá el auditor NO lo atrapa con el gate apagado — ver «Los 3 scripts que pueden saltarse un candado», abajo
+python -m monza_embarques_pricing.init_db          # 🔴 NUEVO (2026-07-30): desconsolidado_clp + bodegaje_clp + costo_agencia_minimo_clp en monza_config (gastos locales por defecto del pricing), más peso_origen en monza_emb_pricing_item y el UNIQUE uq_monza_emb_pricing_gasto_tipo. ⚠️ monza_config es tabla del NÚCLEO Monza: la leen con SELECT de todas las columnas la Configuración, el Cotizador y las Cotizaciones de MonzaParts, y esos 3 routers se montan FUERA del flag → sin esto quedan en 500 CON EL GATE APAGADO. ⚠️ LEER LA ÚLTIMA LÍNEA: si monza_emb_pricing_gasto trae líneas duplicadas legadas, el script SALTA el UNIQUE y sale con éxito (rc=0), y acá el auditor NO lo atrapa con el gate apagado — ver «Los 4 scripts que pueden saltarse un candado», abajo
 python -m migrations.monza_guia_firmada_cotizacion # 🔴 FALTABA EN ESTE CHECKLIST. guia_firmada + guia_firmada_archivo en monza_cotizaciones: el modelo las declara, así que sin ellas cualquier INSERT del ORM de cotizaciones Monza falla con "Unknown column"
 python -m migrations.monza_despachos_ciclo_vida    # 🔴 Monza F2: fecha_despacho + numero_expedicion + índice único DSP (ver docs/monza-flujo-bodega-despachos.md)
 python -m migrations.monza_despachos_fecha_firma   # 🔴 NUEVO (2026-08-06). FALTABA EN ESTE CHECKLIST (hallazgo de la revisión adversarial 2026-08-06 — el patrón exacto del incidente 1054 de julio). fecha_firma + usuario_firma_id en monza_despachos ("Marcar guía firmada", paridad con MachParts). El ORM ya declara las columnas y los routers de Despachos Monza se montan FUERA del gate → sin esto, cualquier lectura/escritura de la entidad despacho Monza responde 1054 y la pantalla cae en 500, CON EL GATE APAGADO. Las hermanas guia_firmada/guia_firmada_archivo las crea monza_contabilidad.init_db; esta migración trae las otras dos
@@ -74,10 +76,12 @@ python -m migrations.monza_oc_fecha_fase3          # 🔴 Monza F3: oc_fecha en 
 python -m migrations.monza_moneda_tarifa           # 🔴 Monza F3: moneda_tarifa en monza_cotizaciones (foto de precios completa; sin backfill)
 python -m migrations.monza_notif_alertas           # 🔴 Monza F9: destinatario_rol + severidad + regla en monza_notificaciones (alertas del barrido diario de las 06:00). La tabla YA existe y create_all NO altera tablas existentes → sin esto MySQL responde "Unknown column 'regla'" y **NINGUNA notificación de MonzaParts se crea**: ni las del barrido (proveedor atrasado, venta lista, plazo crítico) ni las instantáneas que hoy funcionan (venta cerrada, despacho confirmado, embarque en tránsito, reclamos de bodega). El backend arranca igual → la falla es SILENCIOSA: la campana se queda vacía
 python -m migrations.monza_cotizador_parametros    # 🔴 NUEVO (2026-08-05). costo/moneda/peso_kg/markup_pct/tc_aplicado en monza_lead_items + moneda_tarifa/tarifa_aerea en monza_leads: la calculadora de precios GUARDA sus parámetros (antes persistía solo precio_clp y al reabrir mostraba el precio como costo en CLP) y la moneda del flete se elige por cotización. ⚠️ Los modelos YA declaran las columnas y Leads se monta FUERA del gate → sin esto la pantalla de Leads de MonzaParts responde 1054 CON EL GATE APAGADO. Sin backfill deliberado: los ítems viejos quedan NULL y la calculadora cae al comportamiento anterior
+python -m migrations.monza_lead_item_flete         # 🔴 NUEVO (2026-08-21/22). ESTAMPA DE FLETE POR ÍTEM (arreglos del equipo): moneda_tarifa + tarifa_aerea en monza_lead_items (el flete de la CORRIDA que calculó cada precio — la calculadora ahora acepta subconjuntos y el par del lead solo retrata la última corrida) + moneda_tarifa en monza_cotizacion_items (la tarifa congelada por línea viaja CON su moneda; sin ella una emisión de corridas mixtas guardaba "4.5" sin decir de qué). ⚠️ Los modelos YA declaran las columnas y Leads/Cotizaciones se montan FUERA del gate → sin esto las pantallas de Leads y Cotizaciones de MonzaParts responden 1054 CON EL GATE APAGADO. Sin backfill deliberado (freeze-forward): lo viejo queda NULL = "ninguna corrida lo recalculó" y todo lector cae al nivel lead/config, como siempre
 python -m migrations.monza_proveedor_rut               # 🔴 NUEVO (2026-08-06). monza_proveedores.rut (RUT canónico, llave de cruce del libro de compras del SII Monza) + índice. El modelo ya declara la columna → sin esto, cualquier pantalla que lea la entidad MonzaProveedor completa (Compras, Abastecimiento) responde 1054. Las 7 tablas monza_sii_* las crea `monza_wasabil_compras.init_db` de §1.c (es 🟡 porque el Libro SII de Monza obedece al gate contable, igual que su pantalla y su Tesorería). El barrido nocturno corre en el MISMO job propio del scheduler (`run_sii_libro_job`, 05:30 America/Santiago) y usa el WASABIL_API_TOKEN_MONZA que ya existe. El matcher Monza corre al importar una cartola y con el botón de la pantalla; DESATENDIDO de noche solo si se prende `SII_MATCHER_NOCTURNO_MONZA` (§2), que nace APAGADO — igual que la señal RUT-en-glosa en monza_sii_match_config. Ver docs/plan-libro-compras-sii-2026-08-03.md y docs/spec-matcher-banco-libro-2026-08-06.md
 python -m migrations.monza_cotizacion_cierre           # 🔴 NUEVO (2026-08-08). Tabla monza_cotizacion_cierre (historial de versiones del cierre de venta, del 2026-08-05): cada re-cierre guarda la FOTO de con qué datos se cerró — OC, fecha, % de adelanto, forma de pago, total. Es del NÚCLEO Monza (la escribe el cierre de venta, que se monta FUERA del gate), así que va 🔴. No es tabla de plata: es auditoría, y sin ella un re-cierre pisa los datos anteriores sin dejar huella. La creaba el create_all del arranque; tiene script para que el auditor del §1.e no salga rojo por diseño
 python -m migrations.monza_tarifa_aerea_por_moneda     # 🔴 NUEVO (2026-08-08). tarifa_aerea_eur_por_kg + tarifa_aerea_usd_por_kg en monza_config: el courier cobra distinto por moneda y hasta ahora elegir USD cotizaba el número de EUR (flete irreal DENTRO del precio de venta). El modelo ya declara las columnas y Configuración/Cotizador se montan FUERA del gate → sin esto responden 1054 CON EL GATE APAGADO. Hace BACKFILL: copia la tarifa vieja a la columna de SU moneda (la que dice moneda_tarifa); la otra queda NULL y la calculadora BLOQUEA al elegirla hasta que se cargue en Configuración — es a propósito, un flete en 0 subvalúa la venta sin que se note. ⚠️ TAREA POST-DEPLOY: cargar esa segunda tarifa en Configuración
 python -m migrations.monza_cliente_sin_oc              # 🔴 NUEVO (2026-08-08). monza_cotizaciones.cliente_sin_oc: venta a CLIENTE PARTICULAR (no emite OC → se usa el N° y la fecha de la cotización como referencia 801 del SII). El modelo ya declara la columna y Cotizaciones/Ventas se montan FUERA del gate → sin esto responden 1054 CON EL GATE APAGADO. Sin backfill: 0 = "se cerró con OC real del cliente", que es lo que pasó con todas las ventas existentes
+python -m migrations.monza_unique_correlativos      # 🔴 NUEVO (2026-08-27). Índice UNIQUE en el `numero` de monza_oc_proveedor y monza_embarques. Esas dos tablas NO lo tenían, así que dos creaciones simultáneas generaban el MISMO número de OC (o de embarque) y lo duplicaban EN SILENCIO: sin error, sin 500, sin log — y a partir de ahí «OCP-2026-0007» dejaba de identificar una compra y pasaba a identificar dos, con el proveedor, la recepción de bodega y el costeo de CxP colgando de un número ambiguo. FAIL-CLOSED: si ya hay números repetidos NO crea el índice, los lista y pide renumerarlos a mano (verificado el 2026-08-27 en desarrollo: 0 duplicados). ⚠️ OJO CON EL ALCANCE: la rama del correlativo se agregó al bucle de `crear_embarque` y al de la compra PARCIAL (la que se usa cuando el operador reduce alguna cantidad). La vía de compra NORMAL —la que corre el 90% de las veces— NO tiene bucle de reintento, así que ahí el choque simultáneo pasa de duplicar el número en silencio a perder la compra con un 500 visible. Es un cambio de fallo deliberado (entre corromper la numeración y perder una operación de forma ruidosa, la casa prefiere lo segundo), pero hay que saberlo: si dos personas compran exactamente a la vez, una recibe error y tiene que repetir. Meterle el reintento a esa vía toca un router del programador y quedó como deuda registrada
 python -m monza_recepcion_nacional.init_db         # 🔴 ⛓️ 1° de 2 (antes de monza_compras_contab). Tablas de recepción nacional + tipo_origen en monza_oc_proveedor. Obligatorio con el gate APAGADO: su router se monta fuera del flag (main.py) y Abastecimiento Monza filtra por tipo_origen
 python -m monza_contabilidad.init_db               # 🔴 ⛓️ ANTES de monza_wasabil_dte (la FK apunta acá). NUEVO (2026-07-30): monza_cont_adelanto.estado — sin él, TODA la Contabilidad y TODA la Tesorería de Monza responden 1054 (lo filtran los lectores de adelantos, sugerencias, aprobaciones, flujo de caja y resumen). Trae además es_anticipo + anticipo_factura_id (factura de ANTICIPO vía B, docs/monza-factura-anticipo.md) y, por eso es 🔴, parchea columnas de tablas del NÚCLEO Monza que se leen con el gate apagado: pct_adelanto / adelanto_verificado / guia_firmada en monza_cotizaciones y guia_firmada en monza_despachos
 python -m monza_wasabil_dte.init_db                # 🔴 ⛓️ DESPUÉS de monza_contabilidad.init_db (FK a monza_cont_factura_cliente). Tabla monza_wasabil_dte (guías 52 Y facturas 33) + factura_id + UNIQUE anti doble emisión. El create_all del arranque NO la crea. Obligatorio con el gate apagado: los guards de anular despacho y de editar la OC la consultan con import local y esos routers se montan siempre (si la tabla falta, el guard se apaga solo y se podría anular un despacho con guía SII viva)
@@ -109,7 +113,7 @@ en el repo** (`Excel grupo am actual/` está en `.gitignore`). Si no lo encuentr
 con `No se encontró ningún .xlsx en …` — fallan fuerte, no en silencio. Se les puede pasar
 la ruta: `python -m compras_contab.import_plan_cuentas "/ruta/al/archivo.xlsx"`.
 
-### 1.d-bis · Los 3 scripts que pueden SALTARSE un candado y salir con éxito
+### 1.d-bis · Los 4 scripts que pueden SALTARSE un candado y salir con éxito
 
 Estos 3 crean un **UNIQUE** que respalda una invariante **de plata**. Si la tabla trae
 duplicados legados, MySQL responde `1062` y —al ir la migración en una sola transacción— el
@@ -122,7 +126,21 @@ siguen**: es la conducta correcta. Lo que hay que saber es que **salen con `rc=0
 | `embarques_pricing.init_db` | `uq_emb_pricing_gasto_tipo` (`emb_pricing_gasto`) | **doble CxP del forwarder** (ver abajo) |
 | `monza_embarques_pricing.init_db` | `uq_monza_emb_pricing_gasto_tipo` (`monza_emb_pricing_gasto`) | lo mismo, en MonzaParts |
 
-**Cómo leer la salida (los 3 se comportan igual):** basta mirar la **ÚLTIMA línea**.
+**El CUARTO caso, agregado el 2026-08-27 — `migrations.monza_unique_correlativos`.** Sale
+con `rc=0` por una razón DISTINTA a los tres de arriba: si la tabla no existe todavía
+imprime «la tabla no existe todavía — nada que hacer» y termina bien, **sin crear el
+índice**. (Con duplicados hace lo correcto: los lista y sale `rc=1`.)
+
+| Script | UNIQUE | Qué se rompe si queda ausente |
+|---|---|---|
+| `migrations.monza_unique_correlativos` | `uq_monza_ocp_numero` y `uq_monza_emb_numero` | dos creaciones simultáneas generan el MISMO N° de OC de proveedor o de embarque y lo duplican EN SILENCIO: el número deja de identificar una compra y el proveedor, la recepción y el costeo de CxP quedan colgando de un número ambiguo |
+
+**Cómo verificarlo:** que la salida diga `uq_monza_ocp_numero creado` (o `ya existe`) y
+**no** «la tabla no existe todavía». Desde el 2026-08-27 hay además un cinturón: los dos
+modelos declaran el UNIQUE, así que **`deploy/audit_schema.py` (§1.e) delata el índice
+ausente** — antes no podía, porque deriva los UNIQUE esperados del modelo y ahí no estaban.
+
+**Cómo leer la salida (los 3 primeros se comportan igual):** basta mirar la **ÚLTIMA línea**.
 
 - Todo aplicado → `Listo (sin migraciones pendientes).` / `init OK (sin migraciones pendientes).`
 - Un paso saltado → la última cosa que se imprime es un **recuadro** de 78 `=` con
@@ -244,7 +262,17 @@ dice a gritos en cada corrida (`[scheduler][libro-sii] SIN WASABIL_API_TOKEN…`
 
 ```bash
 cd frontend-src && npm install && npm run build
+# PUBLICAR el build (dist/ NO viaja en el repo y el docroot es la RAÍZ del repo —
+# ver deploy/README.md §"Frontend"): sin este paso el navegador sigue sirviendo la
+# versión anterior aunque el backend ya esté nuevo.
+cp -r dist/assets/* ../assets/ && cp dist/index.html ../index.html
 ```
+
+> **Rollback (verificado 2026-08-22):** revertir = SOLO el código (checkout del corte
+> anterior + build + publicación + reinicio). Las columnas de las migraciones nuevas NO
+> se dropean: son NULL, sin constraint ni default, y el ORM viejo ni las nombra en sus
+> SELECT/INSERT — quedan inofensivas. Las ventas Contado cerradas en la ventana quedan
+> con pct 100 y siguen su circuito normal de Tesorería.
 
 ## 3.b ⚠️ REQUISITO NUEVO — nivel de aislamiento de MySQL
 
@@ -283,6 +311,69 @@ Verificación rápida post-deploy: login → Despachos
 en preparación) → Contabilidad → Ventas (barra de avance + "Por facturar") →
 Facturas y Cobranzas ("Emitir factura" debe abrir en modo SII con el folio
 "Lo asigna el SII al emitir" y el enlace al registro manual).
+
+### 4.a-bis · ⚠️ AVISO AL DUEÑO — el día del deploy, los números de Ventas Monza SALTAN (y es CORRECCIÓN, no ventas nuevas)
+
+Desde los arreglos del equipo (2026-08-21, `0d9897f`): **(1)** la pestaña Ventas de
+MonzaParts vuelve a mostrar TODAS las ventas históricas en estado `despachado` — antes
+desaparecían de la lista al despacharse; **(2)** las tarjetas del mes suben al contar
+también las despachadas: `vendidas_mes`/`total_mes` en Ventas y Dashboard, y
+`vendidos_mes`/tasa de cierre/`total_cotizado_mes` en Leads. Quien mire el Dashboard esa
+mañana puede leer el salto como ventas nuevas o como bug: **es el conteo corregido**.
+
+**Medición de 2 minutos EN PRODUCCIÓN, antes de reiniciar** (la BD de desarrollo está
+vacía de datos Monza — el delta real solo existe en prod; anotar el antes/después):
+
+```sql
+-- Despachadas que van a REAPARECER en la pestaña Ventas:
+SELECT COUNT(*), COALESCE(SUM(total_bruto),0) FROM monza_cotizaciones WHERE estado='despachado';
+-- Par del mes NUEVO (lo que dirán las tarjetas) vs VIEJO (cambiar el IN por ='vendida'):
+SELECT COUNT(*), COALESCE(SUM(total_bruto),0) FROM monza_cotizaciones
+ WHERE estado IN ('vendida','despachado') AND fecha_venta >= '<día 1 del mes>';
+```
+
+Y el otro aviso operativo del mismo corte: **cada venta CONTADO ahora espera la
+aprobación de Tesorería** antes de que Abastecimiento pueda comprar (entra a la cola por
+el total). El freno es intencional — es el pedido #8 del equipo, no un atasco.
+
+### 4.a-ter · ⚠️ REPARACIÓN DEL LTV DE LOS CLIENTES MONZA (corte 2026-08-27)
+
+**Sin esquema que migrar: es un script de DATOS y va DESPUÉS de reiniciar.** Repara el
+LTV (la plata acumulada que muestra la ficha de cada cliente), que hasta ahora casi nunca
+se sumaba: el camino real de la operación —cerrar el último despacho— no lo acreditaba, y
+la venta cuyo lead se hubiera borrado quedaba sumada sin poder devolverse.
+
+```bash
+cd backend
+python -m migrations.monza_backfill_ltv_despachado --dry-run   # imprime ANTES → DESPUÉS, no escribe
+python -m migrations.monza_backfill_ltv_despachado             # solo tras revisar el dry-run
+```
+
+**AVISO AL DUEÑO:** los LTV de las fichas **SUBEN** ese día. Es plata que un bug nunca
+contó, **no ventas nuevas** — el mismo tipo de salto que el §4.a-bis. Las ventas SIN lead
+también suman ahora, así que el delta es mayor de lo que uno esperaría.
+El script es idempotente (recalcula desde cero): se puede correr las veces que sea.
+
+### 4.a-quater · ⚠️ CENSAR `users.empresa` ANTES de reiniciar (corte 2026-08-27)
+
+Este corte pone candado de empresa a **6 routers Monza más** (Configuración, Logs,
+Notificaciones, Catálogo, Logística y el visor del webhook), además de los que ya lo
+tenían. El candado es por marca: un operador de MonzaParts cuyo usuario esté marcado como
+`mineria` deja de ver esas pantallas —recibe 403— y va a llamar diciendo «se cayó el
+sistema».
+
+```sql
+SELECT email, empresa FROM users ORDER BY empresa, email;
+```
+
+Todo el que trabaje en MonzaParts tiene que figurar con `empresa='automotriz'`. La
+pantalla de Leads ahora explica el 403 en español («tu usuario no tiene acceso a los datos
+de MonzaParts…»), pero las demás siguen mostrando el error genérico.
+
+**Abastecimiento Monza queda A PROPÓSITO sin candado** (decisión del dueño, documentada en
+`monza_router_abastecimiento.py`): la marca minería puede ver costos y precios de las
+líneas de MonzaParts. Si se quiere cerrar, se canda el router COMPLETO — nunca endpoint
+por endpoint, para no dejar mitades.
 
 ### 4.b · ESTRENO del Libro de Compras del SII (módulo nuevo — hacerlo el mismo día)
 

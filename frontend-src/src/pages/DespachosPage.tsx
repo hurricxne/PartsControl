@@ -1,15 +1,42 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import api, { despachosAPI, cotizacionesAPI, cotizadorAPI, comprasAPI, wasabilAPI, abrirDocumento } from '../services/api'
+import type { DespachoDetalle, DespachoItemDetalle, FirmaItemPayload } from '../services/api'
+import {
+  filtrarItems, contarSeleccion, contarMarcadasOcultas, contarLineasQueViajan,
+  fmtQty as fmtQtyPicking,
+  armarResumenBultos, colapsar, esDespachable,
+} from '../picking/picking'
+import type { PickingMatch } from '../picking/picking'
 import {
   Truck, Package, CheckCircle2, AlertCircle, Search, X,
   ChevronRight, ChevronDown, Plus, Trash2, Send,
   FileSpreadsheet, FileText, FileDown, Loader2,
-  Clock, AlertTriangle, Upload, Pencil, Eye, Receipt,
+  Clock, AlertTriangle, Upload, Pencil, Eye, Receipt, Zap,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
-import { hoyLocal } from '../utils/format'
+import { fmtDate, fmtFechaServidor } from '../utils/format'
+
+/**
+ * HOY en Chile, 'YYYY-MM-DD'. ÚNICA fuente del día en esta pantalla.
+ *
+ * POR QUÉ NO `hoyLocal()` (el día del NAVEGADOR, que es lo que había): el
+ * negocio, el servidor y el SII viven en horario de Chile, no en el del PC del
+ * operador. Con un notebook de zona corrida —o con el turno de noche conectado
+ * desde otra zona— la «Fecha del reparto» del mail al transportista y la fecha
+ * de firma de la guía salían con el día equivocado.
+ * `en-CA` es el locale que imprime justamente 'YYYY-MM-DD', y `timeZone` deja
+ * que el runtime resuelva verano/invierno (mismo criterio que el backend con
+ * zoneinfo). Antes esta pantalla tenía DOS formas distintas de «hoy»: esta, solo
+ * en el tope del selector de fecha_guia, y hoyLocal() en todo lo demás.
+ *
+ * NO sirve para decidir si un despacho se cerró hoy: ese veredicto lo da el
+ * servidor (`cerrado_hoy`), el único que conoce la hora real del cierre.
+ */
+const hoyEnChile = (): string =>
+  new Date().toLocaleDateString('en-CA', { timeZone: 'America/Santiago' })
 
 interface DocumentosOc {
   excel_oc: boolean
@@ -78,7 +105,11 @@ interface ProgresoEstados {
 interface OcCard {
   id: number
   cotizacion_id?: number
-  numero_oc: string
+  /** NULLABLE en la BD (OCs legacy sin N°: models.py `Column(String(100))` sin
+   *  nullable=False). Declararlo `string` hacía que TS bendijera interpolaciones
+   *  que imprimían literalmente «OC null» en el texto que se le copia al
+   *  transportista: la identidad se resuelve en cada call site con `#id`. */
+  numero_oc: string | null
   numero_cotizacion?: string
   cliente: string
   rut_cliente?: string
@@ -99,6 +130,83 @@ interface OcCard {
   dias_restantes_critico?: number | null
   estado: 'listo' | 'parcial' | 'completado' | 'pendiente'
   documentos?: DocumentosOc
+  /** Solo tab «listas» (contrato backend 2026-08-26): n° de ítems con disponible
+   *  REAL (recibido − tomado por despachos abiertos) y Σ de esas unidades (float,
+   *  puede ser 0). Ausentes en otras tabs y con backend viejo. */
+  items_despachables?: number
+  unidades_despachables?: number
+  /** Solo tab «listas» y SOLO cuando unidades_despachables es 0 (contrato
+   *  backend 2026-08-27): POR QUÉ no hay cupo. El motivo lo deriva el backend,
+   *  donde vive la fórmula del cupo — la pantalla no lo re-deduce.
+   *  Ausente/null = backend viejo u otra tab → texto neutro, sin culpar a nadie. */
+  motivo_sin_cupo?: 'en_preparacion' | 'despachado' | 'sin_stock' | null
+}
+
+/** Insignia gris «0 un. por despachar»: qué dice y qué hacer, según el MOTIVO.
+ *  Antes había UN solo texto («En despachos abiertos… ciérralos o anúlalos») que
+ *  mentía en dos de los tres casos: con el cupo consumido por un despacho ya
+ *  CERRADO mandaba a anular un documento inanulable (y probablemente ya
+ *  facturado), y con una recepción parcial en reclamo culpaba a despachos que no
+ *  existen. */
+const MOTIVO_SIN_CUPO: Record<string, { label: string; title: string }> = {
+  en_preparacion: {
+    label: 'En despachos abiertos',
+    // Cerrar NO libera cupo (lo consume el despacho); liberar es SOLO anular.
+    title: 'Todo lo recibido ya está tomado por despachos en preparación. Ciérralos para completar el despacho, o anúlalos para liberar cupo.',
+  },
+  despachado: {
+    label: 'Ya despachado',
+    title: 'Todo lo recibido ya se despachó y esos despachos están cerrados (no se anulan). Si el cliente necesita más, la reposición se pide en una cotización nueva.',
+  },
+  sin_stock: {
+    label: 'Falta recepción en bodega',
+    title: 'Lo vendido todavía no llegó a bodega (o está en reclamo al proveedor). No hay nada que anular ni que cerrar: hay que esperar la recepción.',
+  },
+}
+
+/** Sin motivo (backend viejo): se dice el HECHO y nada más — una instrucción
+ *  inventada es peor que ninguna. */
+const MOTIVO_SIN_CUPO_NEUTRO = {
+  label: 'Sin cupo disponible',
+  title: 'No hay unidades despachables ahora mismo en esta OC.',
+}
+
+/** GET /despachos/counts. Los 2 campos nuevos son ADITIVOS (contrato backend
+ *  2026-08-26): opcionales para no romper contra un backend viejo. */
+interface DespachosCounts {
+  ocs_listas: number
+  items_listos: number
+  items_despachados: number
+  /** OCs con al menos 1 unidad despachable AHORA (no tomada por despachos abiertos). */
+  ocs_con_disponible?: number
+  /** Σ unidades despachables ahora (float). */
+  unidades_despachables?: number
+}
+
+// ── Contrato GET /despachos/listo-para-despachar (panel de los KPIs) ──────────
+interface ListoResumenItem {
+  numero_parte: string
+  descripcion: string
+  qty_disponible: number
+  cantidad: number
+}
+
+interface ListoResumenGrupo {
+  oc_cliente_id: number
+  /** Nullable en la BD (OCs legacy sin N°): el header y la búsqueda del «Ir a la
+   *  OC» caen al id — asumirlo string tumbaba la página con setSearch(null). */
+  numero_oc: string | null
+  cliente: string
+  dias_restantes_critico: number | null
+  fecha_entrega: string | null
+  total_unidades: number
+  items: ListoResumenItem[]
+}
+
+interface ListoResumenResponse {
+  hoy: string
+  /** Solo OCs con disponible > 0, YA ordenadas por urgencia en el backend. */
+  grupos: ListoResumenGrupo[]
 }
 
 interface ItemRow {
@@ -134,9 +242,31 @@ interface DespachoRow {
   fecha_creacion?: string
   fecha_despacho?: string
   items_count: number
+  /** Σ unidades declaradas como faltante de entrega al firmar la guía (0 o ausente
+   *  = llegó todo). Lo manda el listado de la OC para pintar el badge ámbar. */
+  faltante_total?: number
+  /** Rótulo de la caja en que viaja este despacho (picking & packing). Texto libre
+   *  ≤50; ""/null = sin rotular (sin chip). Contrato backend 2026-08-25. */
+  bulto_numero?: string | null
+  /** ¿El despacho se cerró HOY, en día de Chile? Lo calcula el SERVIDOR (contrato
+   *  backend 2026-08-27, ADITIVO). La pantalla NO puede deducirlo: `fecha_despacho`
+   *  viaja sin zona y el server corre en UTC, así que compararla contra el reloj
+   *  del navegador fecha «mañana» todo lo cerrado después de las ~21:00 de Chile.
+   *  Ausente = backend viejo → DESCONOCIDO (nunca se asume que ya viajó). */
+  cerrado_hoy?: boolean
 }
 
+/** GET /despachos/{id} más el mismo campo ADITIVO `cerrado_hoy` del contrato
+ *  2026-08-27. Se declara ACÁ y no en services/api.ts porque el reparto de bultos
+ *  es su único consumidor; opcional para que un backend viejo siga compilando y
+ *  corriendo (el `??` del llamador lo degrada a «desconocido»). */
+type DespachoDetalleConCerrado = DespachoDetalle & { cerrado_hoy?: boolean }
+
 interface OcDetail extends OcCard {
+  /** Tope de ítems por documento de la vía «SII gratuito» (10). Lo emite el
+   *  backend desde wasabil_dte.service para que la pantalla no lo hardcodee.
+   *  Ausente = backend viejo: sin aviso (degradación silenciosa, no un 0). */
+  max_lineas_sii_gratuito?: number
   items: ItemRow[]
   despachos: DespachoRow[]
   embarques?: EmbarqueResumen[]
@@ -225,6 +355,34 @@ function Resaltado({ texto, tokens }: { texto?: string | null; tokens: string[] 
   )
 }
 
+/** Campo de una línea bajo el filtro de picking. Acierto literal → reusa
+ *  Resaltado (subraya el fragmento). Acierto por pasada COLAPSADA → el fragmento
+ *  literal no existe en el texto (7T1997 vs 7T-1997), así que se resalta el
+ *  campo COMPLETO (regla de la spec de buscadores 2026-08-05). */
+function CampoFiltrado({
+  texto,
+  query,
+  colapsado,
+}: {
+  texto: string
+  query: string
+  colapsado: boolean
+}) {
+  const q = query.trim()
+  if (!q) return <>{texto}</>
+  if (colapsado) {
+    return (
+      <mark
+        className="rounded px-0.5"
+        style={{ backgroundColor: 'rgba(245, 158, 11, 0.35)', color: 'inherit' }}
+      >
+        {texto}
+      </mark>
+    )
+  }
+  return <Resaltado texto={texto} tokens={[q]} />
+}
+
 const MATCH_LABELS: Record<string, string> = {
   numero_parte: 'n° parte',
   numero_parte_colapsado: 'n° parte (sin guiones)',
@@ -289,7 +447,9 @@ export default function DespachosPage() {
   const [pageSize, setPageSize] = useState(PAGE_SIZE_INICIAL)
   const [expandedOc, setExpandedOc] = useState<number | null>(null)
   const [modalOc, setModalOc] = useState<OcDetail | null>(null)
-  const [firmarId, setFirmarId] = useState<number | null>(null)
+  // Despacho completo (no solo el id): el modal de firma necesita saber si ya
+  // está firmado (re-firma con faltante) y la fecha de firma previa.
+  const [firmarDespacho, setFirmarDespacho] = useState<DespachoRow | null>(null)
   const [firmarDteFolio, setFirmarDteFolio] = useState<string | null>(null)
   const [editDespacho, setEditDespacho] = useState<DespachoRow | null>(null)
   const [editDespachoDteFolio, setEditDespachoDteFolio] = useState<string | null>(null)
@@ -330,6 +490,10 @@ export default function DespachosPage() {
   const setTab = (t: Tab) => {
     setTabState(t)
     setPageSize(PAGE_SIZE_INICIAL)
+    // Cambiar de pestaña CANCELA el scroll perseguidor (irAOcDesdePanel re-arma
+    // el suyo DESPUÉS de llamar acá): un pendiente que sobrevive al cambio de
+    // contexto saltaría a una card vieja en cualquier render futuro.
+    setScrollOcPendiente(null)
     // push (no replace) al cambiar de pestaña: Atrás vuelve a la pestaña anterior.
     setSearchParams(prev => {
       const p = new URLSearchParams(prev)
@@ -339,16 +503,23 @@ export default function DespachosPage() {
     })
   }
 
-  const { data: counts } = useQuery({
+  const { data: counts } = useQuery<DespachosCounts>({
     queryKey: ['despachos', 'counts'],
     queryFn: despachosAPI.getCounts,
     refetchInterval: 60000,
   })
 
+  // Panel «Listo para despachar» (se abre desde los 2 primeros KPIs).
+  const [showListoResumen, setShowListoResumen] = useState(false)
+  // Scroll pendiente al volver del panel con «Ir a la OC»: la card puede no estar
+  // pintada todavía (cambio de tab o búsqueda asíncrona), así que se persigue por
+  // efecto hasta que aparezca en el listado en vez de un setTimeout a ciegas.
+  const [scrollOcPendiente, setScrollOcPendiente] = useState<number | null>(null)
+
   // La guardia de secuencia contra respuestas fuera de orden la da React Query:
   // cada combinación tab+q+page_size es una queryKey distinta y solo se pinta la
   // del estado vigente (por eso el debounce va ANTES de la queryKey, no después).
-  const { data: ocResp, isLoading } = useQuery<OcListResponse>({
+  const { data: ocResp, isLoading, isFetching } = useQuery<OcListResponse>({
     queryKey: ['despachos', 'oc-clientes', tab, qEfectivo, pageSize],
     queryFn: () =>
       api
@@ -360,11 +531,73 @@ export default function DespachosPage() {
   const ocs = ocResp?.items ?? []
   const totalOcs = ocResp?.total ?? 0
 
+  // Tab «listas»: las cards con unidades_despachables === 0 (todo lo recibido ya
+  // está tomado por despachos abiertos) van al FINAL — no son accionables AHORA
+  // y taparían a las que sí lo son. Partición estable con filter (conserva el
+  // orden de urgencia del backend dentro de cada mitad) en vez de sort: el
+  // criterio de urgencia vive en el servidor, acá no se re-compara nada.
+  // Comparación estricta con 0: campo AUSENTE (otras tabs / backend viejo) no
+  // reordena nada.
+  const ocsOrdenadas = useMemo(() => {
+    if (tab !== 'listas') return ocs
+    const sinDisponible = ocs.filter(o => o.unidades_despachables === 0)
+    if (sinDisponible.length === 0) return ocs
+    return [...ocs.filter(o => o.unidades_despachables !== 0), ...sinDisponible]
+  }, [ocs, tab])
+
+  // «Ir a la OC» desde el panel: cerrar, asegurar tab listas y expandir la card.
+  // Si la card no está en la página actual del listado, se setea el buscador con
+  // el N° de OC (el deep-link ?q= ya existe y el backend busca por oc_cliente).
+  // numero_oc es NULLABLE en la BD (OCs legacy): sin el fallback al id,
+  // setSearch(null) reventaba en search.trim() y tumbaba la página entera.
+  const irAOcDesdePanel = (ocId: number, numeroOc: string | null) => {
+    setShowListoResumen(false)
+    if (tab !== 'listas') setTab('listas') // setTab limpia el pendiente; se re-arma abajo
+    const enPagina = tab === 'listas' && ocs.some(o => o.id === ocId)
+    if (!enPagina) {
+      const termino = numeroOc || String(ocId)
+      setSearch(termino)
+      setSearchQ(termino) // saltea el debounce: el operador ya eligió
+    }
+    setExpandedOc(ocId)
+    setScrollOcPendiente(ocId)
+  }
+
+  // El scroll se ejecuta recién cuando la card pedida existe en el DOM (puede
+  // tardar: la búsqueda / el cambio de tab traen la lista del servidor). Si la
+  // query ASIENTA (isFetching → false) y la card no vino, el pendiente se cancela:
+  // jamás un perseguidor eterno esperando una card que no va a llegar. (Editar la
+  // búsqueda a mano o cambiar de tab también lo cancelan, en sus handlers.)
+  useEffect(() => {
+    if (scrollOcPendiente === null) return
+    const el = document.getElementById(`oc-card-${scrollOcPendiente}`)
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      setScrollOcPendiente(null)
+    } else if (!isFetching) {
+      setScrollOcPendiente(null)
+    }
+  }, [scrollOcPendiente, ocs, isFetching])
+
   const { data: ocDetail } = useQuery({
     queryKey: ['despachos', 'oc-detail', expandedOc],
     queryFn: () => (expandedOc ? despachosAPI.getOcDetail(expandedOc) : null),
     enabled: expandedOc !== null,
   })
+
+  // El modal de crear pinta `modalOc` CONGELADO al abrirse. Cuando el crear rebota
+  // con 400 (otro usuario tomó el cupo), el modal invalida ['despachos'] y el
+  // refetch de oc-detail trae el cupo REAL: este efecto se lo pasa al modal sin
+  // cerrar/reabrir — antes el operador reintentaba a ciegas contra el disponible
+  // viejo. Solo se sincroniza la MISMA OC (el detalle expandido podría ser otra),
+  // y JAMÁS se toca selectedItems del modal: lo marcado se conserva y las
+  // cantidades se re-validan al enviar.
+  useEffect(() => {
+    if (!modalOc || !ocDetail) return
+    const fresco = ocDetail as OcDetail
+    if (fresco.id !== modalOc.id || fresco === modalOc) return
+    setModalOc(fresco)
+  }, [ocDetail, modalOc])
 
   const cerrarMut = useMutation({
     mutationFn: (despachoId: number) => despachosAPI.cerrar(despachoId),
@@ -388,19 +621,32 @@ export default function DespachosPage() {
     <div className="space-y-4">
       {/* KPI cards */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {/* Los 2 primeros KPIs usan los campos NUEVOS de /counts (descuentan lo ya
+            tomado por despachos abiertos) y abren el panel «Listo para despachar».
+            Fallback a ocs_listas (misma magnitud: n° de OCs) solo si el backend
+            todavía no manda el campo aditivo. */}
         <KpiCard
           label="OCs Listas"
-          value={counts?.ocs_listas ?? 0}
+          value={counts?.ocs_con_disponible ?? counts?.ocs_listas ?? 0}
           icon={<Package className="w-5 h-5" />}
           color="text-brand-500"
-          sub="Con ítems en bodega"
+          sub="Con un. por despachar"
+          onClick={() => setShowListoResumen(true)}
         />
         <KpiCard
-          label="Items Disponibles"
-          value={counts?.items_listos ?? 0}
+          label="Un. por Despachar"
+          // Sin fallback numérico: con backend viejo (campo ausente) un «0» sería
+          // mentira — y a diferencia del KPI 1, acá no existe otro campo de la
+          // MISMA unidad al que caer. '—' dice honesto «no lo sé».
+          value={
+            typeof counts?.unidades_despachables === 'number'
+              ? fmtQtyPicking(counts.unidades_despachables)
+              : '—'
+          }
           icon={<CheckCircle2 className="w-5 h-5" />}
           color="text-emerald-500"
-          sub="Listos para despacho"
+          sub="Disponibles ahora en bodega"
+          onClick={() => setShowListoResumen(true)}
         />
         <KpiCard
           label="Items Despachados"
@@ -429,12 +675,19 @@ export default function DespachosPage() {
         <input
           type="text"
           value={search}
-          onChange={e => setSearch(e.target.value)}
+          onChange={e => {
+            setSearch(e.target.value)
+            // Editar la búsqueda A MANO cancela el scroll perseguidor del panel:
+            // el operador cambió de objetivo (irAOcDesdePanel setea search por
+            // código, pero re-arma su pendiente DESPUÉS, así que no le afecta).
+            setScrollOcPendiente(null)
+          }}
           onKeyDown={e => {
             if (e.key === 'Enter') setSearchQ(search.trim()) // saltea el debounce
             if (e.key === 'Escape') {
               setSearch('')
               setSearchQ('')
+              setScrollOcPendiente(null)
             }
           }}
           placeholder="N° parte, repuesto, COT, OC, cliente, embarque, N° despacho o guía…"
@@ -445,6 +698,7 @@ export default function DespachosPage() {
             onClick={() => {
               setSearch('')
               setSearchQ('')
+              setScrollOcPendiente(null)
             }}
             className="absolute right-3 top-1/2 -translate-y-1/2 hover:opacity-100 opacity-60"
             style={{ color: 'var(--text-muted)' }}
@@ -499,7 +753,7 @@ export default function DespachosPage() {
               Buscaste «{qEfectivo}»; también busqué «{qEfectivo.replace(/[-\s]/g, '')}» (sin guiones).
             </div>
           )}
-          {ocs.map((oc: OcCard) => (
+          {ocsOrdenadas.map((oc: OcCard) => (
             <OcRow
               key={oc.id}
               oc={oc}
@@ -518,8 +772,8 @@ export default function DespachosPage() {
                   anularMut.mutate(id)
                 }
               }}
-              onFirmarDespacho={(id: number, dteFolio: string | null) => {
-                setFirmarId(id)
+              onFirmarDespacho={(d: DespachoRow, dteFolio: string | null) => {
+                setFirmarDespacho(d)
                 setFirmarDteFolio(dteFolio)
               }}
               onEditDespacho={(d: DespachoRow, dteFolio: string | null) => {
@@ -547,6 +801,14 @@ export default function DespachosPage() {
         </div>
       )}
 
+      {/* Panel resumen «Listo para despachar» (desde los KPIs) */}
+      {showListoResumen && (
+        <ListoParaDespacharModal
+          onClose={() => setShowListoResumen(false)}
+          onIrAOc={irAOcDesdePanel}
+        />
+      )}
+
       {/* Modal crear despacho */}
       {modalOc && (
         <CrearDespachoModal
@@ -559,14 +821,14 @@ export default function DespachosPage() {
         />
       )}
 
-      {/* Modal firmar guía (subir foto firmada) */}
-      {firmarId !== null && (
+      {/* Modal firmar guía (subir foto firmada, con firma parcial por ítem) */}
+      {firmarDespacho !== null && (
         <FirmarGuiaModal
-          despachoId={firmarId}
+          despacho={firmarDespacho}
           dteFolio={firmarDteFolio}
-          onClose={() => setFirmarId(null)}
+          onClose={() => setFirmarDespacho(null)}
           onDone={() => {
-            setFirmarId(null)
+            setFirmarDespacho(null)
             qc.invalidateQueries({ queryKey: ['despachos'] })
           }}
         />
@@ -606,9 +868,12 @@ export default function DespachosPage() {
   )
 }
 
-function KpiCard({ label, value, icon, color, sub }: any) {
-  return (
-    <div className="card p-4">
+// onClick OPCIONAL: con él la card se vuelve un <button> real (teclado + foco
+// gratis) con hint «ver detalle» al hover; sin él sigue siendo el div inerte de
+// siempre (los otros 2 usos no cambian).
+function KpiCard({ label, value, icon, color, sub, onClick }: any) {
+  const contenido = (
+    <>
       <div className="flex items-center justify-between mb-2">
         <span
           className="text-xs uppercase tracking-wider"
@@ -619,8 +884,28 @@ function KpiCard({ label, value, icon, color, sub }: any) {
         <span className={color}>{icon}</span>
       </div>
       <div className={`text-3xl font-bold ${color}`}>{value}</div>
-      <div className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>{sub}</div>
-    </div>
+      <div className="text-xs mt-1 flex items-center justify-between gap-2" style={{ color: 'var(--text-muted)' }}>
+        <span>{sub}</span>
+        {onClick && (
+          <span
+            className="inline-flex items-center gap-0.5 text-[10px] font-semibold opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100 transition-opacity shrink-0"
+            style={{ color: 'var(--text-faint)' }}
+          >
+            ver detalle <ChevronRight className="w-3 h-3" />
+          </span>
+        )}
+      </div>
+    </>
+  )
+  if (!onClick) return <div className="card p-4">{contenido}</div>
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="card p-4 text-left w-full group cursor-pointer hover:bg-[var(--surface-200)] transition-colors"
+    >
+      {contenido}
+    </button>
   )
 }
 
@@ -687,8 +972,31 @@ function OcRow({
     queryFn: () => wasabilAPI.estadoBatch(despachoIds).then(r => r.data),
     enabled: expanded && despachoIds.length > 0,
   })
+  // Desplegable POR DESPACHO: qué ítems viajaron en cada guía. La carga es
+  // perezosa (recién al abrir) y queda cacheada por React Query.
+  const [despachosAbiertos, setDespachosAbiertos] = useState<Record<number, boolean>>({})
+  // Filtro LOCAL de la tabla de ítems de la OC expandida (pendiente del paso 8 de
+  // la spec de buscadores 2026-08-05): mismos helpers y mismo colapsado que el
+  // buscador de picking del modal, para que las dos cajas encuentren lo mismo.
+  const [filtroItems, setFiltroItems] = useState('')
+  const resultadoItems = useMemo(
+    () => filtrarItems<ItemRow>((detail?.items ?? []) as ItemRow[], filtroItems),
+    [detail?.items, filtroItems],
+  )
+  // Reparto de bultos: solo sobre despachos NO anulados (uno anulado nunca viaja).
+  const [showBultos, setShowBultos] = useState(false)
+  const despachosNoAnulados = useMemo(
+    () => ((detail?.despachos ?? []) as DespachoRow[]).filter(d => d.estado !== 'anulado'),
+    [detail?.despachos],
+  )
+  // Texto de la insignia gris «0 un. por despachar». El motivo lo manda el
+  // backend (única fórmula del cupo); acá solo se elige la redacción, y si el
+  // campo no viaja se cae al neutro en vez de acusar a un despacho inexistente.
+  const sinCupo =
+    (oc.motivo_sin_cupo ? MOTIVO_SIN_CUPO[oc.motivo_sin_cupo] : undefined) ?? MOTIVO_SIN_CUPO_NEUTRO
   return (
-    <div className="card overflow-hidden">
+    // id ancla del «Ir a la OC» del panel Listo para despachar (scrollIntoView).
+    <div id={`oc-card-${oc.id}`} className="card overflow-hidden">
       <button
         onClick={onExpand}
         className="w-full p-4 flex items-center gap-4 hover:bg-[var(--surface-200)] transition text-left"
@@ -699,15 +1007,56 @@ function OcRow({
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1 flex-wrap">
             <span className="text-xs text-brand-500 font-mono font-semibold">
-              OC-<Resaltado texto={oc.numero_oc} tokens={qTokens} />
+              {/* numero_oc es NULLABLE (OCs legacy): sin el fallback la insignia
+                  imprimía un «OC-» pelado. Misma convención que el resto de la
+                  pantalla y que el texto del transportista: «OC #<id>». */}
+              {oc.numero_oc
+                ? <>OC-<Resaltado texto={oc.numero_oc} tokens={qTokens} /></>
+                : `OC #${oc.id}`}
             </span>
-            <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${badge.color}`}>
-              {badge.label}
-              {/* Cobertura REAL de la tarjeta: "Listo · 3 de 7 ítems" — con los
-                  campos que el endpoint ya devuelve (encargo del dueño). */}
-              {oc.estado === 'listo' && oc.total_items > 0 &&
-                ` · ${oc.items_en_bodega} de ${oc.total_items} ítems`}
-            </span>
+            {/* Insignia ÚNICA y honesta. Con los campos nuevos (solo viajan en la
+                tab «listas»), se CORRIGE el chip existente — no se agrega un
+                segundo al lado: una sola verdad.
+                - disponible > 0 → verde: qué se puede despachar AHORA (descuenta
+                  lo ya tomado por despachos abiertos).
+                - disponible = 0 → gris slate, JAMÁS rojo/ámbar: el chip informa,
+                  no alarma. El texto y el porqué los pone el MOTIVO que manda el
+                  backend (ver MOTIVO_SIN_CUPO), y no todos los motivos son
+                  buenas noticias: 'en_preparacion' y 'despachado' son trabajo en
+                  curso o terminado, pero 'sin_stock' es mercadería que no llegó
+                  (o está en reclamo al proveedor). El gris es «esto no se
+                  resuelve en esta pantalla», no «esto está bien».
+                En otras tabs los campos no viajan y el chip queda como estaba. */}
+            {typeof oc.items_despachables === 'number' &&
+            typeof oc.unidades_despachables === 'number' ? (
+              oc.unidades_despachables > 0 ? (
+                <span className="text-xs px-2 py-0.5 rounded-full font-semibold inline-flex items-center gap-1 bg-emerald-500/15 text-emerald-500 dark:text-emerald-400">
+                  <Zap className="w-3 h-3" />
+                  {/* «X de Y ítems»: el denominador es el encargo original del
+                      dueño — la cobertura de la OC, no solo lo despachable. */}
+                  Listo · {oc.items_despachables} de {oc.total_items} ítem{oc.total_items === 1 ? '' : 's'} ·{' '}
+                  {fmtQtyPicking(oc.unidades_despachables)} un. por despachar
+                </span>
+              ) : (
+                /* Mensaje HONESTO por motivo (ver MOTIVO_SIN_CUPO): el cupo en 0
+                   puede venir de despachos abiertos, de despachos ya CERRADOS o
+                   de mercadería que no llegó, y cada caso tiene otra salida. */
+                <span
+                  className="text-xs px-2 py-0.5 rounded-full font-semibold bg-slate-500/15 text-slate-500"
+                  title={sinCupo.title}
+                >
+                  {sinCupo.label} · 0 un. por despachar
+                </span>
+              )
+            ) : (
+              <span className={`text-xs px-2 py-0.5 rounded-full font-semibold ${badge.color}`}>
+                {badge.label}
+                {/* Cobertura REAL de la tarjeta: "Listo · 3 de 7 ítems" — con los
+                    campos que el endpoint ya devuelve (encargo del dueño). */}
+                {oc.estado === 'listo' && oc.total_items > 0 &&
+                  ` · ${oc.items_en_bodega} de ${oc.total_items} ítems`}
+              </span>
+            )}
             <MatchBadges match={oc.match} />
             <DiasRestantesBadge
               dias={oc.dias_restantes_critico ?? oc.dias_restantes_oc ?? null}
@@ -718,7 +1067,8 @@ function OcRow({
             <Resaltado texto={oc.cliente} tokens={qTokens} />
           </div>
           <div className="text-xs truncate" style={{ color: 'var(--text-muted)' }}>
-            <Resaltado texto={oc.numero_cotizacion} tokens={qTokens} /> · OC #{oc.numero_oc}
+            {/* numero_oc nullable: sin el fallback esta línea decía «· OC #». */}
+            <Resaltado texto={oc.numero_cotizacion} tokens={qTokens} /> · OC #{oc.numero_oc || oc.id}
             {oc.fecha_oc && ` · ${oc.fecha_oc}`}
             {oc.cond_pago && ` · ${oc.cond_pago}`}
             {oc.fecha_entrega && ` · Entrega: ${oc.fecha_entrega}`}
@@ -767,9 +1117,50 @@ function OcRow({
 
           {/* Items */}
           <div>
-            <div className="text-xs uppercase tracking-wider mb-2" style={{ color: 'var(--text-faint)' }}>
-              Items ({detail.items.length})
+            <div className="flex items-center justify-between gap-3 mb-2 flex-wrap">
+              {/* aria-live: el lector de pantalla anuncia el "N de M" al filtrar. */}
+              <div aria-live="polite" className="text-xs uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>
+                Items ({filtroItems.trim()
+                  ? `${resultadoItems.matches.length} de ${detail.items.length}`
+                  : detail.items.length})
+              </div>
+              {/* Caja chica del filtro local: filtra EXACTAMENTE los dos campos que
+                  promete el placeholder (el placeholder es contrato). */}
+              <div className="relative w-64 max-w-full">
+                <Search
+                  className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none"
+                  style={{ color: 'var(--text-faint)' }}
+                />
+                <input
+                  value={filtroItems}
+                  onChange={e => setFiltroItems(e.target.value)}
+                  onKeyDown={e => {
+                    // Esc limpia el filtro y nada más (acá no hay modal que cerrar).
+                    if (e.key === 'Escape') {
+                      e.preventDefault()
+                      setFiltroItems('')
+                    }
+                  }}
+                  placeholder="Buscar por N° de parte o descripción"
+                  className="input py-1 pl-8 pr-7 text-xs"
+                />
+                {filtroItems !== '' && (
+                  <button
+                    onClick={() => setFiltroItems('')}
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-[var(--surface-300)]"
+                    style={{ color: 'var(--text-faint)' }}
+                    title="Limpiar filtro"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
             </div>
+            {filtroItems.trim() !== '' && resultadoItems.huboColapsado && (
+              <div className="text-[11px] mb-1.5" style={{ color: 'var(--text-muted)' }}>
+                también busqué <span className="font-mono font-semibold">{resultadoItems.queryColapsada}</span>
+              </div>
+            )}
             <div className="border rounded-xl overflow-x-auto" style={{ borderColor: 'var(--border)' }}>
               <table className="w-full text-sm">
                 <thead style={{ backgroundColor: 'var(--surface-200)' }}>
@@ -786,19 +1177,45 @@ function OcRow({
                   </tr>
                 </thead>
                 <tbody>
-                  {detail.items.map((it: ItemRow) => {
+                  {filtroItems.trim() !== '' && resultadoItems.matches.length === 0 && (
+                    <tr>
+                      <td colSpan={9} className="p-4 text-center">
+                        <span className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+                          No está en esta OC
+                        </span>
+                      </td>
+                    </tr>
+                  )}
+                  {resultadoItems.matches.map((m: PickingMatch<ItemRow>) => {
+                    const it = m.item
                     const yaDespachado = it.estado_item === 'despachado'
                     return (
                       <tr key={it.id} className="border-t" style={{ borderColor: 'var(--border)' }}>
-                        <td className="p-2 font-mono text-xs text-brand-500">{it.numero_parte}</td>
-                        <td className="p-2" style={{ color: 'var(--text-primary)' }}>{it.descripcion}</td>
+                        <td className="p-2 font-mono text-xs text-brand-500">
+                          <CampoFiltrado
+                            texto={it.numero_parte}
+                            query={filtroItems}
+                            colapsado={m.porColapsado && m.camposColapsados.includes('numero_parte')}
+                          />
+                        </td>
+                        <td className="p-2" style={{ color: 'var(--text-primary)' }}>
+                          <CampoFiltrado
+                            texto={it.descripcion}
+                            query={filtroItems}
+                            colapsado={m.porColapsado && m.camposColapsados.includes('descripcion')}
+                          />
+                        </td>
                         <td className="p-2 text-xs" style={{ color: 'var(--text-muted)' }}>{it.marca}</td>
                         <td className="p-2 text-right" style={{ color: 'var(--text-primary)' }}>{it.cantidad}</td>
                         <td className="p-2 text-right" style={{ color: 'var(--text-muted)' }}>{it.qty_despachada}</td>
                         <td className="p-2 text-right">
+                          {/* esDespachable y no `> 0`: mismo umbral que el backend
+                              (0.001), para que la celda no se pinte en verde por un
+                              residuo flotante que la insignia de la card ya declaró
+                              «0 un. por despachar». */}
                           <span
-                            className={it.qty_disponible > 0 ? 'text-emerald-500 font-semibold' : ''}
-                            style={it.qty_disponible > 0 ? undefined : { color: 'var(--text-faint)' }}
+                            className={esDespachable(it.qty_disponible) ? 'text-emerald-500 font-semibold' : ''}
+                            style={esDespachable(it.qty_disponible) ? undefined : { color: 'var(--text-faint)' }}
                           >
                             {it.qty_disponible}
                           </span>
@@ -829,24 +1246,56 @@ function OcRow({
           {/* Despachos */}
           {detail.despachos.length > 0 && (
             <div>
-              <div className="text-xs uppercase tracking-wider mb-2" style={{ color: 'var(--text-faint)' }}>
-                Despachos ({detail.despachos.length})
+              <div className="flex items-center justify-between gap-3 mb-2">
+                <div className="text-xs uppercase tracking-wider" style={{ color: 'var(--text-faint)' }}>
+                  Despachos ({detail.despachos.length})
+                </div>
+                {despachosNoAnulados.length > 0 && (
+                  <button
+                    onClick={() => setShowBultos(true)}
+                    className="px-3 py-1.5 text-xs rounded-lg hover:bg-[var(--surface-300)] flex items-center gap-1 font-semibold border"
+                    style={{ color: 'var(--text-muted)', borderColor: 'var(--border)' }}
+                    title="Cómo se reparten las guías en los bultos de esta OC (texto listo para el transportista)"
+                  >
+                    <Package className="w-3 h-3" /> Bultos
+                  </button>
+                )}
               </div>
               <div className="space-y-2">
                 {detail.despachos.map((d: DespachoRow) => {
                   const dte = (dtes as any)[d.id]
+                  const abierto = !!despachosAbiertos[d.id]
                   return (
                   <div
                     key={d.id}
-                    className="flex items-center justify-between p-3 border rounded-xl"
+                    className="border rounded-xl overflow-hidden"
                     style={{ backgroundColor: 'var(--surface-200)', borderColor: 'var(--border)' }}
                   >
+                  <div className="flex items-center justify-between p-3 gap-2">
+                    <button
+                      onClick={() => setDespachosAbiertos(p => ({ ...p, [d.id]: !p[d.id] }))}
+                      className="p-1 rounded-lg hover:bg-[var(--surface-300)] shrink-0 self-start mt-0.5"
+                      style={{ color: 'var(--text-faint)' }}
+                      title={abierto ? 'Ocultar los ítems de este despacho' : 'Ver los ítems de este despacho'}
+                    >
+                      {abierto ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                    </button>
                     <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-mono text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
                           {d.numero_despacho}
                         </span>
                         <DespachoEstadoBadge estado={d.estado} />
+                        {/* Rótulo del bulto (caja física del empaque). "" o null = sin chip. */}
+                        {(d.bulto_numero || '').trim() !== '' && (
+                          <span
+                            className="text-[10px] font-semibold px-2 py-0.5 rounded-full"
+                            style={{ backgroundColor: 'var(--surface-300)', color: 'var(--text-muted)' }}
+                            title="Bulto (caja) en que viaja este despacho"
+                          >
+                            📦 {d.bulto_numero}
+                          </span>
+                        )}
                         {dte?.estado === 'emitido' && (
                           <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-blue-500/15 text-blue-600 dark:text-blue-400 inline-flex items-center gap-1">
                             <Receipt className="w-3 h-3" /> Guía SII {dte.folio}
@@ -861,6 +1310,16 @@ function OcRow({
                         {d.guia_firmada && (
                           <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1">
                             <CheckCircle2 className="w-3 h-3" /> Guía firmada
+                          </span>
+                        )}
+                        {/* Faltante de ENTREGA declarado al firmar: unidades de la guía
+                            que no llegaron. No se facturan por esta guía. */}
+                        {(d.faltante_total ?? 0) > 0 && (
+                          <span
+                            className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 inline-flex items-center gap-1"
+                            title="Unidades de la guía que no llegaron al cliente (declaradas al firmar). No se facturan por esta guía. Abre el despacho para ver el motivo."
+                          >
+                            <AlertTriangle className="w-3 h-3" /> faltante: {d.faltante_total}
                           </span>
                         )}
                         {/* Guía EN PAPEL sin fecha de emisión: la factura al SII se va a
@@ -891,7 +1350,7 @@ function OcRow({
                             se interpreta en UTC y en Chile muestra el día anterior. */}
                         {d.fecha_guia && ` (${d.fecha_guia.slice(0, 10).split('-').reverse().join('-')})`}
                         {d.numero_expedicion && ` · Exp: ${d.numero_expedicion}`}
-                        {d.fecha_despacho && ` · ${new Date(d.fecha_despacho).toLocaleDateString('es-CL')}`}
+                        {d.fecha_despacho && ` · ${fmtFechaServidor(d.fecha_despacho)}`}
                       </div>
                     </div>
                     <div className="flex flex-wrap gap-2 shrink-0 items-center justify-end">
@@ -948,10 +1407,21 @@ function OcRow({
                       )}
                       {d.estado === 'despachado' && !d.guia_firmada && (
                         <button
-                          onClick={() => onFirmarDespacho(d.id, folioParaModal(dtesListos, dte))}
+                          onClick={() => onFirmarDespacho(d, folioParaModal(dtesListos, dte))}
                           className="px-3 py-1.5 text-xs bg-blue-500/15 text-blue-600 dark:text-blue-400 rounded-lg hover:bg-blue-500/25 flex items-center gap-1 font-semibold"
                         >
                           <CheckCircle2 className="w-3 h-3" /> Marcar guía firmada
+                        </button>
+                      )}
+                      {/* Re-firma: ya firmada CON faltante — se pueden corregir las
+                          cantidades (el backend valida contra lo ya facturado). */}
+                      {d.estado === 'despachado' && Boolean(d.guia_firmada) && (
+                        <button
+                          onClick={() => onFirmarDespacho(d, folioParaModal(dtesListos, dte))}
+                          className="px-3 py-1.5 text-xs bg-amber-500/15 text-amber-600 dark:text-amber-400 rounded-lg hover:bg-amber-500/25 flex items-center gap-1 font-semibold"
+                          title="Corregir las cantidades firmadas o el motivo del faltante"
+                        >
+                          <Pencil className="w-3 h-3" /> Editar firma
                         </button>
                       )}
                       {dte && dte.estado !== 'emitido' && !dte.puede_reintentar && (
@@ -993,14 +1463,19 @@ function OcRow({
                       )}
                     </div>
                   </div>
+                  {abierto && <DespachoItemsDetalle despachoId={d.id} />}
+                  </div>
                   )
                 })}
               </div>
             </div>
           )}
 
-          {/* Action */}
-          {detail.items.some((it: ItemRow) => it.qty_disponible > 0) && (
+          {/* Action — el gate usa la MISMA regla de cupo que el modal y que el
+              backend (esDespachable, tolerancia 0.001): con `> 0` un residuo
+              flotante dejaba el botón encendido sobre una OC que la insignia y
+              el panel ya daban por sin cupo. */}
+          {detail.items.some((it: ItemRow) => esDespachable(it.qty_disponible)) && (
             <div className="space-y-1.5">
               <button
                 onClick={onCrearDespacho}
@@ -1013,6 +1488,120 @@ function OcRow({
               </p>
             </div>
           )}
+        </div>
+      )}
+
+      {showBultos && detail && (
+        <RepartoBultosModal
+          oc={detail}
+          despachos={despachosNoAnulados}
+          onClose={() => setShowBultos(false)}
+        />
+      )}
+    </div>
+  )
+}
+
+// ─── Desplegable: ítems de UN despacho (GET /despachos/{id}) ──────────────────
+// Qué viajó en esta guía y, si la firma fue parcial, cuánto llegó y por qué.
+// Degrada con gracia: un backend previo que no manda qty_firmada / facturado
+// pinta la tabla sin esas columnas.
+function DespachoItemsDetalle({ despachoId }: { despachoId: number }) {
+  const { data: detalle, isLoading, isError } = useQuery<DespachoDetalle>({
+    queryKey: ['despachos', 'detalle', despachoId],
+    queryFn: () => despachosAPI.get(despachoId),
+  })
+
+  if (isLoading) {
+    return (
+      <div className="px-3 py-2 border-t text-xs flex items-center gap-2" style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
+        <Loader2 className="w-3.5 h-3.5 animate-spin" /> Cargando los ítems del despacho…
+      </div>
+    )
+  }
+  if (isError || !detalle) {
+    return (
+      <div className="px-3 py-2 border-t text-xs" style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
+        No se pudieron cargar los ítems del despacho. Cierra y vuelve a abrir el detalle.
+      </div>
+    )
+  }
+  const items = detalle.items ?? []
+  if (items.length === 0) {
+    return (
+      <div className="px-3 py-2 border-t text-xs" style={{ borderColor: 'var(--border)', color: 'var(--text-faint)' }}>
+        Este despacho no tiene detalle de ítems disponible.
+      </div>
+    )
+  }
+  const conFirma = items.some(it => it.qty_firmada !== undefined)
+  const conFacturado = items.some(it => it.facturado !== undefined)
+  const faltanteTotal = detalle.faltante_total ?? 0
+  return (
+    <div className="border-t" style={{ borderColor: 'var(--border)' }}>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead style={{ backgroundColor: 'var(--surface-300)' }}>
+            <tr className="text-[10px] uppercase" style={{ color: 'var(--text-muted)' }}>
+              <th className="text-left p-2">N° Parte</th>
+              <th className="text-left p-2">Descripción</th>
+              <th className="text-left p-2">Marca</th>
+              <th className="text-right p-2">Despachada</th>
+              {conFirma && <th className="text-right p-2">Firmada</th>}
+              {conFacturado && <th className="text-center p-2">Facturado</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((it: DespachoItemDetalle) => {
+              // null/ausente = firmada completa (el caso común no gana fricción)
+              const firmada = it.qty_firmada ?? it.qty_despachada
+              const faltaLinea = it.qty_firmada != null ? it.qty_despachada - it.qty_firmada : 0
+              return (
+                <tr key={it.id} className="border-t" style={{ borderColor: 'var(--border)' }}>
+                  <td className="p-2 font-mono text-brand-500">{it.numero_parte}</td>
+                  <td className="p-2" style={{ color: 'var(--text-primary)' }}>{it.descripcion}</td>
+                  <td className="p-2" style={{ color: 'var(--text-muted)' }}>{it.marca}</td>
+                  <td className="p-2 text-right" style={{ color: 'var(--text-primary)' }}>{it.qty_despachada}</td>
+                  {conFirma && (
+                    <td className="p-2 text-right">
+                      {faltaLinea > 0 ? (
+                        <span
+                          className="text-amber-600 dark:text-amber-400 font-semibold"
+                          title={`No llegaron ${faltaLinea} de ${it.qty_despachada}`}
+                        >
+                          {firmada} <span className="font-normal">(faltan {faltaLinea})</span>
+                        </span>
+                      ) : (
+                        <span style={{ color: 'var(--text-muted)' }}>{firmada}</span>
+                      )}
+                    </td>
+                  )}
+                  {conFacturado && (
+                    <td className="p-2 text-center">
+                      {it.facturado ? (
+                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-blue-500/15 text-blue-600 dark:text-blue-400">
+                          Sí
+                        </span>
+                      ) : (
+                        <span style={{ color: 'var(--text-faint)' }}>—</span>
+                      )}
+                    </td>
+                  )}
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+      {faltanteTotal > 0 && (
+        <div className="px-3 py-2 border-t text-xs flex items-start gap-1.5 bg-amber-500/10" style={{ borderColor: 'var(--border)' }}>
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-amber-500" />
+          <span style={{ color: 'var(--text-muted)' }}>
+            <b className="text-amber-600 dark:text-amber-400">
+              {faltanteTotal} unidad{faltanteTotal === 1 ? '' : 'es'} faltante{faltanteTotal === 1 ? '' : 's'} de entrega
+            </b>
+            {detalle.faltante_motivo && <> — {detalle.faltante_motivo}</>}
+          </span>
         </div>
       )}
     </div>
@@ -1030,7 +1619,8 @@ function DocumentosSection({
   cotizacionId: number
   ocId: number
   docs: DocumentosOc
-  numeroOc?: string
+  /** NULLABLE de verdad (OC legacy sin N°): el `tag` de abajo ya cae a «OC-{id}». */
+  numeroOc?: string | null
   numeroCot?: string
   embarques?: EmbarqueResumen[]
 }) {
@@ -1554,16 +2144,117 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
   // Los datos de transporte (transportista, N° de expedición) y el N° de guía NO se
   // piden aquí a propósito: la guía de despacho SII se emite en el paso 2 y su folio
   // lo asigna el SII; el transportista se agrega en el paso 3, ya con la guía emitida.
+  // EXCEPCIÓN DELIBERADA: el N° de BULTO sí se pide en este paso 1, porque no es un
+  // dato de transporte sino un hecho físico del EMPAQUE — el operador rotula la caja
+  // mientras arma el despacho, con la caja en la mano.
   // Ver EditarDespachoModal (paso 3) y EmitirGuiaSIIModal (paso 2).
+  const qc = useQueryClient()
   const [contacto, setContacto] = useState(oc.contacto || '')
   const [direccion, setDireccion] = useState(oc.direccion || '')
   const [observaciones, setObservaciones] = useState('')
-  const [selectedItems, setSelectedItems] = useState<Record<number, number>>({})
+  const [bulto, setBulto] = useState('')
+  // Cantidad por línea como TEXTO mientras se edita (precedente del MISMO
+  // archivo: FirmarGuiaModal.qtys — «el operador la edita a medias»). Un input
+  // numérico controlado con estado numérico se COME el punto decimal: al teclear
+  // «2.» el value del DOM queda "" (badInput), Number('')||0→0→clamp→1 y React
+  // repinta borrando el buffer. Clamps y validación van al ENVIAR, no por tecla.
+  const [selectedItems, setSelectedItems] = useState<Record<number, string>>({})
+  // ── Picking: buscador local + paso de resumen dentro del mismo modal ──
+  const [busqueda, setBusqueda] = useState('')
+  const [ocultarMarcadas, setOcultarMarcadas] = useState(false)
+  const [mostrarResumen, setMostrarResumen] = useState(false)
+  const buscadorRef = useRef<HTMLInputElement | null>(null)
+  // Refs a los inputs de cantidad: el ciclo del operador es caja en mano → buscar
+  // → Enter → cantidad → Enter → siguiente caja, sin soltar el teclado.
+  const qtyRefs = useRef<Record<number, HTMLInputElement | null>>({})
 
+  // esDespachable (0.001) y no `> 0`: una línea decimal despachada en tandas
+  // deja residuos binarios (0.2 + 0.7 de 0.9 → 1.1e-16) que con `> 0` se
+  // ofrecían como cupo, precargaban «1.1102230246251565e-16» en la cantidad y
+  // dejaban crear un despacho que la guía 52 nunca puede emitir.
   const disponibles = useMemo(
-    () => oc.items.filter((it: ItemRow) => it.qty_disponible > 0),
+    () => oc.items.filter((it: ItemRow) => esDespachable(it.qty_disponible)),
     [oc.items]
   )
+
+  // Filtro local INSTANTÁNEO, sin debounce: es un array en memoria, no el servidor.
+  const resultado = useMemo(
+    () => filtrarItems<ItemRow>(disponibles, busqueda),
+    [disponibles, busqueda]
+  )
+  const hayBusqueda = busqueda.trim() !== ''
+  // La búsqueda le GANA al toggle "Ocultar marcadas": con texto en la caja se busca
+  // sobre TODAS las líneas (el toggle no puede esconderle al operador lo que busca).
+  const visibles = useMemo(() => {
+    if (hayBusqueda || !ocultarMarcadas) return resultado.matches
+    return resultado.matches.filter(m => selectedItems[m.item.id] === undefined)
+  }, [resultado, hayBusqueda, ocultarMarcadas, selectedItems])
+
+  // Cuando la búsqueda no pega en NINGUNA línea despachable, se distingue si el
+  // repuesto sí existe en la OC pero quedó oculto por el filtro qty_disponible>0
+  // (ya despachado o aún no recibido): decirle "no está en esta OC" a algo que
+  // sí está sería mentirle al operador.
+  const enOcPeroSinDisponible = useMemo(() => {
+    if (!hayBusqueda || resultado.matches.length > 0) return false
+    return filtrarItems<ItemRow>(oc.items as ItemRow[], busqueda).matches.length > 0
+  }, [hayBusqueda, resultado.matches.length, oc.items, busqueda])
+
+  // El detalle de la OC se REFRESCA bajo el modal abierto (el padre sincroniza
+  // `modalOc` cuando llega el cupo real tras un 400 por carrera). Una línea YA
+  // MARCADA puede perder su cupo en ese refresco: sale de `disponibles`, así que
+  // deja de renderizarse Y de validarse, pero SIGUE en selectedItems — o sea que
+  // viajaría en el payload y el backend la rebotaría con 400 para siempre, sin que
+  // el operador pueda verla ni desmarcarla. Se detectan acá para mostrarlas y
+  // bloquear el envío con un camino de salida de un clic.
+  const marcadasSinCupo = useMemo(() => {
+    const porId = new Map<number, ItemRow>(
+      (oc.items as ItemRow[]).map((it: ItemRow) => [it.id, it])
+    )
+    return Object.keys(selectedItems)
+      .map(Number)
+      .map(id => ({ id, it: porId.get(id) }))
+      // COMPLEMENTO EXACTO de `disponibles`: mismo predicado (esDespachable), o
+      // el invariante «o está en disponibles o está en marcadasSinCupo» se rompe
+      // en la franja 0 < qty <= 0.001 y la línea desaparece de las dos listas.
+      .filter(({ it }) => !it || !esDespachable(it.qty_disponible))
+  }, [selectedItems, oc.items])
+
+  const quitarSinCupo = () => {
+    setSelectedItems(prev => {
+      const copy = { ...prev }
+      for (const { id } of marcadasSinCupo) delete copy[id]
+      return copy
+    })
+    // Lo que sobrevive es exactamente `lineasQueVan` (la selección CON cupo). Si
+    // no queda nada, se vuelve al picking: dejar al operador en un resumen vacío
+    // con el botón apagado es el mismo callejón sin salida, un paso después.
+    if (mostrarResumen && lineasQueVan.length === 0) setMostrarResumen(false)
+    toast.success('Se quitaron de la selección las líneas sin cupo.')
+  }
+
+  // Vista NUMÉRICA tolerante de la selección (Number(v)||0: un texto a medio
+  // tipear vale 0): solo para contadores y resumen — el payload valida en serio
+  // al enviar. Mismas claves que selectedItems, así los conteos no mienten.
+  const seleccionNumerica = useMemo(() => {
+    const out: Record<number, number> = {}
+    for (const [id, v] of Object.entries(selectedItems)) out[Number(id)] = Number(v) || 0
+    return out
+  }, [selectedItems])
+
+  // Contadores SIEMPRE sobre la selección COMPLETA, nunca sobre lo filtrado.
+  const contadores = contarSeleccion(seleccionNumerica, disponibles.length)
+  const ocultas = contarMarcadasOcultas(seleccionNumerica, visibles.map(m => m.item.id))
+
+  // Tope de la vía «SII gratuito»: se avisa AQUÍ, mientras dividir todavía es
+  // gratis. Después de crear el despacho, dividir cuesta anularlo (guía) o es
+  // derechamente imposible (factura) — hoy el rechazo llega recién al emitir.
+  const topeSii = oc.max_lineas_sii_gratuito
+  // Se cuenta contra `disponibles` (los ids CON cupo): una línea marcada que
+  // perdió su cupo (marcadasSinCupo) no va a viajar en ningún documento — el
+  // envío está bloqueado hasta quitarla — y sumarla corría el aviso del tope
+  // justo en el borde 10/11 y lo descuadraba del «M líneas» del resumen.
+  const lineasQueViajan = contarLineasQueViajan(seleccionNumerica, disponibles.map((it: ItemRow) => it.id))
+  const excedeTopeSii = typeof topeSii === 'number' && topeSii > 0 && lineasQueViajan > topeSii
 
   const toggleItem = (it: ItemRow) => {
     setSelectedItems(prev => {
@@ -1571,19 +2262,114 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
       if (copy[it.id] !== undefined) {
         delete copy[it.id]
       } else {
-        copy[it.id] = it.qty_disponible
+        // El disponible se precarga como STRING (el estado es texto).
+        copy[it.id] = String(it.qty_disponible)
       }
       return copy
     })
   }
 
-  const updateQty = (id: number, value: number) => {
-    // Nunca menos de 1: un 0 o negativo dejaría el ítem "seleccionado" y el
-    // botón Crear habilitado, para chocar recién con el 400 del backend.
-    setSelectedItems(prev => ({ ...prev, [id]: Math.max(1, value) }))
+  // Guarda el TEXTO tal cual se teclea: nada de clamps por tecla (ver el
+  // comentario de selectedItems — el clamp inmediato se comía el punto decimal).
+  const updateQty = (id: number, value: string) => {
+    setSelectedItems(prev => ({ ...prev, [id]: value }))
   }
 
-  const seleccionTotal = Object.keys(selectedItems).length
+  // En blur, si lo tipeado es un número LIMPIO fuera de rango, se normaliza al
+  // rango legal (mín 1, tope disponible). Lo ilegible se deja tal cual: la
+  // validación del envío lo nombra — corregirlo en silencio escondería el typo.
+  const normalizarQtyEnBlur = (it: ItemRow) => {
+    setSelectedItems(prev => {
+      const raw = (prev[it.id] ?? '').trim()
+      const v = Number(raw)
+      if (raw === '' || !Number.isFinite(v)) return prev
+      // Mínimo legal de la LÍNEA: 1, salvo que el propio disponible sea menor —
+      // un remanente fraccionario (despachados 2 de 2.5 m → quedan 0.5) es válido
+      // para el backend (solo exige > 0) y exigir 1 lo dejaba infacturable aquí.
+      const minLegal = Math.min(1, it.qty_disponible)
+      const legal = Math.min(Math.max(v, minLegal), it.qty_disponible)
+      if (legal === v) return prev
+      return { ...prev, [it.id]: String(legal) }
+    })
+  }
+
+  const enfocarCantidad = (id: number) => {
+    // El input de cantidad recién se monta al marcar la línea: se espera al
+    // próximo frame. select() = pisar la cantidad precargada es CONSCIENTE
+    // (lo primero que teclee el operador la reemplaza entera).
+    requestAnimationFrame(() => {
+      const el = qtyRefs.current[id]
+      if (el) {
+        el.focus()
+        el.select()
+      }
+    })
+  }
+
+  // Handlers de Enter LOCALES al buscador y a los inputs de cantidad (onKeyDown).
+  // JAMÁS un listener global del modal: el Enter del resto de los campos (bulto,
+  // destinatario, observaciones) debe seguir inerte — acá no hay <form> a propósito.
+  const onBuscadorKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Escape') {
+      // PRIMERA capa de Esc: limpiar la búsqueda. Esc JAMÁS cierra el modal.
+      e.preventDefault()
+      e.stopPropagation()
+      setBusqueda('')
+      return
+    }
+    if (e.key !== 'Enter') return
+    e.preventDefault()
+    // Enter solo actúa con UNA coincidencia. Con varias (líneas partidas que
+    // comparten n° de parte) JAMÁS se auto-elige: el operador clickea la línea.
+    if (!hayBusqueda || resultado.matches.length !== 1) return
+    const it = resultado.matches[0].item
+    const qtyActual = selectedItems[it.id]
+    if (qtyActual !== undefined) {
+      // Re-búsqueda de una línea ya marcada: avisar y llevar el foco a su
+      // cantidad. Se muestra el TEXTO tal cual (puede estar a medio editar).
+      toast(`Ya marcada con ${qtyActual.trim() || 'cantidad vacía'}`)
+      enfocarCantidad(it.id)
+      return
+    }
+    setSelectedItems(prev => ({ ...prev, [it.id]: String(it.qty_disponible) }))
+    enfocarCantidad(it.id)
+  }
+
+  const onQtyKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (e.key !== 'Enter') return
+    e.preventDefault()
+    // Cierra el ciclo de esta caja: limpiar la búsqueda y devolver el foco al
+    // buscador, listo para teclear la siguiente caja.
+    setBusqueda('')
+    buscadorRef.current?.focus()
+  }
+
+  // Cierre seguro: con líneas marcadas, overlay / X / Cancelar piden confirmación.
+  // window.confirm basta: el archivo no tiene un patrón propio de confirmación.
+  const pedirCierre = () => {
+    const n = contadores.lineasMarcadas
+    // El trabajo TIPEADO también se pierde al cerrar: bulto / observaciones /
+    // destinatario editados cuentan aunque no haya líneas marcadas. Contacto y
+    // dirección se comparan contra lo PRECARGADO de la OC (cerrar sin tocar
+    // nada no debe preguntar).
+    const hayTipeo =
+      bulto.trim() !== '' ||
+      observaciones.trim() !== '' ||
+      contacto !== (oc.contacto || '') ||
+      direccion !== (oc.direccion || '')
+    if (n > 0) {
+      if (!window.confirm(`Tienes ${n} línea${n === 1 ? '' : 's'} marcada${n === 1 ? '' : 's'}, ¿descartar?`)) return
+    } else if (hayTipeo) {
+      if (!window.confirm('Tienes datos escritos sin guardar (bulto, observaciones o destinatario), ¿descartar?')) return
+    }
+    onClose()
+  }
+
+  // Guard SÍNCRONO anti doble-click: isPending recién llega en el re-render, y
+  // dos clicks en la misma ráfaga alcanzaban a disparar dos POST (dos despachos
+  // gemelos). El ref corta el segundo ANTES del re-render; se libera en error
+  // (en éxito el modal se cierra y el ref muere con él).
+  const enviandoRef = useRef(false)
 
   const createMut = useMutation({
     mutationFn: () =>
@@ -1594,23 +2380,125 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
         contacto_destinatario: contacto || null,
         direccion_entrega: direccion || null,
         observaciones: observaciones || null,
+        // Contrato backend 2026-08-25: string ≤50 o null ("" → NULL en el servidor).
+        bulto_numero: bulto.trim() || null,
+        // La conversión texto→número vive AQUÍ, ya validada por enviarCrear.
         items: Object.entries(selectedItems).map(([id, qty]) => ({
           item_cotizacion_id: Number(id),
-          qty_despachada: qty,
+          qty_despachada: Number(qty),
         })),
       }),
     onSuccess: (data: any) => {
       toast.success(`Despacho ${data.numero_despacho} creado. Ahora emite la guía SII, agrega el transportista y confirma el despacho.`)
       onCreated()
     },
-    onError: (e: any) => toast.error(e?.response?.data?.detail || 'Error al crear'),
+    onError: (e: any) => {
+      enviandoRef.current = false
+      toast.error(e?.response?.data?.detail || 'Error al crear')
+      // Un 400 acá casi siempre es DISPONIBLE VIEJO (otro usuario tomó el cupo):
+      // sin refrescar, el modal seguía mostrando el disponible de antes y el
+      // reintento rebotaba igual. Invalidar ['despachos'] trae detalle y listado
+      // frescos para que el operador vea contra qué está eligiendo.
+      qc.invalidateQueries({ queryKey: ['despachos'] })
+    },
   })
+
+  // Validación FINAL de cantidades al ENVIAR — las reglas de siempre: mín 1,
+  // tope disponible, decimales legales (metros, kilos). Es la contraparte del
+  // estado-texto: acá (y no por tecla) se rechaza lo ilegible con nombre de línea.
+  const enviarCrear = () => {
+    if (enviandoRef.current) return
+    // Primero lo invisible: una marcada sin cupo no la ve `disponibles` y viajaría
+    // igual en el payload (rebote 400 eterno y sin causa visible).
+    if (marcadasSinCupo.length > 0) {
+      const nombres = marcadasSinCupo
+        .map(({ id, it }) => it?.numero_parte || `ítem ${id}`)
+        .join(', ')
+      toast.error(
+        `${nombres}: ya no tienen cupo disponible (otro despacho las tomó). ` +
+        'Usa el botón «Quitar de la selección» del aviso ámbar de arriba.'
+      )
+      return
+    }
+    const mala = disponibles.find((it: ItemRow) => {
+      const raw = selectedItems[it.id]
+      if (raw === undefined) return false
+      const v = Number(raw.trim())
+      // Mismo mínimo legal que el blur: un remanente fraccionario < 1 es válido.
+      const minLegal = Math.min(1, it.qty_disponible)
+      return raw.trim() === '' || !Number.isFinite(v) || v < minLegal || v > it.qty_disponible
+    })
+    if (mala) {
+      toast.error(
+        `${mala.numero_parte}: la cantidad debe ser un número entre ` +
+        `${fmtQtyPicking(Math.min(1, mala.qty_disponible))} y ${fmtQtyPicking(mala.qty_disponible)}.`
+      )
+      return
+    }
+    enviandoRef.current = true
+    createMut.mutate()
+  }
+
+  // Para el paso de resumen: lo que va y lo que QUEDA PENDIENTE (disponible que no
+  // se incluyó en este despacho). Jamás la palabra "faltante" en esta UI: ya
+  // significa otra cosa en la firma de la guía (unidades que no llegaron).
+  const lineasQueVan = useMemo(
+    () => disponibles.filter((it: ItemRow) => selectedItems[it.id] !== undefined),
+    [disponibles, selectedItems]
+  )
+  // Unidades de ESE MISMO conjunto. El paso de resumen se cuenta sobre lo que la
+  // tabla lista y no sobre `contadores` (selección completa): con una línea que
+  // perdió el cupo, la cabecera decía «3 líneas, 14 unidades» contra una tabla
+  // «Va en este despacho (2)», y el botón prometía unidades que el documento no
+  // iba a llevar. Los contadores CRUDOS se quedan intactos donde deben estar
+  // (picking, «Ocultar marcadas» y la confirmación al cerrar).
+  const unidadesQueVan = useMemo(
+    () => lineasQueVan.reduce((s: number, it: ItemRow) => s + (seleccionNumerica[it.id] ?? 0), 0),
+    [lineasQueVan, seleccionNumerica]
+  )
+  const lineasPendientes = useMemo(
+    () =>
+      (disponibles as ItemRow[])
+        // Vista numérica tolerante: un texto a medio tipear resta 0 (el envío
+        // real igual lo valida antes de crear).
+        .map(it => ({ it, pendiente: it.qty_disponible - (seleccionNumerica[it.id] ?? 0) }))
+        // esDespachable y no `> 0` (5º punto de decisión por línea de esta
+        // pantalla, ahora alineado con los otros cuatro): la resta de decimales
+        // legales deja residuos binarios —2.5 − 2.5 en dos tandas da 4.16e-17— y
+        // con `> 0` la banda «Queda pendiente» llegaba a imprimir
+        // «4.16e-17 x 7T1997», o sea a inventar un remanente que no existe.
+        .filter(x => esDespachable(x.pendiente)),
+    [disponibles, seleccionNumerica]
+  )
+
+  // Gemelas del split: dos líneas con el MISMO n° de parte son píxel-idénticas.
+  // Cuando 2+ líneas VISIBLES comparten el n° colapsado (7T1997 ≡ 7T-1997),
+  // cada una gana su ordinal «línea i de n» por orden de aparición, para que el
+  // operador sepa cuál de las dos está clickeando.
+  const ordinalGemelas = useMemo(() => {
+    const totales = new Map<string, number>()
+    for (const m of visibles) {
+      const k = colapsar(m.item.numero_parte || '')
+      totales.set(k, (totales.get(k) ?? 0) + 1)
+    }
+    const vistos = new Map<string, number>()
+    const out = new Map<number, { i: number; n: number }>()
+    for (const m of visibles) {
+      const k = colapsar(m.item.numero_parte || '')
+      const n = totales.get(k) ?? 1
+      if (n < 2) continue
+      const i = (vistos.get(k) ?? 0) + 1
+      vistos.set(k, i)
+      out.set(m.item.id, { i, n })
+    }
+    return out
+  }, [visibles])
 
   return (
     <div
       className="fixed inset-0 flex items-center justify-center z-50 p-4"
       style={{ backgroundColor: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)' }}
-      onClick={onClose}
+      onClick={pedirCierre}
     >
       <div
         className="max-w-3xl w-full max-h-[90vh] overflow-hidden flex flex-col rounded-2xl border shadow-2xl"
@@ -1623,14 +2511,17 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
         >
           <div>
             <h2 className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>
-              Crear despacho
+              {mostrarResumen ? 'Revisar despacho' : 'Crear despacho'}
             </h2>
             <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-              OC {oc.numero_oc} · {oc.cliente}
+              {/* numero_oc nullable: sin el fallback la cabecera del modal en que
+                  se CREA el despacho decía «OC  · CLIENTE». Misma convención
+                  «OC #<id>» del modal de bultos y del resto de la pantalla. */}
+              OC {oc.numero_oc || `#${oc.id}`} · {oc.cliente}
             </p>
           </div>
           <button
-            onClick={onClose}
+            onClick={pedirCierre}
             className="p-1.5 rounded-lg hover:bg-[var(--surface-300)]"
             style={{ color: 'var(--text-muted)' }}
           >
@@ -1638,6 +2529,211 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
           </button>
         </div>
 
+        {/* Aviso de líneas marcadas que PERDIERON su cupo mientras el modal estaba
+            abierto (el padre refrescó el detalle tras un 400 por carrera). No se
+            renderizan en la lista porque salieron de `disponibles`, así que sin
+            este aviso el operador no tendría cómo verlas ni desmarcarlas.
+            BANDA PROPIA bajo la cabecera, FUERA de los dos pasos: el guard que la
+            necesita dispara desde «Crear despacho», que vive en el RESUMEN — con
+            el aviso encerrado en el picking, el toast nombraba las partes y el
+            botón para quitarlas era invisible (callejón sin salida).
+            role="alert": se anuncia solo. */}
+        {marcadasSinCupo.length > 0 && (
+          <div
+            className="px-4 py-3 border-b"
+            style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+          >
+            <div
+              role="alert"
+              className="flex items-start justify-between gap-2 flex-wrap rounded-lg px-3 py-2 text-xs"
+              style={{ background: 'rgba(245,158,11,0.12)', border: '1px solid rgba(245,158,11,0.35)' }}
+            >
+              <div style={{ color: 'var(--text-primary)' }}>
+                <span className="font-semibold">
+                  {marcadasSinCupo.length} línea{marcadasSinCupo.length === 1 ? '' : 's'} que marcaste ya no tiene{marcadasSinCupo.length === 1 ? '' : 'n'} cupo
+                </span>
+                {' '}(otro despacho la{marcadasSinCupo.length === 1 ? '' : 's'} tomó):{' '}
+                <span className="font-mono">
+                  {marcadasSinCupo.map(({ id, it }) => it?.numero_parte || `ítem ${id}`).join(', ')}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={quitarSinCupo}
+                className="px-2 py-1 rounded-md font-semibold whitespace-nowrap"
+                style={{ background: 'rgba(245,158,11,0.25)', color: 'var(--text-primary)' }}
+              >
+                Quitar de la selección
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Tope de 10 ítems de la vía «SII gratuito»: los 3 únicos documentos
+            rechazados en la historia real de esta cuenta fueron por esto. El
+            backend ya lo avisa en el «verificar» previo, pero ahí el despacho YA
+            existe y dividirlo cuesta anularlo. Acá el operador todavía puede
+            sacar líneas gratis. INFORMATIVO, no bloquea: el tope es de la vía de
+            emisión electrónica, no del despacho (una guía en papel no lo tiene). */}
+        {excedeTopeSii && (
+          <div
+            role="status"
+            className="px-4 py-3 border-b text-xs"
+            style={{ background: 'rgba(245,158,11,0.10)', borderColor: 'var(--border)', color: 'var(--text-primary)' }}
+          >
+            <span className="font-semibold">
+              {lineasQueViajan} ítems marcados — la emisión al SII acepta hasta {topeSii} por documento.
+            </span>{' '}
+            <span style={{ color: 'var(--text-muted)' }}>
+              Si vas a emitir la guía electrónica, arma dos despachos de {topeSii} o menos:
+              dividirlo después obliga a anular este despacho.
+            </span>
+          </div>
+        )}
+
+        {!mostrarResumen && (
+          /* Buscador de picking + contador — FUERA del scroll, siempre a la vista:
+             el operador cuenta piezas con una caja en la mano y teclea su número. */
+          <div
+            className="px-4 py-3 border-b space-y-2"
+            style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+          >
+            <div className="relative">
+              <Search
+                className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                style={{ color: 'var(--text-faint)' }}
+              />
+              <input
+                ref={buscadorRef}
+                autoFocus
+                value={busqueda}
+                onChange={e => setBusqueda(e.target.value)}
+                onKeyDown={onBuscadorKeyDown}
+                /* El placeholder es contrato: el filtro busca EXACTAMENTE esos dos campos. */
+                placeholder="Buscar por N° de parte o descripción"
+                className="input pl-9 pr-8"
+              />
+              {busqueda !== '' && (
+                <button
+                  onClick={() => {
+                    setBusqueda('')
+                    buscadorRef.current?.focus()
+                  }}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded hover:bg-[var(--surface-300)]"
+                  style={{ color: 'var(--text-faint)' }}
+                  title="Limpiar búsqueda (Esc)"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+            {hayBusqueda && resultado.huboColapsado && (
+              <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                también busqué <span className="font-mono font-semibold">{resultado.queryColapsada}</span>
+              </div>
+            )}
+            {/* Contador fijo: SIEMPRE sobre la selección completa, no lo filtrado.
+                aria-live: el lector de pantalla anuncia cada marca sin mover el foco. */}
+            <div className="flex items-center justify-between gap-2 flex-wrap text-xs">
+              <div aria-live="polite" className="font-semibold" style={{ color: 'var(--text-primary)' }}>
+                Marcadas {contadores.lineasMarcadas} de {contadores.lineasTotal} líneas
+                {' · '}{fmtQtyPicking(contadores.unidadesTotales)} unidades
+                {ocultas > 0 && (
+                  <span className="font-normal" style={{ color: 'var(--text-muted)' }}>
+                    {' '}({ocultas} marcada{ocultas === 1 ? '' : 's'} oculta{ocultas === 1 ? '' : 's'} por el filtro)
+                  </span>
+                )}
+              </div>
+              <label
+                className="flex items-center gap-1.5 cursor-pointer select-none"
+                style={{ color: 'var(--text-muted)' }}
+                title="Con texto en la búsqueda se muestra TODO lo que coincida, marcado o no"
+              >
+                <input
+                  type="checkbox"
+                  checked={ocultarMarcadas}
+                  onChange={e => setOcultarMarcadas(e.target.checked)}
+                  className="w-3.5 h-3.5 accent-brand-500"
+                />
+                Ocultar marcadas
+              </label>
+            </div>
+          </div>
+        )}
+
+        {mostrarResumen ? (
+          /* ── Paso liviano de RESUMEN, dentro del mismo modal ── */
+          <div className="p-4 space-y-4 overflow-y-auto flex-1">
+            <div
+              className="p-3 rounded-xl border text-sm"
+              style={{ backgroundColor: 'var(--surface-200)', borderColor: 'var(--border)', color: 'var(--text-primary)' }}
+            >
+              {/* MISMO conjunto que la tabla de abajo (lineasQueVan): la cabecera
+                  no puede decir «3 líneas» sobre una lista de 2. */}
+              Vas a despachar <b>{lineasQueVan.length} línea{lineasQueVan.length === 1 ? '' : 's'}</b>,{' '}
+              <b>{fmtQtyPicking(unidadesQueVan)} unidades</b>
+              {bulto.trim() !== '' && <> · Bulto N° <b>{bulto.trim()}</b></>}
+            </div>
+
+            <div>
+              <div
+                className="text-xs uppercase tracking-wider mb-2 font-semibold"
+                style={{ color: 'var(--text-faint)' }}
+              >
+                Va en este despacho ({lineasQueVan.length})
+              </div>
+              <div className="border rounded-xl overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+                {lineasQueVan.map((it: ItemRow) => (
+                  <div
+                    key={it.id}
+                    className="p-2.5 flex items-center gap-3 border-b last:border-0 text-sm"
+                    style={{ borderColor: 'var(--border)' }}
+                  >
+                    <span className="font-semibold w-14 text-right shrink-0" style={{ color: 'var(--text-primary)' }}>
+                      {fmtQtyPicking(seleccionNumerica[it.id] ?? 0)} x
+                    </span>
+                    <span className="font-mono text-xs text-brand-500 font-semibold shrink-0">{it.numero_parte}</span>
+                    <span className="truncate" style={{ color: 'var(--text-muted)' }}>{it.descripcion}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {lineasPendientes.length > 0 && (
+              /* Lo que QUEDA PENDIENTE de la OC (disponible no incluido en este
+                 despacho). Nunca "faltante": esa palabra ya es de la firma de guía. */
+              <div>
+                <div
+                  className="text-xs uppercase tracking-wider mb-2 font-semibold"
+                  style={{ color: 'var(--text-faint)' }}
+                >
+                  Queda pendiente (no va en este despacho)
+                </div>
+                <div
+                  className="border rounded-xl overflow-hidden"
+                  style={{ borderColor: 'rgba(245, 158, 11, 0.4)', backgroundColor: 'rgba(245, 158, 11, 0.05)' }}
+                >
+                  {lineasPendientes.map(({ it, pendiente }) => (
+                    <div
+                      key={it.id}
+                      className="p-2.5 flex items-center gap-3 border-b last:border-0 text-sm"
+                      style={{ borderColor: 'rgba(245, 158, 11, 0.25)' }}
+                    >
+                      <span className="font-semibold w-14 text-right shrink-0" style={{ color: 'var(--text-primary)' }}>
+                        {fmtQtyPicking(pendiente)} x
+                      </span>
+                      <span className="font-mono text-xs text-brand-500 font-semibold shrink-0">{it.numero_parte}</span>
+                      <span className="truncate" style={{ color: 'var(--text-muted)' }}>{it.descripcion}</span>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[11px] mt-1" style={{ color: 'var(--text-muted)' }}>
+                  Lo pendiente sigue disponible para un próximo despacho de esta OC.
+                </p>
+              </div>
+            )}
+          </div>
+        ) : (
         <div className="p-4 space-y-4 overflow-y-auto flex-1">
           {/* Guía del flujo: este modal es solo el paso 1 de 4. */}
           <div
@@ -1689,23 +2785,64 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
               className="text-xs uppercase tracking-wider mb-2 font-semibold"
               style={{ color: 'var(--text-faint)' }}
             >
-              Items disponibles ({disponibles.length})
+              Items disponibles ({hayBusqueda ? `${visibles.length} de ${disponibles.length}` : disponibles.length})
             </div>
-            {disponibles.length === 0 ? (
-              <div className="text-center py-4" style={{ color: 'var(--text-faint)' }}>
-                No hay items disponibles para despacho
-              </div>
+            {visibles.length === 0 ? (
+              hayBusqueda ? (
+                /* CERO coincidencias con búsqueda activa: mensaje fuerte, y se
+                   distingue el caso "sí está en la OC pero sin disponible". */
+                <div className="text-center py-6 space-y-1">
+                  <div className="text-sm font-bold" style={{ color: 'var(--text-primary)' }}>
+                    {enOcPeroSinDisponible
+                      ? 'Está en la OC, pero sin cantidad disponible para despachar'
+                      : 'No está en esta OC'}
+                  </div>
+                  <div className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                    {enOcPeroSinDisponible
+                      ? 'La línea existe, pero su disponible es 0 (ya despachada o aún no recibida en bodega).'
+                      : `Ninguna línea despachable coincide con «${busqueda.trim()}».`}
+                  </div>
+                </div>
+              ) : disponibles.length === 0 ? (
+                <div className="text-center py-4" style={{ color: 'var(--text-faint)' }}>
+                  No hay items disponibles para despacho
+                </div>
+              ) : (
+                /* Sin búsqueda y con líneas: todo quedó oculto por el toggle. */
+                <div className="text-center py-4 text-sm" style={{ color: 'var(--text-muted)' }}>
+                  {contadores.lineasMarcadas === 1
+                    ? 'La línea está marcada y oculta por «Ocultar marcadas».'
+                    : `Las ${contadores.lineasMarcadas} líneas están marcadas y ocultas por «Ocultar marcadas».`}
+                </div>
+              )
             ) : (
               <div className="border rounded-xl overflow-hidden" style={{ borderColor: 'var(--border)' }}>
-                {disponibles.map((it: ItemRow) => {
+                {visibles.map((m: PickingMatch<ItemRow>) => {
+                  const it = m.item
                   const selected = selectedItems[it.id] !== undefined
+                  const unica = hayBusqueda && resultado.matches.length === 1
+                  const gemela = ordinalGemelas.get(it.id)
+                  // Iluminación: UNA coincidencia = fondo destacado + badge textual
+                  // «Enter para marcar» (accesible: el color solo no le habla al
+                  // lector de pantalla ni al daltónico); varias = iluminación suave
+                  // (JAMÁS auto-elegir: click manual);
+                  // marcada = cara verde con borde (gana sobre la iluminación).
+                  const fondo = selected
+                    ? 'rgba(16, 185, 129, 0.10)'
+                    : hayBusqueda
+                      ? unica
+                        ? 'rgba(245, 158, 11, 0.18)'
+                        : 'rgba(245, 158, 11, 0.06)'
+                      : 'transparent'
                   return (
                     <div
                       key={it.id}
                       className="p-3 flex items-center gap-3 border-b last:border-0 transition-colors"
                       style={{
                         borderColor: 'var(--border)',
-                        backgroundColor: selected ? 'rgba(26, 92, 240, 0.06)' : 'transparent',
+                        backgroundColor: fondo,
+                        // inset y no borderLeft: el borde no debe correr el layout.
+                        boxShadow: selected ? 'inset 3px 0 0 0 rgb(16, 185, 129)' : undefined,
                       }}
                     >
                       <input
@@ -1715,29 +2852,70 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
                         className="w-4 h-4 accent-brand-500"
                       />
                       <div className="flex-1 min-w-0">
-                        <div className="font-mono text-xs text-brand-500 font-semibold">{it.numero_parte}</div>
+                        <div className="font-mono text-xs text-brand-500 font-semibold">
+                          <CampoFiltrado
+                            texto={it.numero_parte}
+                            query={busqueda}
+                            colapsado={m.porColapsado && m.camposColapsados.includes('numero_parte')}
+                          />
+                          {gemela && (
+                            /* Discriminante de gemelas: sin esto, dos líneas del
+                               split con el mismo n° de parte son indistinguibles
+                               y el operador marca "la otra" sin darse cuenta. */
+                            <span
+                              className="ml-1.5 font-sans font-semibold text-[10px] px-1.5 py-0.5 rounded-full bg-slate-500/15"
+                              style={{ color: 'var(--text-muted)' }}
+                            >
+                              línea {gemela.i} de {gemela.n}
+                            </span>
+                          )}
+                        </div>
                         <div className="text-sm truncate" style={{ color: 'var(--text-primary)' }}>
-                          {it.descripcion}
+                          <CampoFiltrado
+                            texto={it.descripcion}
+                            query={busqueda}
+                            colapsado={m.porColapsado && m.camposColapsados.includes('descripcion')}
+                          />
                         </div>
                         <div className="text-xs" style={{ color: 'var(--text-muted)' }}>{it.marca}</div>
                       </div>
+                      {unica && !selected && (
+                        /* Aviso TEXTUAL del atajo (no solo el fondo ámbar). */
+                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-400 shrink-0">
+                          Enter para marcar
+                        </span>
+                      )}
+                      {selected && <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-500" />}
                       {selected ? (
-                        <input
-                          type="number"
-                          min={1}
-                          max={it.qty_disponible}
-                          value={selectedItems[it.id]}
-                          onChange={e =>
-                            updateQty(it.id, Math.min(it.qty_disponible, Number(e.target.value) || 0))
-                          }
-                          className="input w-20 text-right py-1.5 px-2"
-                        />
+                        <div className="flex flex-col items-end gap-0.5 shrink-0">
+                          <input
+                            ref={el => { qtyRefs.current[it.id] = el }}
+                            type="number"
+                            min={1}
+                            max={it.qty_disponible}
+                            value={selectedItems[it.id]}
+                            /* El TEXTO viaja tal cual al estado (ver selectedItems):
+                               clamps por tecla se comían el punto decimal. */
+                            onChange={e => updateQty(it.id, e.target.value)}
+                            onBlur={() => normalizarQtyEnBlur(it)}
+                            onKeyDown={onQtyKeyDown}
+                            className="input w-20 text-right py-1.5 px-2"
+                          />
+                          {/* Tope visible: reglas de cantidad intactas (mín 1, decimales
+                              legales, tope qty_disponible) — se validan al ENVIAR. */}
+                          <span className="text-[10px]" style={{ color: 'var(--text-faint)' }}>
+                            máx {fmtQtyPicking(it.qty_disponible)}
+                          </span>
+                        </div>
                       ) : (
                         <span
-                          className="text-sm w-20 text-right"
+                          className="text-sm w-20 text-right shrink-0"
                           style={{ color: 'var(--text-muted)' }}
                         >
-                          /{it.qty_disponible} disp.
+                          {/* fmtQtyPicking, igual que el «máx» de la línea marcada:
+                              el mismo número no puede imprimirse de dos formas
+                              («0.10000000000000009» vs «0.1») en la misma fila. */}
+                          /{fmtQtyPicking(it.qty_disponible)} disp.
                         </span>
                       )}
                     </div>
@@ -1746,27 +2924,76 @@ function CrearDespachoModal({ oc, onClose, onCreated }: any) {
               </div>
             )}
           </div>
+
+          {/* Bulto: hecho físico del EMPAQUE (no dato de transporte) — por eso vive
+              en el paso 1. Enter acá es INERTE, como en todo el modal (sin <form>). */}
+          <Input
+            label="Bulto N° (opcional)"
+            value={bulto}
+            /* Array.from y no slice sobre el string: el tope de 50 se cuenta en
+               caracteres reales para no partir un emoji (surrogate) en el borde. */
+            onChange={(v: string) => setBulto(Array.from(v).slice(0, 50).join(''))}
+            placeholder="Ej: 1, B2, Cajas 2-3"
+            hint="Caja en que viaja este despacho (ej: 1, B2, Cajas 2-3)"
+          />
         </div>
+        )}
 
         <div
           className="p-4 border-t flex items-center justify-between"
           style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
         >
+          {/* En el RESUMEN el pie cuenta lo que realmente va (mismo conjunto que
+              la tabla y la cabecera); en el picking se queda el conteo CRUDO de la
+              selección completa, que es su invariante declarado. */}
           <div className="text-sm" style={{ color: 'var(--text-muted)' }}>
-            {seleccionTotal} ítem{seleccionTotal === 1 ? '' : 's'} seleccionado{seleccionTotal === 1 ? '' : 's'}
+            {mostrarResumen ? (
+              <>
+                {lineasQueVan.length} línea{lineasQueVan.length === 1 ? '' : 's'} marcada{lineasQueVan.length === 1 ? '' : 's'}
+                {' · '}{fmtQtyPicking(unidadesQueVan)} unidades
+              </>
+            ) : (
+              <>
+                {contadores.lineasMarcadas} línea{contadores.lineasMarcadas === 1 ? '' : 's'} marcada{contadores.lineasMarcadas === 1 ? '' : 's'}
+                {' · '}{fmtQtyPicking(contadores.unidadesTotales)} unidades
+              </>
+            )}
           </div>
           <div className="flex gap-2">
-            <button onClick={onClose} className="btn-secondary text-sm">
-              Cancelar
-            </button>
-            <button
-              onClick={() => createMut.mutate()}
-              disabled={seleccionTotal === 0 || createMut.isPending}
-              className="btn-primary text-sm"
-            >
-              <Plus className="w-4 h-4" />
-              {createMut.isPending ? 'Creando...' : 'Crear Despacho'}
-            </button>
+            {mostrarResumen ? (
+              <>
+                <button onClick={() => setMostrarResumen(false)} className="btn-secondary text-sm">
+                  Volver
+                </button>
+                {/* Con líneas sin cupo el botón se APAGA: el guard de enviarCrear
+                    sigue siendo el cinturón, pero el operador dejaba de gastar
+                    clics contra un toast. Se apaga con la banda ámbar YA VISIBLE
+                    arriba (si no, sería un botón muerto sin causa a la vista). */}
+                <button
+                  onClick={enviarCrear}
+                  disabled={lineasQueVan.length === 0 || marcadasSinCupo.length > 0 || createMut.isPending}
+                  className="btn-primary text-sm"
+                >
+                  <Plus className="w-4 h-4" />
+                  {createMut.isPending
+                    ? 'Creando...'
+                    : `Crear despacho (${fmtQtyPicking(unidadesQueVan)} unidades)`}
+                </button>
+              </>
+            ) : (
+              <>
+                <button onClick={pedirCierre} className="btn-secondary text-sm">
+                  Cancelar
+                </button>
+                <button
+                  onClick={() => setMostrarResumen(true)}
+                  disabled={contadores.lineasMarcadas === 0}
+                  className="btn-primary text-sm"
+                >
+                  Revisar y crear <ChevronRight className="w-4 h-4" />
+                </button>
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -1799,47 +3026,149 @@ function Input({ label, value, onChange, placeholder, disabled, hint, type = 'te
   )
 }
 
-// ─── Modal: marcar guía firmada (subir foto/PDF de la guía firmada) ───────────
+// ─── Modal: marcar guía firmada (foto/PDF + firma PARCIAL por ítem) ───────────
+// A veces la guía se emitió por ítems que NO llegaron (perdidos en la entrega).
+// El caso común (llegó todo) no gana fricción: los ítems vienen pre-tickeados
+// completos y el body viaja SIN `items` (byte-igual al camino de siempre). Si
+// algo no llegó, el operador destickea o baja la cantidad: eso queda como
+// FALTANTE con motivo obligatorio y no se factura por esta guía.
+const MOTIVO_FALTANTE_MIN = 5
+const MOTIVO_FALTANTE_MAX = 300
+
 function FirmarGuiaModal({
-  despachoId,
+  despacho,
   dteFolio,
   onClose,
   onDone,
 }: {
-  despachoId: number
+  despacho: DespachoRow
   dteFolio?: string | null
   onClose: () => void
   onDone: () => void
 }) {
+  // Re-firma: ya está firmada con faltante y se corrigen cantidades/motivo
+  // (el backend valida contra lo ya facturado y devuelve 409 si no se puede).
+  const esEdicion = !!despacho.guia_firmada
   const [file, setFile] = useState<File | null>(null)
-  const [numeroGuia, setNumeroGuia] = useState('')
-  // hoyLocal() y no toISOString(): en Chile (UTC-3/-4) la fecha UTC ya es
-  // "mañana" pasadas las ~21:00 y la firma quedaría con fecha futura.
-  const [fecha, setFecha] = useState(hoyLocal())
+  const [numeroGuia, setNumeroGuia] = useState(esEdicion ? (despacho.numero_guia || '') : '')
+  // hoyEnChile() y no toISOString(): en Chile (UTC-3/-4) la fecha UTC ya es
+  // "mañana" pasadas las ~21:00 y la firma quedaría con fecha futura. Tampoco el
+  // día del navegador: la firma es un hecho del negocio, que ocurre en Chile.
+  const [fecha, setFecha] = useState(
+    esEdicion && despacho.fecha_firma ? despacho.fecha_firma.slice(0, 10) : hoyEnChile()
+  )
   const [saving, setSaving] = useState(false)
+  // Errores DENTRO del modal (validación local y 409 del backend): recuadro
+  // fijo, no un toast que se esfuma a los 4 segundos.
+  const [errores, setErrores] = useState<string[]>([])
+
+  // Ítems del despacho: mismo GET (y misma cache) que el desplegable de la fila.
+  // Si el backend previo no manda `items`, el modal se comporta como hoy.
+  const { data: detalle, isLoading: cargandoItems, isError: errorItems } = useQuery<DespachoDetalle>({
+    queryKey: ['despachos', 'detalle', despacho.id],
+    queryFn: () => despachosAPI.get(despacho.id),
+  })
+  const items = detalle?.items
+  const [motivo, setMotivo] = useState('')
+  // Cantidad firmada por ítem, como TEXTO (el operador la edita a medias).
+  // Se inicializa al llegar los ítems: la firmada actual (re-firma) o completa.
+  const [qtys, setQtys] = useState<Record<number, string> | null>(null)
+  useEffect(() => {
+    if (!items || qtys !== null) return
+    const base: Record<number, string> = {}
+    for (const it of items) base[it.id] = String(it.qty_firmada ?? it.qty_despachada)
+    setQtys(base)
+    if (detalle?.faltante_motivo) setMotivo(detalle.faltante_motivo)
+  }, [items, qtys, detalle])
 
   // Mismo candado que EditarDespachoModal (ver folioParaModal): con guía
   // electrónica emitida/en proceso, el N° es (o será) el folio del SII.
   const folioBloqueado = dteFolio !== null && dteFolio !== undefined
 
+  const qtyDe = (it: DespachoItemDetalle): number => {
+    const v = Number(qtys?.[it.id] ?? String(it.qty_firmada ?? it.qty_despachada))
+    return Number.isFinite(v) ? v : 0
+  }
+  const totalDespachado = (items ?? []).reduce((s, it) => s + it.qty_despachada, 0)
+  const totalFirmado = (items ?? []).reduce((s, it) => s + qtyDe(it), 0)
+  const faltante = Math.max(totalDespachado - totalFirmado, 0)
+
+  // Destickear = no llegó nada de la línea (qty 0); re-tickear = completa.
+  const toggleItem = (it: DespachoItemDetalle) => {
+    setQtys(p => ({ ...(p ?? {}), [it.id]: qtyDe(it) > 0 ? '0' : String(it.qty_despachada) }))
+  }
+
   const submit = async () => {
-    if (!file) {
-      toast.error('Sube la foto o PDF de la guía firmada')
+    // Validación LOCAL antes de mandar nada (los errores quedan en el recuadro).
+    const errs: string[] = []
+    if (!esEdicion && !file) errs.push('Sube la foto o PDF de la guía firmada.')
+    let itemsPayload: FirmaItemPayload[] | undefined
+    let motivoPayload: string | undefined
+    if (items && items.length > 0 && qtys) {
+      let hayFaltante = false
+      for (const it of items) {
+        const raw = (qtys[it.id] ?? '').trim()
+        const v = Number(raw)
+        // Una línea INTACTA (v == qty_despachada) siempre es válida, aunque la
+        // cantidad despachada sea fraccionaria (2.5 legado): exigirle «entero» a lo
+        // que el operador NI TOCÓ bloqueaba firmar el despacho completo (revisión
+        // adversarial M2). El check de entero aplica solo a valores editados.
+        if (raw === '' || v < 0 || v > it.qty_despachada
+            || (v !== it.qty_despachada && !Number.isInteger(v))) {
+          errs.push(`${it.numero_parte}: la cantidad firmada debe ser un número entero entre 0 y ${it.qty_despachada} (o la cantidad completa).`)
+          continue
+        }
+        if (v < it.qty_despachada) hayFaltante = true
+      }
+      if (errs.length === 0 && hayFaltante) {
+        const m = motivo.trim()
+        if (m.length < MOTIVO_FALTANTE_MIN || m.length > MOTIVO_FALTANTE_MAX) {
+          errs.push(`Explica el motivo del faltante (entre ${MOTIVO_FALTANTE_MIN} y ${MOTIVO_FALTANTE_MAX} caracteres).`)
+        } else {
+          itemsPayload = items.map(it => ({ despacho_item_id: it.id, qty_firmada: Number(qtys[it.id]) }))
+          motivoPayload = m
+        }
+      } else if (esEdicion) {
+        // RE-firma con todo completo: el body lleva items EXPLÍCITOS igual
+        // (revisión H-2). Sin ellos, «sin items = firma completa» + una precarga
+        // nacida de caché vieja podía borrar un faltante real en silencio; con
+        // ellos, lo que viaja es EXACTAMENTE lo que el operador tiene en pantalla.
+        // El camino byte-igual queda solo para la PRIMERA firma.
+        itemsPayload = items.map(it => ({ despacho_item_id: it.id, qty_firmada: Number(qtys[it.id]) }))
+      }
+      // Primera firma con todo completo → el body NO lleva `items` (byte-igual).
+    }
+    if (errs.length > 0) {
+      setErrores(errs)
       return
     }
+    setErrores([])
     setSaving(true)
     try {
-      const up = await despachosAPI.uploadDoc(file)
-      await despachosAPI.firmar(despachoId, {
+      // En la re-firma la foto es opcional: sin archivo nuevo se conserva el actual.
+      const archivo = file ? (await despachosAPI.uploadDoc(file)).filename : undefined
+      await despachosAPI.firmar(despacho.id, {
         fecha_firma: fecha,
         // Con folio SII, el N° de guía no viaja (el backend además lo rechaza)
         numero_guia: folioBloqueado ? undefined : (numeroGuia || undefined),
-        archivo: up.filename,
+        ...(archivo ? { archivo } : {}),
+        ...(itemsPayload ? { items: itemsPayload } : {}),
+        ...(motivoPayload ? { motivo_faltante: motivoPayload } : {}),
       })
-      toast.success('Guía firmada — ya se puede facturar en Contabilidad')
+      if (faltante > 0) {
+        toast.success(
+          `Guía firmada con ${faltante} unidad${faltante === 1 ? '' : 'es'} faltante` +
+          ' — el faltante no se facturará por esta guía'
+        )
+      } else {
+        toast.success('Guía firmada — ya se puede facturar en Contabilidad')
+      }
       onDone()
     } catch (e: any) {
-      toast.error(e?.response?.data?.detail || 'Error al firmar la guía')
+      // El error del backend (p. ej. el 409 "no puedes bajar de lo ya facturado")
+      // se muestra ENTERO en el recuadro del modal.
+      const d = e?.response?.data?.detail
+      setErrores([typeof d === 'string' ? d : d ? JSON.stringify(d) : 'Error al firmar la guía'])
     } finally {
       setSaving(false)
     }
@@ -1852,7 +3181,7 @@ function FirmarGuiaModal({
       onClick={onClose}
     >
       <div
-        className="max-w-md w-full rounded-2xl border shadow-2xl"
+        className="max-w-lg w-full max-h-[90vh] flex flex-col rounded-2xl border shadow-2xl"
         style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}
         onClick={e => e.stopPropagation()}
       >
@@ -1861,24 +3190,31 @@ function FirmarGuiaModal({
           style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
         >
           <h2 className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>
-            Marcar guía firmada
+            {esEdicion ? 'Editar firma de la guía' : 'Marcar guía firmada'}
           </h2>
           <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-[var(--surface-300)]" style={{ color: 'var(--text-muted)' }}>
             <X className="w-5 h-5" />
           </button>
         </div>
-        <div className="p-4 space-y-4">
+        <div className="p-4 space-y-4 overflow-y-auto">
           <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-            Sube la <b>foto o PDF de la guía firmada</b> por el cliente. Quedará disponible en Contabilidad
-            para cobrar (OC + factura + guía firmada).
+            {esEdicion ? (
+              <>Corrige lo que llegó con esta guía. Si subes una foto nueva, reemplaza a la actual;
+              si no, se conserva la que ya está.</>
+            ) : (
+              <>Sube la <b>foto o PDF de la guía firmada</b> por el cliente. Quedará disponible en Contabilidad
+              para cobrar (OC + factura + guía firmada).</>
+            )}
           </p>
           <div>
             <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: 'var(--text-faint)' }}>
-              Foto / PDF de la guía firmada
+              Foto / PDF de la guía firmada{esEdicion ? ' (opcional)' : ''}
             </label>
             <label className="flex items-center gap-2 px-3 py-2 rounded-lg border cursor-pointer hover:bg-[var(--surface-200)]" style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
               <Upload className="w-4 h-4" />
-              <span className="text-sm truncate">{file ? file.name : 'Seleccionar archivo…'}</span>
+              <span className="text-sm truncate">
+                {file ? file.name : esEdicion ? 'Reemplazar archivo… (opcional)' : 'Seleccionar archivo…'}
+              </span>
               <input
                 type="file"
                 accept="image/*,application/pdf"
@@ -1911,11 +3247,132 @@ function FirmarGuiaModal({
               <input type="date" value={fecha} onChange={e => setFecha(e.target.value)} className="input" />
             </div>
           </div>
+
+          {/* ¿Qué llegó con esta guía? — firma parcial por ítem */}
+          <div>
+            <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: 'var(--text-faint)' }}>
+              ¿Qué llegó con esta guía?
+            </label>
+            {cargandoItems ? (
+              <div className="text-xs flex items-center gap-2 py-2" style={{ color: 'var(--text-muted)' }}>
+                <Loader2 className="w-3.5 h-3.5 animate-spin" /> Cargando los ítems del despacho…
+              </div>
+            ) : errorItems || !items || items.length === 0 ? (
+              <p className="text-[11px]" style={{ color: 'var(--text-faint)' }}>
+                {errorItems
+                  ? 'No se pudieron cargar los ítems: la guía se firmará completa (como siempre).'
+                  : 'Sin detalle de ítems disponible: la guía se firmará completa (como siempre).'}
+              </p>
+            ) : (
+              <>
+                <p className="text-[11px] mb-1.5" style={{ color: 'var(--text-faint)' }}>
+                  Viene todo marcado como recibido. Si algo <b>no llegó</b>, destíckalo o baja la cantidad.
+                </p>
+                <div className="border rounded-xl overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+                  {items.map((it: DespachoItemDetalle) => {
+                    const v = qtys?.[it.id] ?? String(it.qty_firmada ?? it.qty_despachada)
+                    const marcado = Number(v) > 0
+                    return (
+                      <div
+                        key={it.id}
+                        className="flex items-center gap-2.5 px-3 py-2 border-t first:border-t-0"
+                        style={{ borderColor: 'var(--border)' }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={marcado}
+                          onChange={() => toggleItem(it)}
+                          className="shrink-0 w-4 h-4 accent-emerald-500 cursor-pointer"
+                          title={marcado ? 'Destickear = esta línea no llegó' : 'Marcar como recibida completa'}
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div className="font-mono text-xs text-brand-500 truncate">{it.numero_parte}</div>
+                          <div className="text-[11px] truncate" style={{ color: 'var(--text-muted)' }}>
+                            {it.descripcion}
+                            {it.marca ? ` · ${it.marca}` : ''}
+                          </div>
+                        </div>
+                        {(it.facturado ?? 0) > 0 && (
+                          <span
+                            className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-blue-500/15 text-blue-600 dark:text-blue-400 shrink-0"
+                            title="Esta línea ya entró a una factura: no se puede bajar de lo facturado"
+                          >
+                            facturada
+                          </span>
+                        )}
+                        <div className="flex items-center gap-1 shrink-0">
+                          <input
+                            type="number"
+                            min={0}
+                            max={it.qty_despachada}
+                            step={1}
+                            value={v}
+                            onChange={e => setQtys(p => ({ ...(p ?? {}), [it.id]: e.target.value }))}
+                            className="input w-16 text-right py-1 text-sm"
+                          />
+                          <span className="text-[11px]" style={{ color: 'var(--text-faint)' }}>
+                            / {it.qty_despachada}
+                          </span>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+                {faltante > 0 && (
+                  <div className="mt-2 space-y-2">
+                    <div className="p-3 rounded-xl border bg-amber-500/10 border-amber-500/30 text-xs flex items-start gap-1.5">
+                      <AlertTriangle className="w-4 h-4 shrink-0 text-amber-500" />
+                      <span style={{ color: 'var(--text-muted)' }}>
+                        Vas a declarar{' '}
+                        <b className="text-amber-600 dark:text-amber-400">
+                          {faltante} unidad{faltante === 1 ? '' : 'es'}
+                        </b>{' '}
+                        como faltante de entrega: no se podrán facturar por esta guía.
+                      </span>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold uppercase tracking-wider mb-1.5" style={{ color: 'var(--text-faint)' }}>
+                        Motivo del faltante (obligatorio)
+                      </label>
+                      <textarea
+                        value={motivo}
+                        onChange={e => setMotivo(e.target.value)}
+                        rows={2}
+                        maxLength={MOTIVO_FALTANTE_MAX}
+                        placeholder="ej: 1 unidad perdida por el transportista — se repondrá en una venta nueva"
+                        className="input resize-none"
+                      />
+                      <p className="text-[11px] mt-1" style={{ color: 'var(--text-faint)' }}>
+                        Entre {MOTIVO_FALTANTE_MIN} y {MOTIVO_FALTANTE_MAX} caracteres.
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          {/* Recuadro de errores: validación local y respuestas del backend */}
+          {errores.length > 0 && (
+            <div className="p-3 rounded-xl border bg-red-500/10 border-red-500/30">
+              <p className="text-xs font-semibold text-red-500 mb-1 flex items-center gap-1.5">
+                <AlertTriangle className="w-4 h-4" /> No se pudo confirmar la firma:
+              </p>
+              <ul className="text-xs space-y-0.5 list-disc pl-4" style={{ color: 'var(--text-muted)' }}>
+                {errores.map((er, i) => <li key={i}>{er}</li>)}
+              </ul>
+            </div>
+          )}
         </div>
         <div className="p-4 border-t flex justify-end gap-2" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
           <button onClick={onClose} className="btn-secondary text-sm">Cancelar</button>
-          <button onClick={submit} disabled={saving || !file} className="btn-primary text-sm flex items-center gap-1.5">
-            {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />} Confirmar firma
+          <button
+            onClick={submit}
+            disabled={saving || (!esEdicion && !file)}
+            className="btn-primary text-sm flex items-center gap-1.5"
+          >
+            {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
+            {esEdicion ? 'Guardar firma' : 'Confirmar firma'}
           </button>
         </div>
       </div>
@@ -1939,10 +3396,16 @@ function EditarDespachoModal({
   const [numeroExpedicion, setNumeroExpedicion] = useState(despacho.numero_expedicion || '')
   const [numeroGuia, setNumeroGuia] = useState(despacho.numero_guia || '')
   const [fechaGuia, setFechaGuia] = useState((despacho.fecha_guia || '').slice(0, 10))
+  // Rótulo del bulto (caja física). Editable siempre: corregir un rotulado no
+  // depende del estado de la guía SII (no viaja al SII).
+  const [bulto, setBulto] = useState(despacho.bulto_numero || '')
+  // Con qué bulto ABRIÓ el modal: el payload solo lo manda si el operador lo
+  // cambió respecto de esto (ver submit).
+  const bultoInicial = (despacho.bulto_numero || '').trim()
   const [saving, setSaving] = useState(false)
   // Tope del selector de fecha: hoy en Chile. Una guía no se emite mañana, y el error de
   // tipeo clásico es el año. El backend valida lo mismo (no confiar sólo en el navegador).
-  const hoyChile = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Santiago' })
+  const hoyChile = hoyEnChile()
 
   // dteFolio: null = sin guía electrónica · 'verificando' = consulta en curso ·
   // 'en_emision' = guía en proceso en el SII (ver folioParaModal) · otro valor =
@@ -1955,6 +3418,14 @@ function EditarDespachoModal({
       await despachosAPI.update(despacho.id, {
         transportista: transportista || null,
         numero_expedicion: numeroExpedicion || null,
+        // El bulto viaja SOLO si el operador lo cambió respecto del valor con
+        // que abrió el modal (que venía de una fila con hasta 30s de caché):
+        // mandarlo siempre hacía que quien edita solo el transportista PISARA
+        // el bulto recién puesto por otro usuario. El backend usa exclude_unset:
+        // no mandar = no tocar; null explícito = borrar (el borrado sigue vivo:
+        // vaciar el campo difiere del inicial y manda null).
+        // Contrato backend 2026-08-25: string ≤50 o null ("" → NULL en el servidor).
+        ...(bulto.trim() !== bultoInicial ? { bulto_numero: bulto.trim() || null } : {}),
         // Guía electrónica emitida (o sin verificar): el folio no se edita a mano, y su
         // fecha la manda el propio DTE 52 (no este campo).
         ...(folioBloqueado ? {} : { numero_guia: numeroGuia || null, fecha_guia: fechaGuia || null }),
@@ -2001,6 +3472,15 @@ function EditarDespachoModal({
           <Input label="Transportista" value={transportista} onChange={setTransportista} placeholder="Ej: Samex" />
           <Input label="N° Expedición (courier / Samex)" value={numeroExpedicion} onChange={setNumeroExpedicion} />
           <Input
+            label="Bulto N°"
+            value={bulto}
+            /* Array.from y no slice sobre el string: el tope de 50 se cuenta en
+               caracteres reales para no partir un emoji (surrogate) en el borde. */
+            onChange={(v: string) => setBulto(Array.from(v).slice(0, 50).join(''))}
+            placeholder="Ej: 1, B2, Cajas 2-3"
+            hint="Caja en que viaja este despacho (ej: 1, B2, Cajas 2-3)"
+          />
+          <Input
             label="N° Guía"
             value={numeroGuia}
             onChange={setNumeroGuia}
@@ -2034,6 +3514,436 @@ function EditarDespachoModal({
           <button onClick={submit} disabled={saving} className="btn-primary text-sm flex items-center gap-1.5">
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />} Guardar
           </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Modal: reparto de bultos de la OC (texto para el transportista) ──────────
+// Qué guía viaja en qué caja. El texto se arma en picking.ts (armarResumenBultos)
+// y se copia tal cual al mail del transportista.
+function RepartoBultosModal({
+  oc,
+  despachos,
+  onClose,
+}: {
+  /** El llamador pasa `detail` (OcDetail): acá solo se pintan estos 4 campos. */
+  oc: Pick<OcDetail, 'id' | 'numero_oc' | 'cliente' | 'direccion'>
+  despachos: DespachoRow[]
+  onClose: () => void
+}) {
+  const [copied, setCopied] = useState(false)
+  const ids = useMemo(() => despachos.map(d => d.id), [despachos])
+
+  // Detalle de cada despacho NO anulado, en paralelo: el bulto y los ítems viven
+  // en GET /despachos/{id}. Cacheado por React Query mientras no cambien los
+  // despachos de la OC.
+  // Bajo la raíz ['despachos'] A PROPÓSITO: crear/editar/firmar/anular ya
+  // invalidan ['despachos'] en todo el archivo, y así esas invalidaciones barren
+  // este caché gratis. Con raíz propia, el staleTime global de 30s dejaba servir
+  // un reparto viejo — y este texto se COPIA al mail del transportista.
+  const { data: detalles, isLoading, isError } = useQuery({
+    queryKey: ['despachos', 'bultos-oc', oc.id, ids],
+    // El tipo se ensancha con `cerrado_hoy` (campo aditivo del contrato nuevo):
+    // services/api.ts todavía describe el detalle sin él.
+    queryFn: (): Promise<DespachoDetalleConCerrado[]> =>
+      Promise.all(ids.map(id => despachosAPI.get(id))),
+  })
+
+  // dd-mm-aaaa (mismo formato que la línea «Fecha del reparto»; fmtDate usa
+  // barras). Se toma el DÍA tal como lo estampó el servidor y se invierte: nada
+  // de new Date('YYYY-MM-DD'), que en Chile corre la fecha un día hacia atrás.
+  const fmtDia = (s?: string | null): string | null => {
+    const dia = (s || '').slice(0, 10)
+    return /^\d{4}-\d{2}-\d{2}$/.test(dia) ? dia.split('-').reverse().join('-') : null
+  }
+
+  const resumen = useMemo(() => {
+    if (!detalles) return null
+    // Cinturón: otro usuario pudo ANULAR un despacho entre que la fila se pintó
+    // y este fetch fresco (el llamador filtra, pero sobre datos con hasta 30s de
+    // caché). Un despacho anulado nunca viaja. Se filtra el PAR (detalle, fila)
+    // junto para no desalinear los fallbacks por índice.
+    const vivos = detalles
+      .map((det, i) => ({ det, fila: despachos[i] }))
+      .filter(({ det }) => det.estado !== 'anulado')
+    return armarResumenBultos({
+      // numero_oc es NULLABLE (OCs legacy): sin el fallback, la PRIMERA línea del
+      // texto que se pega en el mail decía literalmente «OC null - MINERA X».
+      // La identidad se resuelve ACÁ (picking.ts recibe una identidad ya
+      // resuelta, no la decide) y con el MISMO formato que el panel: «OC #123».
+      numero_oc: oc.numero_oc || `#${oc.id}`,
+      cliente: oc.cliente,
+      direccion: oc.direccion || null,
+      // Fecha de HOY en Chile (dd-mm-aaaa): el reparto se manda antes del viaje.
+      // Con el día del NAVEGADOR (hoyLocal, lo que había acá), un PC con la zona
+      // corrida —o el turno de noche desde otra zona— le mandaba al transportista
+      // un mail fechado el día equivocado. El día del negocio es el de Chile.
+      fecha: hoyEnChile().split('-').reverse().join('-'),
+      despachos: vivos.map(({ det, fila }) => {
+        // fecha_despacho (cierre) solo viaja en la fila del listado; el detalle
+        // no la trae. Es un sello INFORMATIVO (ver `fechaSalida` más abajo): el
+        // corte «hoy / ya viajó» NO se calcula con ella.
+        const fechaSalidaIso = fila?.fecha_despacho ?? null
+        // ¿Cerrado HOY? Lo dice el SERVIDOR y nadie más. `fecha_despacho` llega
+        // en UTC y sin zona (el server corre en UTC), así que compararla contra
+        // el reloj del navegador fechaba «mañana» todo lo que se cerró después
+        // de las ~21:00 de Chile: la caja de hoy caía en «YA DESPACHADO — no
+        // viaja en este reparto» y se descontaba de los totales, o sea que el
+        // mail al transportista escondía la caja que tenía que cargar (y a la
+        // mañana siguiente pasaba lo inverso).
+        // El backend nuevo lo manda SIEMPRE en los dos serializers (detalle y
+        // fila), con `fecha_despacho` nulo → false. Se leen los dos por si uno
+        // de los dos endpoints responde desde una versión anterior.
+        // POR QUÉ `?? null` Y NO `?? false`: `false` significa «ya viajó» y
+        // manda la caja al histórico, o sea que un backend viejo —o el hueco de
+        // un deploy a medias— ESCONDERÍA cajas en silencio, que es exactamente
+        // el daño que este arreglo viene a evitar. `null` es «no sé», y el no sé
+        // se resuelve mostrando (vaASalir). Un reparto con una caja de más se ve
+        // y se corrige; uno con una caja de menos se descubre en el cliente.
+        const cerradoHoy = det.cerrado_hoy ?? fila?.cerrado_hoy ?? null
+        return {
+          // Fallback a la fila del listado: un backend previo puede no mandar la
+          // cabecera completa en el detalle (campos opcionales del contrato).
+          numero_despacho: det.numero_despacho || fila?.numero_despacho || `#${det.id}`,
+          numero_guia: det.numero_guia ?? fila?.numero_guia ?? null,
+          bulto_numero: det.bulto_numero ?? fila?.bulto_numero ?? null,
+          // El ESTADO es el eje del reparto (ver picking.ts/vaASalir): 'despachado'
+          // ya salió, 'en_preparacion' va a salir. La firma NO decide.
+          estado: det.estado ?? fila?.estado ?? null,
+          cerradoHoy,
+          // DEUDA MENOR CONOCIDA: este sello imprime el día CRUDO del ISO, que
+          // es UTC — un cierre de las 22:00 de Chile se sella con la fecha del
+          // día siguiente. Es solo texto informativo (el corte del reparto ya no
+          // depende de él); arreglarlo pide que el backend mande la fecha de
+          // cierre ya expresada en día de Chile, como hizo con `cerrado_hoy`.
+          fechaSalida: fmtDia(fechaSalidaIso),
+          fechaFirma: fmtDia(det.fecha_firma ?? fila?.fecha_firma ?? null),
+          guiaFirmada: Boolean(det.guia_firmada ?? fila?.guia_firmada),
+          items: (det.items ?? []).map(it => ({
+            numero_parte: it.numero_parte,
+            descripcion: it.descripcion,
+            // SIEMPRE qty_despachada: el mail al transportista se manda ANTES del
+            // viaje; qty_firmada y el faltante de entrega ocurren DESPUÉS y NO
+            // participan de este resumen.
+            qty: it.qty_despachada,
+          })),
+        }
+      }),
+    })
+  }, [detalles, despachos, oc])
+
+  // Patrón exacto de TextDocModal: clipboard en try/catch + toast si falla.
+  const copy = async () => {
+    if (!resumen) return
+    try {
+      await navigator.clipboard.writeText(resumen.texto)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      toast.error('No se pudo copiar')
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-[9999] flex items-center justify-center p-4"
+      style={{ backgroundColor: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)' }}
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-xl max-h-[90vh] flex flex-col rounded-2xl border shadow-2xl overflow-hidden"
+        style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div
+          className="p-4 border-b flex items-center justify-between"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+        >
+          <div>
+            <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>
+              {/* Mismo fallback de identidad que el texto y que el panel. */}
+              Bultos de la OC {oc.numero_oc || `#${oc.id}`}
+            </h3>
+            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+              {/* «por salir»: los totales NO incluyen los despachos que ya
+                  viajaron (van rotulados aparte en el texto). */}
+              {resumen
+                ? `${oc.cliente} · ${resumen.totalBultos} bulto${resumen.totalBultos === 1 ? '' : 's'} / ` +
+                  `${resumen.totalGuias} guía${resumen.totalGuias === 1 ? '' : 's'} / ` +
+                  `${fmtQtyPicking(resumen.totalUnidades)} unidades por salir`
+                : oc.cliente}
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1.5 rounded-lg hover:bg-[var(--surface-300)]"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <div className="p-4 overflow-y-auto flex-1 space-y-3">
+          {resumen && resumen.yaViajaron > 0 && (
+            /* Aviso NEUTRO (no es un error): esta OC ya tuvo entregas. Van en el
+               texto rotuladas como «YA DESPACHADO» y NO suman a los totales —
+               antes salían mezcladas con las de hoy y el transportista iba a
+               buscar cajas que se entregaron hace semanas. */
+            <div
+              className="flex items-start gap-2 p-3 rounded-xl border text-xs"
+              style={{ backgroundColor: 'var(--surface-200)', borderColor: 'var(--border)', color: 'var(--text-muted)' }}
+            >
+              <Truck className="w-4 h-4 shrink-0 mt-0.5" style={{ color: 'var(--text-faint)' }} />
+              <span>
+                {resumen.yaViajaron} despacho{resumen.yaViajaron === 1 ? '' : 's'} de esta OC ya{' '}
+                {resumen.yaViajaron === 1 ? 'viajó' : 'viajaron'} ({fmtQtyPicking(resumen.unidadesYaViajaron)} unidades):
+                {' '}van al final del texto como histórico y no cuentan en los totales del reparto.
+              </span>
+            </div>
+          )}
+          {resumen?.hayGuiasPendientes && (
+            <div
+              className="flex items-start gap-2 p-3 rounded-xl border text-xs"
+              style={{
+                backgroundColor: 'rgba(245, 158, 11, 0.08)',
+                borderColor: 'rgba(245, 158, 11, 0.4)',
+                color: 'var(--text-muted)',
+              }}
+            >
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-500" />
+              <span>Hay despachos sin guía emitida: van como «Guía N° PENDIENTE».</span>
+            </div>
+          )}
+          {resumen && resumen.colisionesRotulos.length > 0 && (
+            /* Rótulos que solo difieren en mayúsculas: casi seguro es la MISMA
+               caja rotulada dos veces. Se AVISA sin unificar (decisión de
+               picking.ts: unificar en silencio escondería el error). */
+            <div
+              className="flex items-start gap-2 p-3 rounded-xl border text-xs"
+              style={{
+                backgroundColor: 'rgba(245, 158, 11, 0.08)',
+                borderColor: 'rgba(245, 158, 11, 0.4)',
+                color: 'var(--text-muted)',
+              }}
+            >
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-500" />
+              <span>
+                {resumen.colisionesRotulos
+                  .map(g => g.map(r => `«${r}»`).join(' y '))
+                  .join('; ')}{' '}
+                parecen la misma caja con distinto rótulo — corrígelo en «Editar despacho».
+              </span>
+            </div>
+          )}
+          {isLoading && (
+            <div className="flex items-center justify-center gap-2 py-8 text-sm" style={{ color: 'var(--text-muted)' }}>
+              <Loader2 className="w-4 h-4 animate-spin" /> Cargando despachos...
+            </div>
+          )}
+          {isError && (
+            <div className="text-center py-8 text-sm text-red-500">
+              No se pudo cargar el detalle de los despachos
+            </div>
+          )}
+          {resumen && (
+            <pre
+              className="text-sm whitespace-pre-wrap break-words p-3 rounded-lg border select-text"
+              style={{
+                backgroundColor: 'var(--surface)',
+                borderColor: 'var(--border)',
+                color: 'var(--text-primary)',
+              }}
+            >
+              {resumen.texto}
+            </pre>
+          )}
+        </div>
+        <div
+          className="p-3 border-t flex items-center justify-end gap-2"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+        >
+          <button onClick={copy} disabled={!resumen} className="btn-primary text-sm">
+            {copied ? (
+              <>
+                <CheckCircle2 className="w-4 h-4" />
+                Copiado
+              </>
+            ) : (
+              <>
+                <FileText className="w-4 h-4" />
+                Copiar
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Panel: qué hay LISTO para despachar ahora (se abre desde los KPIs) ───────
+// Resumen transversal por OC de la mercadería en bodega con cupo REAL (recibido
+// − tomado por despachos abiertos). UN solo GET: el backend arma los grupos y
+// los ordena por urgencia — acá no se reordena ni se recalcula nada.
+function ListoParaDespacharModal({
+  onClose,
+  onIrAOc,
+}: {
+  onClose: () => void
+  /** Cierra el panel y lleva al operador a la card de esa OC en el listado.
+   *  numeroOc puede venir null (OC legacy sin N°): el padre cae al id. */
+  onIrAOc: (ocId: number, numeroOc: string | null) => void
+}) {
+  const { data, isLoading, isError, refetch, isRefetching } = useQuery<ListoResumenResponse>({
+    queryKey: ['despachos', 'listo-resumen'],
+    queryFn: despachosAPI.listoParaDespachar,
+    // staleTime 0 + refetchOnMount 'always' A PROPÓSITO: una recepción cerrada
+    // en Bodega ocurre en OTRA pantalla y no invalida nada de ['despachos'], y
+    // el staleTime global de 30s (main.tsx) serviría datos viejos justo aquí,
+    // donde el operador decide qué despachar AHORA.
+    staleTime: 0,
+    refetchOnMount: 'always',
+  })
+  const grupos = data?.grupos ?? []
+  const totalUnidades = grupos.reduce((acc, g) => acc + (g.total_unidades || 0), 0)
+
+  return (
+    <div
+      className="fixed inset-0 z-[9999] flex items-center justify-center p-4"
+      style={{ backgroundColor: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)' }}
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-2xl max-h-[90vh] flex flex-col rounded-2xl border shadow-2xl overflow-hidden"
+        style={{ backgroundColor: 'var(--surface-100)', borderColor: 'var(--border)' }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div
+          className="p-4 border-b flex items-center justify-between"
+          style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+        >
+          <div className="flex items-center gap-2.5 min-w-0">
+            <Zap className="w-5 h-5 text-emerald-500 shrink-0" />
+            <div className="min-w-0">
+              <h3 className="font-bold text-sm" style={{ color: 'var(--text-primary)' }}>
+                Listo para despachar
+              </h3>
+              <p className="text-xs truncate" style={{ color: 'var(--text-muted)' }}>
+                {data
+                  ? `${grupos.length} OC${grupos.length === 1 ? '' : 's'} · ` +
+                    `${fmtQtyPicking(totalUnidades)} un. por despachar` +
+                    (data.hoy ? ` · al ${fmtDate(data.hoy)}` : '')
+                  : 'Disponible real en bodega, descontando despachos abiertos'}
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1.5 rounded-lg hover:bg-[var(--surface-300)]"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="p-4 overflow-y-auto flex-1 space-y-3">
+          {isLoading && (
+            /* Esqueleto: 3 grupos fantasma con el mismo layout que los reales. */
+            <>
+              {[0, 1, 2].map(i => (
+                <div
+                  key={i}
+                  className="border rounded-xl p-3 space-y-2 animate-pulse"
+                  style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+                >
+                  <div className="h-4 w-2/3 rounded" style={{ backgroundColor: 'var(--surface-300)' }} />
+                  <div className="h-3 w-full rounded" style={{ backgroundColor: 'var(--surface-300)' }} />
+                  <div className="h-3 w-5/6 rounded" style={{ backgroundColor: 'var(--surface-300)' }} />
+                </div>
+              ))}
+            </>
+          )}
+
+          {isError && !isLoading && (
+            <div className="text-center py-10 space-y-3">
+              <div className="text-sm text-red-500">
+                No se pudo cargar el resumen de despachables
+              </div>
+              <button
+                onClick={() => refetch()}
+                disabled={isRefetching}
+                className="btn-secondary text-sm inline-flex items-center gap-1.5"
+              >
+                {isRefetching && <Loader2 className="w-4 h-4 animate-spin" />} Reintentar
+              </button>
+            </div>
+          )}
+
+          {data && grupos.length === 0 && (
+            /* Vacío POSITIVO: bodega al día no es un error. */
+            <div className="text-center py-10">
+              <CheckCircle2 className="w-8 h-8 mx-auto mb-2 text-emerald-500" />
+              <div className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+                ✓ No hay mercadería en bodega pendiente de despachar
+              </div>
+            </div>
+          )}
+
+          {grupos.map(g => (
+            <div
+              key={g.oc_cliente_id}
+              className="border rounded-xl overflow-hidden"
+              style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}
+            >
+              <div className="p-3 flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-mono font-semibold text-brand-500 shrink-0">
+                  {/* numero_oc null (OC legacy): identidad por id, no «OC-» vacío */}
+                  {g.numero_oc ? `OC-${g.numero_oc}` : `OC #${g.oc_cliente_id}`}
+                </span>
+                <span
+                  className="text-sm font-semibold truncate max-w-[16rem]"
+                  style={{ color: 'var(--text-primary)' }}
+                  title={g.cliente}
+                >
+                  {g.cliente}
+                </span>
+                <DiasRestantesBadge dias={g.dias_restantes_critico} label="entrega" />
+                <span className="text-xs shrink-0" style={{ color: 'var(--text-muted)' }}>
+                  {fmtQtyPicking(g.total_unidades)} un.
+                  {g.fecha_entrega && ` · Entrega: ${fmtDate(g.fecha_entrega)}`}
+                </span>
+                <button
+                  onClick={() => onIrAOc(g.oc_cliente_id, g.numero_oc)}
+                  className="ml-auto px-2.5 py-1 text-xs font-semibold rounded-lg border hover:bg-[var(--surface-300)] inline-flex items-center gap-1 shrink-0"
+                  style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}
+                >
+                  Ir a la OC <ChevronRight className="w-3 h-3" />
+                </button>
+              </div>
+              <div className="border-t" style={{ borderColor: 'var(--border)' }}>
+                {g.items.map((it, i) => (
+                  <div
+                    key={`${it.numero_parte}-${i}`}
+                    className={`px-3 py-1.5 flex items-center gap-3 text-xs ${i > 0 ? 'border-t' : ''}`}
+                    style={{ borderColor: 'var(--border)' }}
+                  >
+                    <span className="font-mono text-brand-500 shrink-0">{it.numero_parte}</span>
+                    <span
+                      className="truncate flex-1"
+                      style={{ color: 'var(--text-muted)' }}
+                      title={it.descripcion}
+                    >
+                      {it.descripcion}
+                    </span>
+                    <span className="shrink-0 font-semibold" style={{ color: 'var(--text-primary)' }}>
+                      {fmtQtyPicking(it.qty_disponible)} de {fmtQtyPicking(it.cantidad)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
         </div>
       </div>
     </div>

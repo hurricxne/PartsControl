@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { PackageSearch, Search, RefreshCw, ChevronDown, ChevronRight, Truck, X, Upload, Loader2 } from "lucide-react";
 import { monzaAbastecimientoAPI, monzaRecepcionNacionalAPI, monzaDocumentosAPI, monzaTotalPendiente, monzaErrMsg } from "../services/monzaApi";
 import type { MonzaPendienteNacionalItem, MonzaItemQty } from "../services/monzaApi";
+import { agruparPorOc, esListadoPlano, semaforoChip, completitudTexto } from "../monza-agrupacion/agrupacion";
+import type { MonzaOcp } from "../monza-agrupacion/agrupacion";
 import { hoyLocal } from "../utils/format";
 import { useMonzaTheme } from "./MonzaLayout";
 import MonzaDocs from "./MonzaDocs";
@@ -30,6 +32,40 @@ interface SegItem {
   // 'nacional' → el ítem NO se prepara/embarca: su camino físico es el CTA
   // "Registrar entrega nacional" (camión + guía del proveedor, directo a bodega).
   tipo_origen?: string;
+  // Claves ADITIVAS del contrato de agrupación (llegan undefined mientras el
+  // backend no las mande): ver src/monza-agrupacion/agrupacion.ts.
+  costo?: number | null;
+  moneda?: string | null;
+  peso_kg?: number | null;
+  peso_total_kg?: number | null;
+  fob_total?: number | null;
+  ocp?: MonzaOcp | null;
+}
+
+/**
+ * OC del ítem para agrupar. Si el backend ya manda `ocp` (contrato nuevo, con
+ * semáforo y completitud), manda ese. Mientras no exista, se SINTETIZA desde las
+ * claves legadas `ocp_*` que este endpoint siempre tuvo — así la agrupación
+ * funciona hoy y la integración es solo «los datos aparecen». La síntesis va SIN
+ * semáforo (sin chip) y sin completitud: los días de atraso los calcula SOLO el
+ * backend (días hábiles Chile), jamás el navegador.
+ */
+function ocpDe(it: SegItem): MonzaOcp | null {
+  if (it.ocp) return it.ocp;
+  if (it.oc_proveedor_id == null) return null;
+  return {
+    id: it.oc_proveedor_id,
+    numero: it.ocp_numero ?? null,
+    numero_oc: it.ocp_numero_oc ?? null,
+    proveedor_nombre: it.ocp_proveedor ?? null,
+    tipo_origen: it.tipo_origen ?? null,
+    plazo_dias: it.ocp_plazo_dias ?? null,
+    awb: it.ocp_awb ?? null,
+    tracking: it.ocp_tracking ?? null,
+    fecha_emision: null,
+    semaforo: null,
+    completitud: null,
+  };
 }
 
 // ── Recepción nacional ────────────────────────────────────────────────────────
@@ -61,18 +97,10 @@ const ESTADO_LINEA: Record<string, { bg: string; color: string; label: string }>
   reclamo:     { bg: "#FEE2E2", color: "#B91C1C", label: "Reclamo" },
 };
 
-function fmtDate(d?: string) { return d ? new Date(d).toLocaleDateString("es-CL") : "—"; }
-
-/** Días transcurridos desde la venta y delta vs plazo prometido */
-function plazoInfo(fechaVenta?: string, plazoDias?: number) {
-  if (!fechaVenta || !plazoDias) return null;
-  const trans = Math.floor((Date.now() - new Date(fechaVenta).getTime()) / 86400000);
-  const delta = plazoDias - trans; // días restantes
-  let color = "#15803D", bg = "#DCFCE7", label = `${delta}d restantes`;
-  if (delta < 0) { color = "#B91C1C"; bg = "#FEE2E2"; label = `Vencido ${Math.abs(delta)}d`; }
-  else if (delta <= 3) { color = "#B45309"; bg = "#FEF3C7"; label = `${delta}d restantes`; }
-  return { trans, delta, color, bg, label };
-}
+// El contador viejo `plazoInfo` (días CORRIDOS desde fecha_venta) fue REEMPLAZADO
+// por el semáforo del backend en la cabecera de cada grupo (días HÁBILES desde la
+// emisión de la OC, misma regla de la alerta de las 06:00). No pueden convivir
+// dos números de atraso distintos en la misma pantalla.
 
 // ── Modal Registrar entrega nacional ─────────────────────────────────────────
 // El proveedor nacional llega con su camión y su guía de despacho. Se registra
@@ -434,12 +462,31 @@ export default function MonzaSeguimientoPage() {
   const { dark } = useMonzaTheme();
   const [items, setItems] = useState<SegItem[]>([]);
   const [loading, setLoading] = useState(true);
+  // Buscador server-side intacto + debounce 300ms: `qInput` es lo tecleado, `q` lo
+  // que viaja al backend cuando el usuario deja de escribir.
+  const [qInput, setQInput] = useState("");
   const [q, setQ] = useState("");
+  useEffect(() => { const t = setTimeout(() => setQ(qInput), 300); return () => clearTimeout(t); }, [qInput]);
   const [estado, setEstado] = useState("");
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const toggleExp = (id: number) => setExpanded((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
-  const [selPrep, setSelPrep] = useState<Set<number>>(new Set());
-  const togglePrep = (id: number) => setSelPrep((p) => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  // La selección para preparar SOBREVIVE al filtro q/estado (filtrar oculta filas,
+  // no des-selecciona). Se guarda el ÍTEM entero — no solo el id — para que
+  // preparar() conserve la cantidad parcial aunque el filtro tenga la fila oculta.
+  const [selPrepData, setSelPrepData] = useState<Record<number, SegItem>>({});
+  const isPrepSel = (id: number) => selPrepData[id] !== undefined;
+  const togglePrep = (it: SegItem) => setSelPrepData((p) => {
+    const n = { ...p };
+    if (n[it.id]) delete n[it.id]; else n[it.id] = it;
+    return n;
+  });
+  const togglePrepGrupo = (its: SegItem[]) => setSelPrepData((p) => {
+    const todos = its.length > 0 && its.every((i) => p[i.id] !== undefined);
+    const n = { ...p };
+    if (todos) its.forEach((i) => { delete n[i.id]; });
+    else its.forEach((i) => { n[i.id] = i; });
+    return n;
+  });
   // Modal "Registrar entrega nacional" (OC nacional: camión + guía, sin embarque)
   const [entregaOcp, setEntregaOcp] = useState<{ id: number; titulo: string } | null>(null);
   // Ítem que se va a devolver al panel de compras (back order). Guarda el ítem entero
@@ -454,10 +501,11 @@ export default function MonzaSeguimientoPage() {
   const preparar = async () => {
     // Solo los ítems con cantidad REBAJADA viajan con `cantidad`; si nadie tocó nada,
     // el servicio manda el pedido por la vía legada (línea completa, sin partir).
-    const pedidos: MonzaItemQty[] = Array.from(selPrep).map((id) => {
-      const it = items.find((c) => c.id === id);
-      const q = it ? qtyPrepDe(it) : undefined;
-      return it && q !== undefined && q < it.cantidad ? { item_id: id, cantidad: q } : { item_id: id };
+    // Se itera sobre lo SELECCIONADO (no sobre la lista visible): un ítem que el
+    // filtro tiene oculto se prepara igual, con su cantidad parcial si la tenía.
+    const pedidos: MonzaItemQty[] = Object.values(selPrepData).map((it) => {
+      const q = qtyPrepDe(it);
+      return q < it.cantidad ? { item_id: it.id, cantidad: q } : { item_id: it.id };
     });
     try {
       const r = await monzaAbastecimientoAPI.preparar(pedidos);
@@ -466,7 +514,7 @@ export default function MonzaSeguimientoPage() {
         `${r.data.preparados} ítem(s) → Logística (por embarcar)`
         + (pend > 0 ? ` · quedan ${pend} unidad(es) en Comprado esperando el próximo embarque` : ""),
       );
-      setSelPrep(new Set()); setQtyPrep({}); fetchAll();
+      setSelPrepData({}); setQtyPrep({}); fetchAll();
     } catch (e: unknown) {
       // El backend explica el motivo (cantidad inválida, estado equivocado, o la
       // línea ya tiene guía/factura encima): mostrarlo es lo único útil aquí.
@@ -484,6 +532,23 @@ export default function MonzaSeguimientoPage() {
     try {
       const res = await monzaAbastecimientoAPI.seguimiento({ q: q || undefined, estado: estado || undefined });
       setItems(res.data);
+      // PODA de la selección zombi (revisión adversarial H3): un ítem seleccionado
+      // que el listado trae con estado ya NO preparable (otro usuario lo preparó o
+      // embarcó) bloqueaba el lote entero con 400 y no se podía desmarcar (su
+      // checkbox solo existía en 'comprado'). Se poda por EVIDENCIA del payload,
+      // nunca por ausencia — ausente puede ser solo "oculto por el filtro/buscador"
+      // y la selección debe sobrevivir al filtro.
+      const porId = new Map((res.data as SegItem[]).map((i) => [i.id, i]));
+      setSelPrepData((prev) => {
+        const next: Record<number, SegItem> = {};
+        let cambio = false;
+        for (const it of Object.values(prev)) {
+          const fresco = porId.get(it.id);
+          if (fresco && fresco.estado_linea !== "comprado") { cambio = true; continue; }
+          next[it.id] = fresco ?? it;
+        }
+        return cambio ? next : prev;
+      });
     } catch { toast.error("Error al cargar seguimiento"); }
     finally { setLoading(false); }
   }, [q, estado]);
@@ -496,6 +561,13 @@ export default function MonzaSeguimientoPage() {
     embarcado: items.filter((i) => i.estado_linea === "embarcado").length,
     en_bodega: items.filter((i) => i.estado_linea === "en_bodega").length,
   };
+
+  // Agrupación por OC: `ocp` del backend si viene; si no, sintetizada desde las
+  // claves legadas (ocpDe). "Sin OC" queda al final; si TODO cae ahí, tabla plana.
+  const grupos = agruparPorOc(items.map((it) => (it.ocp ? it : { ...it, ocp: ocpDe(it) })));
+  const plano = esListadoPlano(grupos);
+  const idsVisibles = new Set(items.map((i) => i.id));
+  const fueraDelFiltro = Object.values(selPrepData).filter((i) => !idsVisibles.has(i.id)).length;
 
   return (
     <div>
@@ -523,7 +595,7 @@ export default function MonzaSeguimientoPage() {
       <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
         <div style={{ position: "relative", flex: 1, minWidth: 240 }}>
           <Search size={14} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "#94A3B8" }} />
-          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar ítem, N° COT..."
+          <input value={qInput} onChange={(e) => setQInput(e.target.value)} placeholder="Buscar ítem, N° COT..."
             style={{ width: "100%", padding: "8px 10px 8px 32px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: bg, color: txt }} />
         </div>
         <select value={estado} onChange={(e) => setEstado(e.target.value)}
@@ -538,10 +610,22 @@ export default function MonzaSeguimientoPage() {
               pipeline activo), pero sí debe poder consultarse a demanda. */}
           <option value="reclamo">Reclamo</option>
         </select>
-        {selPrep.size > 0 && (
-          <button onClick={preparar} style={{ padding: "8px 16px", background: "#F59E0B", border: "none", borderRadius: 8, color: "white", cursor: "pointer", fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
-            <PackageSearch size={14} /> Preparar {selPrep.size} → por embarcar
-          </button>
+        {Object.keys(selPrepData).length > 0 && (
+          <>
+            {fueraDelFiltro > 0 && (
+              <span title="Ítems seleccionados que el filtro actual tiene ocultos: siguen seleccionados y se preparan igual"
+                style={{ fontSize: 11, fontWeight: 700, background: "#FEF3C7", color: "#B45309", padding: "3px 10px", borderRadius: 999 }}>
+                {fueraDelFiltro} fuera del filtro
+              </span>
+            )}
+            <button onClick={preparar} style={{ padding: "8px 16px", background: "#F59E0B", border: "none", borderRadius: 8, color: "white", cursor: "pointer", fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
+              <PackageSearch size={14} /> Preparar {Object.keys(selPrepData).length} → por embarcar
+            </button>
+            <button onClick={() => setSelPrepData({})} title="Des-selecciona todo, incluidos los ítems ocultos por el buscador"
+              style={{ padding: "8px 10px", border: `1px solid ${bd}`, borderRadius: 6, background: "transparent", color: sub, cursor: "pointer", fontSize: 11, fontWeight: 700 }}>
+              Limpiar selección
+            </button>
+          </>
         )}
         <button onClick={fetchAll} style={{ padding: "8px 10px", border: `1px solid ${bd}`, borderRadius: 6, background: bg, cursor: "pointer", color: sub }}>
           <RefreshCw size={14} />
@@ -563,125 +647,145 @@ export default function MonzaSeguimientoPage() {
               <tr style={{ background: dark ? "#0d1321" : "#F8FAFC", borderBottom: `1px solid ${bd}` }}>
                 <th style={{ width: 30 }}></th>
                 <th style={{ width: 30 }} title="Seleccionar comprados para preparar"></th>
-                {["N° COT", "Cliente", "Repuesto", "Cant.", "OC Proveedor", "Proveedor", "AWB / Tracking", "Plazo", "Estado"].map((h) => (
+                {/* La OC, el proveedor, el AWB/tracking y el plazo (semáforo) ahora
+                    viven en la fila-cabecera de cada grupo, no por ítem. */}
+                {["N° COT", "Cliente", "Repuesto", "Cant.", "Estado"].map((h) => (
                   <th key={h} style={{ padding: "10px 12px", textAlign: h === "Cant." ? "right" : "left", fontWeight: 600, fontSize: 11, color: sub, textTransform: "uppercase" as const, letterSpacing: 0.5 }}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {items.flatMap((it) => {
-                const es = ESTADO_LINEA[it.estado_linea] || { bg: "#F1F5F9", color: "#64748B", label: it.estado_linea };
-                const pz = plazoInfo(it.fecha_venta, it.ocp_plazo_dias);
-                const isExp = expanded.has(it.id);
+              {/* Grupos de UN nivel: fila-cabecera con colSpan por OC (proveedor
+                  grande + semáforo + completitud + AWB/tracking + CTAs de la OC),
+                  ordenados por proveedor y fecha; "Sin OC" al final. Si TODO cae a
+                  "Sin OC" (backend sin las claves nuevas) la tabla se pinta plana. */}
+              {grupos.flatMap((g) => {
+                const o = g.ocp;
+                const chip = semaforoChip(o?.semaforo, "plazo_proveedor");
+                const compl = completitudTexto(o?.completitud);
+                const esNacionalGrupo = o != null && o.tipo_origen === "nacional";
                 // Camino físico nacional: sin preparar/embarcar — la UI oculta el check
-                // Y el backend rechaza con 400 (nunca solo la UI). El CTA abre el modal
-                // de entrega mientras el ítem siga recibible (comprado/en_bodega).
-                const esNacional = it.tipo_origen === "nacional" && it.oc_proveedor_id != null;
-                const abrirEntrega = () => setEntregaOcp({
-                  id: it.oc_proveedor_id as number,
-                  titulo: `${it.ocp_numero_oc || it.ocp_numero || "OC"} · ${it.ocp_proveedor || "Proveedor"}`,
+                // Y el backend rechaza con 400 (nunca solo la UI). El CTA de entrega es
+                // de la OC completa, por eso vive en la cabecera del grupo, mientras
+                // algún ítem siga recibible (comprado/en_bodega).
+                const recibible = esNacionalGrupo && g.items.some((i) => NACIONAL_RECIBIBLE.has(i.estado_linea));
+                const abrirEntregaGrupo = () => o && setEntregaOcp({
+                  id: o.id,
+                  titulo: `${o.numero_oc || o.numero || "OC"} · ${o.proveedor_nombre || "Proveedor"}`,
                 });
-                const rows = [
-                  <tr key={it.id} style={{ borderBottom: isExp ? "none" : `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}`, background: selPrep.has(it.id) ? (dark ? "#1a2340" : "#FFFBEB") : "transparent" }}>
-                    <td style={{ textAlign: "center", color: "#94A3B8", cursor: "pointer" }} onClick={() => toggleExp(it.id)}>
-                      {isExp ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                    </td>
-                    <td style={{ textAlign: "center" }}>
-                      {esNacional ? (
-                        NACIONAL_RECIBIBLE.has(it.estado_linea) && (
-                          <button onClick={abrirEntrega} title="Registrar entrega nacional (camión + guía del proveedor)"
-                            style={{ background: "none", border: "none", cursor: "pointer", color: "#15803D", display: "flex", margin: "0 auto", padding: 2 }}>
-                            <Truck size={14} />
+                const preparables = g.items.filter((i) =>
+                  i.estado_linea === "comprado" && !(i.tipo_origen === "nacional" && i.oc_proveedor_id != null));
+                const filas = g.items.flatMap((it) => {
+                  const es = ESTADO_LINEA[it.estado_linea] || { bg: "#F1F5F9", color: "#64748B", label: it.estado_linea };
+                  const isExp = expanded.has(it.id);
+                  const esNacional = it.tipo_origen === "nacional" && it.oc_proveedor_id != null;
+                  const rows = [
+                    <tr key={it.id} style={{ borderBottom: isExp ? "none" : `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}`, background: isPrepSel(it.id) ? (dark ? "#1a2340" : "#FFFBEB") : "transparent" }}>
+                      <td style={{ textAlign: "center", color: "#94A3B8", cursor: "pointer" }} onClick={() => toggleExp(it.id)}>
+                        {isExp ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                      </td>
+                      <td style={{ textAlign: "center" }}>
+                        {((!esNacional && it.estado_linea === "comprado") || isPrepSel(it.id)) && (
+                          <input type="checkbox" checked={isPrepSel(it.id)} onChange={() => togglePrep(it)} title="Marcar como preparado (por embarcar)" style={{ accentColor: "var(--monza-accent)", cursor: "pointer" }} />
+                        )}
+                      </td>
+                      <td style={{ padding: "9px 12px", fontWeight: 600, color: "var(--monza-accent)", fontSize: 12 }}>{it.cot_numero}</td>
+                      <td style={{ padding: "9px 12px", color: txt }}>{it.cliente || "—"}</td>
+                      <td style={{ padding: "9px 12px" }}>
+                        <div style={{ color: txt, fontWeight: 500 }}>{it.descripcion}</div>
+                        {it.numero_parte && <div style={{ fontSize: 10, color: sub }}>{it.numero_parte}{it.marca ? ` · ${it.marca}` : ""}</div>}
+                      </td>
+                      {/* Cant. es editable SOLO mientras el ítem se puede preparar: así el
+                          envío parcial se teclea en la misma fila donde se marca el check.
+                          El <td> corta el click por si la fila gana un handler. */}
+                      <td style={{ padding: "9px 12px", textAlign: "right", color: txt }} onClick={(e) => e.stopPropagation()}>
+                        {!esNacional && it.estado_linea === "comprado" ? (
+                          <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "flex-end", gap: 6 }}>
+                            <input
+                              type="number" min={1} max={it.cantidad} step={1}
+                              aria-label={`Cantidad a preparar de ${it.descripcion} (máximo ${it.cantidad})`}
+                              value={qtyPrepDe(it)}
+                              onChange={(e) => setQtyPrep((p) => ({ ...p, [it.id]: Math.max(1, Math.min(it.cantidad, Math.round(Number(e.target.value) || 0))) }))}
+                              style={{ width: 58, padding: "3px 6px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 12, background: dark ? "#0d1321" : "#F8FAFC", color: txt, textAlign: "right" }}
+                            />
+                            <span style={{ fontSize: 11, color: sub }}>/ {it.cantidad}</span>
+                            {qtyPrepDe(it) < it.cantidad && (
+                              <span title="Preparación parcial: el resto sigue en Comprado esperando el próximo embarque"
+                                style={{ fontSize: 10, fontWeight: 700, background: "#FEF3C7", color: "#B45309", padding: "1px 7px", borderRadius: 999, whiteSpace: "nowrap" }}>
+                                {it.cantidad - qtyPrepDe(it)} pendiente
+                              </span>
+                            )}
+                          </span>
+                        ) : it.cantidad}
+                      </td>
+                      <td style={{ padding: "9px 12px" }}>
+                        <span style={{ fontSize: 11, background: es.bg, color: es.color, padding: "3px 10px", borderRadius: 10, fontWeight: 600 }}>{es.label}</span>
+                        {/* BACK ORDER: solo desde 'comprado' — una vez preparado o
+                            embarcado la mercadería ya salió del proveedor y esto deja de
+                            tener sentido (el backend rechaza igual). Se queda EN LA FILA
+                            porque es por ítem (cantidad y motivo propios), a diferencia
+                            de los CTAs de OC que subieron a la cabecera del grupo. */}
+                        {it.estado_linea === "comprado" && (
+                          <button onClick={(e) => { e.stopPropagation(); setDevolver(it); }}
+                            title="El proveedor no lo va a enviar (back order): devolver al panel de compras"
+                            style={{ display: "block", marginTop: 4, background: "none", border: "none", cursor: "pointer", color: "#B45309", fontSize: 10, fontWeight: 700, padding: 0, textAlign: "left", fontFamily: "inherit" }}>
+                            ← Devolver a compras
                           </button>
-                        )
-                      ) : it.estado_linea === "comprado" && (
-                        <input type="checkbox" checked={selPrep.has(it.id)} onChange={() => togglePrep(it.id)} title="Marcar como preparado (por embarcar)" style={{ accentColor: "var(--monza-accent)", cursor: "pointer" }} />
+                        )}
+                      </td>
+                    </tr>,
+                  ];
+                  if (isExp) {
+                    rows.push(
+                      <tr key={`doc-${it.id}`} style={{ borderBottom: `1px solid ${bd}` }}>
+                        <td colSpan={7} style={{ padding: "8px 16px 14px 42px", background: dark ? "#0a0e1f" : "#F8FAFF" }}>
+                          <MonzaDocs entidad="item" entidadId={it.id} categorias={["foto", "certificado", "documento adicional", "otro"]} titulo="Documentos adicionales del ítem" />
+                        </td>
+                      </tr>
+                    );
+                  }
+                  return rows;
+                });
+                if (plano) return filas;
+                return [
+                  <tr key={g.key} style={{ background: dark ? "#0d1321" : "#F8FAFC", borderTop: `1px solid ${bd}`, borderBottom: `1px solid ${bd}` }}>
+                    <td></td>
+                    <td style={{ textAlign: "center" }}>
+                      {preparables.length > 0 && (
+                        <input type="checkbox" checked={preparables.every((i) => isPrepSel(i.id))} onChange={() => togglePrepGrupo(preparables)} title="Seleccionar los comprados del grupo para preparar" style={{ accentColor: "var(--monza-accent)", cursor: "pointer" }} />
                       )}
                     </td>
-                    <td style={{ padding: "9px 12px", fontWeight: 600, color: "var(--monza-accent)", fontSize: 12 }}>{it.cot_numero}</td>
-                    <td style={{ padding: "9px 12px", color: txt }}>{it.cliente || "—"}</td>
-                    <td style={{ padding: "9px 12px" }}>
-                      <div style={{ color: txt, fontWeight: 500 }}>{it.descripcion}</div>
-                      {it.numero_parte && <div style={{ fontSize: 10, color: sub }}>{it.numero_parte}{it.marca ? ` · ${it.marca}` : ""}</div>}
-                    </td>
-                    {/* Cant. es editable SOLO mientras el ítem se puede preparar: así el
-                        envío parcial se teclea en la misma fila donde se marca el check.
-                        El <td> corta el click por si la fila gana un handler. */}
-                    <td style={{ padding: "9px 12px", textAlign: "right", color: txt }} onClick={(e) => e.stopPropagation()}>
-                      {!esNacional && it.estado_linea === "comprado" ? (
-                        <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "flex-end", gap: 6 }}>
-                          <input
-                            type="number" min={1} max={it.cantidad} step={1}
-                            aria-label={`Cantidad a preparar de ${it.descripcion} (máximo ${it.cantidad})`}
-                            value={qtyPrepDe(it)}
-                            onChange={(e) => setQtyPrep((p) => ({ ...p, [it.id]: Math.max(1, Math.min(it.cantidad, Math.round(Number(e.target.value) || 0))) }))}
-                            style={{ width: 58, padding: "3px 6px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 12, background: dark ? "#0d1321" : "#F8FAFC", color: txt, textAlign: "right" }}
-                          />
-                          <span style={{ fontSize: 11, color: sub }}>/ {it.cantidad}</span>
-                          {qtyPrepDe(it) < it.cantidad && (
-                            <span title="Preparación parcial: el resto sigue en Comprado esperando el próximo embarque"
-                              style={{ fontSize: 10, fontWeight: 700, background: "#FEF3C7", color: "#B45309", padding: "1px 7px", borderRadius: 999, whiteSpace: "nowrap" }}>
-                              {it.cantidad - qtyPrepDe(it)} pendiente
-                            </span>
-                          )}
-                        </span>
-                      ) : it.cantidad}
-                    </td>
-                    <td style={{ padding: "9px 12px", color: sub, fontSize: 12 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        {it.ocp_numero_oc || it.ocp_numero || "—"}
-                        {esNacional && (
+                    <td colSpan={5} style={{ padding: "9px 12px" }}>
+                      <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                        <span style={{ fontSize: 14, fontWeight: 800, color: txt, letterSpacing: 0.3 }}>🏢 {o ? (o.proveedor_nombre || "Proveedor sin nombre") : "Sin OC"}</span>
+                        {o?.numero && <span style={{ fontWeight: 700, color: "var(--monza-accent)", fontSize: 12 }}>{o.numero}</span>}
+                        {o?.numero_oc && <span style={{ color: sub, fontSize: 12 }}>(N° prov. {o.numero_oc})</span>}
+                        {esNacionalGrupo && (
                           <span title="OC nacional: camión + guía del proveedor, sin embarque"
                             style={{ fontSize: 10, fontWeight: 700, background: "#DCFCE7", color: "#15803D", padding: "1px 7px", borderRadius: 999, display: "inline-flex", alignItems: "center", gap: 3 }}>
                             <Truck size={9} /> Nacional
                           </span>
                         )}
+                        {chip && <span title={chip.title} style={{ fontSize: 11, fontWeight: 700, background: chip.bg, color: chip.color, padding: "2px 9px", borderRadius: 999 }}>{chip.label}</span>}
+                        {compl && (
+                          <span style={{ fontSize: 11, fontWeight: 700, background: compl === "completa" ? "#DCFCE7" : (dark ? "#1e2a4a" : "#F1F5F9"), color: compl === "completa" ? "#15803D" : sub, padding: "2px 9px", borderRadius: 999 }}>
+                            {compl}
+                          </span>
+                        )}
+                        {o?.awb && <span style={{ color: sub, fontSize: 11 }}>AWB: {o.awb}</span>}
+                        {o?.tracking && <span style={{ color: sub, fontSize: 11 }}>Trk: {o.tracking}</span>}
+                        {recibible && (
+                          <button onClick={abrirEntregaGrupo} title="Registrar entrega nacional (camión + guía del proveedor)"
+                            style={{ display: "inline-flex", alignItems: "center", gap: 4, background: "none", border: "none", cursor: "pointer", color: "#15803D", fontSize: 11, fontWeight: 700, padding: 0, fontFamily: "inherit" }}>
+                            <Truck size={12} /> Registrar entrega nacional →
+                          </button>
+                        )}
+                        {!o && <span style={{ color: sub, fontSize: 11 }}>ítems sin OC de proveedor asociada</span>}
                       </div>
                     </td>
-                    <td style={{ padding: "9px 12px", color: sub, fontSize: 12 }}>{it.ocp_proveedor || "—"}</td>
-                    <td style={{ padding: "9px 12px", color: sub, fontSize: 11 }}>
-                      {it.ocp_awb ? <div>AWB: {it.ocp_awb}</div> : null}
-                      {it.ocp_tracking ? <div>Trk: {it.ocp_tracking}</div> : null}
-                      {!it.ocp_awb && !it.ocp_tracking ? "—" : null}
-                    </td>
-                    <td style={{ padding: "9px 12px" }}>
-                      {pz ? (
-                        <span style={{ fontSize: 11, background: pz.bg, color: pz.color, padding: "2px 8px", borderRadius: 8, fontWeight: 600 }}>{pz.label}</span>
-                      ) : (
-                        <span style={{ fontSize: 12, color: sub }}>{it.ocp_plazo_dias ? `${it.ocp_plazo_dias}d` : "—"}</span>
-                      )}
-                    </td>
-                    <td style={{ padding: "9px 12px" }}>
-                      <span style={{ fontSize: 11, background: es.bg, color: es.color, padding: "3px 10px", borderRadius: 10, fontWeight: 600 }}>{es.label}</span>
-                      {esNacional && NACIONAL_RECIBIBLE.has(it.estado_linea) && (
-                        <button onClick={abrirEntrega}
-                          style={{ display: "block", marginTop: 4, background: "none", border: "none", cursor: "pointer", color: "#15803D", fontSize: 10, fontWeight: 700, padding: 0, textAlign: "left", fontFamily: "inherit" }}>
-                          Registrar entrega nacional →
-                        </button>
-                      )}
-                      {/* BACK ORDER: solo desde 'comprado' — una vez preparado o
-                          embarcado la mercadería ya salió del proveedor y esto deja de
-                          tener sentido (el backend rechaza igual). */}
-                      {it.estado_linea === "comprado" && (
-                        <button onClick={(e) => { e.stopPropagation(); setDevolver(it); }}
-                          title="El proveedor no lo va a enviar (back order): devolver al panel de compras"
-                          style={{ display: "block", marginTop: 4, background: "none", border: "none", cursor: "pointer", color: "#B45309", fontSize: 10, fontWeight: 700, padding: 0, textAlign: "left", fontFamily: "inherit" }}>
-                          ← Devolver a compras
-                        </button>
-                      )}
-                    </td>
                   </tr>,
+                  ...filas,
                 ];
-                if (isExp) {
-                  rows.push(
-                    <tr key={`doc-${it.id}`} style={{ borderBottom: `1px solid ${bd}` }}>
-                      <td colSpan={11} style={{ padding: "8px 16px 14px 42px", background: dark ? "#0a0e1f" : "#F8FAFF" }}>
-                        <MonzaDocs entidad="item" entidadId={it.id} categorias={["foto", "certificado", "documento adicional", "otro"]} titulo="Documentos adicionales del ítem" />
-                      </td>
-                    </tr>
-                  );
-                }
-                return rows;
               })}
             </tbody>
           </table>

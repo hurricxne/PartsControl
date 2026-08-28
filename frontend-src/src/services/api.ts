@@ -265,6 +265,9 @@ export const contabilidadAPI = {
   listVentas: (q?: string, periodo?: string) =>
     api.get('/contabilidad/ventas', { params: { q: q || undefined, periodo: periodo || undefined } }),
   ventaDetalle: (ocId: number) => api.get(`/contabilidad/ventas/${ocId}`),
+  // Lista LIVIANA para el selector de OC de Emitir Factura: sin motor de precios
+  // (por eso NO es listVentas). Trae el flag de guías facturables por OC.
+  ventasOpciones: () => api.get('/contabilidad/ventas/opciones'),
   despachosFacturables: (ocId: number) => api.get(`/contabilidad/ventas/${ocId}/despachos-facturables`),
   // Facturas / Cuentas por cobrar
   listFacturas: (estado?: string, q?: string) =>
@@ -330,19 +333,78 @@ export async function abrirDocumento(filename: string) {
   window.open(url, '_blank')
 }
 
+// ── Firma PARCIAL de la guía (contrato con backend, 2026-08-22) ──────────────
+// A veces la guía se emitió por ítems que NO llegaron (perdidos en la entrega).
+// Al firmar, el operador puede bajar la cantidad firmada por ítem; la diferencia
+// queda como FALTANTE con motivo obligatorio y no se factura por esa guía.
+
+/** Línea del body de POST /despachos/{id}/firmar (firma parcial). */
+export interface FirmaItemPayload {
+  despacho_item_id: number
+  /** 0..qty_despachada (enteros al editar; una línea intacta fraccionaria pasa completa). 0 = el ítem no llegó. */
+  qty_firmada: number
+}
+
+/** Ítem de GET /despachos/{id}. Los campos de firma son opcionales:
+ *  un backend previo aún no los manda y la UI degrada con gracia. */
+export interface DespachoItemDetalle {
+  /** = despacho_item_id para POST /firmar */
+  id: number
+  numero_parte: string
+  descripcion: string
+  marca: string
+  qty_despachada: number
+  /** null = firmada completa (sin faltante declarado en esta línea). */
+  qty_firmada?: number | null
+  /** La línea ya entró a una factura: el backend rechaza (409) bajar de lo facturado. */
+  facturado?: number   // qty facturada por esta línea de la guía (0 = nada)
+}
+
+/** Respuesta de GET /despachos/{id} (cabecera + ítems). Campos opcionales:
+ *  tolera el backend previo que aún no manda faltante/items. */
+export interface DespachoDetalle {
+  id: number
+  numero_despacho?: string
+  numero_guia?: string | null
+  estado?: string
+  guia_firmada?: boolean
+  fecha_firma?: string | null
+  /** Σ (qty_despachada − qty_firmada) declarado al firmar. */
+  faltante_total?: number
+  faltante_motivo?: string | null
+  /** Rótulo de la caja en que viaja el despacho (picking & packing). ≤50 chars;
+   *  ""/null = sin rotular. Contrato backend 2026-08-25. */
+  bulto_numero?: string | null
+  items?: DespachoItemDetalle[]
+}
+
 export const despachosAPI = {
   getCounts: () => api.get('/despachos/counts').then(r => r.data),
+  // Panel consolidado «Listo para despachar»: OC → ítems con cupo físico real
+  // (misma fórmula del detalle, calculada en lote por el backend).
+  listoParaDespachar: () => api.get('/despachos/listo-para-despachar').then(r => r.data),
   listOcClientes: (tab: string, q?: string) =>
     api.get('/despachos/oc-clientes', { params: { tab, q: q || undefined } }).then(r => r.data),
   getOcDetail: (ocId: number) =>
     api.get(`/despachos/oc-clientes/${ocId}`).then(r => r.data),
   create: (payload: any) =>
     api.post('/despachos/', payload).then(r => r.data),
-  get: (id: number) => api.get(`/despachos/${id}`).then(r => r.data),
+  /** Detalle de UN despacho con sus ítems (base del desplegable y de la firma parcial). */
+  get: (id: number): Promise<DespachoDetalle> =>
+    api.get(`/despachos/${id}`).then(r => r.data),
   update: (id: number, data: Record<string, any>) =>
     api.put(`/despachos/${id}`, data).then(r => r.data),
   cerrar: (id: number) => api.post(`/despachos/${id}/cerrar`).then(r => r.data),
-  firmar: (id: number, data?: { fecha_firma?: string; numero_guia?: string; archivo?: string }) =>
+  /** Marca la guía firmada. `items` omitido = todo firmado completo (el camino de
+   *  siempre). Con firma parcial: `items` con TODAS las líneas y `motivo_faltante`
+   *  obligatorio (5-300 chars) cuando Σ firmada < Σ despachada. */
+  firmar: (id: number, data?: {
+    fecha_firma?: string
+    numero_guia?: string
+    archivo?: string
+    items?: FirmaItemPayload[]
+    motivo_faltante?: string
+  }) =>
     api.post(`/despachos/${id}/firmar`, data || {}).then(r => r.data),
   uploadDoc: (file: File) => {
     const fd = new FormData()

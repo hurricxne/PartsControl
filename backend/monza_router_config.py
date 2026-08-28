@@ -6,9 +6,18 @@ from datetime import datetime
 
 from database import get_db
 from auth import get_current_user
+from empresa_guard import require_empresa
 from monza_models import MonzaConfig
 
-router = APIRouter(prefix="/api/monza/config", tags=["monza-config"])
+router = APIRouter(prefix="/api/monza/config", tags=["monza-config"],
+    # Candado de empresa (hallazgo del equipo de testing 2026-08-27).
+    # El TIPO DE CAMBIO de esta config es el que fija el precio de venta de MonzaParts
+    # (lo copian el cotizador y el cierre de venta), y el GET entrega RUT, razón social,
+    # giro y CUENTA BANCARIA de la empresa. Sin candado, una cuenta de la marca contraria
+    # podía dejar el TC en 1 y toda cotización nueva salía regalada, sin que la pantalla
+    # mostrara nada raro.
+    dependencies=[Depends(require_empresa("automotriz"))],
+)
 
 
 class ConfigOut(BaseModel):

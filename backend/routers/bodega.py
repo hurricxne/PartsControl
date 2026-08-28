@@ -1060,7 +1060,7 @@ def buscar_items(
     from recepcion_nacional.models import RecepcionNacional, RecepcionNacionalItem
     from routers.despachos import (
         _normalizar_q, _variantes_token, _patron, _colapsar,
-        _np_colapsado_sql, _matchea, _qty_recibida_utilizable, _tope_fisico,
+        _np_colapsado_sql, _matchea, _qty_recibida_utilizable, _disponibles_por_item,
     )
 
     estados = (
@@ -1174,12 +1174,30 @@ def buscar_items(
     variantes_por_token = [_variantes_token(t) for t in tokens]
     colapsados = [_colapsar(t) for t in tokens if any(c.isdigit() for c in t)]
 
+    # Disponible por línea DELEGADO en _disponibles_por_item (despachos.py): aquí
+    # vivía la ÚLTIMA copia inline de la fórmula (gate en_bodega + max(tope−ya, 0))
+    # y con esto queda ÚNICA en el sistema — detalle, listado, /counts, panel,
+    # guard de creación y este buscador de picking dicen todos lo mismo. `qty_desp`
+    # cumple el contrato de `qty_already` (Σ despachada de despachos no anulados;
+    # los item_cotizacion_id son únicos globalmente, así que filtrar por item en
+    # vez de por OC trae las mismas filas).
+    #
+    # NO es la salida exacta de la copia que reemplazó, y así debe ser: la
+    # tolerancia (_es_despachable, 0.001) ahora vive DENTRO de
+    # _disponibles_por_item, que colapsa el residuo flotante a 0 pelado. La copia
+    # inline emitía el crudo, así que este buscador llegaba a imprimir
+    # «1.11e-16 disponible» mientras el listado y el panel daban la línea por
+    # agotada. Único cambio de comportamiento, deliberado y exigido por la sonda
+    # e2b de routers/tests/test_listo_para_despachar.py («buscador de Bodega:
+    # mismo 0, 6º consumidor de la fórmula»).
+    disponibles = _disponibles_por_item(
+        [it for it, _cot, _occ in rows], recibidos, qty_desp)
+
     items_out = []
     for it, cot, occ in rows:
-        disponible = 0.0
-        if it.estado_item == "en_bodega":
-            disponible = max(
-                float(_tope_fisico(it, recibidos)) - qty_desp.get(it.id, 0.0), 0.0)
+        # float(): la fórmula compartida devuelve int 0 fuera de bodega y este
+        # endpoint siempre emitió 0.0 — el contrato JSON no debe moverse.
+        disponible = float(disponibles.get(it.id, 0))
 
         match: list = []
         if tokens:

@@ -292,7 +292,7 @@ def _bloque_anular_bloqueado_por_plata():
     """Candado 1: la plata ya está dentro de una factura como cobranza 'adelanto'."""
     cot = _S["cots"]["AP"]
     r = client.post(f"{BASE}/facturas", json={
-        "cotizacion_id": cot, "sin_guia": True, "numero_factura": f"{MARK}-FAP"})
+        "cotizacion_id": cot, "sin_guia": True, "confirmar_retiro_sin_adelanto": True, "numero_factura": f"{MARK}-FAP"})
     check("AP: factura previa -> 200", r.status_code == 200, r.text)
     fid = r.json()["id"] if r.status_code == 200 else None
     r = client.post(f"{BASE}/ventas/{cot}/adelanto/verificar", json={"monto": 59500})
@@ -342,7 +342,7 @@ def _bloque_plata_del_anulado_no_entra():
     check("AX: anular -> 200", ra is not None and ra.status_code == 200,
           ra.text if ra else "sin adelanto")
     r = client.post(f"{BASE}/facturas", json={
-        "cotizacion_id": cot, "sin_guia": True, "numero_factura": f"{MARK}-FAX"})
+        "cotizacion_id": cot, "sin_guia": True, "confirmar_retiro_sin_adelanto": True, "numero_factura": f"{MARK}-FAX"})
     check("AX: factura posterior al anulado -> 200", r.status_code == 200, r.text)
     if r.status_code == 200:
         j = r.json()
@@ -405,7 +405,7 @@ def _bloque_adelanto_no_pactado():
           _adel_db("NP"))
     # Glosa de la cobranza: sin % pactado NO puede decir «Adelanto 0% aplicado».
     r = client.post(f"{BASE}/facturas", json={
-        "cotizacion_id": cot, "sin_guia": True, "numero_factura": f"{MARK}-FNP"})
+        "cotizacion_id": cot, "sin_guia": True, "confirmar_retiro_sin_adelanto": True, "numero_factura": f"{MARK}-FNP"})
     check("NP: factura -> 200 (y aplica el adelanto)", r.status_code == 200, r.text)
     if r.status_code == 200:
         cobs = [c for c in r.json()["cobranzas"] if c["medio"] == "adelanto"]

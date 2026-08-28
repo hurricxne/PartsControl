@@ -242,8 +242,12 @@ def test_la_cotizacion_congela_la_tarifa_DEL_LEAD_no_la_global():
         assert fila[0] == "USD", f"congeló la moneda GLOBAL en vez de la del lead: {fila[0]}"
         assert abs(float(fila[1]) - 6.0) < 0.001, (
             f"congeló la tarifa global (4.5) en vez de la del lead (6.0): {fila[1]}")
-        # …y el ÍTEM lleva la misma tarifa que la cabecera (si difirieran habría dos
-        # fletes para la misma venta: Embarques Pricing lee la del ítem).
+        # …y el ÍTEM SIN estampa propia hereda la tarifa de la cabecera. Desde el
+        # arreglo 4 del equipo (2026-08-21) un ítem CON estampa congela el flete de SU
+        # corrida —puede diferir de la cabecera a propósito, ver
+        # test_lead_item_flete_estampa §5—; este lead nunca pasó por /aplicar, así que
+        # sus ítems no traen estampa y el fallback a cabecera sigue vigente. (Nadie
+        # computa con esta columna: es foto de auditoría/reproducibilidad.)
         item = db.execute(text(
             "SELECT tarifa_aerea FROM monza_cotizacion_items WHERE cotizacion_id = :i"
         ), {"i": cot_id}).fetchone()

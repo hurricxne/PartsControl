@@ -3,7 +3,12 @@ import type {
   EmbarquePricingRow, PricingDetail, PricingSavePayload,
 } from "../monza-embarques-pricing/types";
 
-const api = axios.create({ baseURL: "/api/monza" });
+// `timeout`: sin él, una petición que nunca vuelve deja la pantalla bajo el velo de
+// carga para siempre, sin cartel ni botón de reintento — el vendedor concluye que el
+// sistema se colgó. 60 s es holgado para cualquier listado; las operaciones que
+// legítimamente tardan más (emisión al SII, informes) piden `{ timeout: 0 }` en su
+// propia llamada.
+const api = axios.create({ baseURL: "/api/monza", timeout: 60_000 });
 
 api.interceptors.request.use((cfg) => {
   try {
@@ -13,6 +18,21 @@ api.interceptors.request.use((cfg) => {
   } catch {}
   return cfg;
 });
+
+// La sesión vencida (401) tiene que llevar al login, no confundirse con un problema de
+// red: sin esto la pantalla de Leads mostraba «Revisa tu conexión y reintenta» y el botón
+// Reintentar repetía la misma petición para siempre, porque el token seguía vencido.
+// Es el mismo interceptor que ya tiene el cliente de MachParts (services/api.ts).
+api.interceptors.response.use(
+  (res) => res,
+  (err) => {
+    if (err.response?.status === 401) {
+      try { localStorage.removeItem("machparts-auth"); } catch { /* modo privado */ }
+      window.location.href = "/login";
+    }
+    return Promise.reject(err);
+  },
+);
 
 // ── Config ──────────────────────────────────────────────────────────────────
 export const monzaConfigAPI = {
@@ -560,7 +580,11 @@ export const monzaTesoreriaAPI = {
     fd.append("cuenta_id", String(cuentaId));
     if (nombre) fd.append("nombre", nombre);
     fd.append("file", file);
-    return api.post("/tesoreria/cartolas/importar", fd);
+    // Subida de ARCHIVO: SIN tope de tiempo. El límite global de 60 s alcanza de sobra
+    // para un listado, pero no para un archivo de 20 MB por la conexión de un taller,
+    // y cortarlo deja al operador sin poder completar el trámite — en el caso de la
+    // guía firmada, sin poder facturar.
+    return api.post("/tesoreria/cartolas/importar", fd, { timeout: 0 });
   },
   cartolas: (cuentaId?: number) =>
     api.get("/tesoreria/cartolas", { params: cuentaId ? { cuenta_id: cuentaId } : {} }),
@@ -655,8 +679,13 @@ export const monzaDespachosAPI = {
     const form = new FormData();
     form.append("file", file);
     form.append("tipo", tipo);
+    // Subida de ARCHIVO: SIN tope de tiempo. El límite global de 60 s alcanza de sobra
+    // para un listado, pero no para un archivo de 20 MB por la conexión de un taller,
+    // y cortarlo deja al operador sin poder completar el trámite — en el caso de la
+    // guía firmada, sin poder facturar.
     return api.post(`/cotizaciones/${cotId}/documento`, form, {
       headers: { "Content-Type": "multipart/form-data" },
+      timeout: 0,
     });
   },
   downloadDocumento: (cotId: number) =>
@@ -672,8 +701,12 @@ export const monzaDespachosAPI = {
     form.append("file", file);
     form.append("fecha_firma", fechaFirma);
     if (numeroGuia) form.append("numero_guia", numeroGuia);
+    // SIN tope de tiempo: es la foto de la guía firmada, tomada con el celular en el
+    // taller y de hasta 20 MB. Cortarla a los 60 s deja al operador sin poder marcar la
+    // firma — y sin firma NO se puede facturar. Este es el peor caso del tope global.
     return api.post(`/despachos/entidades/${id}/firmar`, form, {
       headers: { "Content-Type": "multipart/form-data" },
+      timeout: 0,
     });
   },
   // Abre la guía firmada (u otro doc de uploads/docs) vía el serve de ESTE módulo:
@@ -739,15 +772,25 @@ export const monzaWasabilAPI = {
   previewGuia: (despachoId: number, tipoTraslado?: number) =>
     api.post(`/wasabil/despachos/${despachoId}/preview`, null,
       tipoTraslado ? { params: { tipo_traslado: tipoTraslado } } : undefined),
+  // ⚠️ SIN TIEMPO LÍMITE (`timeout: 0`), a propósito y con el resto del cliente en 60 s:
+  // esta llamada emite un documento tributario REAL contra el SII. Cortarla por tiempo
+  // no cancela la emisión —el documento puede quedar emitido igual— y deja el estado
+  // AMBIGUO, que es exactamente la condición que ya provocó dobles emisiones. Ante un
+  // documento irreversible, esperar es siempre más barato que dudar.
   emitirGuia: (despachoId: number, tipoTraslado?: number) =>
     api.post(`/wasabil/despachos/${despachoId}/emitir`, null,
-      tipoTraslado ? { params: { tipo_traslado: tipoTraslado } } : undefined),
+      { timeout: 0, ...(tipoTraslado ? { params: { tipo_traslado: tipoTraslado } } : {}) }),
   estadoGuia: (despachoId: number) => api.get(`/wasabil/despachos/${despachoId}/estado`),
   // OJO: pasar SIEMPRE tipoTraslado al reintentar — omitirlo revierte en silencio
   // al default 1 (venta) aunque el intento fallido fuera otro tipo de traslado.
+  // ⚠️ SIN TIEMPO LÍMITE (`timeout: 0`), a propósito y con el resto del cliente en 60 s:
+  // esta llamada emite un documento tributario REAL contra el SII. Cortarla por tiempo
+  // no cancela la emisión —el documento puede quedar emitido igual— y deja el estado
+  // AMBIGUO, que es exactamente la condición que ya provocó dobles emisiones. Ante un
+  // documento irreversible, esperar es siempre más barato que dudar.
   reintentarGuia: (despachoId: number, tipoTraslado?: number) =>
     api.post(`/wasabil/despachos/${despachoId}/reintentar`, null,
-      tipoTraslado ? { params: { tipo_traslado: tipoTraslado } } : undefined),
+      { timeout: 0, ...(tipoTraslado ? { params: { tipo_traslado: tipoTraslado } } : {}) }),
   // Estado en LOTE (solo BD, sin llamar a Wasabil) → { despacho_id: dte }, para
   // pintar folio/PDF/fallida en las filas sin N llamadas de red.
   estadoBatch: (despachoIds: number[]) =>
@@ -758,7 +801,7 @@ export const monzaWasabilAPI = {
   // constancia de que lo tecleó dos veces, y el backend rechaza si no coinciden.
   registrarFolioGuia: (despachoId: number, folio: string, confirmo: string) =>
     api.post<MonzaDteInfo>(`/wasabil/despachos/${despachoId}/registrar-folio`, null,
-      { params: { folio, confirmo_folio: confirmo } }),
+      { timeout: 0, params: { folio, confirmo_folio: confirmo } }),
 
   // ── Fase 6: FACTURAS electrónicas (DTE 33) ─────────────────────────────────
   // El payload es el MISMO de monzaContabilidadAPI.crearFactura pero SIN
@@ -769,12 +812,18 @@ export const monzaWasabilAPI = {
   previewFacturaSII: (payload: MonzaFacturaPayload) =>
     api.post("/wasabil/facturas/preview", payload),
   // IRREVERSIBLE: crea la factura local sin folio + el claim, y recién ahí emite.
+  // ⚠️ SIN TIEMPO LÍMITE (`timeout: 0`): emite un documento tributario REAL. Cortar
+  // por tiempo no cancela la emisión y deja el estado AMBIGUO — la condición que ya
+  // provocó dobles emisiones. Esperar es más barato que dudar.
   emitirFacturaSII: (payload: MonzaFacturaPayload) =>
-    api.post<MonzaDteFacturaInfo>("/wasabil/facturas/emitir", payload),
+    api.post<MonzaDteFacturaInfo>("/wasabil/facturas/emitir", payload, { timeout: 0 }),
   estadoFacturaSII: (facturaId: number) =>
     api.get<MonzaDteFacturaInfo>(`/wasabil/facturas/${facturaId}/estado`),
+  // ⚠️ SIN TIEMPO LÍMITE (`timeout: 0`): emite un documento tributario REAL. Cortar
+  // por tiempo no cancela la emisión y deja el estado AMBIGUO — la condición que ya
+  // provocó dobles emisiones. Esperar es más barato que dudar.
   reintentarFacturaSII: (facturaId: number) =>
-    api.post<MonzaDteFacturaInfo>(`/wasabil/facturas/${facturaId}/reintentar`),
+    api.post<MonzaDteFacturaInfo>(`/wasabil/facturas/${facturaId}/reintentar`, null, { timeout: 0 }),
   // Estado en LOTE (solo BD, sin llamar a Wasabil) → { factura_id: dte }, para
   // pintar los badges SII del listado sin N llamadas de red (el serializador de
   // Contabilidad Monza no inyecta campos dte_*).
@@ -787,7 +836,7 @@ export const monzaWasabilAPI = {
   registrarFolioFactura: (facturaId: number, folio: string, confirmo: string) =>
     api.post<MonzaDteFacturaInfo & { advertencias?: string[] }>(
       `/wasabil/facturas/${facturaId}/registrar-folio`, null,
-      { params: { folio, confirmo_folio: confirmo } }),
+      { timeout: 0, params: { folio, confirmo_folio: confirmo } }),
 };
 
 // ── Clientes ──────────────────────────────────────────────────────────────────
@@ -810,7 +859,12 @@ export const monzaDocumentosAPI = {
     form.append("entidad_id", String(entidad_id));
     form.append("categoria", categoria);
     form.append("file", file);
-    return api.post("/documentos/upload", form, { headers: { "Content-Type": "multipart/form-data" } });
+    // Subida de ARCHIVO: SIN tope de tiempo. El límite global de 60 s alcanza de sobra
+    // para un listado, pero no para un archivo de 20 MB por la conexión de un taller,
+    // y cortarlo deja al operador sin poder completar el trámite — en el caso de la
+    // guía firmada, sin poder facturar.
+    return api.post("/documentos/upload", form,
+      { headers: { "Content-Type": "multipart/form-data" }, timeout: 0 });
   },
   download: (id: number) => api.get(`/documentos/${id}/download`, { responseType: "arraybuffer" }),
   remove: (id: number) => api.delete(`/documentos/${id}`),
@@ -870,6 +924,11 @@ export function monzaErrMsg(e: unknown, fallback: string): string {
 export const monzaAbastecimientoAPI = {
   kpis: () => api.get("/abastecimiento/kpis"),
   porComprar: (params?: Record<string, unknown>) => api.get("/abastecimiento/por-comprar", { params }),
+  // Contrato ADITIVO de agrupación por proveedor: además de las claves de siempre,
+  // cada ítem gana `costo`, `moneda`, `peso_kg`, `peso_total_kg`, `fob_total` y
+  // `ocp` (objeto con semáforo y completitud CALCULADOS EN EL BACKEND). Tipos en
+  // src/monza-agrupacion/agrupacion.ts (MonzaClavesAgrupacion / MonzaOcp). Mientras
+  // el backend no las mande, llegan undefined y la página degrada a "Sin OC".
   seguimiento: (params?: Record<string, unknown>) => api.get("/abastecimiento/seguimiento", { params }),
   // `cantidades` opcional en el body: [{item_id, cantidad}] activa la asignación
   // PARCIAL (la línea se parte y el remanente vuelve al panel, sin OC). Ausente =
@@ -916,6 +975,9 @@ export interface MonzaDevolverResp {
 // ── Logística (Embarques, alineación MachParts) ───────────────────────────────
 export const monzaLogisticaAPI = {
   kpis: () => api.get("/logistica/kpis"),
+  // Mismo contrato ADITIVO de agrupación que /abastecimiento/seguimiento: cada ítem
+  // gana `costo`, `moneda`, `peso_kg`, `peso_total_kg`, `fob_total` y `ocp` (con
+  // semáforo y completitud del backend). Tipos en src/monza-agrupacion/agrupacion.ts.
   preparados: (params?: Record<string, unknown>) => api.get("/logistica/preparados", { params }),
   // El body acepta `item_ids` (vía legada: línea completa) o `items: [{item_id,
   // cantidad}]` (embarque parcial). Misma URL de siempre; la respuesta informa los

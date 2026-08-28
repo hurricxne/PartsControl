@@ -342,7 +342,7 @@ def _bloque_eliminar_bloqueado_por_plata():
     """Candado 1 del DELETE: la plata ya está dentro de una factura como cobranza."""
     cot = _S["cots"]["EA"]
     r = client.post(f"{BASE}/facturas", json={
-        "cotizacion_id": cot, "sin_guia": True, "numero_factura": f"{MARK}-FEA"})
+        "cotizacion_id": cot, "sin_guia": True, "confirmar_retiro_sin_adelanto": True, "numero_factura": f"{MARK}-FEA"})
     check("EA: factura previa (sin guía) -> 200", r.status_code == 200, r.text[:250])
     fac_id = r.json().get("id") if r.status_code == 200 else None
     r = client.post(f"{BASE}/ventas/{cot}/adelanto/verificar", json={"monto": 59500})

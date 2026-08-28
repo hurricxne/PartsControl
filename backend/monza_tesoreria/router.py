@@ -516,8 +516,11 @@ def listar_aprobaciones(page: int = 1, page_size: int = PAGE_SIZE_DEFAULT,
                  .options(joinedload(MonzaCotizacion.cliente))
                  .filter(MonzaCotizacion.estado.in_(ESTADOS_VENTA)))
     # `por_aprobar` es una EXPECTATIVA (falta la plata), así que sigue pidiendo el % que
-    # informó Comercial: sin pct_adelanto > 0 no hay monto que esperar y toda venta al
-    # contado inundaría la cola.
+    # informó Comercial: sin pct_adelanto > 0 no hay monto que esperar. OJO (arreglos del
+    # equipo 2026-08-21): las ventas AL CONTADO ahora llegan con pct 100 A PROPÓSITO —
+    # que entren a esta cola por el total ES el comportamiento pedido (contado también
+    # exige verificación de Tesorería antes de comprar). El filtro pct > 0 sigue siendo
+    # correcto porque excluye solo el crédito puro; no lo "arregles" filtrando el contado.
     q_pa = base_cots.filter(MonzaCotizacion.pct_adelanto > 0,
                             ~MonzaCotizacion.id.in_(con_adelanto))
     # `aprobadas` es un HECHO (la plata ya está registrada) y por eso NO filtra por

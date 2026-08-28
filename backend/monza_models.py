@@ -225,6 +225,24 @@ class MonzaLeadItem(Base):
     peso_kg = Column(Float, nullable=True)        # peso volumétrico para el flete aéreo
     markup_pct = Column(Float, nullable=True)     # margen aplicado (entero, ej. 28)
     tc_aplicado = Column(Float, nullable=True)    # TC con que se convirtió el costo (auditoría)
+    # ── Estampa del FLETE de la corrida que calculó ESTE precio ───────────────────
+    # Desde que la calculadora acepta subconjuntos (arreglos del equipo 2026-08-21),
+    # un lead puede tener corridas con fletes distintos (alemanes en EUR, americanos
+    # en USD) y el par del LEAD (moneda_tarifa/tarifa_aerea) solo retrata la ÚLTIMA.
+    # Esta pareja completa la foto por ítem que las columnas de arriba empezaron.
+    # CONTRATO:
+    #   · ESCRIBE únicamente POST /cotizador/aplicar, y solo en las filas que ESA
+    #     corrida recalculó (comparación server-side contra lo guardado); una fila
+    #     preexistente que viaja sin cambios conserva su estampa. ItemUpdate no
+    #     incluye estas columnas: no se borran ni editan por PUT.
+    #   · NULL = "ninguna corrida recalculó este ítem desde que existe la estampa"
+    #     (ítems pre-migración, agregados a mano o del bridge). NULL jamás significa
+    #     flete 0: todo lector cae al nivel superior (lead → config), como siempre.
+    #   · LEEN: _item_dict (la sirve al detalle), la siembra del cotizador (subconjunto
+    #     uniforme ignorando NULLs) y create_cotizacion (vía lead_item_id).
+    # Migración: migrations/monza_lead_item_flete.py ANTES de reiniciar.
+    moneda_tarifa = Column(String(10), nullable=True)  # EUR | USD
+    tarifa_aerea = Column(Float, nullable=True)        # por kg, en moneda_tarifa
     supplier_part_pg_id = Column(String(30), nullable=True)
     plazo_entrega = Column(String(100), nullable=True)
 
@@ -343,6 +361,12 @@ class MonzaCotizacionItem(Base):
     peso_kg = Column(Float, default=0)
     tc_aplicado = Column(Float, nullable=True)
     tarifa_aerea = Column(Float, nullable=True)
+    # La MONEDA de esa tarifa (EUR | USD). Desde que la emisión congela el flete de la
+    # CORRIDA de cada línea (arreglos 2026-08-21), dos líneas de la misma cotización
+    # pueden llevar tarifas en monedas distintas: sin esta columna el número quedaba
+    # ambiguo (4.5… ¿de qué?). NULL = línea anterior a la migración monza_lead_item_flete
+    # → su tarifa está en la moneda de la CABECERA (cot.moneda_tarifa), como siempre fue.
+    moneda_tarifa = Column(String(10), nullable=True)
     markup_pct = Column(Float, default=0)  # decimal, ej 0.28 = 28%
     precio_unitario_clp = Column(Float, nullable=True)  # neto sin IVA por unidad
     subtotal_clp = Column(Float, nullable=True)
@@ -457,7 +481,12 @@ class MonzaOcProveedor(Base):
     __tablename__ = "monza_oc_proveedor"
 
     id               = Column(Integer, primary_key=True)
-    numero           = Column(String(50), nullable=True)
+    # UNIQUE declarado para que `deploy/audit_schema.py` LO VERIFIQUE: el índice lo crea
+    # migrations/monza_unique_correlativos.py, pero ese script tiene un camino de salida
+    # silencioso (tabla ausente → rc=0 sin crear nada) y el auditor deriva los UNIQUE
+    # esperados DEL MODELO — sin esta declaración, un índice faltante pasaba invisible y
+    # dos creaciones simultáneas volvían a duplicar el correlativo EN SILENCIO.
+    numero           = Column(String(50), nullable=True, unique=True)
     proveedor_id     = Column(Integer, nullable=True)
     proveedor_nombre = Column(String(200), nullable=True)
     pais             = Column(String(100), nullable=True)
@@ -553,7 +582,9 @@ class MonzaDocumento(Base):
 class MonzaEmbarque(Base):
     __tablename__ = "monza_embarques"
     id                = Column(Integer, primary_key=True)
-    numero            = Column(String(50), nullable=True)
+    # UNIQUE declarado por el MISMO motivo que monza_oc_proveedor.numero (ver ahí): que el
+    # auditor de esquema pueda delatar el índice ausente en vez de dar «sin problemas».
+    numero            = Column(String(50), nullable=True, unique=True)
     estado            = Column(String(30), default="en_bodega_proveedor")  # en_bodega_proveedor en_transito en_aduana en_bodega
     awb               = Column(String(100), nullable=True)
     forwarder         = Column(String(150), nullable=True)

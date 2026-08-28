@@ -13,6 +13,10 @@ from datetime import datetime
 
 from database import get_db
 from auth import get_current_user
+from monza_correlativos import agregar_lead_con_numero, reintentar_carrera
+from monza_rut import rut_identidad
+from monza_telefono import buscar_ficha_por_telefono
+from empresa_guard import require_empresa
 from config import settings
 from monza_models import MonzaLead, MonzaCliente, MonzaWebhookLog, MonzaLeadItem
 
@@ -29,18 +33,6 @@ def _parse_repuestos(raw):
     return [x.strip(" -•\t") for x in parts if x.strip(" -•\t")]
 
 router = APIRouter(prefix="/api/monza/integraciones", tags=["monza-integraciones"])
-
-
-def _gen_numero_lead(db: Session) -> str:
-    anio = datetime.utcnow().year
-    last = (
-        db.query(MonzaLead)
-        .filter(MonzaLead.numero.like(f"L-{anio}-%"))
-        .order_by(MonzaLead.id.desc())
-        .first()
-    )
-    n = int(last.numero.split("-")[-1]) + 1 if last and last.numero else 1
-    return f"L-{anio}-{n:04d}"
 
 
 def _pick(d: dict, *keys):
@@ -101,7 +93,12 @@ async def recibir_lead_nexor(
         payload=raw.decode("utf-8", "replace")[:8000] if raw else "",
     )
     db.add(log)
-    db.flush()
+    # COMMIT inmediato del payload capturado, ANTES de procesar. Con un simple `flush`, el
+    # `db.rollback()` del manejador de errores de más abajo se llevaba por delante esta
+    # misma fila: en el ÚNICO caso donde el payload sirve —cuando el procesamiento falla—
+    # el log quedaba vacío, y el módulo existe justamente para capturarlo. Nexor da el
+    # lead por entregado y no queda ni rastro de qué llegó.
+    db.commit()
 
     # ── Mapeo (estructura Nexor: data.lead) con fallbacks ─────────────────────
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -162,6 +159,11 @@ async def recibir_lead_nexor(
         comentario = " · ".join(prefix) + (f" · {comentario}" if comentario else "")
 
     log.external_id = str(external_id) if external_id else None
+    # Se GUARDA acá, antes de cualquier reintento: cada vuelta hace `db.rollback()`, y
+    # con la asignación sin confirmar la fila quedaba con external_id NULL — o sea, la
+    # llave que sostiene la idempotencia contra una reentrega de Nexor se perdía justo
+    # cuando hubo problemas, que es cuando Nexor reintenta.
+    db.commit()
 
     # ── Idempotencia: si ese external_id ya se procesó, no duplicar ───────────
     if external_id:
@@ -183,13 +185,42 @@ async def recibir_lead_nexor(
         db.commit()
         return {"ok": False, "error": "Sin datos de contacto reconocibles. Payload capturado para revisión.", "log_id": log.id}
 
-    try:
-        # Cliente: dedup por teléfono o email
+    # El reintento va acá, envolviendo TODO el procesamiento, igual que en POST /leads.
+    # Esta puerta es la que MÁS lo necesita: corre sola, sin operador que reintente a
+    # mano, y su carrera natural es contra el vendedor que está registrando al mismo
+    # cliente en ese momento. Cuando el reintento vivía escrito dentro del endpoint del
+    # vendedor, ESTE camino se quedó sin ninguna protección y perdía 4 de cada 6 leads
+    # simultáneos — el mismo error de «arreglar una sola de las dos copias» que causó el
+    # bug original. Ahora las dos puertas llaman al MISMO helper (monza_correlativos).
+    # La función es anidada a propósito: el procesamiento usa una docena de variables
+    # locales ya calculadas, y pasarlas por parámetro sería un diff grande y frágil.
+    def _procesar():
+        # Cliente: dedup por teléfono o email. TERCERA puerta que crea fichas, y la única
+        # que corre sin un operador mirando — razón de más para que decida igual que las
+        # otras dos (POST /clientes y el «cliente al vuelo» del lead). Comparaba el
+        # teléfono LITERAL, así que un lead de Nexor con el número en otro formato
+        # ('+56 9 6229 3336' contra '962293336') no encontraba la ficha que ya existía y
+        # creaba una duplicada — justo lo que las otras dos puertas dejaron de hacer.
+        # `buscar_ficha_por_telefono` normaliza los dos lados y descarta los números que
+        # no identifican a nadie (menos de 8 dígitos: '-', '0', '2342').
         cliente = None
         if telefono:
-            cliente = db.query(MonzaCliente).filter(MonzaCliente.telefono == telefono).first()
+            cliente = buscar_ficha_por_telefono(db, MonzaCliente, telefono)
         if not cliente and email:
             cliente = db.query(MonzaCliente).filter(MonzaCliente.email == email).first()
+
+        # Un número compartido (la recepción de un taller, el celular de un gestor) puede
+        # pegar el lead a la ficha de OTRO contribuyente, y acá no hay RUT en el payload
+        # con el que desempatar ni operador que lo note. No se bloquea —cortar la entrada
+        # automática de leads es peor— pero queda anotado en el log del webhook para que
+        # alguien lo revise: es el único rastro posible de una fusión dudosa.
+        aviso_revisar = None
+        if (cliente and nombre and cliente.nombre
+                and rut_identidad(getattr(cliente, "rut", None))
+                and nombre.strip().lower() != cliente.nombre.strip().lower()):
+            aviso_revisar = (f"REVISAR: lead de «{nombre}» vinculado por teléfono a la ficha "
+                             f"«{cliente.nombre}» (RUT {cliente.rut}) — confirmar si es el mismo cliente")
+            log.error = aviso_revisar[:400]
 
         # Dedup de LEAD: si ya existe un lead de Nexor para este cliente
         # (mismo contacto), actualizar su estado en vez de crear un duplicado.
@@ -211,7 +242,11 @@ async def recibir_lead_nexor(
                 log.procesado = 1
                 log.lead_id = existente.id
                 log.lead_numero = existente.numero
-                log.error = "lead Nexor existente actualizado (mismo contacto)"
+                # Se CONCATENA, no se pisa: el aviso de fusión dudosa es justo el que
+                # importa en el caso repetido —la ficha equivocada ya viene arrastrada de
+                # la entrega anterior— y era el que se perdía.
+                _nota = "lead Nexor existente actualizado (mismo contacto)"
+                log.error = (f"{aviso_revisar} · {_nota}" if aviso_revisar else _nota)[:400]
                 db.commit()
                 return {"ok": True, "actualizado": True, "lead_numero": existente.numero, "lead_id": existente.id}
 
@@ -222,14 +257,15 @@ async def recibir_lead_nexor(
 
         vehiculo = vehiculo_combo or (" ".join([x for x in [marca, modelo] if x]).strip() or None)
         lead = MonzaLead(
-            numero=_gen_numero_lead(db),
             cliente_id=cliente.id,
             vehiculo=vehiculo, vehicle_label=vehiculo, marca=marca, modelo=modelo,
             anio=str(anio) if anio else None, vin=vin,
             canal_origen=canal, estado="pendiente", comentario=comentario, linea="autos",
         )
-        db.add(lead)
-        db.flush()
+        # MISMA puerta que POST /leads (monza_correlativos): la carrera del correlativo
+        # es justo entre este camino autónomo y el del vendedor, así que arreglar solo
+        # uno de los dos no habría servido de nada.
+        agregar_lead_con_numero(db, lead)
 
         # Repuestos solicitados → ítems del lead
         for desc_r in repuestos_list:
@@ -248,18 +284,53 @@ async def recibir_lead_nexor(
             pass
 
         return {"ok": True, "lead_numero": lead.numero, "lead_id": lead.id}
+
+    try:
+        return reintentar_carrera(db, _procesar, que="leads")
+    except HTTPException as e:
+        # Para un llamador AUTOMÁTICO, un 4xx significa «no insistas, el pedido está mal»
+        # — y este 409 dice justo lo contrario: «estaba ocupado, vuelve a intentar». Se
+        # traduce a 503, que es el código que le pide a Nexor reintentar. El payload ya
+        # quedó guardado, así que el lead se puede recuperar a mano igual.
+        if e.status_code == 409:
+            log2 = db.query(MonzaWebhookLog).filter(MonzaWebhookLog.id == log.id).first()
+            if log2:
+                log2.error = "creación simultánea: no se pudo asignar correlativo tras varios intentos"
+                db.commit()
+            raise HTTPException(
+                status_code=503,
+                detail="Sistema ocupado procesando otros leads. Reintenta el envío.",
+            )
+        raise
     except Exception as e:
         db.rollback()
+        # La fila del log YA está commiteada, así que el rollback no se la lleva y esta
+        # relectura siempre la encuentra: se le anota el motivo del fallo y queda
+        # disponible en el visor para reprocesar el lead a mano.
         log2 = db.query(MonzaWebhookLog).filter(MonzaWebhookLog.id == log.id).first()
         if log2:
             log2.error = str(e)[:400]
             db.commit()
-        raise HTTPException(status_code=500, detail=f"Error procesando lead: {e}")
+        # El detalle del error NO viaja al llamador: un error de base de datos arrastra el
+        # INSERT completo con los nombres de las columnas y los datos del cliente, y eso
+        # es el esquema servido en bandeja a quien tenga la API key. El motivo entero
+        # queda en el log, que es donde el operador lo necesita.
+        raise HTTPException(
+            status_code=500,
+            detail="Error procesando el lead. El payload quedó guardado para revisión.",
+        )
 
 
 @router.get("/nexor/log")
-def ver_log(limit: int = 30, db: Session = Depends(get_db), _=Depends(get_current_user)):
-    """Inspeccionar los últimos webhooks recibidos (para finalizar el mapeo)."""
+def ver_log(limit: int = 30, db: Session = Depends(get_db),
+            _=Depends(require_empresa("automotriz"))):
+    """Inspeccionar los últimos webhooks recibidos (para finalizar el mapeo).
+
+    El candado va EN ESTE ENDPOINT y no en el router: el webhook de arriba lo llama
+    Nexor, que se autentica con `X-API-Key` y no tiene sesión de usuario — candar el
+    router entero dejaría de recibir leads. Acá el dato sí es sensible: el log guarda el
+    payload y las cabeceras crudas de cada lead (nombre, teléfono y vehículo del cliente).
+    """
     rows = db.query(MonzaWebhookLog).order_by(desc(MonzaWebhookLog.id)).limit(limit).all()
     return [
         {

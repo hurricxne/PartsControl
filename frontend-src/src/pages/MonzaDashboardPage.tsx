@@ -15,7 +15,10 @@ interface LeadsKPI {
   nuevos_mes: number;
   en_proceso: number;
   vendidos_mes: number;
-  tasa_cierre_pct: number;
+  // null = todavía no entró ningún lead este mes, así que no hay tasa que calcular.
+  // Imprimirlo sin comprobar mostraba «null% tasa de cierre» en la primera pantalla que
+  // ve el dueño; un 0% tampoco sirve: diría «lo estamos haciendo pésimo».
+  tasa_cierre_pct: number | null;
   total_cotizado_mes: number;
   sin_contactar_3d: number;
 }
@@ -273,7 +276,7 @@ export default function MonzaDashboardPage() {
         <BigCard
           label="LEADS NUEVOS (MES)"
           value={String(lk?.nuevos_mes ?? 0)}
-          sub={lk ? `${lk.tasa_cierre_pct}% tasa de cierre` : undefined}
+          sub={lk && lk.tasa_cierre_pct != null ? `${lk.tasa_cierre_pct}% tasa de cierre` : undefined}
           color="#3B82F6"
           data={sparkLeads}
           dark={dark}
@@ -318,7 +321,7 @@ export default function MonzaDashboardPage() {
       {/* ── Fila 3: Small stat cards ── */}
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
         <SmCard label="En proceso"       value={lk?.en_proceso ?? 0}        icon={Clock}       color="#F59E0B" dark={dark} />
-        <SmCard label="Tasa de cierre"   value={`${lk?.tasa_cierre_pct ?? 0}%`} icon={Target}  color="var(--monza-accent)" dark={dark} />
+        <SmCard label="Tasa de cierre"   value={lk?.tasa_cierre_pct != null ? `${lk.tasa_cierre_pct}%` : "—"} icon={Target}  color="var(--monza-accent)" dark={dark} />
         <SmCard label="Sin contactar +3d" value={lk?.sin_contactar_3d ?? 0} icon={AlertCircle} color="#EF4444" dark={dark} />
         <SmCard label="Pendientes entrega" value={vk?.pendientes_entrega ?? 0} icon={Car}       color="#6366F1" dark={dark} />
       </div>

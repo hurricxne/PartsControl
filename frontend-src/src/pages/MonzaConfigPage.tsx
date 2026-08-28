@@ -96,8 +96,15 @@ function ClienteModal({ cliente, onClose, onSaved }: { cliente?: Cliente | null;
         await monzaClientesAPI.update(cliente.id, form);
         toast.success("Cliente actualizado");
       } else {
-        await monzaClientesAPI.create(form);
-        toast.success("Cliente creado");
+        const r = await monzaClientesAPI.create(form);
+        // `reutilizado`: el backend dedupea por RUT/teléfono y devuelve la ficha que ya
+        // existía SIN renombrarla — decir «creado» sería mentirle al operador.
+        const creado = r.data as { nombre?: string; reutilizado?: boolean };
+        if (creado?.reutilizado) {
+          toast(`Ya existía: se usó la ficha de «${creado.nombre}»`);
+        } else {
+          toast.success("Cliente creado");
+        }
       }
       onSaved();
       onClose();

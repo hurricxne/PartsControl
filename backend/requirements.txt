@@ -18,3 +18,8 @@ aiofiles==24.1.0
 apscheduler==3.11.2
 reportlab
 pdfplumber
+
+# Base de datos de zonas horarias: monza_fechas.py resuelve America/Santiago (DST) con
+# zoneinfo. Hoy llega de arrastre por pandas; explícito para que un venv recién creado
+# en el servidor no deje los filtros de fecha sin zona (ZoneInfoNotFoundError).
+tzdata

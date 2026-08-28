@@ -217,21 +217,21 @@ def run():
     check("precio $0 explícito -> 422", r.status_code == 422, r.text)
     # derivado de un ítem en $0 → 400 (antes '< 0': la factura $0 nacía 'pagada')
     r = client.post(f"{BASE}/facturas", json={
-        "cotizacion_id": cots["B"], "sin_guia": True, "numero_factura": f"{MARK}-FB"})
+        "cotizacion_id": cots["B"], "sin_guia": True, "confirmar_retiro_sin_adelanto": True, "numero_factura": f"{MARK}-FB"})
     check("precio $0 derivado del ítem -> 400", r.status_code == 400, r.text)
     check("precio $0: mensaje 'no se puede facturar en $0'",
           "no se puede facturar en $0" in r.text, r.text)
 
     # ── 3) Folio SII obligatorio para tipo 'factura' (venta C) ──
-    r = client.post(f"{BASE}/facturas", json={"cotizacion_id": cots["C"], "sin_guia": True})
+    r = client.post(f"{BASE}/facturas", json={"cotizacion_id": cots["C"], "sin_guia": True, "confirmar_retiro_sin_adelanto": True})
     check("factura sin folio -> 400", r.status_code == 400, r.text)
     check("folio: mensaje espejo GA", "Ingresa el folio SII" in r.text, r.text)
     r = client.post(f"{BASE}/facturas", json={
-        "cotizacion_id": cots["C"], "sin_guia": True, "numero_factura": "   "})
+        "cotizacion_id": cots["C"], "sin_guia": True, "confirmar_retiro_sin_adelanto": True, "numero_factura": "   "})
     check("folio de puros espacios -> 400", r.status_code == 400, r.text)
     # boleta SIN folio → 200 (venta G) y persiste numero_factura NULL
     r = client.post(f"{BASE}/facturas", json={
-        "cotizacion_id": cots["G"], "sin_guia": True, "tipo_doc": "boleta"})
+        "cotizacion_id": cots["G"], "sin_guia": True, "confirmar_retiro_sin_adelanto": True, "tipo_doc": "boleta"})
     check("boleta sin folio -> 200", r.status_code == 200, r.text)
     if r.status_code == 200:
         check("boleta persiste folio NULL",
@@ -239,10 +239,10 @@ def run():
 
     # ── 4) Folio duplicado -> 409 ──
     r = client.post(f"{BASE}/facturas", json={
-        "cotizacion_id": cots["C"], "sin_guia": True, "numero_factura": f"{MARK}-DUP"})
+        "cotizacion_id": cots["C"], "sin_guia": True, "confirmar_retiro_sin_adelanto": True, "numero_factura": f"{MARK}-DUP"})
     check("factura con folio -> 200", r.status_code == 200, r.text)
     r = client.post(f"{BASE}/facturas", json={
-        "cotizacion_id": cots["C"], "sin_guia": True, "numero_factura": f"{MARK}-DUP"})
+        "cotizacion_id": cots["C"], "sin_guia": True, "confirmar_retiro_sin_adelanto": True, "numero_factura": f"{MARK}-DUP"})
     check("folio duplicado -> 409", r.status_code == 409, r.text)
     check("folio duplicado: mensaje menciona el folio", "folio" in r.text.lower(), r.text)
 
@@ -253,7 +253,7 @@ def run():
 
     # ── 5a) RETRO básica (venta D): facturar PRIMERO, verificar DESPUÉS ──
     r = client.post(f"{BASE}/facturas", json={
-        "cotizacion_id": cots["D"], "sin_guia": True, "numero_factura": f"{MARK}-FD"})
+        "cotizacion_id": cots["D"], "sin_guia": True, "confirmar_retiro_sin_adelanto": True, "numero_factura": f"{MARK}-FD"})
     check("D: factura previa 200", r.status_code == 200, r.text)
     fd_id = r.json()["id"] if r.status_code == 200 else None
     check("D: factura previa saldo completo", r.status_code == 200 and r.json()["saldo"] == 119000, r.text)
@@ -272,7 +272,7 @@ def run():
 
     # ── 5b) Cap por SALDO actual, no por bruto (venta E) ──
     r = client.post(f"{BASE}/facturas", json={
-        "cotizacion_id": cots["E"], "sin_guia": True, "numero_factura": f"{MARK}-FE"})
+        "cotizacion_id": cots["E"], "sin_guia": True, "confirmar_retiro_sin_adelanto": True, "numero_factura": f"{MARK}-FE"})
     check("E: factura previa 200", r.status_code == 200, r.text)
     fe_id = r.json()["id"] if r.status_code == 200 else None
     if fe_id:
@@ -292,7 +292,7 @@ def run():
 
     # ── 5c) Factoring VIGENTE se salta (venta F) + 6) observaciones preservadas ──
     r = client.post(f"{BASE}/facturas", json={
-        "cotizacion_id": cots["F"], "sin_guia": True, "numero_factura": f"{MARK}-FF"})
+        "cotizacion_id": cots["F"], "sin_guia": True, "confirmar_retiro_sin_adelanto": True, "numero_factura": f"{MARK}-FF"})
     check("F: factura previa 200", r.status_code == 200, r.text)
     ff_id = r.json()["id"] if r.status_code == 200 else None
     if ff_id:

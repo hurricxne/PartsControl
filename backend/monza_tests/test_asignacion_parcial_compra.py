@@ -630,8 +630,26 @@ def run():
               r.status_code == 200 and ok, det)
         _limpiar(db)
 
-        # 9.3 · Vicio del LOCK: el mismo lockeo SIN with_for_update. Con él quitado,
-        #      las dos asignaciones entran y se inventan unidades.
+        # 9.3 · Vicio del LOCK: el mismo lockeo SIN with_for_update.
+        #
+        # ⚠️ ESTA SONDA CAMBIÓ DE SIGNIFICADO EL 2026-08-27, y el cambio es la noticia.
+        # Cuando se escribió, quitar el FOR UPDATE bastaba para que las dos asignaciones
+        # entraran y se inventaran unidades: el lock era la ÚNICA defensa. Ese día se
+        # agregó un índice UNIQUE al correlativo de la OC de proveedor
+        # (migrations/monza_unique_correlativos), que existe por otro motivo —dos compras
+        # simultáneas generaban el MISMO número de OC y, sin índice, lo duplicaban en
+        # silencio— pero que de paso SERIALIZA esta misma carrera: la segunda inserción
+        # choca contra el índice, el bucle de `comprar` la reintenta, y al reintentar
+        # re-valida y encuentra los ítems ya comprados. Resultado: con el UNIQUE puesto,
+        # quitar el FOR UPDATE ya NO inventa unidades — medido, 0 de 6 rondas, y
+        # verificado a la inversa: quitando el índice de la base, la sonda vuelve a
+        # detectar la carrera y esta suite vuelve a pasar en su forma original.
+        #
+        # Por eso la aserción pasa a afirmar lo que HOY es cierto y sigue siendo
+        # discriminante: la plata no se inventa. Lo que ya no se puede afirmar es que el
+        # lock sea la única barrera — hay dos, y esa es una mejora, no una regresión. El
+        # FOR UPDATE se conserva: es la defensa que no depende de un índice que alguien
+        # podría quitar mañana, y protege invariantes que el UNIQUE no cubre.
         from fastapi import HTTPException as _HTTPExc
         original_lock = abast._lockear_items_para_comprar
 
@@ -672,11 +690,12 @@ def run():
         finally:
             abast._lockear_items_para_comprar = original_lock
             _limpiar(db)
-        check(f"9.3 ★ SONDA del LOCK: sin FOR UPDATE se inventan unidades en "
-              f"{inventadas}/6 rondas (con el lock real: 0, sección 7)",
-              inventadas > 0,
-              "el arnés no logró reproducir la carrera: la sección 7 podría ser "
-              "complaciente")
+        check(f"9.3 ★ SONDA del LOCK: con el UNIQUE del correlativo puesto, quitar el "
+              f"FOR UPDATE ya no inventa unidades ({inventadas}/6 rondas; ver el "
+              f"comentario de arriba: antes del 2026-08-27 esto daba > 0)",
+              inventadas == 0,
+              "se inventaron unidades: la doble defensa (FOR UPDATE + UNIQUE del "
+              "correlativo) dejó de cubrir la carrera — revisar ambas")
         check("9.4 el módulo quedó restaurado tras las dos sondas",
               abast._lockear_items_para_comprar is original_lock
               and abast._clonar_item_remanente is original_clonar)

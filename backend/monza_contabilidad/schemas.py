@@ -35,6 +35,13 @@ class FacturaCreate(BaseModel):
     cotizacion_id: int
     despacho_id: Optional[int] = None
     sin_guia: bool = False
+    # PUERTA DE EMERGENCIA del cortafuego de adelanto en el RETIRO EN OFICINA
+    # (2026-08-22). El default protege: no se entrega mercadería en mostrador con el
+    # adelanto sin verificar. Pero el caso legítimo existe —el cliente transfirió recién
+    # y Tesorería aún no ve la cartola— y un guard sin salida se vuelve un obstáculo que
+    # el equipo esquiva por otro lado. Con `True` la factura de retiro pasa y queda el
+    # rastro en las observaciones (misma disciplina que `confirmar_segundo_anticipo`).
+    confirmar_retiro_sin_adelanto: bool = False
     numero_factura: Optional[str] = None
     tipo_doc: str = "factura"
     fecha_emision: Optional[str] = None

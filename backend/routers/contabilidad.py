@@ -31,6 +31,7 @@ se excluye de la conciliación bancaria de ingresos (la plata se concilia abono�
 
 Endpoints (todos requieren autenticación):
   GET    /ventas                              listado de ventas por OC + resumen de cobranza
+  GET    /ventas/opciones                     listado LIVIANO (sin motor de precios): identidad + guías facturables con fecha
   GET    /ventas/{oc}                         detalle de una venta (ítems, guías, facturas)
   GET    /ventas/{oc}/despachos-facturables   guías firmadas aún facturables (selector "Emitir factura")
   GET    /facturas                            listado de facturas + antigüedad de cartera
@@ -256,11 +257,47 @@ def _despacho_items_de_oc(db: Session, oc_id: int):
     )
 
 
+def _firmada_efectiva_val(qty_firmada, qty_despachada) -> float:
+    """Cantidad FIRMADA efectiva a partir de los DOS valores sueltos (la versión por
+    columnas de `_firmada_efectiva`, para los helpers batch que trabajan con tuplas
+    y no tienen el DespachoItem completo).
+
+    TRAMPA — el coalesce es `is not None`, JAMÁS `or`: qty_firmada == 0 es un valor
+    LEGÍTIMO (el cliente firmó declarando que NO recibió NADA de la línea). Con `or`,
+    ese 0 es falsy y la línea caería al valor despachado: volvería a contar como
+    «facturable» y el sistema ofrecería facturar mercadería que el cliente declaró
+    no recibida. Solo el NULL (guía firmada completa, sin declaración) coalesce."""
+    return _f(qty_firmada) if qty_firmada is not None else _f(qty_despachada)
+
+
+def _firmada_efectiva(di: DespachoItem) -> float:
+    """Cantidad FIRMADA efectiva de una línea de despacho: coalesce(qty_firmada,
+    qty_despachada). La firma PARCIAL (qty_firmada < qty_despachada) declara un
+    FALTANTE: mercadería que la guía dice que viajó pero el cliente NO recibió.
+    Ese faltante NO es facturable por esta guía y NO vuelve por esta venta (la
+    reposición se pide en una cotización nueva). Este coalesce es EL gate: todos
+    los topes de facturación cuentan sobre lo firmado, no sobre lo despachado.
+    La regla vive en `_firmada_efectiva_val` (única definición, aquí solo delega)."""
+    return _firmada_efectiva_val(di.qty_firmada, di.qty_despachada)
+
+
 def _qty_despachada_por_item(db: Session, oc_id: int) -> dict:
+    """Por ítem físico: Σ de la cantidad FIRMADA efectiva (no la despachada pura)
+    de las guías facturables. El nombre histórico se conserva: para facturación,
+    'despachado' siempre significó 'lo que el cliente recibió y firmó'."""
     out = {}
     for di, _d in _despacho_items_de_oc(db, oc_id):
-        out[di.item_cotizacion_id] = out.get(di.item_cotizacion_id, 0.0) + _f(di.qty_despachada)
+        out[di.item_cotizacion_id] = out.get(di.item_cotizacion_id, 0.0) + _firmada_efectiva(di)
     return out
+
+
+def _faltante_declarado_por_item(db: Session, oc_id: int) -> dict:
+    """Unidades declaradas como NO recibidas al firmar (qty_despachada − firmada
+    efectiva) por item_cotizacion_id, sobre guías firmadas de despachos cerrados.
+    Se usa para que POR FACTURAR no mienta: ese faltante nunca se va a facturar
+    por esta venta, así que se descuenta de la mercadería pendiente.
+    Wrapper del batch `_faltante_declarado_por_ocs` (única definición del criterio)."""
+    return _faltante_declarado_por_ocs(db, [oc_id]).get(oc_id, {})
 
 
 def _qty_facturada_por_item(db: Session, oc_id: int) -> dict:
@@ -289,6 +326,333 @@ def _qty_facturada_por_despacho_item(db: Session, oc_id: int) -> dict:
     out = {}
     for did, qty in rows:
         out[did] = out.get(did, 0.0) + _f(qty)
+    return out
+
+
+# ─── Helpers BATCH por varias OC (listados livianos, anti N+1) ────────────────
+# Devuelven TUPLAS de columnas sueltas, nunca entidades ORM completas: un listado
+# de todas las ventas no necesita hidratar Despacho/DespachoItem enteros para
+# contar saldos, y las tuplas mantienen la memoria y el tiempo planos.
+def _lineas_guias_firmadas_por_ocs(db: Session, oc_ids) -> list:
+    """Líneas de guías FACTURABLES (despacho cerrado + guía FIRMADA) de VARIAS OC
+    en UNA query IN — MISMOS filtros que `_despacho_items_de_oc` (estado
+    'despachado' y guia_firmada == 1: solo eso es facturable). Cada fila:
+    (oc_id, despacho_id, numero_despacho, numero_guia, numero_expedicion,
+     fecha_guia, guia_firmada_archivo, despacho_item_id, item_cotizacion_id,
+     qty_despachada, qty_firmada)."""
+    if not oc_ids:
+        return []
+    return (
+        db.query(
+            Despacho.oc_cliente_id,
+            Despacho.id,
+            Despacho.numero_despacho,
+            Despacho.numero_guia,
+            Despacho.numero_expedicion,
+            Despacho.fecha_guia,
+            Despacho.guia_firmada_archivo,
+            DespachoItem.id,
+            DespachoItem.item_cotizacion_id,
+            DespachoItem.qty_despachada,
+            DespachoItem.qty_firmada,
+        )
+        .select_from(DespachoItem)
+        .join(Despacho, Despacho.id == DespachoItem.despacho_id)
+        .filter(
+            Despacho.oc_cliente_id.in_(oc_ids),
+            Despacho.estado == "despachado",
+            Despacho.guia_firmada == 1,
+        )
+        .all()
+    )
+
+
+def _qty_facturada_por_despacho_item_por_ocs(db: Session, oc_ids) -> dict:
+    """{oc_id: {despacho_item_id: Σ cantidad ya facturada}} de VARIAS OC en UNA
+    query IN — MISMOS filtros que `_qty_facturada_por_despacho_item`: en particular,
+    SIN filtro de empresa. La original tampoco lo tiene (el router entero ya está
+    candado a 'mineria' por dependencies, ver el APIRouter de arriba) y divergir
+    aquí rompería la paridad con el selector; el test fija esta convención."""
+    if not oc_ids:
+        return {}
+    rows = (
+        db.query(
+            ContFacturaCliente.oc_cliente_id,
+            ContFacturaClienteItem.despacho_item_id,
+            ContFacturaClienteItem.cantidad,
+        )
+        .select_from(ContFacturaClienteItem)
+        .join(ContFacturaCliente, ContFacturaCliente.id == ContFacturaClienteItem.factura_id)
+        .filter(
+            ContFacturaCliente.oc_cliente_id.in_(oc_ids),
+            ContFacturaClienteItem.despacho_item_id.isnot(None),
+        )
+        .all()
+    )
+    out: dict = {}
+    for oc_id, did, qty in rows:
+        m = out.setdefault(oc_id, {})
+        m[did] = m.get(did, 0.0) + _f(qty)
+    return out
+
+
+def _guias_facturables_por_ocs(db: Session, oc_ids, filas=None) -> dict:
+    """{oc_id: [guías firmadas con saldo aún facturable]} — derivado de los dos
+    batch de arriba (2 queries totales para CUALQUIER cantidad de OC). Es el ÚNICO
+    derivador del criterio «guía facturable»: el selector del modal Emitir factura
+    (`despachos_facturables`) delega aquí, y /ventas/opciones y el badge del
+    listado consumen lo mismo — un solo criterio, imposible que diverjan.
+
+    Saldo por línea = max(firmada efectiva − ya facturada, 0); la guía entra si su
+    saldo total > TOL_QTY. TOL_QTY (unidades), JAMÁS TOL (pesos): 'facturable' es
+    una CANTIDAD, y con TOL=0.5 una guía con saldo fraccional ≤ 0.5 unidades
+    desaparecía del selector aunque crear_factura sí la aceptaba (bug histórico).
+
+    Cada guía emite LOS MISMOS campos que siempre emitió despachos_facturables
+    (contrato del frontend intacto). Sobre fecha_guia: la referencia 52 del DTE 33
+    exige la fecha de EMISIÓN de la guía, así que una guía en papel sin ella NO se
+    puede facturar al SII; viaja hasta el selector para avisarlo ANTES de elegirla
+    — quien factura (Contabilidad) no es quien la carga (Bodega).
+
+    `filas`: las líneas de `_lineas_guias_firmadas_por_ocs` YA obtenidas, para que
+    un caller que también necesita el faltante declarado (listar_ventas) pague el
+    IN una sola vez. None (default) = obtenerlas aquí — los demás llamadores no
+    cambian. Debe venir del MISMO derivador y los MISMOS oc_ids: no se revalida."""
+    if not oc_ids:
+        return {}
+    if filas is None:
+        filas = _lineas_guias_firmadas_por_ocs(db, oc_ids)
+    fact_por_oc = _qty_facturada_por_despacho_item_por_ocs(db, oc_ids)
+    por_desp: dict = {}
+    for (oc_id, desp_id, numero_despacho, numero_guia, numero_expedicion,
+         fecha_guia, guia_firmada_archivo, di_id, _item_id, qty_desp,
+         qty_firm) in filas:
+        # FIRMADA efectiva, no despachada pura: el faltante declarado en una firma
+        # parcial no es facturable, y una guía con 2 firmadas y 2 facturadas debe
+        # DESAPARECER del selector aunque haya despachado 3.
+        facturable = (_firmada_efectiva_val(qty_firm, qty_desp)
+                      - fact_por_oc.get(oc_id, {}).get(di_id, 0.0))
+        e = por_desp.setdefault((oc_id, desp_id), {
+            "id": desp_id, "numero_despacho": numero_despacho,
+            "numero_guia": numero_guia, "numero_expedicion": numero_expedicion,
+            "fecha_guia": fecha_guia.isoformat() if fecha_guia else None,
+            "guia_firmada_archivo": guia_firmada_archivo,
+            "items_count": 0, "facturable": 0.0,
+        })
+        e["items_count"] += 1
+        e["facturable"] += max(facturable, 0.0)
+    out: dict = {}
+    for (oc_id, _desp_id), e in por_desp.items():
+        if e["facturable"] > TOL_QTY:
+            out.setdefault(oc_id, []).append(e)
+    return out
+
+
+def _faltante_declarado_por_ocs(db: Session, oc_ids, filas=None) -> dict:
+    """{oc_id: {item_cotizacion_id: unidades faltantes}} declarado al FIRMAR (firma
+    parcial: qty_despachada − firmada efectiva > TOL_QTY) sobre guías firmadas de
+    despachos cerrados, de VARIAS OC en una pasada — deriva del mismo batch de
+    líneas que las guías facturables.
+
+    Equivalencia EXACTA con el SQL inline que vivía en listar_ventas (filtraba
+    `qty_firmada IS NOT NULL` en la query): aquí esas filas NULL entran al batch
+    pero dan delta 0 —firmada efectiva == despachada— y no pasan el TOL_QTY. Mismo
+    resultado, sin duplicar el criterio en dos lugares.
+
+    `filas`: mismo contrato que en `_guias_facturables_por_ocs` — líneas del batch
+    ya obtenidas (listar_ventas necesita AMBOS derivadores y pagaba el mismo IN dos
+    veces); None = obtenerlas aquí, llamadores existentes intactos."""
+    if filas is None:
+        filas = _lineas_guias_firmadas_por_ocs(db, oc_ids)
+    out: dict = {}
+    for (oc_id, _desp_id, _nd, _ng, _ne, _fg, _arch, _di_id, item_id,
+         qty_desp, qty_firm) in filas:
+        delta = _f(qty_desp) - _firmada_efectiva_val(qty_firm, qty_desp)
+        if delta > TOL_QTY:
+            m = out.setdefault(oc_id, {})
+            m[item_id] = m.get(item_id, 0.0) + delta
+    return out
+
+
+def _fecha_fuente_guia(hay_electronica: bool, fecha_electronica, fecha_papel,
+                       bloqueada: bool = False):
+    """(fecha, fuente) de una guía facturable — CASCADA espejo del orden REAL de
+    `_guia_referencia_de_factura` (wasabil_dte/router.py). EL ORDEN IMPORTA:
+      (a) hay DTE 52 EMITIDO ante el SII → su documentDate, fuente='electronica'
+          (aunque el despacho también tenga fecha en papel: la electrónica manda,
+          igual que en la referencia 52 real de la factura);
+      (a') sin 52 emitida real pero con un DTE 52 que la emisión de la factura NO
+          puede referenciar → fuente='bloqueada'. QUIÉN LO DECIDE: la propia
+          `_guia_no_referenciable` (wasabil_dte/router.py), consultada en batch por
+          `_fecha_fuente_por_despachos` — NO una copia local del criterio. La copia
+          era el bug: reproducía sólo «EMITIDA pero SIN folio» y dejaba pasar como
+          papel limpio los otros tres estados que también rechazan (claim de emisión
+          vigente · uuid con status no-fallido · AMBIGUA por timeout). Ofrecerlas
+          aquí como guía «en papel» es mentir: el operador la elige y choca con el
+          409 recién al emitir. La fecha que viaja es la de papel si existe
+          (informativa) o None.
+          La guía SIGUE contando en n y en el array — paridad con el selector, que
+          también la lista: el aviso es honestidad, no filtro (quien bloquea de
+          verdad es la emisión, con su 409 y su texto).
+      (b) si no hay 52 electrónica → despacho.fecha_guia (papel), fuente='papel';
+      (c) sin ninguna de las dos → (None, None): el selector debe avisar, no inventar.
+
+    Borde (a) ACEPTADO y documentado: DTE emitido real SIN documentDate en su payload
+    → (None, 'electronica'). Es una SUB-promesa segura (decir «electrónica sin fecha»
+    nunca miente); el emisor real de la referencia 52 cae a created_at en ese caso —
+    aquí NO se replica ese fallback porque created_at es hora UTC del server y de
+    noche en Chile ya es «mañana».
+
+    PROHIBIDO fecha_despacho: es el reloj del server al CERRAR el despacho en el
+    sistema, no la fecha de emisión de la guía — usarlo como sustituto produjo DTEs
+    33 REALES ante el SII citando la guía con una fecha que la guía no tiene."""
+    if hay_electronica:
+        return fecha_electronica, "electronica"
+    if bloqueada:
+        return fecha_papel or None, "bloqueada"
+    if fecha_papel:
+        return fecha_papel, "papel"
+    return None, None
+
+
+class _SesionDeUnaFilaDte:
+    """Adaptador de UNA fila `wasabil_dte` YA LEÍDA, con la forma mínima de Session que
+    `wasabil_dte.router._guia_no_referenciable` usa (`query(...).filter(...).first()`).
+
+    POR QUÉ EXISTE. El veredicto «esta guía NO se puede citar en la referencia 52 de la
+    factura» tiene que salir de la función del EMISOR —la misma que responde el 409 al
+    emitir—, jamás de una copia: el bug que esto cierra era exactamente eso. El selector
+    re-derivaba el criterio y sólo reproducía UNO de los cuatro estados que bloquean
+    (emitida-sin-folio · claim de emisión vigente · uuid con status no-fallido · AMBIGUA
+    = uuid NULL con `en_vuelo_desde` y el claim ya vencido), así que pintaba chip verde
+    «lista para facturar» sobre guías cuyo DTE estaba en vuelo, en proceso o ambiguo, y
+    el operador chocaba recién en el preview, con la factura a medio llenar.
+
+    Pero esa función recibe `(db, despacho_id)` y hace su PROPIA lectura por despacho:
+    llamarla guía por guía metería un N+1 dentro del endpoint LIVIANO (/ventas/opciones
+    tiene presupuesto de queries pinzado en el test, y el modal lo refetchea en cada
+    apertura). Este adaptador le entrega la fila que la query batch YA trajo: UNA sola
+    query para todas las guías y CERO lógica duplicada.
+
+    Le sirve la fila COMPLETA (entidad ORM), no un puñado de columnas: si mañana el
+    predicado del emisor mira una columna más, sigue decidiendo bien sin que haya que
+    enterarse acá. Ignora los filtros a propósito — el llamador ya eligió la fila de ESE
+    despacho. `None` es una fila legítima (despacho sin DTE): el propio predicado
+    contesta «no bloquea» en ese caso, así que ni eso se re-deriva aquí.
+
+    DEUDA, y vive en el OTRO módulo: cuando `wasabil_dte` exponga el veredicto por FILA
+    (p. ej. `motivo_guia_no_referenciable_de(dte)`) o su versión batch, este adaptador se
+    borra y se llama esa función directo. Mientras tanto la equivalencia está pinzada:
+    tests_contabilidad/test_ventas_opciones.py siembra los estados uno por uno y exige
+    que `fuente == 'bloqueada'` sea EXACTAMENTE
+    `_guia_no_referenciable(sesión_real, despacho_id) is not None`; si el emisor cambia
+    su lectura interna, el gate cae ruidoso en vez de divergir en silencio.
+
+    Y el CONTRATO de «fila completa» también está pinzado (§ 10-quinquies de esa misma
+    suite): un espía sobre el predicado del emisor exige que lo que llega sea la entidad
+    ORM, con los atributos que el criterio de HOY ni mira. Sin esa sonda, cambiar la query
+    batch por una proyección de 4 columnas pasaba el gate en verde y reventaba con 500 en
+    PRODUCCIÓN el día que el emisor leyera una columna más — una alarma diferida."""
+
+    def __init__(self, fila):
+        self._fila = fila
+
+    def query(self, *args, **kwargs):
+        return self
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def first(self):
+        return self._fila
+
+
+def _documentdate_dte(dte) -> Optional[str]:
+    """Fecha TRIBUTARIA de un DTE (el `documentDate` de su payload) en ISO, o None.
+
+    payload_json JSON-válido pero NO objeto ('"x"', '[1]', 'null'): json.loads no falla
+    y el `.get` moriría con AttributeError —que NO está en el except→ 500 del endpoint
+    ENTERO por una fila sucia. Guard de tipo: degrada a None POR FILA, igual que un JSON
+    roto.
+
+    documentDate ausente → None, JAMÁS created_at: created_at es la hora UTC del server
+    y de noche en Chile ya es «mañana» — mentiría como fecha tributaria. Mejor sin fecha
+    que con una fecha inventada. (Borde aceptado: el emisor real de la referencia 52 sí
+    cae a created_at; aquí se promete MENOS, nunca más — ver _fecha_fuente_guia.)"""
+    try:
+        payload = json.loads(getattr(dte, "payload_json", None) or "{}")
+        if not isinstance(payload, dict):
+            payload = {}
+        if payload.get("documentDate"):
+            return datetime.fromisoformat(payload["documentDate"]).date().isoformat()
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
+def _fecha_fuente_por_despachos(db: Session, guias) -> dict:
+    """{despacho_id: (fecha ISO | None, fuente)} de guías facturables — la pieza que
+    junta los candidatos y deja decidir a `_fecha_fuente_guia`.
+
+    `guias`: los dicts que arma `_guias_facturables_por_ocs` (el derivador ÚNICO del
+    criterio «guía facturable»); sólo se leen `id` y `fecha_guia`. Se recibe la lista y
+    no ids sueltos para NO volver a leer de la BD la fecha de la guía en papel que esos
+    dicts ya traen: un segundo lector del mismo dato es un futuro desalineado.
+
+    Quién decide qué, y por qué así:
+      · BLOQUEADA la decide `wasabil_dte.router._guia_no_referenciable`, la MISMA
+        función con la que la emisión de la factura 33 rechaza la referencia 52 (el
+        porqué del adaptador, en `_SesionDeUnaFilaDte`). Antes se re-derivaba acá con
+        `status == EMITIDO and not folio` y los otros TRES estados que bloquean salían
+        vestidos de guía en papel facturable.
+      · ELECTRÓNICA la decide `_dte_emitido_ante_sii` (status EMITIDO **y** folio), el
+        criterio único de este módulo, sobre esa misma fila.
+      · el ORDEN entre las tres fuentes lo decide `_fecha_fuente_guia`, y sólo él.
+
+    LO QUE ESTE HELPER NO PUEDE VER, a propósito: el rechazo CONFIRMADO del SII (status
+    4 CON uuid) no bloquea aquí porque el emisor tampoco lo bloquea por columnas — su
+    umbral extra (`_problema_52_de_papel`) CONSULTA a Wasabil, y este endpoint es
+    deliberadamente sin red (su razón de existir es ser liviano). Marcar 'bloqueada' a
+    todo rechazo confirmado encendería el aviso también en los casos que sí se facturan
+    legítimamente con la guía de papel, y un aviso que grita lobo entrena al operador a
+    ignorarlo. Quien bloquea de verdad sigue siendo la emisión, con su 409.
+
+    Import LOCAL de wasabil_dte (mismo patrón que `_dte_factura_no_emitido`): el router
+    del emisor importa `routers.contabilidad` en su top-level, así que a nivel de módulo
+    sería un ciclo; en tiempo de request los dos ya están cargados.
+
+    UNA query para cualquier cantidad de guías, y CERO si no hay ninguna."""
+    if not guias:
+        return {}
+    from wasabil_dte.models import WasabilDte
+    from wasabil_dte.service import TIPO_DOC_GUIA
+    from wasabil_dte.router import _guia_no_referenciable
+    # Filas COMPLETAS (no columnas sueltas como los demás batch de este módulo): el
+    # predicado del emisor recibe la fila y mira las columnas que ÉL decide.
+    filas = (db.query(WasabilDte)
+             .filter(WasabilDte.despacho_id.in_([g["id"] for g in guias]),
+                     WasabilDte.tipo_dte == TIPO_DOC_GUIA)
+             .all())
+    por_desp: dict = {}
+    for f in filas:
+        # setdefault = «gana la primera», el mismo criterio que el `.first()` del emisor
+        # sobre la misma query sin ORDER BY (hoy la UniqueConstraint por despacho deja
+        # una sola fila; si esa llave desapareciera, ambos verían la MISMA).
+        por_desp.setdefault(f.despacho_id, f)
+    out: dict = {}
+    for g in guias:
+        fila = por_desp.get(g["id"])
+        motivo = _guia_no_referenciable(_SesionDeUnaFilaDte(fila), g["id"])
+        # 'electronica' exige las dos cosas: que el emisor NO la bloquee y que haya 52
+        # emitida REAL. El `motivo is None` no es adorno: deja al emisor con la última
+        # palabra si algún día un estado bloqueante trae folio.
+        emitida = motivo is None and fila is not None and _dte_emitido_ante_sii(fila)
+        out[g["id"]] = _fecha_fuente_guia(
+            emitida,
+            _documentdate_dte(fila) if emitida else None,
+            g.get("fecha_guia"),
+            bloqueada=motivo is not None,
+        )
     return out
 
 
@@ -603,21 +967,28 @@ def _facturas_de_oc(db: Session, oc_id: int, empresa: Optional[str] = None) -> L
     return q.order_by(ContFacturaCliente.id.asc()).all()
 
 
-def _mercaderia_pendiente_bruto(items_db, pmap: dict, qty_fact: dict, totales: dict) -> float:
+def _mercaderia_pendiente_bruto(items_db, pmap: dict, qty_fact: dict, totales: dict,
+                                faltante_decl: Optional[dict] = None) -> float:
     """Bruto (c/IVA) de la mercadería AÚN sin facturar: Σ cantidad pendiente por ítem
     × su precio de venta vigente. La cantidad pendiente = cantidad − Σ facturada
-    (las tandas parciales restan lo suyo; clamp a 0 por correcciones manuales).
+    − faltante DECLARADO (las tandas parciales restan lo suyo; clamp a 0 por
+    correcciones manuales). `faltante_decl` (item_id -> unidades) son los faltantes
+    de firmas PARCIALES: mercadería que la guía dice que viajó pero el cliente NO
+    recibió — jamás se facturará por esta venta, así que dejarla en "por facturar"
+    sería mentir (la reposición va en una cotización NUEVA).
     Se valúa al pricing VIGENTE a propósito: lo pendiente se facturará al precio del
     momento; lo YA facturado no participa (quedó congelado en sus facturas)."""
     neto_total = _f(totales.get("subtotal_neto_clp"))
     bruto_total = _f(totales.get("total_con_iva_clp"))
     factor_iva = (bruto_total / neto_total) if neto_total > TOL else 1.19
+    faltante_decl = faltante_decl or {}
     pend_neto = 0.0
     for it in items_db:
         cant = _f(it.cantidad)
         if cant <= 0:
             continue
-        qty_pend = max(cant - _f(qty_fact.get(it.id, 0.0)), 0.0)
+        qty_pend = max(
+            cant - _f(qty_fact.get(it.id, 0.0)) - _f(faltante_decl.get(it.id, 0.0)), 0.0)
         if qty_pend <= 0:
             continue
         pend_neto += _f((pmap.get(it.id) or {}).get("total_venta_clp")) * (qty_pend / cant)
@@ -957,6 +1328,22 @@ def listar_ventas(
                 m[item_id] = m.get(item_id, 0.0) + _f(cant)
             if ant_id:
                 desc_por_anticipo[ant_id] = desc_por_anticipo.get(ant_id, 0.0) + (-_f(tot_neto))
+    # Las líneas de guías firmadas se obtienen UNA sola vez y alimentan a los DOS
+    # derivadores de abajo: faltante declarado y guías facturables corrían cada uno
+    # su propia copia del mismo IN (misma query, mismos oc_ids, dos viajes a la BD
+    # por listado). El criterio sigue viviendo solo en _lineas_guias_firmadas_por_ocs.
+    filas_guias = _lineas_guias_firmadas_por_ocs(db, oc_ids) if oc_ids else []
+    # Faltantes DECLARADOS (firma parcial) por OC, en lote. Mismo criterio que el
+    # detalle (_faltante_declarado_por_item delega en el MISMO batch) — sin esto,
+    # el listado mostraría "por facturar" > 0 para mercadería que jamás se
+    # facturará y el detalle diría 0.
+    faltante_by_oc: dict = (
+        _faltante_declarado_por_ocs(db, oc_ids, filas=filas_guias) if oc_ids else {})
+    # Guías firmadas con saldo aún facturable, por OC (badge «por facturar guía»
+    # del listado): el MISMO derivador que alimenta el selector del modal Emitir
+    # factura y /ventas/opciones — un solo criterio para las tres pantallas.
+    guias_fact_by_oc: dict = (
+        _guias_facturables_por_ocs(db, oc_ids, filas=filas_guias) if oc_ids else {})
     # Adelantos por OC en UNA query (badge en Ventas: informados / aprobados / por aplicar)
     adelantos_by_oc: dict = {}
     if oc_ids:
@@ -991,9 +1378,15 @@ def listar_ventas(
                     factor = (_f(f.monto_bruto) / neto_fa) if neto_fa > TOL else 1.0
                     anticipo_pend += pend * factor
         mercaderia_pend = _mercaderia_pendiente_bruto(
-            items_db, _pmap, qty_fact_by_oc.get(oc.id, {}), totales)
+            items_db, _pmap, qty_fact_by_oc.get(oc.id, {}), totales,
+            faltante_decl=faltante_by_oc.get(oc.id))
         resumen = _resumen_cobranza(
             facs_oc, por_facturar_clp=mercaderia_pend - anticipo_pend)
+        # El faltante declarado también se EMITE en el listado (revisión M3b): la
+        # matemática ya lo usaba, pero sin la clave el badge de la lista quedaba
+        # mudo y el detalle decía otra cosa que la fila.
+        resumen["faltante_declarado"] = round(
+            sum(faltante_by_oc.get(oc.id, {}).values()), 4)
         adels = adelantos_by_oc.get(oc.id, [])
         resumen_adelantos = {
             "n": len(adels),
@@ -1005,6 +1398,9 @@ def listar_ventas(
         }
         result.append({
             "adelantos": resumen_adelantos,
+            # ADITIVO: cuántas guías firmadas tiene esta OC con saldo aún facturable
+            # (len del mismo derivador del selector — nada más cambia del endpoint).
+            "guias_facturables_n": len(guias_fact_by_oc.get(oc.id, [])),
             "oc_cliente_id": oc.id,
             "cotizacion_id": cot.id,
             "numero_oc": oc.numero_oc,
@@ -1022,6 +1418,105 @@ def listar_ventas(
         })
     result.sort(key=lambda v: (v.get("fecha_venta") is None, v.get("fecha_venta") or ""), reverse=True)
     return result
+
+
+# ⚠️ POSICIÓN FÍSICA OBLIGATORIA: /ventas/opciones debe declararse ANTES que
+# /ventas/{oc_id} (la función de más abajo). FastAPI matchea las rutas en ORDEN DE
+# REGISTRO y `{oc_id}` es int: si esta función se mueve después de detalle_venta,
+# "opciones" cae en {oc_id}, no parsea como entero y la ruta muere con 422 en
+# silencio. El test test_ventas_opciones.py (check 1) pesca la mudanza.
+@router.get("/ventas/opciones")
+def ventas_opciones(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Listado LIVIANO de ventas para poblar selectores (p.ej. elegir OC y guía al
+    emitir una factura sin entrar al detalle): identidad de la venta + sus guías
+    firmadas con saldo aún facturable, cada una con la FECHA DE EMISIÓN real de la
+    guía y de dónde salió ('electronica' | 'bloqueada' | 'papel' | None —
+    'bloqueada' = CUALQUIER estado del DTE 52 con el que la emisión de la factura 33
+    rechaza la referencia a esa guía, dicho por la función del emisor y no por una
+    copia; ver _fecha_fuente_por_despachos y _fecha_fuente_guia).
+
+    CERO motor de precios: este endpoint JAMÁS llama a `_precios_de_cotizacion` (ni
+    a pricing_service) — es su razón de existir: el selector necesita identidad y
+    guías, no plata, y el motor es lo que hace pesado a GET /ventas. El test lo
+    protege con una bomba (monkeypatch que explota si alguien lo llama).
+
+    Hereda del router el candado de empresa ('mineria') y de rol."""
+    # (1) Identidad de la venta en columnas sueltas (sin hidratar ORM). El JOIN
+    # interno ya excluye OCs sin cotización (paridad con `if not cot: continue`
+    # de listar_ventas).
+    filas = (
+        db.query(
+            OcCliente.id, OcCliente.numero_oc, OcCliente.fecha_oc, OcCliente.cond_pago,
+            Cotizacion.id, Cotizacion.numero, Cotizacion.cliente,
+            Cotizacion.rut_cliente, Cotizacion.created_at,
+        )
+        .select_from(OcCliente)
+        .join(Cotizacion, Cotizacion.id == OcCliente.cotizacion_id)
+        .all()
+    )
+    # (2) Cotizaciones CON ítems — paridad con `if not items_db: continue` de
+    # listar_ventas, pero con un DISTINCT liviano en vez de pasar por el motor.
+    cot_ids = {f[4] for f in filas}
+    cots_con_items = set()
+    if cot_ids:
+        cots_con_items = {
+            cid for (cid,) in db.query(ItemCotizacion.cotizacion_id)
+            .filter(ItemCotizacion.cotizacion_id.in_(cot_ids)).distinct().all()
+        }
+    oc_ids = [f[0] for f in filas if f[4] in cots_con_items]
+    # (3)+(4) Guías firmadas con saldo facturable (2 queries IN, mismo derivador
+    # que el selector del modal).
+    guias_by_oc = _guias_facturables_por_ocs(db, oc_ids)
+    # (5) Fecha y FUENTE de cada guía facturable en UNA query sobre wasabil_dte:
+    # quién bloquea (la función del emisor), quién es electrónica real
+    # (_dte_emitido_ante_sii) y el orden entre las fuentes (_fecha_fuente_guia) viven
+    # todos en `_fecha_fuente_por_despachos` — este endpoint sólo consume el veredicto.
+    # El selector del modal (`despachos_facturables`) consume EL MISMO helper: por eso
+    # las dos pantallas ya no pueden decir cosas distintas de la misma guía.
+    fecha_fuente = _fecha_fuente_por_despachos(
+        db, [g for gs in guias_by_oc.values() for g in gs])
+    opciones = []
+    for (oc_id, numero_oc, fecha_oc, cond_pago, cot_id, numero_cot,
+         cliente, rut_cliente, created_at) in filas:
+        if cot_id not in cots_con_items:
+            continue
+        guias = guias_by_oc.get(oc_id, [])
+        guias_out = []
+        for g in guias:
+            # La cascada de fecha/fuente ya la resolvió `_fecha_fuente_por_despachos`
+            # (que a su vez delega el orden en _fecha_fuente_guia, único punto mutable).
+            # Default conservador si por lo que sea faltara el veredicto: «sin fecha»,
+            # que es lo que el selector sabe avisar — nunca inventar una fecha.
+            fecha, fuente = fecha_fuente.get(g["id"], (None, None))
+            guias_out.append({
+                "numero_guia": g["numero_guia"],
+                "numero_despacho": g["numero_despacho"],
+                "fecha": fecha,
+                "fuente": fuente,
+            })
+        opciones.append({
+            "oc_cliente_id": oc_id,
+            "numero_oc": numero_oc,
+            "numero_cotizacion": numero_cot,
+            "cliente": cliente or "",
+            "rut_cliente": rut_cliente or "",
+            "fecha_venta": created_at.isoformat() if created_at else None,
+            "fecha_oc": fecha_oc,
+            "cond_pago": cond_pago,
+            "guias_facturables_n": len(guias),
+            # El array anidado SOLO viene poblado con n > 0 (vacío si no hay nada
+            # facturable): el selector no debe ofrecer guías sin saldo.
+            "guias_facturables": guias_out,
+        })
+    # Orden: fecha_venta DESC con los None AL FINAL. OJO: NO replicar el sort de
+    # listar_ventas — su clave (is None, fecha) con reverse=True pone los None
+    # PRIMERO; aquí una venta sin fecha no puede tapar a las recientes.
+    opciones.sort(key=lambda v: (v["fecha_venta"] is not None, v["fecha_venta"] or ""),
+                  reverse=True)
+    return {"hoy": _hoy_chile().isoformat(), "opciones": opciones}
 
 
 @router.get("/ventas/{oc_id}")
@@ -1056,6 +1551,15 @@ def detalle_venta(
             "despacho_item_id": di.id, "despacho_id": d.id,
             "numero_despacho": d.numero_despacho, "numero_guia": d.numero_guia,
             "estado": d.estado, "qty_despachada": _f(di.qty_despachada),
+            # null = firma completa (o sin firmar); número = firma PARCIAL: el resto
+            # es faltante declarado, no facturable por esta guía.
+            # `is not None`, JAMÁS `or` (mismo coalesce que _firmada_efectiva_val, y acá
+            # el error miente al revés): con `or`, una línea firmada en 0 —el cliente
+            # declaró que NO recibió NADA de ella— se publicaría como null, o sea como
+            # FIRMA COMPLETA. Estado alcanzable: la firma parcial solo rechaza que la
+            # SUMA firmada de la guía sea 0, así que una línea en 0 junto a otra en 2 es
+            # legítima. Pinzado en tests_contabilidad/test_ventas_opciones.py § 6-ter.
+            "qty_firmada": (_f(di.qty_firmada) if di.qty_firmada is not None else None),
             "guia_firmada": bool(d.guia_firmada),
             "numero_expedicion": d.numero_expedicion,
             "guia_firmada_archivo": d.guia_firmada_archivo,
@@ -1110,11 +1614,18 @@ def detalle_venta(
     for fi, _fac in fac_rows:
         if fi.item_cotizacion_id:
             qty_fact[fi.item_cotizacion_id] = qty_fact.get(fi.item_cotizacion_id, 0.0) + _f(fi.cantidad)
-    mercaderia_pend = _mercaderia_pendiente_bruto(items_db, pmap, qty_fact, totales)
+    # Base FÍSICA siempre (regla de oro de esta pantalla), y HONESTA: el faltante
+    # declarado en firmas parciales se descuenta — no se facturará por esta venta.
+    # Se expone aparte para que la pantalla lo diga («2 por facturar + 1 faltante»).
+    faltante_decl = _faltante_declarado_por_item(db, oc.id)
+    mercaderia_pend = _mercaderia_pendiente_bruto(
+        items_db, pmap, qty_fact, totales, faltante_decl=faltante_decl)
     resumen = _resumen_cobranza(
         facturas, por_facturar_clp=mercaderia_pend - anticipo_por_descontar
     )
     resumen["anticipo_por_descontar_clp"] = round(anticipo_por_descontar, 0)
+    # Unidades declaradas como faltantes al firmar (Σ de todas las guías de la OC)
+    resumen["faltante_declarado"] = round(sum(faltante_decl.values()), 4)
     # Cifra autoritativa para la UI (nota de la barra y sección "Por facturar"):
     # evita que el frontend la reconstruya como por_facturar + anticipo, que con
     # anticipo > mercadería (clamp) sobredeclararía la mercadería pendiente.
@@ -1150,28 +1661,37 @@ def despachos_facturables(
     """Guías de despacho FACTURABLES de la OC: despachos cerrados (estado 'despachado')
     Y con la guía FIRMADA (entregada y firmada por el cliente), con saldo aún facturable.
     Alimenta el selector del modal 'Emitir factura' para que no ofrezca guías ya facturadas.
-    Cada guía incluye numero_expedicion y guia_firmada_archivo (para verla antes de emitir)."""
-    fact_di = _qty_facturada_por_despacho_item(db, oc_id)
-    by_desp = {}
-    for di, d in _despacho_items_de_oc(db, oc_id):
-        facturable = _f(di.qty_despachada) - fact_di.get(di.id, 0.0)
-        e = by_desp.setdefault(d.id, {
-            "id": d.id, "numero_despacho": d.numero_despacho,
-            "numero_guia": d.numero_guia, "numero_expedicion": d.numero_expedicion,
-            # Fecha de EMISIÓN de la guía: la referencia 52 del DTE 33 la exige, así que
-            # una guía en papel sin ella NO se puede facturar al SII. Viaja hasta acá para
-            # que el selector lo avise ANTES de elegirla — quien factura (Contabilidad) no
-            # es quien la carga (Bodega), y si no se ve acá el bloqueo sorprende al final.
-            "fecha_guia": d.fecha_guia.isoformat() if d.fecha_guia else None,
-            "guia_firmada_archivo": d.guia_firmada_archivo,
-            "items_count": 0, "facturable": 0.0,
-        })
-        e["items_count"] += 1
-        e["facturable"] += max(facturable, 0.0)
-    # TOL_QTY (unidades), no TOL (pesos): 'facturable' es una CANTIDAD; con TOL=0.5 una
-    # guía con saldo fraccional ≤0.5 unidades desaparecía del selector aunque crear_factura
-    # sí la aceptaba (mismo criterio que la derivación de líneas).
-    return [e for e in by_desp.values() if e["facturable"] > TOL_QTY]
+    Cada guía incluye numero_expedicion y guia_firmada_archivo (para verla antes de emitir).
+
+    El criterio y los campos viven en `_guias_facturables_por_ocs` (el derivador
+    ÚNICO, compartido con /ventas/opciones y el badge del listado): aquí solo se
+    delega — el contrato JSON histórico de este endpoint NO cambia.
+
+    ADITIVO, dos campos por guía: `fecha` (ISO | None) y `fuente`
+    ('electronica' | 'papel' | 'bloqueada' | None), del MISMO helper que usa
+    /ventas/opciones. POR QUÉ: la fila del selector pintaba «(sin fecha ⚠)» en TODA
+    guía ELECTRÓNICA porque mostraba `fecha_guia`, que es la columna de la guía en
+    PAPEL y que la emisión al SII nunca escribe (pisa `numero_guia` con el folio y
+    nada más). Resultado: el chip de esa misma pantalla decía la fecha correcta —
+    calculada por esta cascada— y la fila de abajo la desmentía a 40 píxeles, con un
+    texto que además mandaba a cargar a mano una fecha que la cascada ignora.
+    `fecha_guia` se conserva tal cual (contrato viejo); quien decide es `fecha`.
+
+    ORDEN: por `fecha` ASC con las SIN FECHA primero — mismo criterio que
+    `ordenarFacturables` del selector de OC. Una guía sin fecha de emisión no se puede
+    facturar al SII (la referencia 52 la exige) y necesita acción humana, así que
+    encabeza en vez de perderse al final. Se ordena LA SALIDA de este endpoint, no el
+    derivador: el orden es de esta pantalla, el criterio es de todos."""
+    guias = _guias_facturables_por_ocs(db, [oc_id]).get(oc_id, [])
+    fecha_fuente = _fecha_fuente_por_despachos(db, guias)
+    salida = []
+    for g in guias:
+        fecha, fuente = fecha_fuente.get(g["id"], (None, None))
+        salida.append({**g, "fecha": fecha, "fuente": fuente})
+    # (fecha is not None, fecha): False < True ⇒ las sin fecha PRIMERO; entre las que
+    # tienen fecha, el orden lexicográfico de un ISO YYYY-MM-DD ES el cronológico.
+    salida.sort(key=lambda g: (g["fecha"] is not None, g["fecha"] or ""))
+    return salida
 
 
 # ─── Adelantos de cliente: informar / listar / editar / anular ────────────────
@@ -1509,6 +2029,22 @@ def _precios_congelados_guia(db: Session, despacho_id: Optional[int]):
         detalles = json.loads(dte.payload_json).get("details", [])
     except (ValueError, TypeError):
         return {}, {}
+    # Sanitizador de wasabil_dte: las claves por n° de parte se normalizan IGUAL que
+    # al emitir (v4 limpia el `code`), en el armado Y en el lookup del consumidor —
+    # así payloads viejos (code crudo) y nuevos siguen matcheando (es idempotente).
+    # ADVERTENCIA (no confiar de más en `por_parte`): `sanitizar_latin1` es idempotente
+    # DENTRO de una versión, pero NO es estable ENTRE VERSIONES, y el payload de un DTE
+    # ya emitido está CONGELADO con el sanitizador del día en que se emitió. El propio
+    # ejemplo del fix v4 lo muestra: un `code` congelado por el sanitizador viejo
+    # («RODILLO\x0bINFERIOR» → "RODILLOINFERIOR") NO empata con el mismo n° de parte
+    # pasado por el de hoy («RODILLO INFERIOR»), así que esa línea no encuentra su precio
+    # congelado y RECALCULA con el cotizador de hoy — en silencio, que es lo peor.
+    # Riesgo real BAJO: el camino principal es `externalId` (el payload local lo trae
+    # incluso en los DTE viejos) y hace falta un separador invisible DENTRO del número de
+    # parte para que difieran. Pero si alguien vuelve a tocar el sanitizador, este
+    # fallback se rompe sin que nada avise: NO apoyar decisiones de plata nuevas sobre
+    # `por_parte` sin re-normalizar los payloads viejos primero.
+    from wasabil_dte.service import sanitizar_latin1 as _san_l1
     por_di, por_parte, vistos_parte = {}, {}, set()
     for d in detalles:
         if d.get("price") is None:
@@ -1519,7 +2055,7 @@ def _precios_congelados_guia(db: Session, despacho_id: Optional[int]):
                 por_di[int(ext)] = d["price"]
             except (ValueError, TypeError):
                 pass
-        code = (d.get("code") or "").strip()
+        code = _san_l1(d.get("code"))
         if code:
             if code in vistos_parte:
                 por_parte.pop(code, None)   # duplicado → no confiable por n° de parte
@@ -1624,6 +2160,9 @@ def _construir_factura(db: Session, payload, oc: OcCliente, cot, empresa: str) -
     # Precios congelados de la guía electrónica ya emitida (si la hay): la factura debe
     # cuadrar con la guía 52 enviada al SII, no recalcular con la config de hoy.
     congel_di, congel_parte = _precios_congelados_guia(db, payload.despacho_id)
+    # Mismo sanitizador con que se normalizaron las claves de congel_parte: el lookup
+    # de más abajo debe colapsar el n° de parte IGUAL o el precio congelado no matchea.
+    from wasabil_dte.service import sanitizar_latin1 as _san_l1
     hay_congelados = bool(congel_di or congel_parte)
     n_congeladas = 0
 
@@ -1658,10 +2197,12 @@ def _construir_factura(db: Session, payload, oc: OcCliente, cot, empresa: str) -
     if payload.items:
         lineas = payload.items
     elif guia_ok:
-        # Derivar líneas acotando por guía (despacho_item) Y por ítem físico
+        # Derivar líneas acotando por guía (despacho_item) Y por ítem físico.
+        # FIRMADA efectiva (coalesce con qty_despachada): la firma parcial deja el
+        # faltante fuera de la derivación — esa mercadería no llegó al cliente.
         usado_deriv = {}
         for di in desp.items:
-            disp_di = _f(di.qty_despachada) - fact_qty_di.get(di.id, 0.0)
+            disp_di = _firmada_efectiva(di) - fact_qty_di.get(di.id, 0.0)
             disp_item = (
                 desp_qty_item.get(di.item_cotizacion_id, 0.0)
                 - fact_qty_item.get(di.item_cotizacion_id, 0.0)
@@ -1712,14 +2253,35 @@ def _construir_factura(db: Session, payload, oc: OcCliente, cot, empresa: str) -
             di = di_by_id.get(ln.despacho_item_id)
             if not di or di.item_cotizacion_id != ln.item_cotizacion_id:
                 problemas.append(f"Guía/despacho inválido para {it.numero_parte}"); continue
-            disp_di = _f(di.qty_despachada) - fact_qty_di.get(di.id, 0.0) - usado_di.get(di.id, 0.0)
+            # La línea explícita debe ser DE LA GUÍA DECLARADA (lector de cruces
+            # 2026-08-22): con despacho_id=guía A se podía colar un despacho_item de
+            # la guía B — la factura referenciaba (ref 52) una guía por mercadería
+            # que viajó en otra, y con líneas HERMANAS del mismo N° de parte el
+            # precio podía salir del congelado equivocado. Solo alcanzable por
+            # payload directo a la API (el front deriva), pero un documento
+            # tributario no se arma con la referencia equivocada ni por accidente.
+            if guia_ok and desp is not None and di.despacho_id != desp.id:
+                # El texto habla el MISMO idioma que el guard históricamente
+                # posterior de wasabil_dte («OTRA guía» + el id de la línea): la
+                # suite del callejón W1 afirma ese contrato y el operador ve un
+                # solo vocabulario venga por la capa que venga.
+                problemas.append(
+                    f"{it.numero_parte}: la línea {ln.despacho_item_id} pertenece a "
+                    f"OTRA guía (despacho {di.despacho_id}, no {desp.id}) — factura "
+                    "cada guía con sus propias líneas"); continue
+            # FIRMADA efectiva: los ítems explícitos tampoco pueden facturar el
+            # faltante declarado de la guía (mismo gate que la derivación).
+            disp_di = _firmada_efectiva(di) - fact_qty_di.get(di.id, 0.0) - usado_di.get(di.id, 0.0)
             disponible = min(disponible, disp_di)
         if cantidad > disponible + TOL_QTY:
             problemas.append(f"{it.numero_parte}: cantidad excede lo despachado/no facturado "
                              f"(disp {max(disponible,0):.0f})"); continue
 
         ci = pmap.get(ln.item_cotizacion_id, {})
-        parte = (it.numero_parte or "").strip()
+        # Sanitizada IGUAL que la clave de congel_parte (los DOS lados del cruce se
+        # normalizan como al emitir): un guión largo pegado en el n° de parte ya no
+        # des-matchea el precio congelado de la guía.
+        parte = _san_l1(it.numero_parte)
         if ln.precio_unit_neto is not None:
             precio = ln.precio_unit_neto  # precio explícito del payload manda
         elif ln.despacho_item_id is not None and ln.despacho_item_id in congel_di:
@@ -2119,7 +2681,12 @@ def _persistir_factura(db: Session, payload, oc: OcCliente, cot, datos: dict, *,
         cot.cliente = razon_payload
 
     fecha_emision = _parse_date(payload.fecha_emision) or _hoy_chile()
-    # `is not None`: plazo 0 días (contado) también debe generar vencimiento (= emisión)
+    # `is not None`, JAMÁS `if payload.plazo_dias`: plazo 0 días (CONTADO) también debe
+    # generar vencimiento (= fecha de emisión). El schema admite el 0 explícitamente
+    # (FacturaCreate.plazo_dias: Field(None, ge=0, le=3650)), así que llega de la pantalla;
+    # con el 0 falsy la factura al contado nacería SIN fecha_vencimiento y el semáforo la
+    # clasificaría 'sin_fecha' (no vence nunca, no entra a la cobranza vencida).
+    # Pinzado en tests_contabilidad/test_ventas_opciones.py § 15-bis.
     fecha_venc = (fecha_emision + timedelta(days=int(payload.plazo_dias))
                   if payload.plazo_dias is not None else None)
 

@@ -1,12 +1,19 @@
 import { useState, useEffect, useCallback } from "react";
 import { Ship, Plane, Search, RefreshCw, Package, ChevronDown, ChevronRight, X, Boxes } from "lucide-react";
-import { monzaLogisticaAPI, monzaTotalPendiente, monzaErrMsg } from "../services/monzaApi";
+import { monzaLogisticaAPI, monzaConfigAPI, monzaTotalPendiente, monzaErrMsg } from "../services/monzaApi";
 import type { MonzaItemQty } from "../services/monzaApi";
+import {
+  agruparPorOc, esListadoPlano, semaforoChip, completitudTexto,
+  sumarSeleccion, badgeAduanero, TEXTO_ADUANA_REFERENCIAL,
+} from "../monza-agrupacion/agrupacion";
+import type { MonzaClavesAgrupacion } from "../monza-agrupacion/agrupacion";
 import { useMonzaTheme } from "./MonzaLayout";
 import MonzaDocs from "./MonzaDocs";
 import toast from "react-hot-toast";
 
-interface PrepItem { id: number; cot_numero: string; cliente?: string; descripcion: string; numero_parte?: string; marca?: string; calidad?: string; cantidad: number; }
+// Las claves de agrupación (costo/moneda/pesos/fob_total/ocp) son ADITIVAS: llegan
+// undefined mientras el backend no las mande y la página degrada (grupo "Sin OC").
+interface PrepItem extends MonzaClavesAgrupacion { id: number; cot_numero: string; cliente?: string; descripcion: string; numero_parte?: string; marca?: string; calidad?: string; cantidad: number; }
 interface Embarque {
   id: number; numero: string; estado: string; awb?: string; forwarder?: string; tracking?: string;
   fecha_despacho?: string; fecha_llegada_est?: string; notas?: string; items_count: number; created_at?: string;
@@ -136,11 +143,31 @@ export default function MonzaLogisticaPage() {
   const [embs, setEmbs] = useState<Embarque[]>([]);
   const [kpis, setKpis] = useState<KPIs | null>(null);
   const [loading, setLoading] = useState(true);
+  // Buscador server-side intacto + debounce 300ms: `qInput` es lo tecleado, `q` lo
+  // que viaja al backend cuando el usuario deja de escribir.
+  const [qInput, setQInput] = useState("");
   const [q, setQ] = useState("");
-  const [sel, setSel] = useState<Set<number>>(new Set());
+  useEffect(() => { const t = setTimeout(() => setQ(qInput), 300); return () => clearTimeout(t); }, [qInput]);
+  // La selección SOBREVIVE al filtro q (antes se perdía en silencio: el modal
+  // filtraba contra la lista visible). Se guarda el ÍTEM entero, no solo el id,
+  // para que embarcar y la barra de totales funcionen con lo realmente
+  // seleccionado aunque el filtro lo tenga oculto.
+  const [selData, setSelData] = useState<Record<number, PrepItem>>({});
   const [showModal, setShowModal] = useState(false);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [details, setDetails] = useState<Record<number, Embarque>>({});
+  // TCs de GET /config para el badge aduanero referencial. Si la carga falla o el
+  // TC viene ≤ 0, quedan null y el badge simplemente NO se muestra (fail-closed:
+  // jamás dividir por un TC inválido).
+  const [tcs, setTcs] = useState<{ usd: number | null; eur: number | null }>({ usd: null, eur: null });
+  useEffect(() => {
+    monzaConfigAPI.get()
+      .then(({ data }) => setTcs({
+        usd: Number(data?.tc_usd_clp) > 0 ? Number(data.tc_usd_clp) : null,
+        eur: Number(data?.tc_eur_clp) > 0 ? Number(data.tc_eur_clp) : null,
+      }))
+      .catch(() => setTcs({ usd: null, eur: null }));
+  }, []);
 
   const bg = dark ? "#131b3e" : "white"; const bd = dark ? "#1e2a4a" : "#E2E8F0"; const txt = dark ? "white" : "#1E293B"; const sub = dark ? "#8899cc" : "#64748B";
 
@@ -149,11 +176,37 @@ export default function MonzaLogisticaPage() {
     try {
       const [k, p, e] = await Promise.all([monzaLogisticaAPI.kpis(), monzaLogisticaAPI.preparados({ q: q || undefined }), monzaLogisticaAPI.listEmbarques()]);
       setKpis(k.data); setPrep(p.data); setEmbs(e.data);
+      // PODA de la selección zombi (revisión adversarial H3): si un ítem seleccionado
+      // ya NO viene en /preparados y el buscador está VACÍO, es que dejó de estar
+      // preparado (otro usuario lo embarcó) — mantenerlo seleccionado bloqueaba el
+      // lote entero con un 400 sin forma de desmarcarlo (la fila ya no se pinta).
+      // Con filtro activo NO se poda por ausencia: ausente puede significar solo
+      // "oculto por el buscador", y la selección debe sobrevivir al filtro.
+      if (!q) {
+        const vivos = new Set((p.data as PrepItem[]).map((i) => i.id));
+        setSelData((prev) => {
+          const next: Record<number, PrepItem> = {};
+          for (const it of Object.values(prev)) if (vivos.has(it.id)) next[it.id] = it;
+          return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+        });
+      }
     } catch { toast.error("Error al cargar logística"); } finally { setLoading(false); }
   }, [q]);
   useEffect(() => { fetchAll(); }, [fetchAll]);
 
-  const toggleSel = (id: number) => setSel((p) => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const isSel = (id: number) => selData[id] !== undefined;
+  const toggleSel = (it: PrepItem) => setSelData((p) => {
+    const n = { ...p };
+    if (n[it.id]) delete n[it.id]; else n[it.id] = it;
+    return n;
+  });
+  const toggleGrupo = (its: PrepItem[]) => setSelData((p) => {
+    const todos = its.length > 0 && its.every((i) => p[i.id] !== undefined);
+    const n = { ...p };
+    if (todos) its.forEach((i) => { delete n[i.id]; });
+    else its.forEach((i) => { n[i.id] = i; });
+    return n;
+  });
   const advance = async (e: Embarque) => {
     const ne = NEXT[e.estado]; if (!ne) return;
     try { await monzaLogisticaAPI.updateEmbarque(e.id, { estado: ne }); toast.success(`${e.numero} → ${EST[ne].label}`); fetchAll(); } catch { toast.error("Error"); }
@@ -163,7 +216,17 @@ export default function MonzaLogisticaPage() {
     if (!details[id]) { try { const r = await monzaLogisticaAPI.getEmbarque(id); setDetails((p) => ({ ...p, [id]: r.data })); } catch {} }
   };
 
-  const selItems = prep.filter((i) => sel.has(i.id));
+  // TODO lo seleccionado (incluye lo que el filtro q tiene oculto): esto es lo que
+  // viaja al modal de embarque y lo que suma la barra de totales.
+  const selItems = Object.values(selData);
+  const selCount = selItems.length;
+  const prepIds = new Set(prep.map((i) => i.id));
+  const fueraDelFiltro = selItems.filter((i) => !prepIds.has(i.id)).length;
+  const grupos = agruparPorOc(prep);
+  const plano = esListadoPlano(grupos);
+  const totales = selCount > 0 ? sumarSeleccion(selItems) : null;
+  const badge = totales ? badgeAduanero(totales, tcs.usd, tcs.eur) : null;
+  const fmtNum = (v: number, dec = 1) => v.toLocaleString("es-CL", { maximumFractionDigits: dec });
 
   return (
     <div>
@@ -196,13 +259,53 @@ export default function MonzaLogisticaPage() {
       <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
         <div style={{ position: "relative", flex: 1, minWidth: 240 }}>
           <Search size={14} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "#94A3B8" }} />
-          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar..." style={{ width: "100%", padding: "8px 10px 8px 32px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: bg, color: txt }} />
+          <input value={qInput} onChange={(e) => setQInput(e.target.value)} placeholder="Buscar..." style={{ width: "100%", padding: "8px 10px 8px 32px", border: `1px solid ${bd}`, borderRadius: 6, fontSize: 13, boxSizing: "border-box" as const, background: bg, color: txt }} />
         </div>
-        {tab === "preparados" && sel.size > 0 && (
-          <button onClick={() => setShowModal(true)} style={{ padding: "8px 16px", background: "var(--monza-accent)", border: "none", borderRadius: 8, color: "white", cursor: "pointer", fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}><Ship size={14} /> Embarcar {sel.size} ítem(s)</button>
+        {tab === "preparados" && selCount > 0 && (
+          <button onClick={() => setShowModal(true)} style={{ padding: "8px 16px", background: "var(--monza-accent)", border: "none", borderRadius: 8, color: "white", cursor: "pointer", fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}><Ship size={14} /> Embarcar {selCount} ítem(s)</button>
         )}
         <button onClick={fetchAll} style={{ padding: "8px 10px", border: `1px solid ${bd}`, borderRadius: 6, background: bg, cursor: "pointer", color: sub }}><RefreshCw size={14} /></button>
       </div>
+
+      {/* Barra de totales de la selección (solo Por embarcar). Muestra SIEMPRE lo
+          realmente seleccionado — el filtro q oculta filas, no des-selecciona. */}
+      {tab === "preparados" && totales && (
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, background: bg, border: `1px solid ${bd}`, borderRadius: 10, padding: "10px 14px", marginBottom: 12, fontSize: 12 }}>
+          <Boxes size={14} className="monza-ic" />
+          <span style={{ fontWeight: 800, color: txt }}>{totales.items} ítem(s)</span>
+          <span style={{ color: sub }}>{fmtNum(totales.unidades, 0)} unidad(es)</span>
+          {fueraDelFiltro > 0 && (
+            <span title="Ítems seleccionados que el filtro actual tiene ocultos: siguen seleccionados y se embarcan igual"
+              style={{ fontSize: 11, fontWeight: 700, background: "#FEF3C7", color: "#B45309", padding: "2px 9px", borderRadius: 999 }}>
+              {fueraDelFiltro} fuera del filtro
+            </span>
+          )}
+          <button onClick={() => setSelData({})} title="Des-selecciona todo, incluidos los ítems ocultos por el buscador"
+            style={{ fontSize: 11, fontWeight: 700, border: `1px solid ${bd}`, borderRadius: 6, background: "transparent", color: sub, padding: "3px 9px", cursor: "pointer" }}>
+            Limpiar selección
+          </button>
+          <span style={{ color: txt }}>
+            Σ {fmtNum(totales.kg)} kg
+            {totales.sinPeso > 0 && <span style={{ color: "#B45309", fontWeight: 700 }}> · {totales.sinPeso} sin peso</span>}
+          </span>
+          <span style={{ color: txt }}>
+            Σ FOB: {totales.monedas.length === 0 ? "—" : totales.monedas.map((m) => `${m} ${fmtNum(totales.fobPorMoneda[m] ?? 0, 2)}`).join(" · ")}
+            {totales.fobIncompleto > 0 && <span style={{ color: "#B45309", fontWeight: 700 }}> · FOB incompleto ({totales.fobIncompleto})</span>}
+          </span>
+          {totales.mixto && (
+            <span style={{ fontSize: 11, fontWeight: 700, background: dark ? "#1e2a4a" : "#F1F5F9", color: sub, padding: "2px 9px", borderRadius: 999 }}>
+              mixto {totales.monedas.join("/")}
+            </span>
+          )}
+          {badge && (
+            <span title={`FOB de la selección ≈ US$ ${fmtNum(badge.usd, 0)} convertido con los TC de Configuración`}
+              style={{ fontSize: 11, fontWeight: 700, background: badge.bg, color: badge.color, padding: "2px 9px", borderRadius: 999 }}>
+              {badge.label}
+            </span>
+          )}
+          <span style={{ color: sub, fontStyle: "italic" }}>{TEXTO_ADUANA_REFERENCIAL}</span>
+        </div>
+      )}
 
       <div style={{ background: bg, border: `1px solid ${bd}`, borderRadius: 10, overflow: "hidden" }}>
         {loading ? <div style={{ padding: 40, textAlign: "center", color: "#94A3B8" }}>Cargando...</div>
@@ -210,19 +313,52 @@ export default function MonzaLogisticaPage() {
           prep.length === 0 ? <div style={{ padding: 48, textAlign: "center", color: "#94A3B8" }}><Package size={32} color="#E2E8F0" style={{ display: "block", margin: "0 auto 8px" }} />No hay ítems preparados para embarcar.</div>
           : <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
               <thead><tr style={{ background: dark ? "#0d1321" : "#F8FAFC", borderBottom: `1px solid ${bd}` }}>
-                <th style={{ width: 36, padding: "10px 8px", textAlign: "center" }}><input type="checkbox" checked={sel.size === prep.length && prep.length > 0} onChange={() => setSel(sel.size === prep.length ? new Set() : new Set(prep.map((i) => i.id)))} style={{ accentColor: "var(--monza-accent)" }} /></th>
+                <th style={{ width: 36, padding: "10px 8px", textAlign: "center" }}><input type="checkbox" checked={prep.length > 0 && prep.every((i) => isSel(i.id))} onChange={() => toggleGrupo(prep)} title="Seleccionar todo lo visible (lo seleccionado fuera del filtro no se toca)" style={{ accentColor: "var(--monza-accent)" }} /></th>
                 {["N° COT", "Cliente", "Repuesto", "Marca/Calidad", "Cant."].map((h) => <th key={h} style={{ padding: "10px 12px", textAlign: h === "Cant." ? "right" : "left", fontWeight: 600, fontSize: 11, color: sub, textTransform: "uppercase" as const }}>{h}</th>)}
               </tr></thead>
-              <tbody>{prep.map((it) => (
-                <tr key={it.id} onClick={() => toggleSel(it.id)} style={{ borderBottom: `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}`, background: sel.has(it.id) ? (dark ? "#1a2340" : "#F5F3FF") : "transparent", cursor: "pointer" }}>
-                  <td style={{ textAlign: "center", padding: 8 }}><input type="checkbox" checked={sel.has(it.id)} onChange={() => toggleSel(it.id)} onClick={(e) => e.stopPropagation()} style={{ accentColor: "var(--monza-accent)" }} /></td>
-                  <td style={{ padding: "9px 12px", fontWeight: 600, color: "var(--monza-accent)", fontSize: 12 }}>{it.cot_numero}</td>
-                  <td style={{ padding: "9px 12px", color: txt }}>{it.cliente || "—"}</td>
-                  <td style={{ padding: "9px 12px" }}><div style={{ color: txt, fontWeight: 500 }}>{it.descripcion}</div>{it.numero_parte && <div style={{ fontSize: 10, color: sub }}>{it.numero_parte}</div>}</td>
-                  <td style={{ padding: "9px 12px", color: sub, fontSize: 12 }}>{it.marca || "—"}{it.calidad ? ` · ${it.calidad}` : ""}</td>
-                  <td style={{ padding: "9px 12px", textAlign: "right", color: txt }}>{it.cantidad}</td>
-                </tr>
-              ))}</tbody>
+              {/* Grupos de UN nivel: fila-cabecera con colSpan por OC (proveedor grande),
+                  ordenados por proveedor y fecha; "Sin OC" al final. Si TODO cae a
+                  "Sin OC" (backend sin las claves nuevas) la tabla se pinta plana. */}
+              <tbody>{grupos.flatMap((g) => {
+                const o = g.ocp;
+                const chip = semaforoChip(o?.semaforo, "edad_oc");
+                const compl = completitudTexto(o?.completitud);
+                const filas = g.items.map((it) => (
+                  <tr key={it.id} onClick={() => toggleSel(it)} style={{ borderBottom: `1px solid ${dark ? "#1e2a4a" : "#F1F5F9"}`, background: isSel(it.id) ? (dark ? "#1a2340" : "#F5F3FF") : "transparent", cursor: "pointer" }}>
+                    <td style={{ textAlign: "center", padding: 8 }}><input type="checkbox" checked={isSel(it.id)} onChange={() => toggleSel(it)} onClick={(e) => e.stopPropagation()} style={{ accentColor: "var(--monza-accent)" }} /></td>
+                    <td style={{ padding: "9px 12px", fontWeight: 600, color: "var(--monza-accent)", fontSize: 12 }}>{it.cot_numero}</td>
+                    <td style={{ padding: "9px 12px", color: txt }}>{it.cliente || "—"}</td>
+                    <td style={{ padding: "9px 12px" }}><div style={{ color: txt, fontWeight: 500 }}>{it.descripcion}</div>{it.numero_parte && <div style={{ fontSize: 10, color: sub }}>{it.numero_parte}</div>}</td>
+                    <td style={{ padding: "9px 12px", color: sub, fontSize: 12 }}>{it.marca || "—"}{it.calidad ? ` · ${it.calidad}` : ""}</td>
+                    <td style={{ padding: "9px 12px", textAlign: "right", color: txt }}>{it.cantidad}</td>
+                  </tr>
+                ));
+                if (plano) return filas;
+                return [
+                  <tr key={g.key} style={{ background: dark ? "#0d1321" : "#F8FAFC", borderTop: `1px solid ${bd}`, borderBottom: `1px solid ${bd}` }}>
+                    <td style={{ textAlign: "center", padding: 8 }}>
+                      <input type="checkbox" checked={g.items.every((i) => isSel(i.id))} onChange={() => toggleGrupo(g.items)} title="Seleccionar todo el grupo" style={{ accentColor: "var(--monza-accent)" }} />
+                    </td>
+                    <td colSpan={5} style={{ padding: "9px 12px" }}>
+                      <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                        <span style={{ fontSize: 14, fontWeight: 800, color: txt, letterSpacing: 0.3 }}>🏢 {o ? (o.proveedor_nombre || "Proveedor sin nombre") : "Sin OC"}</span>
+                        {o?.numero && <span style={{ fontWeight: 700, color: "var(--monza-accent)", fontSize: 12 }}>{o.numero}</span>}
+                        {o?.numero_oc && <span style={{ color: sub, fontSize: 12 }}>(N° prov. {o.numero_oc})</span>}
+                        {chip && <span title={chip.title} style={{ fontSize: 11, fontWeight: 700, background: chip.bg, color: chip.color, padding: "2px 9px", borderRadius: 999 }}>{chip.label}</span>}
+                        {compl && (
+                          <span style={{ fontSize: 11, fontWeight: 700, background: compl === "completa" ? "#DCFCE7" : (dark ? "#1e2a4a" : "#F1F5F9"), color: compl === "completa" ? "#15803D" : sub, padding: "2px 9px", borderRadius: 999 }}>
+                            {compl}
+                          </span>
+                        )}
+                        {o?.awb && <span style={{ color: sub, fontSize: 11 }}>AWB: {o.awb}</span>}
+                        {o?.tracking && <span style={{ color: sub, fontSize: 11 }}>Trk: {o.tracking}</span>}
+                        {!o && <span style={{ color: sub, fontSize: 11 }}>ítems sin OC de proveedor asociada</span>}
+                      </div>
+                    </td>
+                  </tr>,
+                  ...filas,
+                ];
+              })}</tbody>
             </table>
         ) : (
           embs.length === 0 ? <div style={{ padding: 48, textAlign: "center", color: "#94A3B8" }}><Ship size={32} color="#E2E8F0" style={{ display: "block", margin: "0 auto 8px" }} />No hay embarques.</div>
@@ -261,7 +397,7 @@ export default function MonzaLogisticaPage() {
         )}
       </div>
 
-      {showModal && <CrearEmbarqueModal items={selItems} onClose={() => setShowModal(false)} onDone={() => { setShowModal(false); setSel(new Set()); fetchAll(); }} />}
+      {showModal && <CrearEmbarqueModal items={selItems} onClose={() => setShowModal(false)} onDone={() => { setShowModal(false); setSelData({}); fetchAll(); }} />}
     </div>
   );
 }
