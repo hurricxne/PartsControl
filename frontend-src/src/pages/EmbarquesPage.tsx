@@ -366,7 +366,9 @@ function EmbCard({ emb, onRefresh }: { emb: Embarque; onRefresh: () => void }) {
     doc_adicional:      toDocFile(emb.doc_adicional),
   })
 
-  const badge = BADGE[emb.estado] ?? BADGE.en_bodega_proveedor
+  // Fallback honesto: ante un estado desconocido, mostrar el valor crudo (o "Desconocido"),
+  // NO "En Bodega Proveedor" — antes ese default confundia al operador.
+  const badge = BADGE[emb.estado] ?? { cls: 'bg-gray-500/10 text-gray-400 border-gray-500/20', label: emb.estado || 'Desconocido' }
 
   const fetchDetail = useCallback(async () => {
     setLoadingDetail(true)
