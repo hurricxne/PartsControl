@@ -754,6 +754,30 @@ def _anotar_auditoria(db: Session, dte: Optional[WasabilDte], linea: Optional[st
 # intervención humana — re-emitir sería un SEGUNDO documento tributario REAL, y Grupo AM
 # es la marca que ya emite de verdad. `sustantivo` mantiene el texto en el idioma del
 # documento (el operador de una FACTURA no debe leer un mensaje sobre despachos).
+# Tope del extracto de la causa original en los mensajes de error (el `error` de la fila
+# puede traer el JSON completo del proveedor; no debe reventar el mensaje HTTP).
+LARGO_CAUSA_ORIGEN = 400
+
+
+def _causa_original(dte) -> str:
+    """Sufijo con el error del intento ANTERIOR (el que dejo el documento sin emitir).
+
+    Sin esto el operador solo ve el fallo de la VERIFICACION, que es posterior, y lee la
+    causa al reves. Caso real (2026-09-17, MonzaParts DSP-2026-0027): el origen fue un HTTP
+    500 de Wasabil por una tabla ausente en SU base de datos, pero el mensaje mostraba
+    unicamente el 405 del listado; con solo ese dato, el soporte del proveedor concluyo que
+    la culpa era del ERP. El error ya estaba guardado en la fila: faltaba exponerlo.
+
+    NO cambia ninguna decision: el flujo aborta igual. Es puramente informativo, y por eso
+    es seguro incluirlo en los dos caminos (con uuid y sin uuid)."""
+    causa = (getattr(dte, "error", "") or "").strip()
+    if not causa:
+        return ""
+    if len(causa) > LARGO_CAUSA_ORIGEN:
+        causa = causa[:LARGO_CAUSA_ORIGEN].rstrip() + "\u2026"
+    return f" \u00b7 Causa del intento anterior: {causa}"
+
+
 def _msg_rescate_sin_folio(dte: WasabilDte, sustantivo: str) -> str:
     return (f"El documento de {sustantivo} quedó EMITIDO en el SII pero su folio todavía "
             f"no llega desde Wasabil (uuid {dte.uuid or 'no registrado'}): NO se re-emite, "
@@ -1211,7 +1235,8 @@ def reintentar_guia(
             db.refresh(dte)
         except wasabil.WasabilError:
             raise HTTPException(502, "No se pudo verificar el estado real del documento en "
-                                     "Wasabil; reintenta en unos minutos (no se re-crea a ciegas)")
+                                     "Wasabil; reintenta en unos minutos (no se re-crea a "
+                                     f"ciegas).{_causa_original(dte)}")
         if dte.status_id in (STATUS_EMITIDO, STATUS_PROCESANDO, STATUS_PENDIENTE):
             # Emitido/en proceso/borrador: NO corresponde re-crear
             if rescate_de_folio and _vacio(dte.folio):
@@ -1231,7 +1256,8 @@ def reintentar_guia(
             doc = _rescatar_por_referencia(ref, compat_v1=True) if ref else None
         except wasabil.WasabilError as e:
             raise HTTPException(502, "No se pudo verificar en Wasabil si el documento ya existe; "
-                                     f"reintenta en unos minutos (no se re-crea a ciegas). {e}")
+                                     f"reintenta en unos minutos (no se re-crea a ciegas). {e}"
+                                     f"{_causa_original(dte)}")
         if doc:
             _actualizar_desde_wasabil(db, dte, doc)
             db.commit()
@@ -2328,7 +2354,8 @@ def reintentar_factura_sii(
             db.refresh(dte)
         except wasabil.WasabilError:
             raise HTTPException(502, "No se pudo verificar el estado real del documento en "
-                                     "Wasabil; reintenta en unos minutos (no se re-crea a ciegas)")
+                                     "Wasabil; reintenta en unos minutos (no se re-crea a "
+                                     f"ciegas).{_causa_original(dte)}")
         if dte.status_id in (STATUS_EMITIDO, STATUS_PROCESANDO, STATUS_PENDIENTE):
             _finalizar_factura_emitida(db, dte)
             db.refresh(dte)
@@ -2342,7 +2369,8 @@ def reintentar_factura_sii(
             doc_w = _rescatar_por_referencia(ref)
         except wasabil.WasabilError as e:
             raise HTTPException(502, "No se pudo verificar en Wasabil si el documento ya existe; "
-                                     f"reintenta en unos minutos (no se re-crea a ciegas). {e}")
+                                     f"reintenta en unos minutos (no se re-crea a ciegas). {e}"
+                                     f"{_causa_original(dte)}")
         if doc_w:
             _actualizar_desde_wasabil(db, dte, doc_w)
             db.commit()
