@@ -19,7 +19,8 @@ Lo que esta suite certifica, en orden de importancia:
      CADA rechazo la base queda intacta (ni línea movida ni OC nacida).
   4. CONCURRENCIA con hilos REALES y FOTO PLANA de ids (7): sin el lock, dos
      asignaciones simultáneas leen cantidad=3 las dos y SE INVENTAN UNIDADES
-     (sonda 9.3 lo reproduce quitando el FOR UPDATE).
+     (la sonda 9.3 lo MIDE quitando el FOR UPDATE; la sección 7 exige que el lock
+     real lo impida).
 
 ADAPTACIONES AL MODELO MONZA (verificadas en el reconocimiento, 2026-08-10):
 · Sin tabla de vínculo (OcProveedorItem no existe): la FK vive en la línea. No hay
@@ -533,7 +534,7 @@ def run():
         # ══════════════════════════════════════════════════════════════════════
         # 7 · CONCURRENCIA con hilos REALES y FOTO PLANA de ids. Sin el lock, dos
         #     asignaciones simultáneas leen cantidad=3 las dos, cada una clona su
-        #     remanente y SE INVENTAN UNIDADES (la sonda 9.3 lo demuestra).
+        #     remanente y SE INVENTAN UNIDADES (la sonda 9.3 lo mide sin el lock).
         # ══════════════════════════════════════════════════════════════════════
         for r_i in range(RONDAS):
             _limpiar(db)
@@ -632,24 +633,30 @@ def run():
 
         # 9.3 · Vicio del LOCK: el mismo lockeo SIN with_for_update.
         #
-        # ⚠️ ESTA SONDA CAMBIÓ DE SIGNIFICADO EL 2026-08-27, y el cambio es la noticia.
-        # Cuando se escribió, quitar el FOR UPDATE bastaba para que las dos asignaciones
-        # entraran y se inventaran unidades: el lock era la ÚNICA defensa. Ese día se
-        # agregó un índice UNIQUE al correlativo de la OC de proveedor
-        # (migrations/monza_unique_correlativos), que existe por otro motivo —dos compras
-        # simultáneas generaban el MISMO número de OC y, sin índice, lo duplicaban en
-        # silencio— pero que de paso SERIALIZA esta misma carrera: la segunda inserción
-        # choca contra el índice, el bucle de `comprar` la reintenta, y al reintentar
-        # re-valida y encuentra los ítems ya comprados. Resultado: con el UNIQUE puesto,
-        # quitar el FOR UPDATE ya NO inventa unidades — medido, 0 de 6 rondas, y
-        # verificado a la inversa: quitando el índice de la base, la sonda vuelve a
-        # detectar la carrera y esta suite vuelve a pasar en su forma original.
+        # HISTORIA. Cuando se escribió, quitar el FOR UPDATE bastaba para que las dos
+        # asignaciones entraran y se inventaran unidades. El 2026-08-27 se agregó un índice
+        # UNIQUE al correlativo de la OC de proveedor (migrations/monza_unique_correlativos)
+        # y se midió 0 de 6 rondas: se concluyó que el UNIQUE "serializa" la carrera (la
+        # segunda inserción choca, `comprar` reintenta, re-valida y ve los ítems comprados)
+        # y la aserción pasó a exigir 0.
         #
-        # Por eso la aserción pasa a afirmar lo que HOY es cierto y sigue siendo
-        # discriminante: la plata no se inventa. Lo que ya no se puede afirmar es que el
-        # lock sea la única barrera — hay dos, y esa es una mejora, no una regresión. El
-        # FOR UPDATE se conserva: es la defensa que no depende de un índice que alguien
-        # podría quitar mañana, y protege invariantes que el UNIQUE no cubre.
+        # ESO ERA TIMING, NO GARANTÍA (medido 2026-09-25, migración de dinero a DECIMAL).
+        # El UNIQUE solo choca si las dos transacciones calculan el correlativo ANTES de
+        # que la primera haga commit. Si la segunda lo calcula después, saca el número
+        # SIGUIENTE, no choca y entra: sin lock, 1 de cada ~12 rondas las dos compras
+        # salieron con OCs distintas (OCP-…-0005 y -0006) y Σcant=4/3. Con los modelos
+        # Numeric el timing de la lectura de ítems cambió lo justo para que la ventana
+        # aparezca en ~la mitad de las corridas de 6 rondas; con los Float, en ninguna de 7.
+        # Una aserción sobre una carrera sin lock no es determinista en ningún sentido.
+        #
+        # POR ESO 9.3 ES UNA MEDICIÓN (no falla): cuántas rondas inventan unidades SIN el
+        # lock. Sirve de diagnóstico — si alguna vez sube mucho, algo cambió en `comprar`.
+        # La ASERCIÓN que protege la plata ya existe y es determinista: la sección 7, la
+        # MISMA carrera con el lock REAL, exige en cada ronda Σ conservadas, exactamente
+        # una compra 200 y una sola OC (el FOR UPDATE hace esperar a la segunda
+        # transacción hasta el commit de la primera, que al re-leer ve 'comprado' → 409).
+        # El UNIQUE sigue siendo útil (evita números de OC duplicados), pero NO es una
+        # segunda barrera contra esta carrera: la única es el FOR UPDATE. No quitarlo.
         from fastapi import HTTPException as _HTTPExc
         original_lock = abast._lockear_items_para_comprar
 
@@ -690,12 +697,8 @@ def run():
         finally:
             abast._lockear_items_para_comprar = original_lock
             _limpiar(db)
-        check(f"9.3 ★ SONDA del LOCK: con el UNIQUE del correlativo puesto, quitar el "
-              f"FOR UPDATE ya no inventa unidades ({inventadas}/6 rondas; ver el "
-              f"comentario de arriba: antes del 2026-08-27 esto daba > 0)",
-              inventadas == 0,
-              "se inventaron unidades: la doble defensa (FOR UPDATE + UNIQUE del "
-              "correlativo) dejó de cubrir la carrera — revisar ambas")
+        print(f"INFO | 9.3 MEDICIÓN sin FOR UPDATE: {inventadas}/6 rondas inventan unidades "
+              f"(no falla: es timing; la aserción con el lock real es la sección 7)")
         check("9.4 el módulo quedó restaurado tras las dos sondas",
               abast._lockear_items_para_comprar is original_lock
               and abast._clonar_item_remanente is original_clonar)
