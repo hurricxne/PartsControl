@@ -1791,6 +1791,58 @@ def _validar_receptor_factura(cot: MonzaCotizacion, tipo_doc: str,
     }
 
 
+def _paso_float(v: float) -> float:
+    """Granularidad de `v` en una columna FLOAT de esta MariaDB: conserva 6 CIFRAS
+    SIGNIFICATIVAS, así que a partir de $1.000.000 el valor se guarda corrido a la
+    decena, a partir de $10.000.000 a la centena, y así. Medido en PROD 2026-09-25:
+    `CAST(1546983 AS FLOAT)` → `1546980`, `CAST(1299986 AS FLOAT)` → `1299990`."""
+    v = abs(_f(v))
+    if v < 1_000_000:
+        return 0.0
+    return 10.0 ** (len(str(int(v))) - 6)
+
+
+def _total_venta_para_tope(cot: MonzaCotizacion, iva_rate) -> float:
+    """Total bruto de la venta para el tope Σ brutos, DERIVADO de las líneas congeladas
+    en vez de leerse de la cabecera.
+
+    POR QUÉ (incidente 2026-09-25, COT-2026-000195): `monza_cotizaciones.total_bruto`
+    es FLOAT y esta MariaDB solo conserva 6 cifras significativas, de modo que TODA
+    venta sobre $1.000.000 se guarda corrida (ver `_paso_float`). El tope comparaba esa
+    cabecera mutilada contra un neto+IVA recalculado con aritmética exacta desde los
+    ítems y la factura se rechazaba a sí misma por una diferencia que no existe: la
+    venta sumaba 1.546.983 por línea y la cabecera decía 1.546.980. Medido en PROD:
+    **79 de las 179 ventas sobre el millón quedaron infacturables** — el 100 % de las
+    bloqueadas está sobre el millón, ninguna por debajo.
+
+    Las dos puntas del tope tienen que salir de la MISMA base. Los precios por ítem
+    están igual de CONGELADOS que la cabecera, son de donde se derivan las líneas de la
+    factura, y el split de Abastecimiento preserva Σ subtotal_clp por invariante
+    declarado (`_clonar_item_remanente`), así que derivar de ellos NO afloja el guard:
+    lo vuelve exacto.
+
+    CINTURÓN: la cabecera solo se corrige cuando la diferencia es explicable por la
+    pérdida del FLOAT (± un paso de granularidad + la holgura de redondeo). Si las
+    líneas se despegaran de la cabecera por cualquier OTRA razón, manda la cabecera y
+    el tope sigue siendo el de antes — este arreglo no es una puerta para subir el
+    cupo de una venta editando ítems.
+
+    Esto NO arregla la causa: el histórico, el PDF y los tableros siguen leyendo la
+    cabecera torcida, y toda venta nueva sobre el millón sigue naciendo así. La
+    corrección de raíz es migrar las columnas de dinero a DECIMAL(14,2) — ticket
+    MTK-2026-0005 y nota 19 del CLAUDE.md."""
+    cabecera = _f(cot.total_bruto)
+    items = getattr(cot, "items", None) or []
+    subtotales = [i.subtotal_clp for i in items if i.subtotal_clp is not None]
+    if not subtotales:
+        return cabecera
+    neto = round(sum(_f(s) for s in subtotales), 2)
+    derivado = neto + _iva_clp(neto, iva_rate)
+    if abs(derivado - cabecera) > _paso_float(cabecera) + TOL_PAGO:
+        return cabecera
+    return derivado
+
+
 def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion,
                        *, acumular: bool = False) -> dict:
     """Valida y CONSTRUYE los datos de la factura sin escribir nada: receptor, líneas
@@ -2196,7 +2248,7 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
     # el bruto de la factura de anticipo ya está dentro de `facturado`, y evaluar el
     # tope con el neto SIN descontar rechazaría la factura final por un cupo que el
     # descuento acaba de devolver.
-    total_venta = _f(cot.total_bruto)
+    total_venta = _total_venta_para_tope(cot, iva_rate)
     if validadas and not probs.items and total_venta > 0:
         facturas_previas = (
             db.query(MonzaContFacturaCliente)
