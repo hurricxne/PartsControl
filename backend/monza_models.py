@@ -4,6 +4,24 @@ from datetime import datetime
 from models.models import Base, User
 
 
+# ── Dinero ────────────────────────────────────────────────────────────────────
+# Los montos van en DECIMAL, nunca en FLOAT (migrations/monza_dinero_decimal.py,
+# 2026-09-25). El FLOAT de 4 bytes GUARDA exacto hasta 16.777.216, pero MariaDB lo
+# ENTREGA al cliente con 6 cifras significativas: toda venta sobre $1.000.000 se leía
+# corrida a la decena y la factura se rechazaba contra su propia cabecera
+# (MTK-2026-0005, COT-2026-000195).
+# asdecimal=False: la BD guarda exacto y Python sigue recibiendo float (double, 15
+# cifras), así que el código que opera estos campos junto a floats no cambia — con
+# Decimal, cada `Decimal * 0.19` reventaría con TypeError.
+def _clp():
+    return Numeric(14, 2, asdecimal=False)
+
+
+def _costo():
+    """Costo unitario en la moneda de ORIGEN (EUR/USD/CLP): lleva 4 decimales."""
+    return Numeric(16, 4, asdecimal=False)
+
+
 # ── Clientes ──────────────────────────────────────────────────────────────────
 
 class MonzaCliente(Base):
@@ -16,7 +34,7 @@ class MonzaCliente(Base):
     email = Column(String(100), nullable=True)
     vehiculos = Column(JSON, default=list)
     etiquetas = Column(JSON, default=list)
-    ltv = Column(Float, default=0)
+    ltv = Column(_clp(), default=0)
     leads_total = Column(Integer, default=0)
     vendidos_total = Column(Integer, default=0)
     # Columnas migradas desde Postgres
@@ -175,7 +193,7 @@ class MonzaLead(Base):
     estado = Column(String(30), default="pendiente")  # pendiente/en_proceso/vendido/rechazado
     comentario = Column(Text, nullable=True)
     linea = Column(String(20), nullable=True)  # autos/maquinaria
-    total_estimado = Column(Float, default=0)
+    total_estimado = Column(_clp(), default=0)
     sin_contactar_dias = Column(Integer, default=0)
     # ── Flete aéreo de ESTA cotización ────────────────────────────────────────────
     # La moneda de la tarifa vivía SÓLO en monza_config (global, EUR por defecto) y no
@@ -213,14 +231,14 @@ class MonzaLeadItem(Base):
     procedencia = Column(String(100), nullable=True)
     calidad = Column(String(30), default="sin_calificar")  # sin_calificar/genuine/oem/aftermarket
     cantidad = Column(Integer, default=1)
-    precio_clp = Column(Float, nullable=True)  # precio calculado/aplicado (sin IVA, por unidad)
+    precio_clp = Column(_clp(), nullable=True)  # precio calculado/aplicado (sin IVA, por unidad)
     # ── Parámetros con que la CALCULADORA obtuvo ese precio ───────────────────────
     # Sin ellos el precio era irreproducible: `aplicar_precios` guardaba sólo el
     # precio_clp y al reabrir la calculadora no había nada que restaurar, así que el
     # frontend metía el PRECIO en el campo del costo y forzaba CLP con markup 0.
     # La cotización (MonzaCotizacionItem) ya congelaba estos mismos campos; el agujero
     # estaba una etapa antes, acá en el lead.
-    costo = Column(Float, nullable=True)          # costo unitario en la moneda de origen
+    costo = Column(_costo(), nullable=True)       # costo unitario en la moneda de origen
     moneda = Column(String(10), nullable=True)    # EUR | USD | CLP
     peso_kg = Column(Float, nullable=True)        # peso volumétrico para el flete aéreo
     markup_pct = Column(Float, nullable=True)     # margen aplicado (entero, ej. 28)
@@ -298,9 +316,9 @@ class MonzaCotizacion(Base):
     linea = Column(String(20), nullable=True)  # autos/maquinaria
     vehiculo = Column(String(200), nullable=True)
     anio = Column(String(10), nullable=True)
-    total_neto = Column(Float, default=0)
-    iva_monto = Column(Float, default=0)
-    total_bruto = Column(Float, default=0)
+    total_neto = Column(_clp(), default=0)
+    iva_monto = Column(_clp(), default=0)
+    total_bruto = Column(_clp(), default=0)
     fecha_venta = Column(DateTime, nullable=True)
     fecha_entrega_est = Column(Date, nullable=True)
     oc_cliente = Column(String(100), nullable=True)
@@ -356,7 +374,7 @@ class MonzaCotizacionItem(Base):
     procedencia = Column(String(100), nullable=True)
     calidad = Column(String(30), nullable=True)
     cantidad = Column(Integer, default=1)
-    costo = Column(Float, nullable=True)
+    costo = Column(_costo(), nullable=True)
     moneda = Column(String(10), default="EUR")
     peso_kg = Column(Float, default=0)
     tc_aplicado = Column(Float, nullable=True)
@@ -368,8 +386,8 @@ class MonzaCotizacionItem(Base):
     # → su tarifa está en la moneda de la CABECERA (cot.moneda_tarifa), como siempre fue.
     moneda_tarifa = Column(String(10), nullable=True)
     markup_pct = Column(Float, default=0)  # decimal, ej 0.28 = 28%
-    precio_unitario_clp = Column(Float, nullable=True)  # neto sin IVA por unidad
-    subtotal_clp = Column(Float, nullable=True)
+    precio_unitario_clp = Column(_clp(), nullable=True)  # neto sin IVA por unidad
+    subtotal_clp = Column(_clp(), nullable=True)
     plazo_entrega = Column(String(100), nullable=True)
     estado_linea = Column(String(30), default="cotizado")  # cotizado por_comprar comprado en_transito en_bodega despachado reclamo
     oc_proveedor_id = Column(Integer, nullable=True)
@@ -761,7 +779,7 @@ class MonzaCotizacionCierre(Base):
     fecha_entrega_est = Column(Date, nullable=True)
     pct_adelanto = Column(Integer, nullable=True)
     forma_pago = Column(String(100), nullable=True)
-    total_bruto = Column(Float, nullable=True)
+    total_bruto = Column(_clp(), nullable=True)
 
     cerrado_at = Column(DateTime, default=datetime.utcnow)
     cerrado_por_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)

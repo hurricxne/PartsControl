@@ -1792,10 +1792,11 @@ def _validar_receptor_factura(cot: MonzaCotizacion, tipo_doc: str,
 
 
 def _paso_float(v: float) -> float:
-    """Granularidad de `v` en una columna FLOAT de esta MariaDB: conserva 6 CIFRAS
-    SIGNIFICATIVAS, así que a partir de $1.000.000 el valor se guarda corrido a la
-    decena, a partir de $10.000.000 a la centena, y así. Medido en PROD 2026-09-25:
-    `CAST(1546983 AS FLOAT)` → `1546980`, `CAST(1299986 AS FLOAT)` → `1299990`."""
+    """Granularidad con que la app LEE `v` de una columna FLOAT de esta MariaDB: el
+    protocolo lo entrega como texto de 6 CIFRAS SIGNIFICATIVAS, así que a partir de
+    $1.000.000 llega corrido a la decena, a partir de $10.000.000 a la centena, y así.
+    Medido en PROD 2026-09-25: guardado 1546983, leído 1546980. (El valor binario sí
+    es exacto hasta 16.777.216 — por eso la migración a DECIMAL lo recupera.)"""
     v = abs(_f(v))
     if v < 1_000_000:
         return 0.0
@@ -1807,19 +1808,22 @@ def _total_venta_para_tope(cot: MonzaCotizacion, iva_rate) -> float:
     en vez de leerse de la cabecera.
 
     POR QUÉ (incidente 2026-09-25, COT-2026-000195): `monza_cotizaciones.total_bruto`
-    es FLOAT y esta MariaDB solo conserva 6 cifras significativas, de modo que TODA
-    venta sobre $1.000.000 se guarda corrida (ver `_paso_float`). El tope comparaba esa
+    era FLOAT y esta MariaDB lo entrega con 6 cifras significativas, de modo que TODA
+    venta sobre $1.000.000 se LEÍA corrida (ver `_paso_float`). El tope comparaba esa
     cabecera mutilada contra un neto+IVA recalculado con aritmética exacta desde los
     ítems y la factura se rechazaba a sí misma por una diferencia que no existe: la
-    venta sumaba 1.546.983 por línea y la cabecera decía 1.546.980. Medido en PROD:
+    venta sumaba 1.546.983 por línea y la cabecera se leía 1.546.980. Medido en PROD:
     **79 de las 179 ventas sobre el millón quedaron infacturables** — el 100 % de las
     bloqueadas está sobre el millón, ninguna por debajo.
 
-    Las dos puntas del tope tienen que salir de la MISMA base. Los precios por ítem
-    están igual de CONGELADOS que la cabecera, son de donde se derivan las líneas de la
-    factura, y el split de Abastecimiento preserva Σ subtotal_clp por invariante
-    declarado (`_clonar_item_remanente`), así que derivar de ellos NO afloja el guard:
-    lo vuelve exacto.
+    Las dos puntas del tope tienen que salir de la MISMA base, y la base es la FÓRMULA
+    DE LA LÍNEA DE FACTURA: `_total_linea(precio_unitario_clp, cantidad)`, no
+    `subtotal_clp`. La primera versión de este arreglo sumaba subtotales y en 2 de
+    1.244 líneas el subtotal se había leído truncado por DEBAJO de precio × cantidad:
+    esas dos ventas (COT-2026-000494 y 000525, en propuesta) habrían quedado
+    bloqueadas por $2-4 donde antes pasaban. Los precios por ítem están igual de
+    CONGELADOS que la cabecera, así que derivar de ellos NO afloja el guard: lo vuelve
+    exacto. Sin precio (legado), la línea aporta su subtotal.
 
     CINTURÓN: la cabecera solo se corrige cuando la diferencia es explicable por la
     pérdida del FLOAT (± un paso de granularidad + la holgura de redondeo). Si las
@@ -1827,16 +1831,21 @@ def _total_venta_para_tope(cot: MonzaCotizacion, iva_rate) -> float:
     el tope sigue siendo el de antes — este arreglo no es una puerta para subir el
     cupo de una venta editando ítems.
 
-    Esto NO arregla la causa: el histórico, el PDF y los tableros siguen leyendo la
-    cabecera torcida, y toda venta nueva sobre el millón sigue naciendo así. La
-    corrección de raíz es migrar las columnas de dinero a DECIMAL(14,2) — ticket
-    MTK-2026-0005 y nota 19 del CLAUDE.md."""
+    Tras la migración a DECIMAL (migrations/monza_dinero_decimal.py) la cabecera se
+    lee exacta y este cálculo coincide con ella: el cinturón pasa a ser un no-op en el
+    caso normal. Se deja como defensa — la cabecera y la factura siguen siendo dos
+    cálculos distintos, y el tope tiene que medir con la vara de la factura."""
     cabecera = _f(cot.total_bruto)
     items = getattr(cot, "items", None) or []
-    subtotales = [i.subtotal_clp for i in items if i.subtotal_clp is not None]
-    if not subtotales:
+    aportes = []
+    for i in items:
+        if i.precio_unitario_clp is not None:
+            aportes.append(_total_linea(i.precio_unitario_clp, _f(i.cantidad)))
+        elif i.subtotal_clp is not None:
+            aportes.append(_f(i.subtotal_clp))
+    if not aportes:
         return cabecera
-    neto = round(sum(_f(s) for s in subtotales), 2)
+    neto = round(sum(aportes), 2)
     derivado = neto + _iva_clp(neto, iva_rate)
     if abs(derivado - cabecera) > _paso_float(cabecera) + TOL_PAGO:
         return cabecera
