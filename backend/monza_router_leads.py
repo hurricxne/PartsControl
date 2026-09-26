@@ -234,6 +234,36 @@ def _cliente_dict(c: MonzaCliente) -> dict:
     }
 
 
+# Textos de un ítem de lead y cómo nombrarlos ante el usuario. El ANCHO se lee de la
+# columna del modelo, no se copia acá, para que no se desincronicen.
+# POR QUÉ (2026-09-25, PROD): un texto más largo que su columna llegaba a la base y el
+# usuario veía un 500 crudo — "Data too long for column 'numero_parte'", dos veces ese
+# día, al pegar la descripción del repuesto en el campo del N° de parte.
+_TEXTOS_ITEM = {
+    "descripcion": "La descripción",
+    "numero_parte": "El N° de parte",
+    "marca": "La marca",
+    "procedencia": "La procedencia",
+    "calidad": "La calidad",
+    "plazo_entrega": "El plazo de entrega",
+}
+
+
+def _validar_largos_item(datos: dict, prefijo: str = "") -> None:
+    """422 con un mensaje que el usuario entiende si algún texto no cabe en su columna.
+    Cuenta CARACTERES, igual que MariaDB en utf8mb4: una tilde o una ñ valen uno."""
+    for campo, nombre in _TEXTOS_ITEM.items():
+        valor = datos.get(campo)
+        maximo = MonzaLeadItem.__table__.c[campo].type.length
+        if isinstance(valor, str) and maximo and len(valor) > maximo:
+            pista = (" Si pegaste la descripción del repuesto, va en el campo Descripción."
+                     if campo == "numero_parte" else "")
+            raise HTTPException(
+                status_code=422,
+                detail=f"{prefijo}{nombre} admite hasta {maximo} caracteres y tiene {len(valor)}.{pista}",
+            )
+
+
 def _item_dict(it: MonzaLeadItem) -> dict:
     return {
         "id": it.id,
@@ -617,6 +647,11 @@ def create_lead(body: LeadCreate, db: Session = Depends(get_db), current_user=De
     Medido con 6 creaciones REALMENTE simultáneas del mismo cliente: sin esto sobrevivían
     2 y los otros 4 leads se perdían con un 500 mientras el vendedor los estaba tipeando.
     """
+    # ANTES de crear nada (cliente al vuelo, correlativo): un ítem que no cabe no puede
+    # dejar un lead o una ficha a medio nacer. Mismo filtro de ítems vacíos que la tx.
+    for n, it in enumerate(body.items, start=1):
+        if it.descripcion.strip():
+            _validar_largos_item(it.model_dump(), prefijo=f"Repuesto {n}: ")
     return reintentar_carrera(db, lambda: _crear_lead_tx(body, db, current_user), que="leads")
 
 
@@ -860,6 +895,7 @@ def add_item(lead_id: int, body: ItemIn, db: Session = Depends(get_db), _=Depend
     lead = db.query(MonzaLead).filter(MonzaLead.id == lead_id).first()
     if not lead:
         raise HTTPException(status_code=404, detail="Lead no encontrado")
+    _validar_largos_item(body.model_dump())
     item = MonzaLeadItem(lead_id=lead_id, **body.model_dump())
     db.add(item)
     lead.fecha_actualizacion = datetime.utcnow()
@@ -875,6 +911,7 @@ def update_item(lead_id: int, item_id: int, body: ItemUpdate, db: Session = Depe
     ).first()
     if not item:
         raise HTTPException(status_code=404, detail="Item no encontrado")
+    _validar_largos_item(body.model_dump(exclude_none=True))
     for field, value in body.model_dump(exclude_none=True).items():
         setattr(item, field, value)
     db.commit()

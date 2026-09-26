@@ -693,7 +693,13 @@ function AgregarItemModal({ leadId, onClose, onAdded }: { leadId: number; onClos
       toast.success("Repuesto agregado");
       onAdded();
       onClose();
-    } catch { toast.error("Error al agregar repuesto"); }
+    } catch (e) {
+      // El detalle del backend dice QUÉ corregir (ej. "El N° de parte admite hasta 100
+      // caracteres"); el genérico solo queda para errores sin mensaje (red, 500).
+      const err = e as { response?: { data?: { detail?: string } } };
+      const detalle = err?.response?.data?.detail;
+      toast.error(typeof detalle === "string" ? detalle : "Error al agregar repuesto");
+    }
     finally { setSaving(false); }
   };
 
@@ -1380,7 +1386,11 @@ function LeadDetail({ lead, onRefresh }: { lead: Lead; onRefresh: () => void }) 
       // backend y borrar el plazo era un no-op silencioso (micro-fix D5, 2026-08-21).
       await monzaLeadsAPI.updateItem(lead.id, itemId, { plazo_entrega: value.trim() });
       refresh();
-    } catch { toast.error("Error al guardar plazo"); }
+    } catch (e) {
+      const err = e as { response?: { data?: { detail?: string } } };
+      const detalle = err?.response?.data?.detail;
+      toast.error(typeof detalle === "string" ? detalle : "Error al guardar plazo");
+    }
   };
 
   const saveNumeroParte = async (itemId: number, value: string) => {
@@ -1389,7 +1399,11 @@ function LeadDetail({ lead, onRefresh }: { lead: Lead; onRefresh: () => void }) 
       // Mismo contrato que el plazo: "" limpia (jamás `|| null`, que exclude_none bota).
       await monzaLeadsAPI.updateItem(lead.id, itemId, { numero_parte: value.trim() });
       refresh();
-    } catch { toast.error("Error al guardar N° de parte"); }
+    } catch (e) {
+      const err = e as { response?: { data?: { detail?: string } } };
+      const detalle = err?.response?.data?.detail;
+      toast.error(typeof detalle === "string" ? detalle : "Error al guardar N° de parte");
+    }
   };
 
   if (loading) return <div style={{ padding: 24, textAlign: "center", color: "#94A3B8", fontSize: 13 }}>Cargando detalle...</div>;
