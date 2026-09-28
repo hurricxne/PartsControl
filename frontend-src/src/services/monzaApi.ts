@@ -767,6 +767,11 @@ export interface MonzaDescuentoAnticipo {
   folio?: string | null;
   monto_neto: number;
 }
+// Guía emitida FUERA del sistema: el parámetro solo viaja cuando hay declaración, así un
+// preview/emisión normal manda exactamente lo mismo que antes.
+const paramsVerif52 = (verificado?: string) =>
+  verificado ? { verificado_sin_guia_electronica: verificado } : undefined;
+
 export const monzaWasabilAPI = {
   config: () => api.get("/wasabil/config"),
   previewGuia: (despachoId: number, tipoTraslado?: number) =>
@@ -809,21 +814,25 @@ export const monzaWasabilAPI = {
   // payload si viene con folio). preview NO persiste y NO toca el SII.
   // Fase 7: con es_anticipo:true el preview devuelve además `es_anticipo` y
   // `descuentos` (los anticipos que ESTA factura descuenta).
-  previewFacturaSII: (payload: MonzaFacturaPayload) =>
-    api.post("/wasabil/facturas/preview", payload),
+  // `verificado`: guía emitida FUERA del sistema — la referencia del despacho que el
+  // operador repitió tras revisar Wasabil (el preview la pide en `verificacion_52`).
+  previewFacturaSII: (payload: MonzaFacturaPayload, verificado?: string) =>
+    api.post("/wasabil/facturas/preview", payload, { params: paramsVerif52(verificado) }),
   // IRREVERSIBLE: crea la factura local sin folio + el claim, y recién ahí emite.
   // ⚠️ SIN TIEMPO LÍMITE (`timeout: 0`): emite un documento tributario REAL. Cortar
   // por tiempo no cancela la emisión y deja el estado AMBIGUO — la condición que ya
   // provocó dobles emisiones. Esperar es más barato que dudar.
-  emitirFacturaSII: (payload: MonzaFacturaPayload) =>
-    api.post<MonzaDteFacturaInfo>("/wasabil/facturas/emitir", payload, { timeout: 0 }),
+  emitirFacturaSII: (payload: MonzaFacturaPayload, verificado?: string) =>
+    api.post<MonzaDteFacturaInfo>("/wasabil/facturas/emitir", payload,
+      { timeout: 0, params: paramsVerif52(verificado) }),
   estadoFacturaSII: (facturaId: number) =>
     api.get<MonzaDteFacturaInfo>(`/wasabil/facturas/${facturaId}/estado`),
   // ⚠️ SIN TIEMPO LÍMITE (`timeout: 0`): emite un documento tributario REAL. Cortar
   // por tiempo no cancela la emisión y deja el estado AMBIGUO — la condición que ya
   // provocó dobles emisiones. Esperar es más barato que dudar.
-  reintentarFacturaSII: (facturaId: number) =>
-    api.post<MonzaDteFacturaInfo>(`/wasabil/facturas/${facturaId}/reintentar`, null, { timeout: 0 }),
+  reintentarFacturaSII: (facturaId: number, verificado?: string) =>
+    api.post<MonzaDteFacturaInfo>(`/wasabil/facturas/${facturaId}/reintentar`, null,
+      { timeout: 0, params: paramsVerif52(verificado) }),
   // Estado en LOTE (solo BD, sin llamar a Wasabil) → { factura_id: dte }, para
   // pintar los badges SII del listado sin N llamadas de red (el serializador de
   // Contabilidad Monza no inyecta campos dte_*).

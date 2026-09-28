@@ -186,6 +186,13 @@ interface PreviewFactura {
   // Fase 7: la factura ES un anticipo / la factura DESCUENTA anticipos previos.
   es_anticipo?: boolean;
   descuentos?: MonzaDescuentoAnticipo[];
+  // La guía electrónica fue rechazada y la real se emitió FUERA del sistema: para citarla
+  // hay que confirmar la referencia del despacho tras revisar Wasabil. `mensaje` es el
+  // mismo texto que viene en `problemas` (se reemplaza por el paso guiado).
+  verificacion_52?: {
+    referencia: string; numero_guia: string; fecha_guia: string;
+    referencia_no_coincide?: boolean; mensaje?: string;
+  } | null;
 }
 
 // Fase 7: los tres endpoints SII de factura (emitir / estado / reintentar) devuelven
@@ -225,6 +232,13 @@ function EmisionFacturaSIIModal({ payload, facturaId, onDone, onVolver, onCerrar
   // tributario real. Por lo mismo aquí NO se resincroniza con el preview como hace el
   // modal de guías: allá el preview es por despacho.id, acá es por un payload sin id.
   const [emisionIntentada, setEmisionIntentada] = useState(false);
+  // Guía emitida FUERA del sistema: lo que el operador teclea y, una vez que el backend lo
+  // acepta, la declaración que acompaña a emitir/reintentar (el backend la audita).
+  const [refEscrita, setRefEscrita] = useState("");
+  const [declaracion52, setDeclaracion52] = useState<string | undefined>(undefined);
+  const [verificando52, setVerificando52] = useState(false);
+  const [error52, setError52] = useState("");
+  const inputBase = useInput();
 
   // Única fuente de verdad del botón Reintentar: puede_reintentar del backend.
   const faseSegunDte = (d?: MonzaDteFacturaInfo | null): FaseFactura => {
@@ -298,10 +312,28 @@ function EmisionFacturaSIIModal({ payload, facturaId, onDone, onVolver, onCerrar
     else if (data.puede_reintentar) { setFase("fallido"); onDone(); }
     else setFase("sondeo");
   };
+  // Re-valida con la referencia confirmada: es el BACKEND quien decide si la acepta (y si
+  // Wasabil tiene una guía emitida con ella, la rechaza igual). Nada se emite acá.
+  const confirmarReferencia = async () => {
+    const ref = refEscrita.trim();
+    setVerificando52(true); setError52("");
+    try {
+      const { data } = await monzaWasabilAPI.previewFacturaSII(payload!, ref);
+      const nuevo = data as PreviewFactura;
+      setPrev(nuevo);
+      // Aceptada = el backend ya no la pide Y la factura quedó citando una guía 52. Si
+      // Wasabil tiene una guía EMITIDA con esa referencia, no hay 52 citada: no se acepta.
+      const cita52 = (nuevo.referencias || []).some(r => String(r.tipo) === "52");
+      setDeclaracion52(!nuevo.verificacion_52 && cita52 ? ref : undefined);
+    } catch (e: unknown) {
+      // Aquí no se emitió nada: el error se muestra en el mismo paso y se puede reintentar.
+      setError52(errMsg(e, "No se pudo verificar la referencia"));
+    } finally { setVerificando52(false); }
+  };
   const emitir = async () => {
     setEmisionIntentada(true);
     setFase("emitiendo"); setError("");
-    try { procesarRespuesta((await monzaWasabilAPI.emitirFacturaSII(payload!)).data); }
+    try { procesarRespuesta((await monzaWasabilAPI.emitirFacturaSII(payload!, declaracion52)).data); }
     catch (e: unknown) {
       // 409 (datos / emisión en curso) o 502 (sin confirmación de Wasabil): la factura
       // PUDO quedar creada. NO se vuelve al formulario ni se resincroniza el preview:
@@ -315,7 +347,7 @@ function EmisionFacturaSIIModal({ payload, facturaId, onDone, onVolver, onCerrar
     const id = dte?.factura_id || facturaId;
     if (!id) return;
     setFase("emitiendo"); setError("");
-    try { procesarRespuesta((await monzaWasabilAPI.reintentarFacturaSII(id)).data); }
+    try { procesarRespuesta((await monzaWasabilAPI.reintentarFacturaSII(id, declaracion52)).data); }
     catch (e: unknown) { setError(errMsg(e, "No se pudo reintentar la emisión")); setFase("error"); onDone(); }
   };
 
@@ -331,6 +363,11 @@ function EmisionFacturaSIIModal({ payload, facturaId, onDone, onVolver, onCerrar
   const NOTA_ANTICIPO = "Factura de anticipo:";
   const advertenciasAmbar = (prev?.advertencias || []).filter(a => !a.startsWith(NOTA_ANTICIPO));
   const notasAnticipo = (prev?.advertencias || []).filter(a => a.startsWith(NOTA_ANTICIPO));
+  // El problema que pide la verificación se reemplaza por el paso guiado (igualdad exacta
+  // con el texto que el backend manda en `verificacion_52.mensaje`).
+  const v52 = prev?.verificacion_52 || null;
+  const problemasVisibles = (prev?.problemas || []).filter(p => !v52 || p !== v52.mensaje);
+  const refCoincide = !!v52 && refEscrita.trim() === v52.referencia;
   const cajaRoja: React.CSSProperties = { padding: "10px 14px", borderRadius: 10, border: "1px solid rgba(239,68,68,0.35)", background: "rgba(239,68,68,0.10)" };
   const cajaAmbar: React.CSSProperties = { padding: "10px 14px", borderRadius: 10, border: "1px solid rgba(245,158,11,0.35)", background: "rgba(245,158,11,0.10)" };
   const cajaVerde: React.CSSProperties = { padding: "10px 14px", borderRadius: 10, border: "1px solid rgba(16,185,129,0.35)", background: "rgba(16,185,129,0.10)" };
@@ -457,12 +494,57 @@ function EmisionFacturaSIIModal({ payload, facturaId, onDone, onVolver, onCerrar
               </span>
             </div>
           )}
-          {(prev.problemas?.length ?? 0) > 0 && (
+          {problemasVisibles.length > 0 && (
             <div style={cajaRoja}>
               <div style={{ fontSize: 11, fontWeight: 700, color: "#EF4444", marginBottom: 4 }}>Para emitir falta resolver:</div>
               <ul style={{ margin: 0, paddingLeft: 18, fontSize: 11, color: s.muted }}>
-                {prev.problemas!.map((p, i) => <li key={i}>{p}</li>)}
+                {problemasVisibles.map((p, i) => <li key={i}>{p}</li>)}
               </ul>
+            </div>
+          )}
+          {/* Guía emitida FUERA del sistema: el SII rechazó la guía electrónica y la real se
+              emitió a mano. El operador confirma, tecleando la referencia del despacho, que
+              revisó Wasabil y no hay una guía emitida con ella. El backend lo registra. */}
+          {v52 && (
+            <div style={cajaAmbar}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "#B45309", display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+                <AlertTriangle size={14} style={{ flexShrink: 0 }} /> La guía electrónica de este despacho fue rechazada por el SII
+              </div>
+              <p style={{ fontSize: 12, color: s.text, margin: "0 0 8px", lineHeight: 1.5 }}>
+                Si la mercadería salió con una guía emitida <b>fuera del sistema</b>:
+              </p>
+              <ol style={{ margin: "0 0 8px", paddingLeft: 18, fontSize: 12, color: s.text, lineHeight: 1.6 }}>
+                <li>En app.wasabil.com busca los documentos con la referencia{" "}
+                  <b style={{ fontFamily: "monospace" }}>{v52.referencia}</b>.</li>
+                <li>Si <b>no</b> hay ninguna guía EMITIDA con ella, escríbela aquí para confirmar.
+                  Si la hay, no factures: pide soporte.</li>
+              </ol>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input value={refEscrita} onChange={e => setRefEscrita(e.target.value)}
+                  placeholder={v52.referencia} aria-label="Referencia del despacho" autoComplete="off" spellCheck={false}
+                  style={{ ...inputBase, flex: 1, width: "auto", fontSize: 13, fontFamily: "monospace" }} />
+                <button onClick={confirmarReferencia} disabled={!refCoincide || verificando52}
+                  style={{ padding: "8px 14px", border: "none", borderRadius: 8, background: "var(--monza-accent)", color: "white", fontWeight: 700, fontSize: 12, cursor: refCoincide && !verificando52 ? "pointer" : "not-allowed", opacity: refCoincide && !verificando52 ? 1 : 0.5, display: "inline-flex", alignItems: "center", gap: 6, fontFamily: "inherit", whiteSpace: "nowrap" }}>
+                  {verificando52 ? <Loader2 size={13} className="animate-spin" /> : <KeyRound size={13} />} Confirmar verificación
+                </button>
+              </div>
+              {refEscrita.trim() !== "" && !refCoincide && (
+                <div style={{ fontSize: 11, color: "#EF4444", marginTop: 4 }}>No coincide con la referencia del despacho.</div>
+              )}
+              {error52 && <div style={{ fontSize: 11, color: "#EF4444", marginTop: 4 }}>{error52}</div>}
+              <div style={{ fontSize: 11, color: s.muted, marginTop: 6 }}>
+                La factura citará la guía N° <b style={{ color: s.text }}>{v52.numero_guia}</b> del {fmtDate(v52.fecha_guia)}.
+                Tu verificación queda registrada con tu usuario.
+              </div>
+            </div>
+          )}
+          {declaracion52 && !v52 && (
+            <div style={cajaVerde}>
+              <div style={{ fontSize: 11, color: s.text, display: "flex", alignItems: "center", gap: 6 }}>
+                <CheckCircle2 size={13} color="#15803D" style={{ flexShrink: 0 }} />
+                Verificaste en Wasabil la referencia <b style={{ fontFamily: "monospace" }}>{declaracion52}</b>: la
+                factura citará la guía emitida fuera del sistema, y tu verificación se registra al emitir.
+              </div>
             </div>
           )}
           {advertenciasAmbar.length > 0 && (

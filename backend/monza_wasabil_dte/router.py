@@ -1497,10 +1497,11 @@ def _msg_guia_rechazada_con_documento(dte: MonzaWasabilDte) -> str:
             f"en Wasabil (uuid {dte.uuid}): el N° de guía tecleado a mano ya NO se acepta "
             "como referencia 52. Este despacho pasó por guía electrónica, así que el único "
             "N° válido es el folio del SII, y un rechazo de ESE documento no prueba que "
-            "Wasabil no tenga otro EMITIDO con la misma referencia. Usa Reintentar (antes "
-            "de re-emitir, el sistema verifica en Wasabil si ya hay una guía emitida por "
-            "este despacho); si la mercadería salió con guía en PAPEL, pide soporte para "
-            "registrar su folio.")
+            "Wasabil no tenga otro EMITIDO con la misma referencia. Si la mercadería todavía "
+            "no sale, usa Reintentar en Despachos (antes de re-emitir, el sistema verifica en "
+            "Wasabil si ya hay una guía emitida por este despacho). Si ya salió con una guía "
+            "emitida FUERA del sistema, al facturar se te pedirá confirmar que lo revisaste "
+            "en Wasabil.")
 
 
 def _guia_no_referenciable(db: Session, despacho_id: int) -> Optional[str]:
@@ -1604,8 +1605,150 @@ def _fecha_guia_papel(desp) -> Tuple[Optional[date], Optional[str]]:
         "despacho en el sistema, que es lo que se usaba antes y salía equivocado.")
 
 
+# ═══ GUÍA EMITIDA FUERA DEL SISTEMA (paridad MachParts: verificado_sin_guia_electronica) ═══
+# El caso (MTK-2026-0008, 2026-09-28): el SII rechazó la guía electrónica del despacho, el
+# documento quedó en Wasabil con uuid, y la mercadería salió con una guía emitida a mano
+# cuyo N° el operador tecleó en el despacho. `_guia_no_referenciable` lo bloquea (MEDIO-5)
+# y bien: el sistema no puede probar SOLO que ese N° sea el real. Hasta esta salida lo
+# destrababa soporte con SQL. Ahora lo hace el operador, en la misma factura y con
+# rastro: repite la referencia interna del despacho (DSP-AAAA-####) después de revisarla
+# en app.wasabil.com — escribirla es la prueba de que la buscó; un `true` no prueba nada.
+#
+# DIFERENCIA DELIBERADA CON MACHPARTS: allá, si Wasabil CONFIRMA que no hay ninguna 52
+# emitida con la referencia, el N° tecleado pasa solo. Acá se pide la declaración igual,
+# porque en el flujo guía-primero de Monza el `numero_guia` que sobrevive a un intento
+# electrónico puede ser el VIEJO (el que la emisión iba a pisar), y eso Wasabil no lo
+# puede descartar: lo confirma la persona que ve "la factura citará la guía N° X". Con
+# `GET /documents` respondiendo 405 en el API real, hoy el veredicto es siempre
+# "no se puede concluir" y la diferencia no se nota; queda escrita para el día en que sí.
+PARAM_VERIF_52 = "verificado_sin_guia_electronica"
+
+
+def _guias_emitidas_por_referencia(referencia: str) -> Tuple[Optional[str], str]:
+    """(folios de las guías EMITIDAS con esta referencia, respuesta de Wasabil). SOLO
+    LECTURA. `folios` es None salvo que Wasabil CONFIRME al menos una emitida: es lo único
+    que se distingue, porque cualquier otra respuesta exige la declaración igual. Misma
+    lectura de la fuente que el cinturón del reintento (`_clasificar_referencia`)."""
+    ref = (referencia or "").strip()
+    if not ref:
+        return None, "el despacho no tiene N° interno (DSP-AAAA-####) con el que buscar en Wasabil"
+    try:
+        emitidos, pueden_tener_folio, completa = _clasificar_referencia(ref)
+    except wasabil.WasabilError as e:
+        return None, f"no se pudo consultar ({e})"
+    if emitidos:
+        return _folios_de(emitidos), ""
+    if pueden_tener_folio:
+        return None, (f"tiene {len(pueden_tener_folio)} documento(s) con esta referencia que "
+                      "todavía pueden quedarse con un folio")
+    if not completa:
+        return None, "la búsqueda quedó incompleta (lista paginada)"
+    return None, "no encontró ninguna guía emitida con esa referencia"
+
+
+def _es_rechazo_con_documento(dte: Optional[MonzaWasabilDte]) -> bool:
+    """¿Es EXACTAMENTE el estado MEDIO-5 de `_guia_no_referenciable` (rechazada por el SII,
+    con el documento en Wasabil y sin emisión en curso)? Es el ÚNICO estado que la
+    declaración puede destrabar: EN PROCESO, AMBIGUA y EMITIDA sin folio siguen
+    bloqueando. La alineación con el predicado la fija test_guia_emitida_fuera.py."""
+    return (dte is not None and dte.status_id == STATUS_FALLIDO and bool(dte.uuid)
+            and not claim_vigente(dte))
+
+
+def _problema_guia_emitida_fuera(db: Session, despacho_id: int, dte: MonzaWasabilDte,
+                                 numero: str, fecha: date, declaracion: Optional[str]
+                                 ) -> Tuple[Optional[str], Optional[dict], Optional[dict]]:
+    """(problema, verificación_pendiente, auditoría) para citar el N° tecleado en un
+    despacho cuya guía electrónica fue rechazada. Consulta Wasabil (SOLO LECTURA).
+
+      · Wasabil CONFIRMA una guía emitida con la referencia → problema ABSOLUTO que nombra
+        el folio real. Ninguna declaración lo levanta.
+      · En cualquier otro caso → hace falta la declaración: sin ella (o con otra
+        referencia) vuelve el problema + los datos que la pantalla necesita para pedirla;
+        con ella vuelve la auditoría, que el llamador persiste ANTES de emitir."""
+    ref = _referencia_interna_guia(db, despacho_id)
+    folios, respuesta_wasabil = _guias_emitidas_por_referencia(ref)
+    if folios:
+        return (f"Wasabil tiene guía(s) EMITIDA(S) con la referencia '{ref}' (folio(s): "
+                f"{folios}): ése es el folio REAL de la guía de este despacho, no el N° "
+                f"{numero} tecleado a mano. La factura no se emite: citaría una guía que no "
+                "ampara esta mercadería, y eso no se deshace. Pide soporte para dejar "
+                "registrado el folio correcto."), None, None
+    if not ref:
+        return f"No se puede verificar la guía de este despacho: {respuesta_wasabil}.", None, None
+    guia = {"referencia": ref, "numero_guia": numero, "fecha_guia": fecha.isoformat()}
+    declarada = (declaracion or "").strip()
+    if declarada == ref:
+        return None, None, {**guia, "dte_id": dte.id, "respuesta_wasabil": respuesta_wasabil}
+    no_coincide = (f" La referencia escrita ('{declarada}') no coincide con la del despacho."
+                   if declarada else "")
+    mensaje = (
+        f"El SII RECHAZÓ la guía electrónica de este despacho y el documento existe en "
+        f"Wasabil (uuid {dte.uuid}), así que el N° de guía tecleado a mano ({numero}) ya NO "
+        f"se acepta como referencia 52 sin verificación. Si la mercadería salió con la guía "
+        f"N° {numero} del {fecha:%d-%m-%Y} emitida FUERA del sistema: busca en "
+        f"app.wasabil.com los documentos con la referencia '{ref}' y, si NO hay ninguna "
+        f"guía EMITIDA con ella, confírmalo escribiendo '{ref}' (parámetro {PARAM_VERIF_52}). "
+        f"Tu verificación queda registrada. Si hay una guía emitida con esa referencia, NO "
+        f"factures: pide soporte.{no_coincide}")
+    # `mensaje` viaja también en la verificación: la pantalla lo reemplaza por su paso
+    # guiado quitándolo de la lista de problemas por IGUALDAD, sin interpretar texto.
+    return mensaje, {**guia, "referencia_no_coincide": bool(declarada),
+                     "mensaje": mensaje}, None
+
+
+def _linea_auditoria_guia_fuera(aud: dict, usuario) -> str:
+    """Rastro de la declaración. Va en la fila de la GUÍA rechazada (el documento sobre el
+    que se declaró) y se escribe ANTES de que salga la 33: si aparece un duplicado, dice
+    quién autorizó citar ese N° y con qué verificación."""
+    uid = getattr(usuario, "id", None)
+    email = getattr(usuario, "email", None) or "sin correo"
+    return (f"VERIFICACIÓN HUMANA {datetime.utcnow():%Y-%m-%d %H:%M} UTC · usuario "
+            f"{uid if uid is not None else 'no identificado'} ({email}): declaró que en "
+            f"Wasabil NO existe ninguna guía EMITIDA con la referencia '{aud['referencia']}' "
+            f"y autorizó facturar citando la guía N° {aud['numero_guia']} del "
+            f"{aud['fecha_guia']}, emitida fuera del sistema. Respuesta de Wasabil: "
+            f"{aud['respuesta_wasabil']}. Si aparece un documento duplicado, ésta es la "
+            "autorización que lo permitió.")
+
+
+def _anotar_auditoria_guia(db: Session, aud: Optional[dict], usuario) -> Optional[str]:
+    """Persiste y COMMITEA la línea de auditoría en `error` de la fila de la guía, que es
+    lo que ve el operador. Devuelve un PROBLEMA si no se pudo guardar: sin rastro no se
+    emite, y el llamador lo trata como cualquier problema de armado (en `emitir`, eso
+    deshace la factura recién creada en vez de dejarla zombi)."""
+    if not aud:
+        return None
+    fila = db.query(MonzaWasabilDte).filter(MonzaWasabilDte.id == aud["dte_id"]).first()
+    if fila is None:
+        return ("No se pudo registrar la verificación de la guía (la fila de la guía "
+                "rechazada ya no existe): no se emite sin rastro.")
+    linea = _linea_auditoria_guia_fuera(aud, usuario)
+    previo = (fila.error or "").strip()
+    fila.error = (linea if not previo else f"{linea} · {previo}")[:2000]
+    # Copia ESTRUCTURADA y acumulativa: `error` es un campo volátil (el reintento de la guía
+    # lo limpia) y se recorta a 2000. Mismo lugar que usa el procedimiento de soporte
+    # (`_desvinculado_por_soporte`, CLAUDE.md nota 10 de MonzaParts).
+    try:
+        resp = json.loads(fila.respuesta_json or "{}")
+    except ValueError:
+        resp = {"respuesta_original_texto": fila.respuesta_json}
+    if not isinstance(resp, dict):
+        resp = {"respuesta_original": resp}
+    resp.setdefault("_verificaciones_guia_fuera", []).append({
+        **{k: aud[k] for k in ("referencia", "numero_guia", "fecha_guia", "respuesta_wasabil")},
+        "usuario_id": getattr(usuario, "id", None), "usuario_email": getattr(usuario, "email", None),
+        "fecha_utc": datetime.utcnow().isoformat(timespec="seconds"),
+    })
+    fila.respuesta_json = json.dumps(resp, ensure_ascii=False)
+    db.commit()
+    logger.warning("FACTURA CON GUÍA EMITIDA FUERA DEL SISTEMA: %s", linea)
+    return None
+
+
 def _referencia_guia_de_despacho(
-        db: Session, despacho_id: Optional[int]
+        db: Session, despacho_id: Optional[int], declaracion: Optional[str] = None,
+        info_52: Optional[dict] = None,
 ) -> Tuple[Optional[str], Optional[date], Optional[str]]:
     """(folio, fecha, problema) de la guía a referenciar (tipo 52) en la factura.
 
@@ -1618,14 +1761,39 @@ def _referencia_guia_de_despacho(
     snapshot se congela al crear la factura y puede tener el N° tecleado viejo.
 
     En Monza no hay relación ORM factura→despacho (despacho_id es un snapshot sin
-    FK), así que el despacho se consulta a mano."""
+    FK), así que el despacho se consulta a mano.
+
+    Guía rechazada con documento en Wasabil + guía real emitida FUERA del sistema: el N°
+    tecleado se cita solo con la `declaracion` del operador (ver
+    `_problema_guia_emitida_fuera`). `info_52`, si viene, recibe `verificacion` (lo que la
+    pantalla necesita para pedirla) o `auditoria` (lo que el llamador persiste antes de
+    emitir)."""
     if not despacho_id:
         return None, None, None
     motivo_guia = _guia_no_referenciable(db, despacho_id)
     if motivo_guia:
-        # Fuente ÚNICA del texto: preview, emisión y reintento leen el MISMO mensaje, y
-        # cada estado bloqueante nombra su propio remedio (ver _guia_no_referenciable).
-        return None, None, motivo_guia
+        dte_rechazo = _dte_de_despacho(db, despacho_id)
+        if not _es_rechazo_con_documento(dte_rechazo):
+            # Fuente ÚNICA del texto: preview, emisión y reintento leen el MISMO mensaje, y
+            # cada estado bloqueante nombra su propio remedio (ver _guia_no_referenciable).
+            return None, None, motivo_guia
+        desp = db.query(MonzaDespacho).filter(MonzaDespacho.id == despacho_id).first()
+        numero = (desp.numero_guia or "").strip() if desp else ""
+        if not numero:
+            return None, None, (
+                f"{motivo_guia} Para facturar con la guía emitida fuera del sistema, "
+                "registra primero su N° y su fecha en Despachos → Editar.")
+        fecha, problema_fecha = _fecha_guia_papel(desp)
+        if problema_fecha:
+            return None, None, problema_fecha
+        problema, verificacion, auditoria = _problema_guia_emitida_fuera(
+            db, despacho_id, dte_rechazo, numero, fecha, declaracion)
+        if info_52 is not None:
+            info_52["verificacion"] = verificacion
+            info_52["auditoria"] = auditoria
+        if problema:
+            return None, None, problema
+        return numero, fecha, None
     dte_guia = (db.query(MonzaWasabilDte)
                 .filter(MonzaWasabilDte.despacho_id == despacho_id,
                         MonzaWasabilDte.tipo_dte == TIPO_DOC_GUIA,
@@ -1819,7 +1987,9 @@ def _referencias_de_venta(db: Session, cot, *, sin_guia: bool, despacho_id: Opti
                           problemas: List[str], advertencias: List[str],
                           anticipos: Optional[List[dict]] = None,
                           es_anticipo: bool = False,
-                          fecha_documento: Optional[date] = None):
+                          fecha_documento: Optional[date] = None,
+                          declaracion_52: Optional[str] = None,
+                          info_52: Optional[dict] = None):
     """Referencias 801 (+ 52 + 33) de una factura de esta venta. Única fuente de verdad
     de la matriz de referencias: la usan el preview/emitir (desde el payload) y el
     armado del documento (desde la factura persistida), para que el reintento arme
@@ -1840,7 +2010,8 @@ def _referencias_de_venta(db: Session, cot, *, sin_guia: bool, despacho_id: Opti
         advertencias.append("Retiro en oficina: la factura no lleva referencia a guía de "
                             "despacho (tipo 52); la factura ampara el traslado")
     elif despacho_id:
-        guia_folio, guia_fecha, problema_guia = _referencia_guia_de_despacho(db, despacho_id)
+        guia_folio, guia_fecha, problema_guia = _referencia_guia_de_despacho(
+            db, despacho_id, declaracion=declaracion_52, info_52=info_52)
         if problema_guia:
             problemas.append(problema_guia)
     referencias, problemas_ref = armar_referencias_factura(
@@ -1853,11 +2024,16 @@ def _referencias_de_venta(db: Session, cot, *, sin_guia: bool, despacho_id: Opti
     return referencias
 
 
-def _preparar_emision_factura(db: Session, payload: FacturaCreate) -> dict:
+def _preparar_emision_factura(db: Session, payload: FacturaCreate,
+                              declaracion_52: Optional[str] = None) -> dict:
     """Arma y valida TODO para emitir una factura NUEVA (SIN persistir y SIN locks;
     puede llamar a Wasabil para la ficha del cliente). Es la única fuente de verdad
     de la validación del preview — la emisión RE-VALIDA bajo lock con las mismas
-    funciones de Contabilidad."""
+    funciones de Contabilidad.
+
+    `declaracion_52`: la verificación del operador para citar una guía emitida fuera del
+    sistema (ver `_problema_guia_emitida_fuera`). El contexto devuelve `verificacion_52`
+    cuando hace falta pedirla, para que la pantalla la pida sin leer el texto del error."""
     problemas: List[str] = []
     advertencias: List[str] = []
     if (payload.numero_factura or "").strip():
@@ -1933,6 +2109,7 @@ def _preparar_emision_factura(db: Session, payload: FacturaCreate) -> dict:
                 f"las líneas (despacho {desp_id}): no se emite una factura que referencie "
                 "una guía distinta a la que trasladó la mercadería. Revisa las líneas o "
                 "factura desde la guía correcta.")
+    info_52: dict = {}
     referencias = _referencias_de_venta(
         db, cot, sin_guia=payload.sin_guia, despacho_id=desp_id,
         problemas=problemas, advertencias=advertencias,
@@ -1943,18 +2120,24 @@ def _preparar_emision_factura(db: Session, payload: FacturaCreate) -> dict:
         es_anticipo=bool(payload.es_anticipo),
         # Fecha que va a llevar el documento: MISMA fórmula que usa Contabilidad Monza al
         # persistir la factura, para que el guard mida contra lo que se va a emitir.
-        fecha_documento=_parse_date(payload.fecha_emision) or hoy_chile())
+        fecha_documento=_parse_date(payload.fecha_emision) or hoy_chile(),
+        declaracion_52=declaracion_52, info_52=info_52)
 
     return {
         "cot": cot, "datos": datos, "receptor": receptor, "client_id": client_id,
         "referencias": referencias, "problemas": problemas, "advertencias": advertencias,
+        "verificacion_52": info_52.get("verificacion"),
     }
 
 
 def _armar_payload_factura(db: Session, factura, client_id: Optional[int],
-                           issue: bool) -> Tuple[dict, List[str]]:
+                           issue: bool, declaracion_52: Optional[str] = None,
+                           info_52: Optional[dict] = None) -> Tuple[dict, List[str]]:
     """Payload del DTE 33 DESDE la factura local persistida (líneas congeladas): lo
-    emitido es EXACTAMENTE lo registrado, y el reintento re-arma lo mismo."""
+    emitido es EXACTAMENTE lo registrado, y el reintento re-arma lo mismo.
+
+    `declaracion_52` / `info_52`: ver `_referencia_guia_de_despacho`. El que emite lee
+    `info_52["auditoria"]` y la persiste con `_anotar_auditoria_guia` ANTES del POST."""
     problemas: List[str] = []
     advertencias: List[str] = []
     lineas, problemas_lineas = armar_lineas_factura(list(factura.items))
@@ -1995,7 +2178,8 @@ def _armar_payload_factura(db: Session, factura, client_id: Optional[int],
         es_anticipo=bool(factura.es_anticipo),
         # MISMO valor que armar_factura pone en documentDate (abajo): si difirieran, el
         # control cruzaría la fecha de la guía contra una fecha que el DTE no lleva.
-        fecha_documento=factura.fecha_emision or hoy_chile())
+        fecha_documento=factura.fecha_emision or hoy_chile(),
+        declaracion_52=declaracion_52, info_52=info_52)
     doc = armar_factura(
         referencia_interna=_referencia_interna_factura(factura.id),
         lineas=lineas, referencias=referencias, client_id=client_id,
@@ -2183,13 +2367,20 @@ def registrar_folio_guia(
 @router.post("/facturas/preview")
 def preview_factura_sii(
     payload: FacturaCreate,
+    verificado_sin_guia_electronica: Optional[str] = Query(
+        None,
+        description="Guía emitida FUERA del sistema: la referencia interna del despacho "
+                    "(DSP-AAAA-####), repetida después de revisar en app.wasabil.com que no "
+                    "hay ninguna guía EMITIDA con ella (ver _problema_guia_emitida_fuera)"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Previsualización de la factura 33: líneas + referencias + receptor real de
     Wasabil + validaciones. NO persiste NADA y NO toca el SII (issue=False).
-    `puede_emitir` es True solo si no hay ningún problema bloqueante."""
-    ctx = _preparar_emision_factura(db, payload)
+    `puede_emitir` es True solo si no hay ningún problema bloqueante.
+    `verificacion_52` viene cuando la guía se emitió fuera del sistema y hace falta que
+    el operador confirme la referencia: la pantalla la pide con esos datos."""
+    ctx = _preparar_emision_factura(db, payload, verificado_sin_guia_electronica)
     datos = ctx["datos"]
     return {
         "puede_emitir": not ctx["problemas"],
@@ -2209,12 +2400,18 @@ def preview_factura_sii(
         # cuando esta lista viene con datos, y el badge cuando es_anticipo.
         "es_anticipo": bool(payload.es_anticipo),
         "descuentos": datos.get("descuentos", []),
+        "verificacion_52": ctx["verificacion_52"],
     }
 
 
 @router.post("/facturas/emitir")
 def emitir_factura_sii(
     payload: FacturaCreate,
+    verificado_sin_guia_electronica: Optional[str] = Query(
+        None,
+        description="Guía emitida FUERA del sistema: la referencia interna del despacho, "
+                    "repetida tras revisar Wasabil (ver preview). Queda registrada en la guía "
+                    "antes de emitir"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -2222,7 +2419,7 @@ def emitir_factura_sii(
     este botón tras la previsualización). Crea la factura LOCAL sin folio + el claim
     anti doble emisión en la MISMA transacción, commiteados ANTES de cualquier HTTP;
     el folio del SII se escribe al confirmarse la emisión."""
-    ctx = _preparar_emision_factura(db, payload)
+    ctx = _preparar_emision_factura(db, payload, verificado_sin_guia_electronica)
     if ctx["problemas"]:
         raise HTTPException(409, " · ".join(ctx["problemas"]))
     empresa = getattr(current_user, "empresa", None) or "automotriz"
@@ -2278,7 +2475,15 @@ def emitir_factura_sii(
     # ── Payload DESDE la factura persistida + HTTP (ya sin locks) ──
     factura = (db.query(MonzaContFacturaCliente)
                .filter(MonzaContFacturaCliente.id == factura_id).first())
-    doc, problemas_doc = _armar_payload_factura(db, factura, ctx["client_id"], issue=True)
+    info_52: dict = {}
+    doc, problemas_doc = _armar_payload_factura(
+        db, factura, ctx["client_id"], issue=True,
+        declaracion_52=verificado_sin_guia_electronica, info_52=info_52)
+    if not problemas_doc:
+        # La verificación humana queda escrita en la guía ANTES de lo irreversible.
+        problema_aud = _anotar_auditoria_guia(db, info_52.get("auditoria"), current_user)
+        if problema_aud:
+            problemas_doc = [problema_aud]
     if problemas_doc:
         # No debería ocurrir (el preview ya validó). Nada salió aún hacia Wasabil, así
         # que se DESHACE la factura recién creada: si no, quedaría una zombi
@@ -2408,6 +2613,12 @@ def reintentar_factura_sii(
                     "una factura emitida con la referencia FACT-<id>: declara que una "
                     "PERSONA lo revisó en app.wasabil.com y no existe. Nunca levanta el "
                     "bloqueo cuando el documento emitido está PROBADO. Queda en el log."),
+    verificado_sin_guia_electronica: Optional[str] = Query(
+        None,
+        description="Guía emitida FUERA del sistema: la referencia interna del despacho, "
+                    "repetida tras revisar Wasabil (ver _problema_guia_emitida_fuera). Es "
+                    "otra verificación que confirmo_sin_documento_emitido: aquélla es sobre "
+                    "la FACTURA, ésta sobre la GUÍA que la factura cita"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -2510,8 +2721,16 @@ def reintentar_factura_sii(
         db, ((cli.rut if cli else None) or "").strip(),
         (cli.nombre if cli else None) or factura.cliente_nombre,
         problemas, advertencias)
-    doc, problemas_doc = _armar_payload_factura(db, factura, client_id, issue=True)
+    info_52: dict = {}
+    doc, problemas_doc = _armar_payload_factura(
+        db, factura, client_id, issue=True,
+        declaracion_52=verificado_sin_guia_electronica, info_52=info_52)
     problemas.extend(problemas_doc)
+    if not problemas:
+        # Antes del claim: si la auditoría no se puede guardar, no queda nada reclamado.
+        problema_aud = _anotar_auditoria_guia(db, info_52.get("auditoria"), current_user)
+        if problema_aud:
+            problemas.append(problema_aud)
     if problemas:
         raise HTTPException(409, " · ".join(problemas))
 
