@@ -225,10 +225,14 @@ def buscar_emitidos_por_folio(codigo_sii: str, folio: int) -> List[dict]:
     vacía se leería como «no existe», que para el origen 'externo' sería un falso visto
     bueno (el folio podría estar en Wasabil entre los documentos que no se trajeron).
     """
+    # El folio va en `search` («folio:N», búsqueda EXACTA): Wasabil IGNORA el filtro
+    # `folio` aunque su documentación lo describe (verificado en PROD 2026-09-30: con
+    # `folio: 223` devolvía las últimas 10 facturas; con `search: "folio:223"`, solo la 223).
+    # `siiDocumentTypeCode` y `received` sí los respeta.
     body = {
         "received": False,
         "siiDocumentTypeCode": str(codigo_sii),
-        "folio": int(folio),
+        "search": f"folio:{int(folio)}",
         "page": 1,
         "perPage": PER_PAGE_VERIFICACION,
         "sortBy": "folio",

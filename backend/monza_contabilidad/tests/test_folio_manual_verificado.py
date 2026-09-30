@@ -362,8 +362,17 @@ def run():
         def _resp(items):
             return lambda body, params=None, timeout=None: {
                 "success": True, "data": {"list": {"items": items, "total": len(items), "lastPage": 1}}}
-        wc._post_query = _resp([_doc(39, 987650040, 11900)])
+        enviados = []
+
+        def _registra(body, params=None, timeout=None):
+            enviados.append(body)
+            return _resp([_doc(39, 987650040, 11900)])(body)
+        wc._post_query = _registra
         check("7a el documento que calza vuelve", len(wc.buscar_emitidos_por_folio("39", 987650040)) == 1)
+        # Regresión PROD 2026-09-30: Wasabil ignora `folio`; solo filtra por `search`.
+        check("7a-bis el folio viaja en search «folio:N» (el filtro `folio` Wasabil lo ignora)",
+              enviados and enviados[0].get("search") == "folio:987650040"
+              and enviados[0].get("siiDocumentTypeCode") == "39", enviados)
         wc._post_query = _resp([_doc(33, 111, 11900)])
         try:
             wc.buscar_emitidos_por_folio("39", 987650040)
