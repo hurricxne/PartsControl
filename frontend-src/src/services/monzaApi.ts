@@ -74,6 +74,10 @@ export type MonzaFacturaPayload = {
   // existe) salvo que venga esta marca. Solo viaja cuando el usuario la confirma en el
   // modal — omitirla es lo normal y deja el bloqueo puesto.
   confirmar_segundo_anticipo?: boolean;
+  // Registro MANUAL verificado (2026-09-29): solo la vía manual los manda; la emisión
+  // electrónica no los usa (ahí el folio lo asigna el SII).
+  origen_folio?: MonzaOrigenFolio;
+  declaracion_externo?: string;
 };
 
 // Respuesta de POST /contabilidad/facturas: la factura serializada MÁS las
@@ -84,6 +88,39 @@ export interface MonzaFacturaCreada {
   id: number;
   numero_factura?: string | null;
   advertencias?: string[];
+}
+
+// ── Registro MANUAL verificado (2026-09-29) ─────────────────────────────────────
+// Todo documento ya emitido que se registra a mano declara su ORIGEN: 'wasabil' (el
+// backend verifica el folio contra Wasabil: tipo, emitido, total y —en factura— RUT) o
+// 'externo' (emitido fuera de Wasabil: exige una declaración que queda auditada).
+export type MonzaOrigenFolio = "wasabil" | "externo";
+
+/** Lo que Wasabil sabe del documento encontrado (montos en CLP, lo enviado al SII). */
+export interface MonzaDocumentoWasabil {
+  uuid: string | null;
+  tipo_sii: string;
+  folio: string;
+  fecha: string | null;
+  status_id: number | null;
+  receptor_rut: string | null;
+  receptor_nombre: string | null;
+  neto: number | null;
+  iva: number | null;
+  total: number | null;
+}
+
+/** Respuesta de POST /contabilidad/facturas/verificar-folio. `ok` gobierna el botón
+ *  «Registrar»; `mensaje` se muestra tal cual (el backend ya lo redacta para el operador).
+ *  `estado`: verificado | externo_ok | no_existe | no_emitido | sandbox | monto_distinto |
+ *  rut_distinto | existe_en_wasabil | duplicado | datos_factura. */
+export interface MonzaVerificacionFolio {
+  ok: boolean;
+  estado: string;
+  mensaje: string;
+  documento: MonzaDocumentoWasabil | null;
+  advertencias: string[];
+  bruto_a_registrar: number;
 }
 
 // ── Preview de la factura de la vía MANUAL (POST /contabilidad/facturas/preview) ──
@@ -232,6 +269,11 @@ export const monzaContabilidadAPI = {
   // que cambian lo que el usuario cree que pasó).
   crearFactura: (data: MonzaFacturaPayload) =>
     api.post<MonzaFacturaCreada>("/contabilidad/facturas", data),
+  // VERIFICA el folio de un documento ya emitido ANTES de registrarlo (mismo payload que
+  // crearFactura, con numero_factura + origen_folio). No persiste nada; el POST de
+  // registro vuelve a verificar en el servidor. 503 = Wasabil no respondió (reintentar).
+  verificarFolio: (data: MonzaFacturaPayload) =>
+    api.post<MonzaVerificacionFolio>("/contabilidad/facturas/verificar-folio", data),
   eliminarFactura: (id: number) => api.delete(`/contabilidad/facturas/${id}`),
   // Cobranzas
   registrarCobranza: (facturaId: number, data: MonzaCobranzaPayload) =>

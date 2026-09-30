@@ -263,6 +263,11 @@ def _serialize_factura(factura, guia_viva=None, adelanto_id=None) -> dict:
         # Factura de ANTICIPO (vía B): la UI la distingue con badge y sin guía. Va como
         # bool y no como 0/1 para que el front no tenga que interpretar el entero.
         "es_anticipo": bool(factura.es_anticipo),
+        # Registro manual (2026-09-29): 'wasabil' (folio verificado) | 'externo' (emitido
+        # fuera de Wasabil, con declaración) | None (vía SII o factura histórica).
+        # getattr: los serializadores de la casa también reciben dobles de prueba.
+        "origen_folio": getattr(factura, "origen_folio", None),
+        "declaracion_externo": getattr(factura, "declaracion_externo", None),
         "cotizacion_id": factura.cotizacion_id,
         "numero_cotizacion": factura.numero_cotizacion,
         "cliente": factura.cliente_nombre or "",

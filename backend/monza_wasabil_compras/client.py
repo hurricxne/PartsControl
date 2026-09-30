@@ -80,18 +80,22 @@ def _headers() -> dict:
     }
 
 
-def _post_query(body: dict, params: Optional[dict] = None) -> dict:
+def _post_query(body: dict, params: Optional[dict] = None,
+                timeout: float = TIMEOUT_SEGUNDOS) -> dict:
     """POST a /documents/query. Punto único de red — los tests lo reemplazan por un fake.
 
     Cualquier problema (timeout, 4xx/5xx, JSON ilegible) es WasabilComprasError: acá no hay
     «best effort». A diferencia de la EMISIÓN (donde un error tras el POST deja un documento
     quizá creado y hay que rescatarlo), una CONSULTA fallida no deja nada colgando: se aborta
     y se reintenta después, entero.
+
+    `timeout` es parámetro (2026-09-29) porque la verificación de folio de Contabilidad
+    consulta con la venta BLOQUEADA y no puede esperar los 30 s del barrido nocturno.
     """
     if not esta_configurado():
         raise WasabilComprasNoConfigurado()
     try:
-        with httpx.Client(timeout=TIMEOUT_SEGUNDOS) as http:
+        with httpx.Client(timeout=timeout) as http:
             resp = http.post(_url_query(), json=body, params=params or {},
                              headers=_headers())
     except httpx.TimeoutException as e:
@@ -191,6 +195,50 @@ def barrer_recibidos(*, from_date: Optional[str] = None,
             f"Barrido inconsistente: recorrí {len(vistos)} documentos únicos y el API "
             f"declara {total}. No se concluye nada de una lectura a medias")
     return list(vistos.values())
+
+
+# Verificación de folio (registro manual de Contabilidad, 2026-09-29): una consulta
+# puntual con la venta bloqueada — corta a propósito. Si Wasabil no contesta en este
+# plazo, el registro se BLOQUEA y el operador reintenta (decisión del dueño: ningún
+# folio entra sin comprobar).
+TIMEOUT_VERIFICACION_SEGUNDOS = 10
+# Un folio + tipo identifica UN documento emitido. Se piden unos pocos por si el API
+# devolviera también sandbox o duplicados raros; más de esto ya es un filtro roto.
+PER_PAGE_VERIFICACION = 10
+
+
+def buscar_emitidos_por_folio(codigo_sii: str, folio: int) -> List[dict]:
+    """Documentos EMITIDOS por MonzaParts con ese tipo SII y ese folio (lista, quizá vacía).
+
+    Para qué: el registro MANUAL de una factura (33) o boleta (39) en Contabilidad →
+    Facturas verifica que el folio tecleado exista de verdad en Wasabil antes de
+    contabilizarlo (monza_contabilidad/verificacion_folio.py decide qué hacer con esto).
+
+    Misma ruta de solo lectura del módulo (`POST /documents/query`, la sonda de la suite
+    lo sigue cumpliendo) con `received=false`: un documento RECIBIDO de un proveedor con
+    el mismo número NO es nuestra factura.
+
+    NO se confía ciegamente en el filtro remoto: se re-filtra acá por tipo y folio. Si el
+    API ignorara un filtro (cambio de versión, nombre de campo), devolvería documentos
+    ajenos y la verificación "encontraría" una boleta que no es — el re-filtro convierte
+    ese desvío en "no existe", que es el lado seguro.
+    """
+    body = {
+        "received": False,
+        "siiDocumentTypeCode": str(codigo_sii),
+        "folio": int(folio),
+        "page": 1,
+        "perPage": PER_PAGE_VERIFICACION,
+        "sortBy": "folio",
+    }
+    data = _post_query(body, timeout=TIMEOUT_VERIFICACION_SEGUNDOS)
+    items, _total, _last_page = _extraer_lista(data)
+    return [
+        doc for doc in items
+        if str(doc.get("sii_document_type_id")) == str(codigo_sii)
+        and str(doc.get("folio") or "").strip() == str(int(folio))
+        and not doc.get("received")
+    ]
 
 
 def _acumular(vistos: dict, items: Iterable[dict]) -> None:

@@ -1,6 +1,6 @@
 """Schemas (Pydantic) del módulo Contabilidad MonzaParts. Validan la entrada en el
 borde del sistema (mismo contrato que el módulo de Grupo AM)."""
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 from pydantic import BaseModel, Field
 
@@ -65,6 +65,14 @@ class FacturaCreate(BaseModel):
     # No se elimina la posibilidad —hay negocios que pactan dos anticipos parciales—:
     # se exige decirlo a propósito. Ver _construir_factura_anticipo.
     confirmar_segundo_anticipo: bool = False
+    # REGISTRO MANUAL VERIFICADO (2026-09-29, ver monza_contabilidad/verificacion_folio.py).
+    # Solo lo lee la vía MANUAL (POST /facturas y /facturas/verificar-folio); la emisión
+    # electrónica los ignora (ahí el folio lo asigna el SII). Opcionales en el schema para
+    # no romper el contrato compartido: la vía manual los exige en el endpoint.
+    #   'wasabil' → el folio se verifica contra Wasabil (tipo, estado, total, RUT).
+    #   'externo' → documento emitido FUERA de Wasabil: exige `declaracion_externo`.
+    origen_folio: Optional[Literal["wasabil", "externo"]] = None
+    declaracion_externo: Optional[str] = Field(None, max_length=500)
 
 
 class CobranzaIn(BaseModel):

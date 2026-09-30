@@ -26,6 +26,14 @@ class Settings(BaseSettings):
     # Mismo criterio que la señal RUT-en-glosa, que tambien nace apagada.
     SII_MATCHER_NOCTURNO: bool = False
     SII_MATCHER_NOCTURNO_MONZA: bool = False
+    # Registro MANUAL de factura/boleta en Contabilidad MonzaParts (2026-09-29): con True
+    # (default, PROD) todo folio tecleado se VERIFICA contra Wasabil o se declara emitido
+    # fuera de Wasabil (monza_contabilidad/verificacion_folio.py). False = comportamiento
+    # anterior (folio sin verificar). Existe para dos cosas: correr las suites antiguas
+    # que registran facturas manuales sin simular Wasabil
+    # (`MONZA_FOLIO_VERIFICACION=false pytest ...`) y como interruptor de emergencia si
+    # el API de consulta de Wasabil cambiara. NO es para "saltarse" la verificación.
+    MONZA_FOLIO_VERIFICACION: bool = True
     # create_all al arrancar: crea tablas que falten (NO agrega columnas a tablas
     # existentes; para eso estan backend/migrations/).
     AUTO_CREATE_TABLES: bool = True

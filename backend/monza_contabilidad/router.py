@@ -64,7 +64,7 @@ Factura de ANTICIPO (Fase 7, vía B) — `es_anticipo=true` en POST /facturas:
   GET    /kpis                                indicadores de cobranza
 """
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -85,6 +85,11 @@ from .models import (
 )
 from .schemas import (FacturaItemIn, FacturaCreate, CobranzaIn, FactoringIn,
                       RevertirFactoringIn, AdelantoVerificarIn)
+from .verificacion_folio import (
+    ORIGEN_EXTERNO, ORIGEN_WASABIL, DECLARACION_MIN, FolioNoVerificable, ResultadoFolio,
+    normalizar_folio, verificar_folio,
+)
+from config import settings
 from .service import (
     TOL, TOL_QTY, TOL_PAGO, MEDIO_FACT_ADELANTO, MEDIO_FACT_RETENCION, MEDIO_ADELANTO,
     ADEL_ANULADO, ADEL_APROBADO,
@@ -202,6 +207,36 @@ def _qty_facturada_por_despacho_item(db: Session, cot_id: int) -> dict:
     out = {}
     for did, qty in rows:
         out[did] = out.get(did, 0.0) + _f(qty)
+    return out
+
+
+def _qty_boleta_en_guia_sin_firma_por_item(db: Session, cot_id: int) -> dict:
+    """Qty por ítem que BOLETAS consumieron de despachos cuya guía está SIN firmar.
+
+    Existe por la excepción B2C de la boleta (2026-09-29): una boleta puede salir de un
+    despacho sin firma, pero el cupo de la FACTURA se mide solo contra lo FIRMADO. Sin
+    restar este consumo del lado factura, una boleta sobre la guía B (sin firmar) le
+    comía el cupo a la factura de la guía A (firmada) del mismo ítem: 10 vendidos, A=5
+    firmada, B=5 sin firmar → boleta de B por 5 → la factura de A calculaba
+    firmado 5 − facturado-guía 5 = 0 y respondía «ya fue facturado por completo» con A
+    intacta. Si después se firma B, su consumo pasa solo al lado firmado (el firmado del
+    ítem sube en la misma cantidad), así que el neteo sigue cuadrando."""
+    rows = (
+        db.query(MonzaContFacturaClienteItem.item_cotizacion_id, MonzaContFacturaClienteItem.cantidad)
+        .join(MonzaContFacturaCliente, MonzaContFacturaCliente.id == MonzaContFacturaClienteItem.factura_id)
+        .join(MonzaDespachoItem, MonzaDespachoItem.id == MonzaContFacturaClienteItem.despacho_item_id)
+        .join(MonzaDespacho, MonzaDespacho.id == MonzaDespachoItem.despacho_id)
+        .filter(
+            MonzaContFacturaCliente.cotizacion_id == cot_id,
+            MonzaContFacturaCliente.tipo_doc == "boleta",
+            or_(MonzaDespacho.guia_firmada.is_(None), MonzaDespacho.guia_firmada == 0),
+        )
+        .all()
+    )
+    out = {}
+    for iid, qty in rows:
+        if iid is not None:
+            out[iid] = out.get(iid, 0.0) + _f(qty)
     return out
 
 
@@ -784,7 +819,9 @@ def _bloqueo_dte_factura(db: Session, factura_id: int, usuario_id=None) -> None:
         # ante el SII y se anula allá.
         # CASO TRABADO (colisión de folio, hallazgo B-3): el DTE quedó EMITIDO pero la
         # factura local se quedó SIN N° porque ese folio ya estaba registrado A MANO en
-        # otra factura (el UNIQUE de Monza es global). Ahí "anúlala en Wasabil" es un
+        # otra factura (el UNIQUE de Monza es por tipo+folio desde 2026-09-29; el DTE de
+        # este módulo es siempre FACTURA 33, así que la colisión es con otra factura).
+        # Ahí "anúlala en Wasabil" es un
         # consejo EQUIVOCADO —el documento del SII está bien; lo que falla es local— y
         # el operador queda sin salida: la factura no se borra y, si es un anticipo, la
         # factura del despacho tampoco se puede emitir (la referencia 33 exige el folio).
@@ -796,8 +833,8 @@ def _bloqueo_dte_factura(db: Session, factura_id: int, usuario_id=None) -> None:
         local = (db.query(MonzaContFacturaCliente.numero_factura)
                  .filter(MonzaContFacturaCliente.id == factura_id).first())
         if folio_txt and local is not None and not (local[0] or "").strip():
-            otra = (db.query(MonzaContFacturaCliente)
-                    .filter(MonzaContFacturaCliente.numero_factura == folio_txt).first())
+            # Solo FACTURAS: una boleta con el mismo N° es otra numeración y no colisiona.
+            otra = _folio_duplicado(db, "factura", folio_txt)
             if otra is not None:
                 venta = f" de la venta {otra.numero_cotizacion}" if otra.numero_cotizacion else ""
                 raise HTTPException(
@@ -1930,9 +1967,23 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
     # Lo YA facturado no se re-litiga: el gate aplica hacia adelante (las facturas
     # históricas pre-candado quedan como están; los topes usan max(0, ...) para que
     # un legado sobre-facturado no descuadre el cálculo).
+    #
+    # EXCEPCIÓN BOLETA (decisión del dueño 2026-09-29, venta B2C): la BOLETA no exige
+    # guía firmada. La persona natural rara vez devuelve una guía firmada, y exigirla
+    # dejaba la venta B2C sin salida. Si la boleta se asocia a un despacho, basta que
+    # esté 'despachado' (la mercadería salió); si no hay despacho, va por retiro en
+    # oficina como siempre. La FACTURA no cambia: con guía, la guía va firmada.
+    # Se implementa en UN solo lugar: para la boleta "firmado" pasa a significar
+    # "despachado", así los tres puntos del gate (modo despacho, ítems explícitos y la
+    # validación por línea) y los topes por canal quedan coherentes sin ramas nuevas.
+    exige_firma = tipo_doc != "boleta"
+
+    def _cuenta_como_firmada(d) -> bool:
+        return (not exige_firma) or bool(getattr(d, "guia_firmada", 0))
+
     desp_qty_item_firmada = {}
     for di, d in desp_items:
-        if getattr(d, "guia_firmada", 0):
+        if _cuenta_como_firmada(d):
             desp_qty_item_firmada[di.item_id] = (
                 desp_qty_item_firmada.get(di.item_id, 0.0) + _f(di.qty_despachada)
             )
@@ -1943,6 +1994,20 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
         iid: max(0.0, qty - fact_retiro_item.get(iid, 0.0))
         for iid, qty in fact_qty_item.items()
     }
+    # Consumo del canal guía CONTRA EL CUPO de este documento (`firmado − esto`). Para la
+    # FACTURA el cupo es lo FIRMADO, así que lo que las boletas consumieron de guías SIN
+    # firmar no sale de ese cupo (ver _qty_boleta_en_guia_sin_firma_por_item). Variable
+    # APARTE a propósito: `pendiente_guias_item` (el tope del retiro, abajo) sigue usando
+    # el consumo completo — lo boleteado de una guía ya no está pendiente en ella. El
+    # techo global vendido − facturado TOTAL sigue intacto: nada se puede sobre-facturar.
+    fact_guia_cupo = fact_guia_item
+    if exige_firma:
+        boleta_sin_firma = _qty_boleta_en_guia_sin_firma_por_item(db, cot.id)
+        if boleta_sin_firma:
+            fact_guia_cupo = {
+                iid: max(0.0, qty - boleta_sin_firma.get(iid, 0.0))
+                for iid, qty in fact_guia_item.items()
+            }
     comprometida_viva = _qty_comprometida_en_despachos_por_item(db, cot.id)
     pendiente_guias_item = {
         iid: max(0.0, qty - fact_guia_item.get(iid, 0.0))
@@ -1975,7 +2040,7 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
                 probs.add(404, "Despacho no encontrado para esta venta")
             elif desp_sel.estado != "despachado":
                 probs.add(400, "Solo se puede facturar una guía en estado 'despachado'")
-            elif not getattr(desp_sel, "guia_firmada", 0):
+            elif not _cuenta_como_firmada(desp_sel):
                 # Mismo texto que el modo despacho (un solo mensaje por regla).
                 probs.add(400, "La guía de este despacho no está FIRMADA por el cliente: "
                                "márcala en Despachos (subiendo la foto/PDF firmada y la "
@@ -2009,7 +2074,7 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
             probs.add(404, "Despacho no encontrado para esta venta")
         elif desp.estado != "despachado":
             probs.add(400, "Solo se puede facturar una guía en estado 'despachado'")
-        elif not getattr(desp, "guia_firmada", 0):
+        elif not _cuenta_como_firmada(desp):
             # REGLA 2026-08-06 (espejo del guard de routers/contabilidad.py de GA):
             # SOLO se factura una guía FIRMADA — entregada y firmada por el cliente.
             # La marca la pone Despachos (foto/PDF + fecha); acá únicamente se exige.
@@ -2025,6 +2090,11 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
             if not (desp.numero_guia or "").strip():
                 advertencias.append("El despacho no tiene N° de guía registrado: la factura "
                                     "quedará sin referencia de guía (complétalo en Despachos)")
+            # Boleta sobre una guía SIN firmar: permitido (excepción B2C de arriba), pero
+            # se deja dicho para que nadie lo lea después como "firma olvidada".
+            if not exige_firma and not getattr(desp, "guia_firmada", 0):
+                advertencias.append("Boleta sobre un despacho con la guía SIN firmar: "
+                                    "permitido para boletas (venta B2C)")
             usado_deriv = {}
             # Ítems del despacho elegido
             desp_item_rows = db.query(MonzaDespachoItem).filter(
@@ -2046,7 +2116,7 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
                 )
                 disp_item = min(
                     desp_qty_item_firmada.get(di.item_id, 0.0)
-                    - fact_guia_item.get(di.item_id, 0.0),
+                    - fact_guia_cupo.get(di.item_id, 0.0),
                     techo_global,
                 ) - usado_deriv.get(di.item_id, 0.0)
                 disponible = min(disp_di, disp_item)
@@ -2067,7 +2137,7 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
                 # antigua devuelve el cupo, porque sube el firmado del ítem).
                 legado = any(
                     desp_qty_item_firmada.get(di.item_id, 0.0)
-                    - fact_guia_item.get(di.item_id, 0.0) < -TOL_QTY
+                    - fact_guia_cupo.get(di.item_id, 0.0) < -TOL_QTY
                     for di in desp_item_rows
                 )
                 if legado:
@@ -2125,7 +2195,7 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
                     probs.add(400, f"{it.numero_parte or it.descripcion} no ha sido despachado; no se puede facturar")
                 continue
             disponible = min(
-                despachado_item - fact_guia_item.get(ln.item_cotizacion_id, 0.0),
+                despachado_item - fact_guia_cupo.get(ln.item_cotizacion_id, 0.0),
                 _f(it.cantidad) - fact_qty_item.get(ln.item_cotizacion_id, 0.0),
             ) - usado_item.get(ln.item_cotizacion_id, 0.0)
             if ln.despacho_item_id is not None:
@@ -2134,7 +2204,7 @@ def _construir_factura(db: Session, payload: FacturaCreate, cot: MonzaCotizacion
                     probs.add(400, f"Guía/despacho inválido para {it.numero_parte or it.descripcion}")
                     continue
                 d_de_linea = desp_by_id.get(di.despacho_id)
-                if not d_de_linea or not getattr(d_de_linea, "guia_firmada", 0):
+                if not d_de_linea or not _cuenta_como_firmada(d_de_linea):
                     probs.add(400, "La guía de este despacho no está FIRMADA por el cliente: "
                                    "márcala en Despachos (subiendo la foto/PDF firmada y la "
                                    "fecha de la firma) antes de facturar")
@@ -2640,6 +2710,93 @@ def preview_factura(
     }
 
 
+# ── Registro MANUAL verificado (2026-09-29) ───────────────────────────────────────
+# Todo folio tecleado se verifica contra Wasabil o se declara emitido fuera de Wasabil.
+# La decisión vive en verificacion_folio.py (lógica pura); acá solo el cableado HTTP y la
+# auditoría. Ver el docstring de ese módulo para el porqué de cada regla.
+
+def _folio_duplicado(db: Session, tipo_doc: str, folio: str) -> Optional[MonzaContFacturaCliente]:
+    """Otra factura local con el MISMO tipo y folio. Por tipo, no global: ante el SII la
+    boleta N° 35 y la factura N° 35 son documentos distintos (uq_monza_cont_factura_tipo_folio)."""
+    return db.query(MonzaContFacturaCliente).filter(
+        MonzaContFacturaCliente.tipo_doc == tipo_doc,
+        MonzaContFacturaCliente.numero_factura == folio,
+    ).first()
+
+
+def _validar_origen_folio(payload: FacturaCreate) -> str:
+    """Origen obligatorio y, si es externo, la declaración con contenido REAL (strip).
+    Devuelve el origen. 400 con mensaje para el operador si falta algo."""
+    origen = payload.origen_folio
+    if origen not in (ORIGEN_WASABIL, ORIGEN_EXTERNO):
+        raise HTTPException(400, "Indica el origen del documento: «Emitido en Wasabil» (se "
+                                 "verifica) o «Emitido fuera de Wasabil»")
+    if origen == ORIGEN_EXTERNO and len((payload.declaracion_externo or "").strip()) < DECLARACION_MIN:
+        raise HTTPException(400, "Para un documento emitido fuera de Wasabil escribe dónde y por "
+                                 f"qué se emitió (mínimo {DECLARACION_MIN} caracteres): queda como "
+                                 "respaldo de la factura")
+    return origen
+
+
+def _verificar_folio_http(payload: FacturaCreate, tipo_doc: str, folio, datos: dict,
+                          cot: MonzaCotizacion) -> ResultadoFolio:
+    """verificar_folio con los errores traducidos a HTTP: dato mal tecleado → 400,
+    Wasabil sin respuesta → 503 (no se registra nada: decisión del dueño)."""
+    cli = cot.cliente
+    try:
+        return verificar_folio(
+            tipo_doc=tipo_doc, folio=folio, origen=payload.origen_folio,
+            bruto_esperado=datos["bruto"], rut_esperado=(cli.rut if cli else None),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except FolioNoVerificable as e:
+        logger.warning("Verificación de folio Monza sin respuesta de Wasabil: %s", e)
+        raise HTTPException(503, str(e))
+
+
+@router.post("/facturas/verificar-folio")
+def verificar_folio_factura(
+    payload: FacturaCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """VERIFICA el folio de un documento ya emitido ANTES de registrarlo (botón «Verificar
+    en Wasabil» del modal). No persiste nada y no bloquea la venta: el POST /facturas
+    vuelve a verificar todo bajo lock — esto es para que el operador vea el resultado
+    (tipo, fecha, receptor, total de Wasabil vs total a registrar) antes del clic.
+
+    Los montos a comparar salen de las MISMAS funciones que valida el POST
+    (`_construir_factura` / `_construir_factura_anticipo`), así que lo que dice «verificado»
+    acá es lo mismo que se va a registrar. Si los datos de la factura tienen problemas
+    (guía sin firmar, tope, receptor), se devuelven como tales en vez de consultar Wasabil:
+    no tiene sentido verificar un folio para una factura que no se puede registrar."""
+    tipo_doc = payload.tipo_doc or "factura"
+    if payload.es_anticipo and tipo_doc != "factura":
+        raise HTTPException(400, "La factura de anticipo debe ser tipo 'factura' (no boleta)")
+    _validar_origen_folio(payload)
+    cot = _cargar_venta(db, payload.cotizacion_id, lock=False)
+    datos = (_construir_factura_anticipo(db, payload, cot) if payload.es_anticipo
+             else _construir_factura(db, payload, cot, acumular=True))
+    if datos["problemas"]:
+        return {"ok": False, "estado": "datos_factura",
+                "mensaje": " · ".join(datos["problemas"]),
+                "documento": None, "advertencias": [], "bruto_a_registrar": datos["bruto"]}
+    try:
+        folio = str(normalizar_folio(payload.numero_factura))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    otra = _folio_duplicado(db, tipo_doc, folio)
+    if otra:
+        venta = f" (venta {otra.numero_cotizacion})" if otra.numero_cotizacion else ""
+        return {"ok": False, "estado": "duplicado",
+                "mensaje": f"El folio {folio} ya está registrado en la {tipo_doc} local "
+                           f"#{otra.id}{venta}",
+                "documento": None, "advertencias": [], "bruto_a_registrar": datos["bruto"]}
+    resultado = _verificar_folio_http(payload, tipo_doc, folio, datos, cot)
+    return {**resultado.as_dict(), "bruto_a_registrar": datos["bruto"]}
+
+
 @router.post("/facturas")
 def crear_factura(
     payload: FacturaCreate,
@@ -2674,14 +2831,25 @@ def crear_factura(
     # verifican las suites. _construir_factura lo revalida — es una función pura.
     _validar_receptor_factura(cot, tipo_doc, _ProblemasFactura(acumular=False))
 
+    # REGISTRO VERIFICADO (2026-09-29): con MONZA_FOLIO_VERIFICACION (default en PROD) el
+    # origen del documento es obligatorio y el folio también para BOLETA — sin folio no
+    # hay nada que verificar, y una boleta sin número no se puede rastrear ante el SII.
+    # Con el flag apagado rige exactamente la regla anterior (ver config.py).
+    verificar = settings.MONZA_FOLIO_VERIFICACION
+    if verificar:
+        _validar_origen_folio(payload)
+
     # Folio SII: OBLIGATORIO para tipo 'factura' (hoy se digita a mano del DTE emitido;
-    # espejo GA contabilidad.py pre-Wasabil) y único. Una boleta puede quedar sin folio
-    # (el UNIQUE admite NULLs). `.strip()` de paso rechaza el folio de puros espacios.
-    # Se valida ANTES de derivar líneas: un reenvío con el mismo folio debe decir
-    # "folio duplicado", no "esta venta ya fue facturada por completo".
+    # espejo GA contabilidad.py pre-Wasabil) y único. Sin verificación, una boleta puede
+    # quedar sin folio (el UNIQUE admite NULLs). `.strip()` de paso rechaza el folio de
+    # puros espacios. Se valida ANTES de derivar líneas: un reenvío con el mismo folio
+    # debe decir "folio duplicado", no "esta venta ya fue facturada por completo".
     folio = (payload.numero_factura or "").strip()
     if tipo_doc == "factura" and not folio:
         raise HTTPException(400, "Ingresa el folio SII de la factura (o cámbialo a boleta)")
+    if verificar and not folio:
+        raise HTTPException(400, "Ingresa el folio SII de la boleta: se verifica contra Wasabil "
+                                 "antes de registrarla")
     # Folio NUMÉRICO cuando la factura es un ANTICIPO. La factura del despacho lo va a
     # citar en una referencia tipo 33, y el SII exige que el FolioRef sea el folio
     # correlativo —un número— del DTE referenciado. El módulo de facturas electrónicas
@@ -2703,12 +2871,18 @@ def crear_factura(
             "correlativo que le asignó el SII: la factura de la mercadería la va a "
             "referenciar (referencia tipo 33) y el SII solo acepta folios numéricos de "
             "hasta 18 dígitos. Escríbelo con dígitos, sin letras, guiones ni espacios.")
+    if verificar:
+        # Con verificación el folio se guarda NORMALIZADO ('035' → '35'): es el mismo
+        # documento ante el SII y así el UNIQUE por tipo no deja pasar la variante.
+        try:
+            folio = str(normalizar_folio(folio))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     if folio:
-        dup = db.query(MonzaContFacturaCliente).filter(
-            MonzaContFacturaCliente.numero_factura == folio,
-        ).first()
-        if dup:
-            raise HTTPException(409, f"El folio {folio} ya existe")
+        # Duplicado POR TIPO (uq_monza_cont_factura_tipo_folio): la boleta N° 35 no choca
+        # con la factura N° 35 — son numeraciones distintas ante el SII.
+        if _folio_duplicado(db, tipo_doc, folio):
+            raise HTTPException(409, f"El folio {folio} ya existe ({tipo_doc})")
 
     # acumular=False: cada regla incumplida sale con su propio código/mensaje, igual
     # que cuando este endpoint era un bloque único. La vía B (anticipo) tiene su propio
@@ -2725,16 +2899,42 @@ def crear_factura(
     if datos["problemas"]:
         raise HTTPException(datos["problemas_status"] or 409, " · ".join(datos["problemas"]))
 
+    # Verificación contra Wasabil DESPUÉS de construir (el total a comparar es el que se
+    # va a persistir) y con la venta ya bloqueada: el tope no se mueve mientras se
+    # consulta. El front ya verificó, pero acá se RE-verifica: el servidor nunca confía
+    # en un "ok" del navegador. Timeout corto (10 s) porque el lock está tomado.
+    verificacion: Optional[ResultadoFolio] = None
+    if verificar:
+        verificacion = _verificar_folio_http(payload, tipo_doc, folio, datos, cot)
+        if not verificacion.ok:
+            raise HTTPException(409, verificacion.mensaje)
+        doc = verificacion.documento or {}
+        if payload.origen_folio == ORIGEN_WASABIL and doc.get("fecha"):
+            # La fecha tributaria es la del documento emitido, no la que se tecleó:
+            # copia inmutable del payload (el resto del flujo lee payload.fecha_emision).
+            payload = payload.model_copy(update={"fecha_emision": doc["fecha"]})
+
     try:
         factura = _persistir_factura(
             db, payload, cot, datos, folio=folio or None, tipo_doc=tipo_doc,
             usuario_id=getattr(current_user, "id", None), aplicar_adelantos=True,
         )
+        if verificacion is not None:
+            # Auditoría del registro manual: quién, cuándo, contra qué documento de
+            # Wasabil (uuid) o con qué declaración si se emitió fuera.
+            factura.origen_folio = payload.origen_folio
+            factura.wasabil_uuid = (verificacion.documento or {}).get("uuid")
+            factura.folio_verificado_por = getattr(current_user, "id", None)
+            factura.folio_verificado_at = datetime.utcnow()
+            if payload.origen_folio == ORIGEN_EXTERNO:
+                factura.declaracion_externo = (payload.declaracion_externo or "").strip()
         db.commit()
     except IntegrityError as e:
         db.rollback()
         orig = str(getattr(e, "orig", e))
-        if "uq_monza_cont_factura_folio" in orig:
+        # Los dos nombres: el nuevo (por tipo) y el viejo (global), por si la migración
+        # aún no corrió en ese servidor.
+        if "uq_monza_cont_factura_tipo_folio" in orig or "uq_monza_cont_factura_folio" in orig:
             raise HTTPException(409, "Folio de factura duplicado")
         logger.error("IntegrityError al crear factura Monza: %s", orig)
         raise HTTPException(409, "No se pudo guardar la factura (conflicto de integridad)")
@@ -2749,7 +2949,8 @@ def crear_factura(
     # factura en $0 marcada «Pagada» sin ninguna explicación. Campo ADITIVO —siempre
     # presente, lista vacía cuando no hay nada que decir— para que el front no tenga que
     # distinguir entre "sin advertencias" y "backend viejo".
-    out["advertencias"] = list(datos.get("advertencias") or [])
+    out["advertencias"] = list(datos.get("advertencias") or []) + \
+        (list(verificacion.advertencias) if verificacion is not None else [])
     return out
 
 

@@ -13,6 +13,7 @@ import { fmtClp, hoyLocal } from "../utils/format";
 import { monzaContabilidadAPI, monzaDespachosAPI, monzaWasabilAPI } from "../services/monzaApi";
 import type {
   MonzaDteFacturaInfo, MonzaDescuentoAnticipo, MonzaFacturaPayload, MonzaFacturaPreview,
+  MonzaOrigenFolio, MonzaVerificacionFolio,
 } from "../services/monzaApi";
 // La guía firmada se abre con monzaDespachosAPI.abrirGuiaFirmada (2026-08-06): el
 // abrirDocumento de services/api.ts pega al serve de GA, que exige empresa 'mineria'
@@ -677,6 +678,128 @@ function EmisionFacturaSIIModal({ payload, facturaId, onDone, onVolver, onCerrar
   );
 }
 
+// ─── Registro MANUAL verificado (2026-09-29) ──────────────────────────────────
+// Todo documento ya emitido que se registra a mano declara su ORIGEN y se verifica:
+//   · «Emitido en Wasabil» → el backend consulta Wasabil (tipo, emitido, total y, en
+//     factura, RUT del cliente). La fecha de emisión se toma del documento.
+//   · «Emitido fuera de Wasabil» → sin dónde verificarlo: declaración obligatoria que
+//     queda auditada (y si el folio SÍ está en Wasabil, el backend lo rechaza).
+// La verificación vale SOLO para lo que se verificó: cambiar venta, despacho, tipo,
+// folio u origen la invalida (la `clave`), y el POST de registro re-verifica todo en el
+// servidor. Wasabil caído = no se registra (decisión del dueño): se reintenta.
+const DECLARACION_MIN = 10;  // mismo mínimo que valida el backend (verificacion_folio.py)
+
+function useVerificacionFolio(clave: string) {
+  const [resultado, setResultado] = useState<{ clave: string; datos: MonzaVerificacionFolio } | null>(null);
+  const [verificando, setVerificando] = useState(false);
+  const verificar = async (payload: MonzaFacturaPayload) => {
+    const pedida = clave;
+    setVerificando(true);
+    try {
+      const { data } = await monzaContabilidadAPI.verificarFolio(payload);
+      setResultado({ clave: pedida, datos: data });
+    } catch (e: unknown) {
+      // 503 (Wasabil no respondió) y 400 (folio mal escrito) llegan con su texto: se
+      // muestran en la misma tarjeta, nunca en silencio.
+      setResultado({ clave: pedida, datos: {
+        ok: false, estado: "error", mensaje: errMsg(e, "No se pudo verificar el folio"),
+        documento: null, advertencias: [], bruto_a_registrar: 0,
+      } });
+    } finally { setVerificando(false); }
+  };
+  // Solo cuenta la verificación de ESTOS datos: una vieja no habilita nada.
+  const verificacion = resultado && resultado.clave === clave ? resultado.datos : null;
+  return { verificacion, verificando, verificar };
+}
+
+/** ¿El registro manual está listo para enviarse? (verificación vigente y OK; y si es
+ *  externo, declaración con contenido + casilla marcada). */
+function folioManualListo(origen: MonzaOrigenFolio, verif: MonzaVerificacionFolio | null,
+                          declaracion: string, confirmaExterno: boolean): boolean {
+  if (!verif?.ok) return false;
+  if (origen === "externo") return declaracion.trim().length >= DECLARACION_MIN && confirmaExterno;
+  return true;
+}
+
+interface PanelFolioManualProps {
+  origen: MonzaOrigenFolio; onOrigen: (o: MonzaOrigenFolio) => void;
+  declaracion: string; onDeclaracion: (v: string) => void;
+  confirmaExterno: boolean; onConfirmaExterno: (v: boolean) => void;
+  /** El preview está OK y hay folio: recién ahí tiene sentido consultar Wasabil. */
+  puedeVerificar: boolean;
+  verificando: boolean;
+  verificacion: MonzaVerificacionFolio | null;
+  onVerificar: () => void;
+}
+
+function PanelFolioManual(p: PanelFolioManualProps) {
+  const s = useStyles();
+  const inp = useInput();
+  const doc = p.verificacion?.documento;
+  const opcion = (valor: MonzaOrigenFolio, titulo: string, detalle: string) => (
+    <label style={{ flex: 1, display: "flex", gap: 8, alignItems: "flex-start", cursor: "pointer", padding: "8px 10px", borderRadius: 8,
+      border: p.origen === valor ? "1px solid var(--monza-accent)" : s.cardBd, background: p.origen === valor ? s.sub : "transparent" }}>
+      <input type="radio" name="origen-folio" checked={p.origen === valor} onChange={() => p.onOrigen(valor)}
+        style={{ accentColor: "var(--monza-accent)", marginTop: 2 }} />
+      <span style={{ fontSize: 12, color: s.text }}><b>{titulo}</b>
+        <span style={{ display: "block", fontSize: 11, color: s.muted }}>{detalle}</span></span>
+    </label>
+  );
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <Field label="Origen del documento *">
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {opcion("wasabil", "Emitido en Wasabil", "Se verifica el folio contra Wasabil")}
+          {opcion("externo", "Emitido fuera de Wasabil", "Portal SII, POS u otro sistema")}
+        </div>
+      </Field>
+      {p.origen === "externo" && (
+        <>
+          <Field label="¿Dónde y por qué se emitió fuera de Wasabil? *">
+            <input style={inp} value={p.declaracion} onChange={e => p.onDeclaracion(e.target.value)} maxLength={500}
+              placeholder="Ej. Boleta emitida en el POS de la tienda el 12-09" />
+          </Field>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, color: s.text }}>
+            <input type="checkbox" checked={p.confirmaExterno} onChange={e => p.onConfirmaExterno(e.target.checked)} style={{ accentColor: "var(--monza-accent)" }} />
+            Confirmo que el documento existe ante el SII con este folio y tipo
+          </label>
+        </>
+      )}
+      <button type="button" onClick={p.onVerificar} disabled={!p.puedeVerificar || p.verificando}
+        style={{ ...btnSecondary(s), opacity: (!p.puedeVerificar || p.verificando) ? 0.5 : 1, cursor: (!p.puedeVerificar || p.verificando) ? "not-allowed" : "pointer" }}>
+        {p.verificando ? <Loader2 size={14} className="animate-spin" /> : <Search size={14} />}
+        {p.origen === "wasabil" ? "Verificar folio en Wasabil" : "Comprobar que el folio no está en Wasabil"}
+      </button>
+      {p.verificacion && (
+        <div style={{ padding: "8px 10px", borderRadius: 8, fontSize: 12,
+          border: `1px solid ${p.verificacion.ok ? "rgba(16,185,129,0.45)" : "rgba(239,68,68,0.35)"}`,
+          background: p.verificacion.ok ? "rgba(16,185,129,0.10)" : "rgba(239,68,68,0.10)",
+          color: p.verificacion.ok ? "#15803D" : "#B91C1C" }}>
+          <div style={{ display: "flex", gap: 6, alignItems: "flex-start" }}>
+            {p.verificacion.ok ? <CheckCircle2 size={14} style={{ flexShrink: 0, marginTop: 1 }} /> : <AlertCircle size={14} style={{ flexShrink: 0, marginTop: 1 }} />}
+            <span>{p.verificacion.mensaje}</span>
+          </div>
+          {doc && (
+            <div style={{ marginTop: 6, display: "flex", gap: 12, flexWrap: "wrap", fontSize: 11, color: s.muted }}>
+              <span>Tipo <b style={{ color: s.text }}>{doc.tipo_sii || "—"}</b></span>
+              <span>Folio <b style={{ color: s.text }}>{doc.folio || "—"}</b></span>
+              <span>Fecha <b style={{ color: s.text }}>{fmtDate(doc.fecha)}</b></span>
+              <span>Receptor <b style={{ color: s.text }}>{doc.receptor_nombre || "—"}</b>{doc.receptor_rut ? ` · ${doc.receptor_rut}` : ""}</span>
+              <span>Total Wasabil <b style={{ color: s.text }}>{doc.total != null ? fmtClp(doc.total) : "—"}</b></span>
+              <span>A registrar <b style={{ color: s.text }}>{fmtClp(p.verificacion.bruto_a_registrar)}</b></span>
+            </div>
+          )}
+          {p.verificacion.advertencias.length > 0 && (
+            <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 11, color: "#B45309" }}>
+              {p.verificacion.advertencias.map((a, i) => <li key={i}>{a}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Modal: emitir factura (desde un despacho/guía de una cotización) ──────────
 // Fila del selector de ventas. `cond_pago` es la condición PACTADA en la venta
 // (cotizacion.forma_pago): el backend siempre la publicó y la pantalla la descartaba.
@@ -722,6 +845,23 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
   const [loadingPrev, setLoadingPrev] = useState(false);
   const [prevError, setPrevError] = useState("");
   const [reintentoPrev, setReintentoPrev] = useState(0);  // re-consulta el preview tras un error
+  // Registro MANUAL verificado (2026-09-29): origen del documento + verificación.
+  const [origen, setOrigen] = useState<MonzaOrigenFolio>("wasabil");
+  const [declaracion, setDeclaracion] = useState("");
+  const [confirmaExterno, setConfirmaExterno] = useState(false);
+  const claveVerif = JSON.stringify([cotId, sinGuia ? "retiro" : despachoId, tipo, folio.trim(), origen]);
+  const { verificacion, verificando, verificar } = useVerificacionFolio(claveVerif);
+  // BOLETA (venta B2C): no exige guía firmada — decisión del dueño 2026-09-29.
+  const esBoleta = tipo === "boleta";
+  const fechaDeWasabil = !modoSii && origen === "wasabil" && !!verificacion?.ok && !!verificacion.documento?.fecha;
+
+  // La fecha tributaria de un documento verificado es la de Wasabil (el backend la
+  // impone igual): se copia al formulario para que lo que se ve sea lo que se registra.
+  useEffect(() => {
+    if (origen === "wasabil" && verificacion?.ok && verificacion.documento?.fecha) {
+      setFecha(verificacion.documento.fecha);
+    }
+  }, [verificacion, origen]);
 
   useEffect(() => {
     monzaContabilidadAPI.listVentas().then(({ data }) =>
@@ -775,9 +915,14 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
 
   // El FOLIO no entra en `puede_emitir` (eso habla de los DATOS de la factura): se
   // exige aparte y solo en la vía manual, donde el operador ya tiene el DTE en la mano.
-  const folioFaltante = tipo === "factura" && !modoSii && !folio.trim();
-  const puedeEmitir = !!preview && preview.puede_emitir
-    && (preview.lineas?.length ?? 0) > 0 && !folioFaltante && !loadingPrev;
+  // Desde 2026-09-29 también en BOLETA: sin folio no hay nada que verificar.
+  const folioFaltante = !modoSii && !folio.trim();
+  const datosOk = !!preview && preview.puede_emitir
+    && (preview.lineas?.length ?? 0) > 0 && !loadingPrev;
+  // Vía manual: además del preview, la verificación del folio tiene que estar vigente
+  // y OK (y la declaración completa si el documento se emitió fuera de Wasabil).
+  const puedeEmitir = datosOk && (modoSii
+    || (!folioFaltante && folioManualListo(origen, verificacion, declaracion, confirmaExterno)));
   const ivaLabelPreview = etiquetaIva(preview?.totales?.iva_rate);
 
   // Payload COMÚN a los dos modos y SIN folio: el modo SII lo persiste en NULL (el
@@ -795,6 +940,13 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
       || (plazo === "" ? undefined : (Number(plazo) === 0 ? "Contado" : `${plazo} días`)),
     observaciones: obs || undefined,
   });
+  // Vía MANUAL: el mismo payload + origen del documento (y la declaración si es externo).
+  // Lo usan la verificación y el registro, así los dos hablan exactamente de lo mismo.
+  const payloadManual = (): MonzaFacturaPayload => ({
+    ...armarPayload(),
+    origen_folio: origen,
+    ...(origen === "externo" ? { declaracion_externo: declaracion.trim() } : {}),
+  });
 
   const submit = async () => {
     if (!cotId) { toast.error("Selecciona la venta"); return; }
@@ -806,11 +958,11 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
       setSiiPayload(armarPayload());
       return;
     }
-    if (tipo === "factura" && !folio.trim()) { toast.error("Ingresa el folio SII de la factura"); return; }
+    if (!folio.trim()) { toast.error(`Ingresa el folio SII de la ${tipo}`); return; }
     setSaving(true);
     try {
-      const { data } = await monzaContabilidadAPI.crearFactura({ ...armarPayload(), numero_factura: folio.trim() || undefined });
-      toast.success("Factura registrada");
+      const { data } = await monzaContabilidadAPI.crearFactura({ ...payloadManual(), numero_factura: folio.trim() });
+      toast.success(tipo === "boleta" ? "Boleta registrada" : "Factura registrada");
       avisarAdvertencias(data?.advertencias);
       onDone(); onClose();
     } catch (e: unknown) { toast.error(errMsg(e, "No se pudo registrar la factura")); } finally { setSaving(false); }
@@ -850,16 +1002,17 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
             {/* Con TODAS las guías sin firmar, "Selecciona despacho…" mentía (no hay
                 nada seleccionable): el placeholder lo dice y el aviso ámbar de abajo
                 explica cómo destrabarlo. */}
-            <option value="">{cotId ? (despachos.length ? (despachos.every(d => !d.guia_firmada) ? "Todas las guías están SIN FIRMAR (se marca en Despachos)" : "Selecciona despacho…") : "Sin despachos por facturar") : "Elige una venta primero"}</option>
+            <option value="">{cotId ? (despachos.length ? (despachos.every(d => !d.guia_firmada) && !esBoleta ? "Todas las guías están SIN FIRMAR (se marca en Despachos)" : "Selecciona despacho…") : "Sin despachos por facturar") : "Elige una venta primero"}</option>
             {/* «sin fecha» avisa acá que esa guía en papel no se va a poder emitir al SII:
                 la referencia 52 exige la fecha de emisión. Se carga en Despachos → Editar.
-                «SIN FIRMAR» va DESHABILITADA (regla 2026-08-06): el backend igual la
-                rechaza — el disabled evita elegir algo que va a fallar y dice por qué. */}
-            {despachos.map(d => <option key={d.id} value={d.id} disabled={!d.guia_firmada}>{d.numero_despacho}{d.numero_guia ? ` · Guía ${d.numero_guia}${d.fecha_guia ? "" : " (sin fecha)"}` : ""} ({d.items_count} ítems){d.guia_firmada ? ` · firmada${d.fecha_firma ? ` ${d.fecha_firma.slice(0, 10).split("-").reverse().join("-")}` : ""}` : " · SIN FIRMAR — márcala en Despachos"}</option>)}
+                «SIN FIRMAR» va DESHABILITADA para FACTURA (regla 2026-08-06): el backend
+                igual la rechaza — el disabled evita elegir algo que va a fallar y dice
+                por qué. Para BOLETA se habilita (venta B2C, decisión del dueño 2026-09-29). */}
+            {despachos.map(d => <option key={d.id} value={d.id} disabled={!d.guia_firmada && !esBoleta}>{d.numero_despacho}{d.numero_guia ? ` · Guía ${d.numero_guia}${d.fecha_guia ? "" : " (sin fecha)"}` : ""} ({d.items_count} ítems){d.guia_firmada ? ` · firmada${d.fecha_firma ? ` ${d.fecha_firma.slice(0, 10).split("-").reverse().join("-")}` : ""}` : esBoleta ? " · sin firmar (permitido en boleta)" : " · SIN FIRMAR — márcala en Despachos"}</option>)}
           </select>
           {/* Guías bloqueadas por falta de firma: se dice ACÁ, no solo dentro del
-              <option> deshabilitado (que en gris chico nadie lee). */}
-          {despachos.some(d => !d.guia_firmada) && (
+              <option> deshabilitado (que en gris chico nadie lee). En boleta no aplica. */}
+          {!esBoleta && despachos.some(d => !d.guia_firmada) && (
             <div style={{ marginTop: 6, fontSize: 11, color: "#B45309" }}>
               ⚠ {despachos.filter(d => !d.guia_firmada).length === 1 ? "Hay 1 guía que no se puede facturar" : `Hay ${despachos.filter(d => !d.guia_firmada).length} guías que no se pueden facturar`} porque
               el cliente aún no la{despachos.filter(d => !d.guia_firmada).length === 1 ? "" : "s"} firma: súbela{despachos.filter(d => !d.guia_firmada).length === 1 ? "" : "s"} en
@@ -882,6 +1035,8 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
                   </button>
                 ) : d.guia_firmada ? (
                   <span style={{ color: "#B45309" }}>⚠ Marcada como firmada, pero <b>sin foto de respaldo adjunta</b> (firmas antiguas; re-fírmala en Despachos para adjuntarla)</span>
+                ) : esBoleta ? (
+                  <span>Guía sin firmar: <b>permitido para boleta</b> (venta B2C).</span>
                 ) : (
                   <span style={{ color: "#B45309" }}>⚠ Esta guía <b>no está firmada</b>: no se puede facturar. Márcala en <b>Despachos → Marcar guía firmada</b>.</span>
                 )}
@@ -1004,8 +1159,8 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
             <div style={{ ...inp, color: s.muted, fontSize: 13 }}>Lo asigna el SII al emitir</div>
           </Field>
         ) : (
-          <Field label={`N° Factura (folio SII)${tipo === "factura" ? " *" : ""}`}>
-            <input style={inp} value={folio} onChange={e => setFolio(e.target.value)} placeholder="Ej. 35" />
+          <Field label={`N° ${esBoleta ? "Boleta" : "Factura"} (folio SII) *`}>
+            <input style={inp} value={folio} onChange={e => setFolio(e.target.value)} placeholder="Ej. 35" inputMode="numeric" />
           </Field>
         )}
         <Field label="Tipo">
@@ -1013,28 +1168,49 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
               factura, y así el usuario no lee "Emitir al SII" para chocar con un 409. */}
           {/* Volver a "factura" REPONE el modo SII (que es el default): quedarse en
               manual en silencio hacía que el usuario tecleara un folio sin querer. */}
-          <select style={inp} value={tipo} onChange={e => { setTipo(e.target.value); setModoSii(e.target.value === "factura"); }}>
+          {/* Cambiar el tipo SUELTA el despacho elegido: una guía sin firmar válida para
+              boleta no lo es para factura (y el selector la deshabilita). */}
+          <select style={inp} value={tipo} onChange={e => { setTipo(e.target.value); setModoSii(e.target.value === "factura"); setDespachoId(""); }}>
             <option value="factura">Factura</option><option value="boleta">Boleta</option>
           </select>
         </Field>
-        <Field label="Fecha emisión"><input type="date" style={inp} value={fecha} onChange={e => setFecha(e.target.value)} /></Field>
+        {/* Documento verificado en Wasabil: la fecha es la del documento (el backend la
+            impone igual), así que no se edita. */}
+        <Field label="Fecha emisión"><input type="date" style={{ ...inp, opacity: fechaDeWasabil ? 0.6 : 1 }} value={fecha} disabled={fechaDeWasabil} onChange={e => setFecha(e.target.value)} /></Field>
         <Field label="Plazo (días)"><input type="number" style={inp} value={plazo} onChange={e => setPlazo(e.target.value)} /></Field>
       </div>
       <Field label="Observaciones (opcional)">
         <input style={inp} value={obs} onChange={e => setObs(e.target.value)}
           placeholder={sinGuia ? "Ej. retira Juan Pérez (si lo dejas vacío: \"Retiro en oficina\")" : "Notas de la factura"} />
       </Field>
+      {/* Registro MANUAL verificado (2026-09-29): origen + verificación del folio. */}
+      {!modoSii && (
+        <PanelFolioManual
+          origen={origen} onOrigen={setOrigen}
+          declaracion={declaracion} onDeclaracion={setDeclaracion}
+          confirmaExterno={confirmaExterno} onConfirmaExterno={setConfirmaExterno}
+          puedeVerificar={datosOk && !folioFaltante}
+          verificando={verificando} verificacion={verificacion}
+          onVerificar={() => verificar({ ...payloadManual(), numero_factura: folio.trim() })}
+        />
+      )}
       {/* A6 · El botón lo gobierna el PREVIEW (`puede_emitir`): antes era disabled={saving}
           a secas y se podía disparar un DTE real —o registrar un folio ya consumido—
-          sobre datos que el backend iba a rechazar. */}
+          sobre datos que el backend iba a rechazar. En la vía manual, además, la
+          verificación del folio (2026-09-29). */}
       <button onClick={submit} disabled={saving || !puedeEmitir}
         style={{ ...btnPrimary(), opacity: (saving || !puedeEmitir) ? 0.5 : 1, cursor: (saving || !puedeEmitir) ? "not-allowed" : "pointer" }}>
         {saving ? <Loader2 className="animate-spin" size={16} /> : modoSii ? <Send size={16} /> : <Receipt size={16} />}
-        {modoSii ? "Emitir factura al SII" : "Registrar factura emitida"}
+        {modoSii ? "Emitir factura al SII" : `Registrar ${esBoleta ? "boleta" : "factura"} emitida`}
       </button>
       {folioFaltante && (
         <p style={{ fontSize: 11, color: "#B45309", margin: 0, textAlign: "center" }}>
-          Ingresa el folio SII de la factura ya emitida para poder registrarla.
+          Ingresa el folio SII de la {esBoleta ? "boleta" : "factura"} ya emitida para poder verificarla y registrarla.
+        </p>
+      )}
+      {!modoSii && !folioFaltante && datosOk && !verificacion && (
+        <p style={{ fontSize: 11, color: s.muted, margin: 0, textAlign: "center" }}>
+          Verifica el folio para habilitar el registro.
         </p>
       )}
       {/* El registro manual NUNCA se elimina: es el respaldo cuando Wasabil está
@@ -1119,6 +1295,18 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
   // El neto se teclea: el preview se consulta con el valor ASENTADO (~450 ms) para no
   // pedir una previsualización por cada tecla.
   const [netoDebounced, setNetoDebounced] = useState(0);
+  // Registro MANUAL verificado (2026-09-29): mismo panel que el modal de factura normal.
+  const [origen, setOrigen] = useState<MonzaOrigenFolio>("wasabil");
+  const [declaracion, setDeclaracion] = useState("");
+  const [confirmaExterno, setConfirmaExterno] = useState(false);
+  const claveVerif = JSON.stringify([cotId, montoNeto, confirmarSegundo, folio.trim(), origen]);
+  const { verificacion, verificando, verificar } = useVerificacionFolio(claveVerif);
+  const fechaDeWasabil = !modoSii && origen === "wasabil" && !!verificacion?.ok && !!verificacion.documento?.fecha;
+  useEffect(() => {
+    if (origen === "wasabil" && verificacion?.ok && verificacion.documento?.fecha) {
+      setFecha(verificacion.documento.fecha);
+    }
+  }, [verificacion, origen]);
 
   useEffect(() => {
     monzaContabilidadAPI.listVentas().then(({ data }) =>
@@ -1212,8 +1400,9 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
   // debounce no alcanza al campo, el anterior está desactualizado y no habilita nada.
   const previewVigente = preview && netoDebounced === neto ? preview : null;
   const ivaLabelPreview = etiquetaIva(preview?.totales?.iva_rate ?? ivaRate);
-  const puedeEmitir = !!previewVigente && previewVigente.puede_emitir
-    && neto > 0 && !excede && (modoSii || !!folio.trim());
+  const datosOk = !!previewVigente && previewVigente.puede_emitir && neto > 0 && !excede;
+  const puedeEmitir = datosOk && (modoSii
+    || (!!folio.trim() && folioManualListo(origen, verificacion, declaracion, confirmaExterno)));
 
   // Payload COMÚN a los dos modos y SIN folio: el modo SII lo persiste en NULL (lo
   // asigna el SII) y el manual lo agrega recién al llamar a crearFactura.
@@ -1231,6 +1420,11 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
     // Solo viaja marcado: sin esto el backend bloquea el 2º anticipo de la venta.
     ...(confirmarSegundo ? { confirmar_segundo_anticipo: true } : {}),
   });
+  const payloadManual = (): MonzaFacturaPayload => ({
+    ...armarPayload(),
+    origen_folio: origen,
+    ...(origen === "externo" ? { declaracion_externo: declaracion.trim() } : {}),
+  });
 
   const submit = async () => {
     if (!cotId) { toast.error("Selecciona la venta"); return; }
@@ -1243,7 +1437,7 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
     if (!folio.trim()) { toast.error("Ingresa el folio SII de la factura de anticipo"); return; }
     setSaving(true);
     try {
-      const { data } = await monzaContabilidadAPI.crearFactura({ ...armarPayload(), numero_factura: folio.trim() });
+      const { data } = await monzaContabilidadAPI.crearFactura({ ...payloadManual(), numero_factura: folio.trim() });
       toast.success("Factura de anticipo registrada — al facturar el despacho real se descuenta sola");
       // Acá salen los avisos que cambian lo que el usuario cree que pasó (p. ej. que el
       // adelanto NO se pudo mover a esta factura y quedó por cobrar).
@@ -1342,7 +1536,7 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
         <Field label="Monto NETO del anticipo (CLP)">
           <input type="number" style={inp} value={montoNeto} onChange={e => setMontoNeto(e.target.value)} placeholder="Ej. 50000" />
         </Field>
-        <Field label="Fecha emisión"><input type="date" style={inp} value={fecha} onChange={e => setFecha(e.target.value)} /></Field>
+        <Field label="Fecha emisión"><input type="date" style={{ ...inp, opacity: fechaDeWasabil ? 0.6 : 1 }} value={fecha} disabled={fechaDeWasabil} onChange={e => setFecha(e.target.value)} /></Field>
         <Field label="Plazo (días)">
           <input type="number" min={0} style={inp} value={plazo} onChange={e => setPlazo(e.target.value)} />
         </Field>
@@ -1434,6 +1628,17 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
         El RUT y la razón social salen de la <b style={{ color: s.text }}>venta</b>. Si faltan, complétalos en el Cierre de Venta
         y vuelve a intentar.
       </p>
+      {/* Registro MANUAL verificado (2026-09-29): origen + verificación del folio. */}
+      {!modoSii && (
+        <PanelFolioManual
+          origen={origen} onOrigen={setOrigen}
+          declaracion={declaracion} onDeclaracion={setDeclaracion}
+          confirmaExterno={confirmaExterno} onConfirmaExterno={setConfirmaExterno}
+          puedeVerificar={datosOk && !!folio.trim()}
+          verificando={verificando} verificacion={verificacion}
+          onVerificar={() => verificar({ ...payloadManual(), numero_factura: folio.trim() })}
+        />
+      )}
       {/* A6 · El botón lo gobierna el PREVIEW: emitir un anticipo es IRREVERSIBLE y antes
           se podía disparar con la ficha del cliente incompleta, sobre el cupo de la venta
           o duplicando un anticipo que ya existía (el backend lo rechazaba después). */}

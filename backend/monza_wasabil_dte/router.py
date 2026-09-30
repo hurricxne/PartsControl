@@ -2292,7 +2292,9 @@ def _finalizar_factura_emitida(db: Session, dte: MonzaWasabilDte) -> List[str]:
         db.flush()
     except IntegrityError:
         # Colisión con un folio ya registrado A MANO en otra factura local (el UNIQUE
-        # de Monza es global). El DTE queda EMITIDO igual: perder el folio de un
+        # de Monza es por tipo+folio desde 2026-09-29: acá solo puede chocar con otra
+        # FACTURA; una boleta con el mismo N° ya no colisiona). El DTE queda EMITIDO
+        # igual: perder el folio de un
         # documento ya vivo ante el SII sería peor que el duplicado.
         #
         # El mensaje tiene que traer el REMEDIO COMPLETO, porque desde aquí la venta se
@@ -2304,7 +2306,8 @@ def _finalizar_factura_emitida(db: Session, dte: MonzaWasabilDte) -> List[str]:
         # culpable en vez de dejar al operador buscándola con SQL.
         db.rollback()
         otra = (db.query(MonzaContFacturaCliente)
-                .filter(MonzaContFacturaCliente.numero_factura == str(dte.folio))
+                .filter(MonzaContFacturaCliente.tipo_doc == "factura",
+                        MonzaContFacturaCliente.numero_factura == str(dte.folio))
                 .first())
         if otra:
             venta = f" de la venta {otra.numero_cotizacion}" if otra.numero_cotizacion else ""

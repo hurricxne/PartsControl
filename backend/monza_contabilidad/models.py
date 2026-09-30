@@ -28,8 +28,12 @@ class MonzaContFacturaCliente(Base):
     """Factura a cliente de MonzaParts (cuentas por cobrar)."""
     __tablename__ = "monza_cont_factura_cliente"
     __table_args__ = (
-        # Folio único (los NULL/borradores sin folio no colisionan en MySQL).
-        UniqueConstraint("numero_factura", name="uq_monza_cont_factura_folio"),
+        # Folio único POR TIPO de documento (2026-09-29): ante el SII cada tipo tiene su
+        # propia numeración, así que la boleta N° 35 y la factura N° 35 son documentos
+        # distintos y legítimos. El UNIQUE global anterior (uq_monza_cont_factura_folio)
+        # rechazaba registrar la boleta. Los NULL (borradores / vía SII en vuelo) siguen
+        # sin colisionar en MySQL. Lo instala migrations/monza_factura_folio_por_tipo.py.
+        UniqueConstraint("tipo_doc", "numero_factura", name="uq_monza_cont_factura_tipo_folio"),
         {"mysql_engine": "InnoDB"},
     )
 
@@ -90,6 +94,18 @@ class MonzaContFacturaCliente(Base):
     observaciones = Column(Text, nullable=True)
     usuario_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # ── Auditoría del REGISTRO MANUAL de folio (2026-09-29) ─────────────────────
+    # Ver monza_contabilidad/verificacion_folio.py. Todas NULL en las facturas
+    # históricas y en las emitidas por la plataforma (vía SII): solo las llena el
+    # registro manual. `origen_folio`: 'wasabil' (verificado contra Wasabil) |
+    # 'externo' (emitido fuera de Wasabil, con declaración).
+    origen_folio = Column(String(20), nullable=True)
+    wasabil_uuid = Column(String(64), nullable=True)        # documento verificado en Wasabil
+    folio_verificado_por = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"),
+                                  nullable=True)
+    folio_verificado_at = Column(DateTime, nullable=True)
+    declaracion_externo = Column(Text, nullable=True)       # solo origen 'externo'
 
     # foreign_keys EXPLÍCITO: la línea tiene DOS FKs a esta misma tabla (factura_id, la
     # dueña, y anticipo_factura_id, la factura de anticipo que descuenta) y SQLAlchemy no
