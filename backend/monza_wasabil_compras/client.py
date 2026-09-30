@@ -81,7 +81,7 @@ def _headers() -> dict:
 
 
 def _post_query(body: dict, params: Optional[dict] = None,
-                timeout: float = TIMEOUT_SEGUNDOS) -> dict:
+                timeout: "float | httpx.Timeout" = TIMEOUT_SEGUNDOS) -> dict:
     """POST a /documents/query. Punto único de red — los tests lo reemplazan por un fake.
 
     Cualquier problema (timeout, 4xx/5xx, JSON ilegible) es WasabilComprasError: acá no hay
@@ -199,9 +199,10 @@ def barrer_recibidos(*, from_date: Optional[str] = None,
 
 # Verificación de folio (registro manual de Contabilidad, 2026-09-29): una consulta
 # puntual con la venta bloqueada — corta a propósito. Si Wasabil no contesta en este
-# plazo, el registro se BLOQUEA y el operador reintenta (decisión del dueño: ningún
-# folio entra sin comprobar).
-TIMEOUT_VERIFICACION_SEGUNDOS = 10
+# plazo, el origen 'wasabil' se BLOQUEA y el operador reintenta; el 'externo' pasa
+# marcado como no comprobado (decisión del dueño 2026-09-30, verificacion_folio.py).
+# httpx aplica el timeout POR FASE: conexión corta para no retener el lock ~30 s.
+TIMEOUT_VERIFICACION_SEGUNDOS = httpx.Timeout(10.0, connect=3.0)
 # Un folio + tipo identifica UN documento emitido. Se piden unos pocos por si el API
 # devolviera también sandbox o duplicados raros; más de esto ya es un filtro roto.
 PER_PAGE_VERIFICACION = 10
@@ -218,10 +219,11 @@ def buscar_emitidos_por_folio(codigo_sii: str, folio: int) -> List[dict]:
     lo sigue cumpliendo) con `received=false`: un documento RECIBIDO de un proveedor con
     el mismo número NO es nuestra factura.
 
-    NO se confía ciegamente en el filtro remoto: se re-filtra acá por tipo y folio. Si el
-    API ignorara un filtro (cambio de versión, nombre de campo), devolvería documentos
-    ajenos y la verificación "encontraría" una boleta que no es — el re-filtro convierte
-    ese desvío en "no existe", que es el lado seguro.
+    NO se confía ciegamente en el filtro remoto: se re-filtra acá por tipo y folio. Y si
+    el API devuelve documentos que NO calzan, es que ignoró un filtro (cambio de versión,
+    nombre de campo): eso es WasabilComprasError («no sé»), no una lista vacía. Una lista
+    vacía se leería como «no existe», que para el origen 'externo' sería un falso visto
+    bueno (el folio podría estar en Wasabil entre los documentos que no se trajeron).
     """
     body = {
         "received": False,
@@ -233,12 +235,18 @@ def buscar_emitidos_por_folio(codigo_sii: str, folio: int) -> List[dict]:
     }
     data = _post_query(body, timeout=TIMEOUT_VERIFICACION_SEGUNDOS)
     items, _total, _last_page = _extraer_lista(data)
-    return [
+    calzan = [
         doc for doc in items
         if str(doc.get("sii_document_type_id")) == str(codigo_sii)
         and str(doc.get("folio") or "").strip() == str(int(folio))
         and not doc.get("received")
     ]
+    if len(calzan) != len(items):
+        raise WasabilComprasError(
+            f"Wasabil devolvió {len(items) - len(calzan)} documento(s) que no son tipo "
+            f"{codigo_sii} folio {int(folio)} emitidos: ignoró un filtro de la consulta — "
+            "comparar contra docs/wasabil-api-llms-full-2026-08-05.txt")
+    return calzan
 
 
 def _acumular(vistos: dict, items: Iterable[dict]) -> None:

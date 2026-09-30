@@ -30,8 +30,11 @@ ORDEN SEGURO DEL ÍNDICE
     el viejo existe no puede haber duplicados (tipo, folio) — igual se verifica.
 
 FAIL-CLOSED
-    Si ya hubiera folios repetidos para el mismo tipo, NO se crea el índice ni se toca
-    ningún dato (renumerar documentos tributarios es una decisión de negocio).
+    Si ya hubiera folios repetidos para el mismo tipo, NO se crea el índice, NO se borra
+    el viejo y no se renumera nada (renumerar documentos tributarios es una decisión de
+    negocio). OJO: para entonces las columnas nuevas y el tipo_doc NULL → 'factura' YA
+    quedaron aplicados (en MariaDB cada DDL confirma solo; no hay vuelta atrás dentro del
+    script). Es inocuo: son aditivos y re-correr el script los reconoce.
 
 Idempotente y portable (MySQL/MariaDB). Uso (desde backend/, con el venv activo):
     python -m migrations.monza_factura_folio_por_tipo

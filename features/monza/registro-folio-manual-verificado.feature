@@ -6,7 +6,7 @@ Característica: Registrar a mano una factura o boleta ya emitida, verificando s
 
   Antecedentes:
     Dado que la venta "COT-2026-000300" de "Juan Pérez" por $11.900 está cerrada
-    Y el cliente de la venta tiene el RUT "76.543.210-8"
+    Y el cliente de la venta tiene el RUT "76.543.210-3"
 
   Escenario: Una boleta emitida en Wasabil se verifica y se registra
     Dado que en Wasabil existe la boleta N° 35 emitida el 20-09-2026 por $11.900
@@ -30,7 +30,7 @@ Característica: Registrar a mano una factura o boleta ya emitida, verificando s
 
   Escenario: Una factura sin guía de despacho se registra como retiro en oficina
     Dado que la venta no tiene despachos
-    Y que en Wasabil existe la factura N° 120 emitida al RUT "76.543.210-8" por $11.900
+    Y que en Wasabil existe la factura N° 120 emitida al RUT "76.543.210-3" por $11.900
     Cuando el usuario registra la factura N° 120 como retiro en oficina
     Entonces la factura se registra
 
@@ -64,15 +64,30 @@ Característica: Registrar a mano una factura o boleta ya emitida, verificando s
     Cuando el usuario registra la boleta N° 39 indicando que se emitió fuera de Wasabil
     Entonces el sistema indica que ese folio sí existe en Wasabil y que debe elegir "Emitido en Wasabil"
 
-  Escenario: Si Wasabil no responde, no se registra nada
+  Escenario: Si Wasabil no responde, un documento emitido en Wasabil no se registra
     Dado que Wasabil no responde
-    Cuando el usuario intenta registrar la boleta N° 40
+    Cuando el usuario intenta registrar la boleta N° 40 indicando que se emitió en Wasabil
     Entonces el sistema indica que no pudo consultar Wasabil y que reintente más tarde
     Y no se registra ningún documento
 
+  Escenario: Si Wasabil no responde, un documento externo se registra marcado como no comprobado
+    Dado que Wasabil no responde
+    Cuando el usuario registra la boleta N° 41 indicando que se emitió fuera de Wasabil
+    Y escribe "Boleta antigua emitida en el portal del SII" y confirma que el documento existe ante el SII
+    Entonces la boleta se registra
+    Y el sistema advierte que no se pudo comprobar que el folio no esté en Wasabil
+    Y la declaración queda con una marca del sistema que dice que el folio no se comprobó contra Wasabil
+
+  Escenario: Con la verificación apagada, la pantalla permite registrar sin consultar Wasabil
+    Dado que la verificación de folios está apagada por emergencia
+    Y que Wasabil no responde
+    Cuando el usuario comprueba la boleta N° 42 en el modal
+    Entonces el sistema indica que el folio se registrará sin verificar
+    Y permite registrar la boleta
+
   Escenario: Una boleta y una factura pueden tener el mismo número
     Dado que ya está registrada la boleta N° 35 de otra venta
-    Y que en Wasabil existe la factura N° 35 emitida al RUT "76.543.210-8" por $11.900
+    Y que en Wasabil existe la factura N° 35 emitida al RUT "76.543.210-3" por $11.900
     Cuando el usuario registra la factura N° 35 de la venta
     Entonces la factura se registra
 

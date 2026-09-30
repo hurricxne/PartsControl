@@ -113,7 +113,9 @@ export interface MonzaDocumentoWasabil {
 /** Respuesta de POST /contabilidad/facturas/verificar-folio. `ok` gobierna el botón
  *  «Registrar»; `mensaje` se muestra tal cual (el backend ya lo redacta para el operador).
  *  `estado`: verificado | externo_ok | no_existe | no_emitido | sandbox | monto_distinto |
- *  rut_distinto | existe_en_wasabil | duplicado | datos_factura. */
+ *  rut_distinto | existe_en_wasabil | duplicado | datos_factura. También con `ok`:
+ *  externo_sin_consulta (Wasabil no respondió; el externo pasa marcado, con advertencia) y
+ *  sin_verificacion (interruptor MONZA_FOLIO_VERIFICACION apagado). */
 export interface MonzaVerificacionFolio {
   ok: boolean;
   estado: string;

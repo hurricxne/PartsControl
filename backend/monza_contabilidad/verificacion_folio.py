@@ -16,8 +16,10 @@ POR QUÉ EXISTE (pedido del dueño, 2026-09-29)
         declaración escrita que queda auditada. Igual se consulta Wasabil: si ese folio+tipo
         SÍ está allá, el operador eligió mal el origen y se le bloquea (los folios de un tipo
         son UNA sola numeración por emisor ante el SII, salga de donde salga el documento).
-      · Wasabil caído / sin token → se BLOQUEA en los dos orígenes (decisión del dueño:
-        ningún folio entra sin comprobar; se reintenta más tarde).
+      · Wasabil caído / sin token → 'wasabil' se BLOQUEA (no hay contra qué verificar; se
+        reintenta). 'externo' PASA con su declaración, marcado como no comprobado
+        (decisión del dueño 2026-09-30: hay documentos antiguos emitidos fuera de Wasabil
+        que tienen que poder cargarse; desde esa fecha todo se emite por Wasabil).
 
     Este módulo es lógica PURA sobre lo que devuelve Wasabil: no toca la BD ni lanza
     HTTPException. El router decide los códigos HTTP y dónde se guarda la auditoría.
@@ -58,16 +60,17 @@ FOLIO_MAX_DIGITOS = 18
 
 
 class FolioNoVerificable(Exception):
-    """Wasabil no pudo responder (caído, timeout, sin token, respuesta ilegible). El
-    router lo traduce a 503: no es un "no existe", es un "no sé" — y con un "no sé" no se
-    registra nada."""
+    """Wasabil no pudo responder (caído, timeout, sin token, respuesta ilegible) y el
+    origen es 'wasabil'. El router lo traduce a 503: no es un "no existe", es un "no sé",
+    y con un "no sé" no se registra un documento que dice estar en Wasabil. (Con origen
+    'externo' no se lanza: vuelve `externo_sin_consulta`.)"""
 
 
 @dataclass(frozen=True)
 class ResultadoFolio:
     ok: bool
-    # verificado | externo_ok | no_existe | no_emitido | sandbox | monto_distinto |
-    # rut_distinto | existe_en_wasabil
+    # verificado | externo_ok | externo_sin_consulta | no_existe | no_emitido | sandbox |
+    # monto_distinto | rut_distinto | existe_en_wasabil
     estado: str
     mensaje: str
     # Lo que Wasabil sabe del documento (None si no se encontró): se muestra en el modal
@@ -103,7 +106,9 @@ def _resumen_documento(doc: dict) -> dict:
         "uuid": doc.get("uuid"),
         "tipo_sii": str(doc.get("sii_document_type_id") or ""),
         "folio": str(doc.get("folio") or ""),
-        "fecha": doc.get("document_date"),
+        # [:10] como sync._parse_fecha: si Wasabil entregara fecha con hora, el
+        # <input type=date> del modal quedaría vacío y _parse_date del router caería a hoy.
+        "fecha": str(doc["document_date"])[:10] if doc.get("document_date") else None,
         "status_id": doc.get("status_id"),
         "receptor_rut": doc.get("receiver_rut"),
         "receptor_nombre": doc.get("receiver_name"),
@@ -131,7 +136,8 @@ def verificar_folio(*, tipo_doc: str, folio, origen: str, bruto_esperado: float,
     parámetro) para que una suite pueda reemplazar el nombre del módulo con monkeypatch.
 
     Lanza ValueError (dato mal tecleado → 400) o FolioNoVerificable (Wasabil no
-    respondió → 503). Todo lo demás vuelve como ResultadoFolio con `ok` y un mensaje."""
+    respondió y el origen es 'wasabil' → 503). Todo lo demás vuelve como ResultadoFolio
+    con `ok` y un mensaje."""
     if tipo_doc not in TIPO_SII:
         raise ValueError(f"Tipo de documento '{tipo_doc}' no se puede registrar por esta vía "
                          "(solo factura o boleta)")
@@ -145,6 +151,16 @@ def verificar_folio(*, tipo_doc: str, folio, origen: str, bruto_esperado: float,
     try:
         docs = buscar(codigo, n_folio)
     except WasabilComprasError as e:
+        if origen == ORIGEN_EXTERNO:
+            # La declaración es el respaldo; lo único que no se pudo hacer es descartar que
+            # el operador eligiera mal el origen. Se registra y se deja dicho (el router lo
+            # anota en la declaración como marca del sistema).
+            return ResultadoFolio(
+                True, "externo_sin_consulta",
+                f"Wasabil no respondió: el folio {n_folio} se registrará como documento "
+                "emitido FUERA de Wasabil, con tu declaración como respaldo.",
+                advertencias=[f"No se pudo comprobar que el folio {n_folio} no esté en "
+                              f"Wasabil ({e}). Queda marcado como no comprobado."])
         raise FolioNoVerificable(
             f"No se pudo consultar Wasabil para verificar el folio {n_folio}: {e}. "
             "Reintenta en unos minutos; el documento no se registra sin verificar.") from e

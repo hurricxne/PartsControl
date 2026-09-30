@@ -90,6 +90,7 @@ from .verificacion_folio import (
     normalizar_folio, verificar_folio,
 )
 from config import settings
+from monza_fechas import ahora_chile
 from .service import (
     TOL, TOL_QTY, TOL_PAGO, MEDIO_FACT_ADELANTO, MEDIO_FACT_RETENCION, MEDIO_ADELANTO,
     ADEL_ANULADO, ADEL_APROBADO,
@@ -2724,6 +2725,18 @@ def _folio_duplicado(db: Session, tipo_doc: str, folio: str) -> Optional[MonzaCo
     ).first()
 
 
+def _declaracion_con_marca(payload: FacturaCreate, verificacion: ResultadoFolio) -> str:
+    """La declaración del documento externo, más una línea del SISTEMA cuando Wasabil no
+    respondió: queda escrito, junto a la explicación del operador, que no se descartó que
+    el folio estuviera en Wasabil (decisión del dueño 2026-09-30)."""
+    texto = (payload.declaracion_externo or "").strip()
+    if verificacion.estado != "externo_sin_consulta":
+        return texto
+    ahora = ahora_chile().strftime("%d-%m-%Y %H:%M")
+    return (f"{texto}\n[sistema {ahora}] Wasabil no respondió: no se comprobó que el folio "
+            "no esté en Wasabil.")
+
+
 def _validar_origen_folio(payload: FacturaCreate) -> str:
     """Origen obligatorio y, si es externo, la declaración con contenido REAL (strip).
     Devuelve el origen. 400 con mensaje para el operador si falta algo."""
@@ -2741,10 +2754,11 @@ def _validar_origen_folio(payload: FacturaCreate) -> str:
 def _verificar_folio_http(payload: FacturaCreate, tipo_doc: str, folio, datos: dict,
                           cot: MonzaCotizacion) -> ResultadoFolio:
     """verificar_folio con los errores traducidos a HTTP: dato mal tecleado → 400,
-    Wasabil sin respuesta → 503 (no se registra nada: decisión del dueño)."""
+    Wasabil sin respuesta con origen 'wasabil' → 503 (no se registra nada). Con origen
+    'externo' no llega acá como error: vuelve `externo_sin_consulta` (ok, marcado)."""
     cli = cot.cliente
     try:
-        return verificar_folio(
+        resultado = verificar_folio(
             tipo_doc=tipo_doc, folio=folio, origen=payload.origen_folio,
             bruto_esperado=datos["bruto"], rut_esperado=(cli.rut if cli else None),
         )
@@ -2753,6 +2767,12 @@ def _verificar_folio_http(payload: FacturaCreate, tipo_doc: str, folio, datos: d
     except FolioNoVerificable as e:
         logger.warning("Verificación de folio Monza sin respuesta de Wasabil: %s", e)
         raise HTTPException(503, str(e))
+    if resultado.estado == "externo_sin_consulta":
+        # error (no warning): si la causa es un token faltante, TODO externo pasaría sin
+        # comprobar; tiene que verse en el registro de errores, no quedar en silencio.
+        logger.error("Folio Monza %s %s declarado externo SIN consultar Wasabil: %s",
+                     tipo_doc, folio, " · ".join(resultado.advertencias))
+    return resultado
 
 
 @router.post("/facturas/verificar-folio")
@@ -2770,11 +2790,33 @@ def verificar_folio_factura(
     (`_construir_factura` / `_construir_factura_anticipo`), así que lo que dice «verificado»
     acá es lo mismo que se va a registrar. Si los datos de la factura tienen problemas
     (guía sin firmar, tope, receptor), se devuelven como tales en vez de consultar Wasabil:
-    no tiene sentido verificar un folio para una factura que no se puede registrar."""
+    no tiene sentido verificar un folio para una factura que no se puede registrar.
+
+    Con MONZA_FOLIO_VERIFICACION apagado responde `sin_verificacion` (ok) sin consultar
+    Wasabil: el modal exige este «ok» para habilitar «Registrar», así que sin esta salida
+    el interruptor de emergencia dejaba la pantalla igual de bloqueada."""
     tipo_doc = payload.tipo_doc or "factura"
     if payload.es_anticipo and tipo_doc != "factura":
         raise HTTPException(400, "La factura de anticipo debe ser tipo 'factura' (no boleta)")
-    _validar_origen_folio(payload)
+    verificar = settings.MONZA_FOLIO_VERIFICACION
+    if verificar:
+        _validar_origen_folio(payload)
+        try:
+            folio = str(normalizar_folio(payload.numero_factura))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    else:
+        folio = (payload.numero_factura or "").strip()  # regla anterior: tal cual
+    # El duplicado ANTES de derivar las líneas, igual que en POST /facturas: el folio ya
+    # registrado en ESTA venta la deja «facturada por completo», y ese mensaje escondía
+    # la causa real («folio duplicado»).
+    otra = _folio_duplicado(db, tipo_doc, folio) if folio else None
+    if otra:
+        venta = f" (venta {otra.numero_cotizacion})" if otra.numero_cotizacion else ""
+        return {"ok": False, "estado": "duplicado",
+                "mensaje": f"El folio {folio} ya está registrado en la {tipo_doc} local "
+                           f"#{otra.id}{venta}",
+                "documento": None, "advertencias": [], "bruto_a_registrar": 0.0}
     cot = _cargar_venta(db, payload.cotizacion_id, lock=False)
     datos = (_construir_factura_anticipo(db, payload, cot) if payload.es_anticipo
              else _construir_factura(db, payload, cot, acumular=True))
@@ -2782,16 +2824,10 @@ def verificar_folio_factura(
         return {"ok": False, "estado": "datos_factura",
                 "mensaje": " · ".join(datos["problemas"]),
                 "documento": None, "advertencias": [], "bruto_a_registrar": datos["bruto"]}
-    try:
-        folio = str(normalizar_folio(payload.numero_factura))
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    otra = _folio_duplicado(db, tipo_doc, folio)
-    if otra:
-        venta = f" (venta {otra.numero_cotizacion})" if otra.numero_cotizacion else ""
-        return {"ok": False, "estado": "duplicado",
-                "mensaje": f"El folio {folio} ya está registrado en la {tipo_doc} local "
-                           f"#{otra.id}{venta}",
+    if not verificar:
+        return {"ok": True, "estado": "sin_verificacion",
+                "mensaje": "La verificación de folios contra Wasabil está APAGADA (interruptor "
+                           "de emergencia): el documento se registrará sin comprobar.",
                 "documento": None, "advertencias": [], "bruto_a_registrar": datos["bruto"]}
     resultado = _verificar_folio_http(payload, tipo_doc, folio, datos, cot)
     return {**resultado.as_dict(), "bruto_a_registrar": datos["bruto"]}
@@ -2927,7 +2963,7 @@ def crear_factura(
             factura.folio_verificado_por = getattr(current_user, "id", None)
             factura.folio_verificado_at = datetime.utcnow()
             if payload.origen_folio == ORIGEN_EXTERNO:
-                factura.declaracion_externo = (payload.declaracion_externo or "").strip()
+                factura.declaracion_externo = _declaracion_con_marca(payload, verificacion)
         db.commit()
     except IntegrityError as e:
         db.rollback()

@@ -3,7 +3,8 @@
 Lo que se fija acá (ver monza_contabilidad/verificacion_folio.py):
   1. Todo registro manual declara ORIGEN: 'wasabil' (el folio se verifica: existe, tipo,
      emitido, total y —en factura— RUT) o 'externo' (declaración obligatoria; si el folio
-     SÍ está en Wasabil se bloquea). Wasabil caído → 503 y no se registra nada.
+     SÍ está en Wasabil se bloquea). Wasabil caído → 503 para 'wasabil'; el 'externo'
+     pasa con su declaración marcada como no comprobada (dueño 2026-09-30).
   2. Folio OBLIGATORIO también para boleta, y único POR TIPO: la boleta N° X y la
      factura N° X conviven (uq_monza_cont_factura_tipo_folio).
   3. BOLETA sin guía firmada (venta B2C): se boletea un despacho 'despachado' con la
@@ -11,7 +12,8 @@ Lo que se fija acá (ver monza_contabilidad/verificacion_folio.py):
   4. La fecha de un documento verificado es la de Wasabil; la auditoría queda en la
      factura (origen, uuid, quién, cuándo, declaración).
   5. POST /facturas/verificar-folio NO persiste nada.
-  6. Con MONZA_FOLIO_VERIFICACION=false rige la regla anterior (boleta sin folio → 200).
+  6. Con MONZA_FOLIO_VERIFICACION=false rige la regla anterior (boleta sin folio → 200) y
+     verificar-folio responde ok sin consultar Wasabil (el modal no queda trabado).
 
 ESTILO de la casa: datos MARCADOS, limpieza total en `finally`, auth realista (una lectura
 en la misma sesión del request) y `check()` que acumula. Wasabil SIMULADO: se reemplaza
@@ -40,11 +42,12 @@ import monza_models as mm  # noqa: E402
 from monza_contabilidad import verificacion_folio  # noqa: E402
 from monza_contabilidad.router import router as router_contab  # noqa: E402
 from monza_contabilidad.models import MonzaContFacturaCliente, MonzaContAdelanto  # noqa: E402
+import monza_wasabil_compras.client as wc  # noqa: E402
 from monza_wasabil_compras.client import WasabilComprasError  # noqa: E402
 
 MARK = "__TEST_FMV__"
 EMAIL = f"test-{MARK}@monza.test"
-RUT_CLIENTE = "76.543.210-8"
+RUT_CLIENTE = "76.543.210-3"  # DV válido: la factura exige un RUT válido (_validar_receptor_factura)
 BASE = "/api/monza/contabilidad"
 # Folios altos para no chocar con datos de desarrollo. El MISMO número se usa como boleta
 # y como factura a propósito (unicidad por tipo).
@@ -139,6 +142,7 @@ def seed():
         _venta(db, "D")                                  # documento externo
         _venta(db, "E")                                  # flag apagado
         _venta(db, "F")                                  # errores varios (nada se crea)
+        _venta(db, "H")                                  # externo con Wasabil caído
         # G: mismo ítem en DOS guías — G1 firmada (5) y G2 sin firmar (5). La boleta de
         # G2 no puede comerse el cupo de la factura de G1 (hallazgo de la revisión).
         _venta(db, "G")
@@ -246,13 +250,16 @@ def run():
               "tipo_doc": "factura", "numero_factura": F_FACTURA_C, "origen_folio": "wasabil"}
     r = _post(body_c)
     check("3a factura emitida a OTRO RUT → 409", r.status_code == 409 and "RUT" in r.text, r.text)
-    WASABIL["docs"][("33", int(F_FACTURA_C))] = [_doc(33, F_FACTURA_C, 11900, rut="76543210-8")]
+    WASABIL["docs"][("33", int(F_FACTURA_C))] = [_doc(33, F_FACTURA_C, 11900, rut="76543210-3")]
     r = _post(body_c)
     check("3b factura N° X convive con la boleta N° X (unicidad por tipo) → 200",
           r.status_code == 200, r.text)
     r = client.post(f"{BASE}/facturas/verificar-folio", json=body_c)
     check("3c el mismo folio+tipo otra vez → 'duplicado'",
           r.status_code == 200 and not r.json()["ok"] and r.json()["estado"] == "duplicado", r.text)
+    r = _post(body_c)
+    check("3d registrarlo otra vez → 409 folio duplicado (no «ya facturada»)",
+          r.status_code == 409 and "ya existe" in r.text, r.text)
 
     # ══ 4 · Documento emitido FUERA de Wasabil ══
     body_d = {"cotizacion_id": _S["cots"]["D"], "sin_guia": True, "confirmar_retiro_sin_adelanto": True,
@@ -290,12 +297,25 @@ def run():
     WASABIL["caido"] = True
     r = _post({**base_f, "numero_factura": "987650013", "origen_folio": "wasabil"})
     check("5f Wasabil caído → 503 (no se registra sin verificar)", r.status_code == 503, r.text)
-    r = _post({**base_f, "numero_factura": "987650013", "origen_folio": "externo",
-               "declaracion_externo": "Emitida en el portal del SII"})
-    check("5g Wasabil caído bloquea también el externo → 503", r.status_code == 503, r.text)
     WASABIL["caido"] = False
     check("5h ningún error dejó facturas", len(_facturas("F")) == 0,
           [f.numero_factura for f in _facturas("F")])
+
+    # ══ 5-ter · Wasabil caído + documento EXTERNO (venta H): pasa marcado (dueño 2026-09-30) ══
+    WASABIL["caido"] = True
+    r = _post({"cotizacion_id": _S["cots"]["H"], "sin_guia": True, "confirmar_retiro_sin_adelanto": True,
+               "tipo_doc": "boleta", "numero_factura": "987650013", "origen_folio": "externo",
+               "declaracion_externo": "Boleta antigua emitida en el portal del SII"})
+    WASABIL["caido"] = False
+    check("5g Wasabil caído + externo → 200 (la declaración es el respaldo)", r.status_code == 200, r.text)
+    check("5g-bis advierte que el folio no se comprobó contra Wasabil",
+          r.status_code == 200 and any("no comprobado" in a for a in r.json().get("advertencias", [])), r.text)
+    fh = _facturas("H")
+    check("5g-ter la declaración queda con la marca del sistema",
+          len(fh) == 1 and fh[0].origen_folio == "externo"
+          and (fh[0].declaracion_externo or "").startswith("Boleta antigua emitida en el portal del SII\n[sistema ")
+          and "no se comprobó" in fh[0].declaracion_externo,
+          [f.declaracion_externo for f in fh])
 
     # ══ 5-bis · Guía firmada + guía sin firmar del MISMO ítem (venta G) ══
     # Sonda: sin _qty_boleta_en_guia_sin_firma_por_item, 5-bis-b responde 409 «ya fue
@@ -320,12 +340,38 @@ def run():
 
     # ══ 6 · Interruptor apagado: regla anterior (boleta sin folio → 200) ══
     settings.MONZA_FOLIO_VERIFICACION = False
+    WASABIL["caido"] = True   # si se consultara Wasabil, 6b respondería 503
     try:
+        r = client.post(f"{BASE}/facturas/verificar-folio",
+                        json={"cotizacion_id": _S["cots"]["E"], "sin_guia": True,
+                              "confirmar_retiro_sin_adelanto": True, "tipo_doc": "boleta",
+                              "numero_factura": "987650030", "origen_folio": "wasabil"})
+        check("6b flag apagado: verificar-folio responde ok sin consultar Wasabil (la pantalla no se traba)",
+              r.status_code == 200 and r.json()["ok"] and r.json()["estado"] == "sin_verificacion", r.text)
         r = _post({"cotizacion_id": _S["cots"]["E"], "sin_guia": True,
                    "confirmar_retiro_sin_adelanto": True, "tipo_doc": "boleta"})
         check("6a flag apagado: boleta sin folio ni origen → 200", r.status_code == 200, r.text)
     finally:
         settings.MONZA_FOLIO_VERIFICACION = True
+        WASABIL["caido"] = False
+
+    # ══ 7 · Cliente de consulta: si Wasabil ignora un filtro, es «no sé», no «no existe» ══
+    # (con «no existe» el origen 'externo' pasaría como si el folio no estuviera en Wasabil)
+    original_post = wc._post_query
+    try:
+        def _resp(items):
+            return lambda body, params=None, timeout=None: {
+                "success": True, "data": {"list": {"items": items, "total": len(items), "lastPage": 1}}}
+        wc._post_query = _resp([_doc(39, 987650040, 11900)])
+        check("7a el documento que calza vuelve", len(wc.buscar_emitidos_por_folio("39", 987650040)) == 1)
+        wc._post_query = _resp([_doc(33, 111, 11900)])
+        try:
+            wc.buscar_emitidos_por_folio("39", 987650040)
+            check("7b filtro ignorado → WasabilComprasError", False, "no lanzó")
+        except WasabilComprasError:
+            check("7b filtro ignorado → WasabilComprasError", True)
+    finally:
+        wc._post_query = original_post
 
     print()
     ok = not _fails

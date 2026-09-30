@@ -686,8 +686,15 @@ function EmisionFacturaSIIModal({ payload, facturaId, onDone, onVolver, onCerrar
 //     queda auditada (y si el folio SÍ está en Wasabil, el backend lo rechaza).
 // La verificación vale SOLO para lo que se verificó: cambiar venta, despacho, tipo,
 // folio u origen la invalida (la `clave`), y el POST de registro re-verifica todo en el
-// servidor. Wasabil caído = no se registra (decisión del dueño): se reintenta.
+// servidor. Wasabil caído (decisión del dueño 2026-09-30): «Emitido en Wasabil» no se
+// registra (se reintenta); «fuera de Wasabil» pasa con advertencia, marcado como no comprobado.
 const DECLARACION_MIN = 10;  // mismo mínimo que valida el backend (verificacion_folio.py)
+
+/** «Comprobar» solo con la declaración escrita si el documento es externo: sin ella el
+ *  backend responde 400 y ese error quedaría pegado (la clave no incluye la declaración). */
+function declaracionSuficiente(origen: MonzaOrigenFolio, declaracion: string): boolean {
+  return origen !== "externo" || declaracion.trim().length >= DECLARACION_MIN;
+}
 
 function useVerificacionFolio(clave: string) {
   const [resultado, setResultado] = useState<{ clave: string; datos: MonzaVerificacionFolio } | null>(null);
@@ -716,9 +723,8 @@ function useVerificacionFolio(clave: string) {
  *  externo, declaración con contenido + casilla marcada). */
 function folioManualListo(origen: MonzaOrigenFolio, verif: MonzaVerificacionFolio | null,
                           declaracion: string, confirmaExterno: boolean): boolean {
-  if (!verif?.ok) return false;
-  if (origen === "externo") return declaracion.trim().length >= DECLARACION_MIN && confirmaExterno;
-  return true;
+  if (!verif?.ok || !declaracionSuficiente(origen, declaracion)) return false;
+  return origen !== "externo" || confirmaExterno;
 }
 
 interface PanelFolioManualProps {
@@ -1189,7 +1195,7 @@ function CrearFacturaModal({ onClose, onDone }: { onClose: () => void; onDone: (
           origen={origen} onOrigen={setOrigen}
           declaracion={declaracion} onDeclaracion={setDeclaracion}
           confirmaExterno={confirmaExterno} onConfirmaExterno={setConfirmaExterno}
-          puedeVerificar={datosOk && !folioFaltante}
+          puedeVerificar={datosOk && !folioFaltante && declaracionSuficiente(origen, declaracion)}
           verificando={verificando} verificacion={verificacion}
           onVerificar={() => verificar({ ...payloadManual(), numero_factura: folio.trim() })}
         />
@@ -1634,7 +1640,7 @@ function AnticipoFacturaModal({ onClose, onDone }: { onClose: () => void; onDone
           origen={origen} onOrigen={setOrigen}
           declaracion={declaracion} onDeclaracion={setDeclaracion}
           confirmaExterno={confirmaExterno} onConfirmaExterno={setConfirmaExterno}
-          puedeVerificar={datosOk && !!folio.trim()}
+          puedeVerificar={datosOk && !!folio.trim() && declaracionSuficiente(origen, declaracion)}
           verificando={verificando} verificacion={verificacion}
           onVerificar={() => verificar({ ...payloadManual(), numero_factura: folio.trim() })}
         />
