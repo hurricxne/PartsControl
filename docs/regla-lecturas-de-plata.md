@@ -60,6 +60,14 @@ if payload.monto > bruto - pagado:                     # ❌ el tope miente
 5. **Los helpers se copian por módulo**, no se comparten entre módulos (los módulos de la
    casa son aislados a propósito).
 
+Fuera de Contabilidad, la misma regla en el Cierre de Venta: `crear_oc_cliente`
+(`routers/compras.py`) lee la cotización con `populate_existing().with_for_update()`,
+así que dos cierres simultáneos de la misma venta quedan en fila y el segundo cae en el
+early-return idempotente (sonda §F de `routers/tests/test_fecha_promesa.py`). Pendiente
+por la regla 4: `UNIQUE(cotizacion_id)` en `oc_cliente` con captura de `IntegrityError`,
+la capa que no depende del nivel de aislamiento; exige una migración sobre una tabla del
+programador y revisar antes los duplicados históricos.
+
 ## Y la regla para las PRUEBAS
 
 Las suites sustituían `get_current_user` por un `lambda` que **no consulta la BD**. Con
@@ -73,7 +81,10 @@ Todas las suites usan ahora un override que hace una lectura real en la misma se
 rondas cada una y **verifica leyendo con conexión nueva** (la sesión del propio test
 también arrastra su foto y puede dar un falso rojo… o un falso verde).
 
-## Pendiente: bajar el motor a READ COMMITTED
+## Hecho: el motor corre en READ COMMITTED
+
+`backend/database.py` ya fija `isolation_level="READ COMMITTED"`. Lo que sigue es el
+razonamiento y los requisitos que se cumplieron para aplicarlo.
 
 La mesa redonda (3 votos a 1) recomendó **además** poner el engine en `READ COMMITTED`
 (`backend/database.py`, un parámetro de `create_engine`), que cierra la clase entera de

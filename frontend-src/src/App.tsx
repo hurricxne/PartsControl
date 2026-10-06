@@ -1,5 +1,5 @@
 import { Routes, Route, Navigate, useLocation } from 'react-router-dom'
-import { useAuthStore } from './stores/authStore'
+import { useAuthStore, esCuentaPortal } from './stores/authStore'
 import LoginPage from './pages/LoginPage'
 import DashboardLayout from './pages/DashboardLayout'
 import DashboardPage from './pages/DashboardPage'
@@ -38,7 +38,26 @@ import TicketsPage from './pages/TicketsPage'
 // Libro de Compras del SII (Grupo AM, Fases A1+A2): tablero + bandeja + reglas por RUT.
 // Revertir: quitar este import, la ruta 'libro-sii' y la entrada del menú en DashboardLayout.
 import LibroSiiPage from './pages/LibroSiiPage'
+// Portal de Clientes. Dos mundos distintos en la misma carpeta (src/portal/):
+//   · '/portal/*' → lo que ve el CLIENTE, fuera de los dos cascarones internos.
+//     PortalLayout es su cascarón propio (cabecera, datos de la sesión, cambio de la
+//     clave temporal) y adentro van sus pantallas: inicio, pedidos, una orden, el
+//     seguimiento de un ítem y la cuenta.
+//   · CuentasPortalPage → '/cuentas-portal', pantalla INTERNA de Grupo AM para crear y
+//     administrar esas cuentas. La ruta interna NO empieza con '/portal': DashboardLayout
+//     resuelve el título por prefijo y la confundiría con la del cliente.
+// Revertir: quitar estos imports, PortalRoute, RutaDesconocida, el desvío portal de
+// PrivateRoute, el bloque de rutas '/portal', la ruta 'cuentas-portal', la entrada del
+// menú Admin en DashboardLayout y la carpeta src/portal/.
+import PortalLayout from './portal/PortalLayout'
+import TableroPage from './portal/TableroPage'
+import PedidosPage from './portal/PedidosPage'
+import OrdenPage from './portal/OrdenPage'
+import ItemPage from './portal/ItemPage'
+import CuentaPage from './portal/CuentaPage'
+import CuentasPortalPage from './portal/CuentasPortalPage'
 
+// Guard de los DOS cascarones internos (MachParts y MonzaParts).
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated())
   const user = useAuthStore((s) => s.user)
@@ -54,7 +73,37 @@ function PrivateRoute({ children }: { children: React.ReactNode }) {
     document.documentElement.setAttribute('data-empresa', empresaTema)
   }
 
-  return isAuthenticated ? <>{children}</> : <Navigate to="/login" replace />
+  if (!isAuthenticated) return <Navigate to="/login" replace />
+  // Una cuenta del Portal de Clientes no entra a NINGUNA ruta interna. El desvío va acá y
+  // no en cada layout porque este es el único componente por el que pasan los dos
+  // cascarones: puesto en DashboardLayout, /monzaparts/* quedaría abierto. Se corta ANTES
+  // de montar el layout, que al montarse ya pide contadores y notificaciones del ERP.
+  // Es solo ruteo (el backend le responde 403 a ese token en todo el ERP): evita que el
+  // cliente vea el menú interno con las tablas vacías.
+  if (esCuentaPortal(user)) return <Navigate to="/portal" replace />
+  return <>{children}</>
+}
+
+// Guard de '/portal': el espejo de PrivateRoute. El personal no navega el portal con su
+// cuenta (el backend le respondería 403: la vista "todos los clientes" no existe a
+// propósito), así que vuelve a su inicio de siempre.
+function PortalRoute({ children }: { children: React.ReactNode }) {
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated())
+  const user = useAuthStore((s) => s.user)
+
+  if (!isAuthenticated) return <Navigate to="/login" replace />
+  if (!esCuentaPortal(user)) {
+    return <Navigate to={user?.empresa === 'automotriz' ? '/monzaparts/leads' : '/'} replace />
+  }
+  return <>{children}</>
+}
+
+// Comodín. El personal sigue cayendo en '/' como siempre. La cuenta portal va directo a
+// '/portal': mandarla a '/' también terminaría ahí (PrivateRoute la desvía), pero con un
+// salto de más por una ruta interna que no tiene por qué pisar.
+function RutaDesconocida() {
+  const user = useAuthStore((s) => s.user)
+  return <Navigate to={esCuentaPortal(user) ? '/portal' : '/'} replace />
 }
 
 
@@ -93,6 +142,24 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
+      {/* Portal de Clientes: fuera de DashboardLayout y MonzaLayout a propósito. Las
+          llaves de las URL son ids: el N° de OC es texto libre y no sirve de llave. */}
+      <Route
+        path="/portal"
+        element={
+          <PortalRoute>
+            <PortalLayout />
+          </PortalRoute>
+        }
+      >
+        <Route index element={<TableroPage />} />
+        <Route path="pedidos" element={<PedidosPage />} />
+        <Route path="pedidos/:ordenId" element={<OrdenPage />} />
+        <Route path="pedidos/:ordenId/items/:itemId" element={<ItemPage />} />
+        <Route path="cuenta" element={<CuentaPage />} />
+        {/* Cualquier otra dirección bajo /portal vuelve al inicio del portal. */}
+        <Route path="*" element={<Navigate to="/portal" replace />} />
+      </Route>
       <Route
         path="/"
         element={
@@ -129,6 +196,7 @@ export default function App() {
         <Route path="usuarios"      element={<UsuariosPage />} />
         <Route path="proveedores"   element={<ProveedoresPage />} />
         <Route path="tickets"       element={<TicketsPage />} />
+        <Route path="cuentas-portal" element={<CuentasPortalPage />} />
       </Route>
 
       {/* MonzaParts */}
@@ -163,7 +231,7 @@ export default function App() {
         <Route path="configuracion" element={<MonzaConfigPage />} />
       </Route>
 
-      <Route path="*" element={<Navigate to="/" replace />} />
+      <Route path="*" element={<RutaDesconocida />} />
     </Routes>
   )
 }

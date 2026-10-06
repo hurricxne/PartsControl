@@ -23,3 +23,9 @@ pdfplumber
 # zoneinfo. Hoy llega de arrastre por pandas; explícito para que un venv recién creado
 # en el servidor no deje los filtros de fecha sin zona (ZoneInfoNotFoundError).
 tzdata
+
+# Imágenes: el Portal de Clientes genera el derivado de cada foto (reducido y sin
+# metadatos) con Pillow, y portal/fotos.py lo importa al cargar el módulo. Hoy llega de
+# arrastre por reportlab y pdfplumber; explícito para que un venv recién creado en el
+# servidor no deje al backend sin poder arrancar (ImportError al montar el router).
+pillow>=12.2

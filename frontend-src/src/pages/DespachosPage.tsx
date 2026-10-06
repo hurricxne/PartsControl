@@ -15,8 +15,10 @@ import {
   ChevronRight, ChevronDown, Plus, Trash2, Send,
   FileSpreadsheet, FileText, FileDown, Loader2,
   Clock, AlertTriangle, Upload, Pencil, Eye, Receipt, Zap,
+  Image as ImageIcon,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
+import FotosItemModal from '../components/FotosItemModal'
 import { fmtDate, fmtFechaServidor } from '../utils/format'
 
 /**
@@ -1511,6 +1513,10 @@ function DespachoItemsDetalle({ despachoId }: { despachoId: number }) {
     queryKey: ['despachos', 'detalle', despachoId],
     queryFn: () => despachosAPI.get(despachoId),
   })
+  // Visor de fotos del ítem (recepción + despacho). Solo consulta.
+  // Va ANTES de los returns tempranos: un hook no puede declararse dentro de un `if`.
+  const [fotosItem, setFotosItem] = useState<
+    { id: number; parte: string; desc: string } | null>(null)
 
   if (isLoading) {
     return (
@@ -1558,7 +1564,27 @@ function DespachoItemsDetalle({ despachoId }: { despachoId: number }) {
               const faltaLinea = it.qty_firmada != null ? it.qty_despachada - it.qty_firmada : 0
               return (
                 <tr key={it.id} className="border-t" style={{ borderColor: 'var(--border)' }}>
-                  <td className="p-2 font-mono text-brand-500">{it.numero_parte}</td>
+                  <td className="p-2 font-mono text-brand-500">
+                    <span className="inline-flex items-center gap-1.5">
+                      {it.numero_parte}
+                      {/* Fotos del ítem: recepción (existen hoy) y despacho (Fase 5).
+                          Solo consulta — desde acá no se borran. */}
+                      {it.item_cotizacion_id != null && (
+                        <button
+                          onClick={() => setFotosItem({
+                            id: it.item_cotizacion_id!,
+                            parte: it.numero_parte,
+                            desc: it.descripcion,
+                          })}
+                          aria-label={`Ver fotos de ${it.numero_parte}`}
+                          title="Ver fotos de recepción y despacho"
+                          className="shrink-0 p-0.5 rounded hover:bg-[var(--surface-200)]"
+                        >
+                          <ImageIcon className="w-3.5 h-3.5" style={{ color: 'var(--text-faint)' }} />
+                        </button>
+                      )}
+                    </span>
+                  </td>
                   <td className="p-2" style={{ color: 'var(--text-primary)' }}>{it.descripcion}</td>
                   <td className="p-2" style={{ color: 'var(--text-muted)' }}>{it.marca}</td>
                   <td className="p-2 text-right" style={{ color: 'var(--text-primary)' }}>{it.qty_despachada}</td>
@@ -1603,6 +1629,16 @@ function DespachoItemsDetalle({ despachoId }: { despachoId: number }) {
             {detalle.faltante_motivo && <> — {detalle.faltante_motivo}</>}
           </span>
         </div>
+      )}
+      {/* Visor de fotos del ítem. Va DENTRO del contenedor: sacarlo fuera dejaba dos
+          elementos hermanos en el return, que JSX no acepta sin un fragmento. */}
+      {fotosItem && (
+        <FotosItemModal
+          itemCotizacionId={fotosItem.id}
+          numeroParte={fotosItem.parte}
+          descripcion={fotosItem.desc}
+          onClose={() => setFotosItem(null)}
+        />
       )}
     </div>
   )

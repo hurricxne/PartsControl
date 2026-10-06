@@ -50,6 +50,9 @@ python -m migrations.despacho_fecha_guia           # 🔴 NUEVO (2026-07-30). fe
 python -m migrations.despacho_qty_firmada          # 🔴 CRÍTICA · NUEVO (2026-08-22). FIRMA PARCIAL de la guía: despacho_items.qty_firmada (FLOAT NULL) + despachos.faltante_motivo (TEXT NULL). Solo Grupo AM. Los modelos ya declaran las columnas → SIN ESTO: cerrar/anular despachos, firmar, FACTURAR y la emisión de guías al SII revientan con 1054 «Unknown column». ⚠️ LA TRAMPA: las bandejas de Despachos y de Bodega SOBREVIVEN (consultan columnas sueltas) — el sistema PARECE sano hasta que alguien cierra un despacho o factura. Idempotente; no toca datos (lo firmado hasta hoy queda NULL = firma completa, que es lo que significaba)
 python -m migrations.despacho_bulto_numero         # 🔴 CRÍTICA · NUEVO (2026-08-25). PICKING & PACKING: despachos.bulto_numero (VARCHAR(50) NULL) — el N° de bulto (caja) en que viaja cada despacho, para el reparto de bultos por OC y el mail al transportista. Solo Grupo AM. El modelo ya declara la columna → SIN ESTO: expandir una OC en Despachos, cerrar, firmar, anular, emitir guías al SII y FACTURAR revientan con 1054 «Unknown column despachos.bulto_numero». ⚠️ MISMA TRAMPA que qty_firmada: el listado de OCs SOBREVIVE (consulta columnas sueltas) — el sistema PARECE sano hasta abrir un detalle o cerrar. Idempotente; no toca datos (los despachos existentes quedan NULL = sin bulto)
 python -m migrations.proveedor_rut                 # 🔴 NUEVO (2026-08-06). proveedores.rut (RUT canónico, llave de cruce del libro de compras del SII) + índice. Los modelos ya declaran la columna → sin esto, cualquier pantalla que lea la entidad Proveedor completa (Compras, Abastecimiento) responde 1054
+python -m migrations.item_fecha_promesa_cliente    # 🔴 NUEVO (2026-08-30). FASE 2 DEL PORTAL: items_cotizacion.fecha_promesa_cliente (DATE NULL) — la fecha prometida al cliente, congelada al Cierre de Venta (día del cierre + plazo hábiles, el plazo del ítem o, si no tiene, el por defecto del cotizador; después el plazo se pisa al comprar y la fecha viva se movería sola). Solo Grupo AM. El modelo ya declara la columna → SIN ESTO: cualquier pantalla que lea la entidad ItemCotizacion completa (Ventas, Compras, Despachos, Cierre de Venta) responde 1054 «Unknown column items_cotizacion.fecha_promesa_cliente». Idempotente; sin backfill deliberado (freeze-forward, mismo criterio que pricing_snapshot): lo cerrado antes queda NULL y las pantallas siguen con el cálculo de siempre. Ver docs/fase-2-portal-fecha-promesa-2026-08-30.md
+python -m portal.init_db                           # 🔴 CRÍTICA — LA MÁS PELIGROSA DE ESTA LISTA · NUEVO (2026-10-02). FASE 1 DEL PORTAL: users.tipo_acceso (VARCHAR(20) NOT NULL DEFAULT 'interno') + cotizaciones.cliente_id (INT NULL + índice + FK a clientes ON DELETE SET NULL) + las tablas usuario_cliente y portal_acceso. ⚠️ A diferencia de las anteriores («el sistema PARECE sano»), saltarse ESTA tumba el LOGIN: los modelos ya declaran users.tipo_acceso y `users` es compartida por las DOS marcas → el SELECT del login y el de auth.get_current_user responden 1054 «Unknown column users.tipo_acceso» y NADIE entra ni usa el sistema, ni en MachParts ni en MonzaParts. Correr ANTES de reiniciar, sí o sí. Idempotente; no toca datos: todo usuario existente queda 'interno' (lo que era) y toda cotización con cliente_id NULL. ⛔ ROLLBACK CON ORDEN — NO es «solo código»: las cuentas de los clientes viven en `users`, activas y con empresa 'mineria', y lo ÚNICO que las mantiene fuera del ERP es el corte de auth.get_current_user, que es código de esta fase. Si se revierte el código con cuentas portal activas, el get_current_user anterior no mira tipo_acceso y cada cuenta de cliente pasa a tener acceso COMPLETO al ERP. Para revertir: (1) `python -m portal.desactivar_cuentas --aplicar` (is_active=0, que el código viejo sí respeta), (2) recién entonces el código. Las columnas pueden quedarse. Ver docs/fase-1-portal-identidad-2026-10-02.md §7
+python -m portal.vincular_clientes --aplicar       # ℹ️ PASO DE DATOS, no de esquema (no lleva 🔴/🟡: no depende del gate de Monza ni impide arrancar) · DESPUÉS de portal.init_db. Ancla cada venta histórica a su ficha de cliente por RUT y lista las HUÉRFANAS (ventas cerradas que el cliente no vería en su portal: sin RUT, RUT mal formado, sin ficha, o dos fichas con el mismo RUT). Sin `--aplicar` es un ensayo que no escribe. No hay nada que «aprobar» antes: el mismo cálculo corre solo cada vez que se cierra una venta o se guarda una ficha en Clientes; este paso solo pone al día de una vez lo anterior. NO lo descubre `audit_schema.py --pasos` (no es un init_db ni una migración): si se olvida, el portal queda VACÍO para las ventas viejas (cliente_id NULL = la venta no existe para el portal). La lista de huérfanas es trabajo para el dueño: crear o unificar fichas en Clientes. ⛔ `python -m portal.seed_piloto` NO es un paso de PRODUCCIÓN: crea 2 clientes DEMO con cuentas de prueba — solo para el piloto en desarrollo, o en PROD si el dueño lo pide expresamente
 python -m wasabil_compras.init_db                  # 🔴 ⛓️ DESPUÉS de tesoreria.init_db (sus FKs apuntan a conc_movimiento; si falta, el script corta con un mensaje en castellano en vez de un errno 150). NUEVO (2026-08-08). Crea las 7 tablas del libro de compras del SII de Grupo AM: sii_libro_doc / sii_libro_sync_run / sii_libro_regla_rut (el espejo) + sii_libro_match / sii_match_run / sii_match_etiqueta_mov / sii_match_config (el matcher banco↔libro). ⚠️ POR QUÉ ES UN SCRIPT Y NO "lo crea el create_all": lo creaba, sí, pero AL REINICIAR — o sea DESPUÉS del §1.e, que corre antes. En el primer deploy el auditor las veía ausentes, salía rc=1 y ordenaba «correr las migraciones», que no existían: un rojo por diseño que enseña a ignorar el rojo. El barrido nocturno corre en su PROPIO job del scheduler (`run_sii_libro_job`, 05:30 America/Santiago — se separó del job de alertas de las 06:00, que no comparte nada con él) y usa el WASABIL_API_TOKEN que ya existe. El matcher corre al importar una cartola y con el botón de la pantalla; DESATENDIDO de noche solo si se prende `SII_MATCHER_NOCTURNO` (§2), que nace APAGADO — igual que la señal RUT-en-glosa en sii_match_config. Ver docs/plan-libro-compras-sii-2026-08-03.md y docs/spec-matcher-banco-libro-2026-08-06.md
 ```
 
@@ -259,6 +262,58 @@ dice a gritos en cada corrida (`[scheduler][libro-sii] SIN WASABIL_API_TOKEN…`
   al `backend/.env` y reiniciando. En el arranque el log lo confirma:
   `[scheduler] … matcher nocturno GA=ON`.
 
+### Las tres variables NUEVAS de la Fase 0 del Portal (2026-08-20)
+
+Las tres son OPCIONALES y las tres tienen un valor por omisión seguro. El detalle completo
+de qué cambió y por qué está en **`docs/fase-0-portal-cambios-2026-08-20.md`**.
+
+- **`CORS_ORIGINS`** — ⚠️ **DEFINIRLA EN PRODUCCIÓN.** Es lo único de la Fase 0 que hay que
+  escribir a mano en el servidor:
+  ```
+  CORS_ORIGINS=["https://machparts.bigcode.cl"]
+  ```
+  Sin ella, el valor por omisión incluye `http://localhost:5173` —el origen de desarrollo—
+  y con `allow_credentials=True` eso queda autorizado también en producción. El backend lo
+  dice en el log de arranque mientras falte:
+  `[config] AVISO CORS: hay origenes de desarrollo autorizados [...]`.
+  **Cuando el aviso desaparece, está bien puesta.**
+
+- **`LOGIN_RATE_LIMIT_ENABLED`** — *(ausente = `true`)*. Tope de intentos del login:
+  5 fallos por cuenta en 15 min, y 10 cuentas distintas por IP en 15 min. **Dejarla ausente.**
+  Solo se pone en `false` si bloquea a alguien en un día de operación crítica; los contadores
+  también se limpian enteros con `pm2 restart machparts-api`.
+  Para ver el estado de una cuenta sin leer logs (exige sesión de Grupo AM):
+  `GET /api/auth/rate-limit/estado?email=...&ip=...` — devuelve intentos, si está bloqueada,
+  cuántos segundos faltan y el **PID**. Si dos llamadas seguidas dan PID distintos, hay más de
+  un worker y cada uno lleva su propio contador (el limitador vive en memoria del proceso).
+
+- **`SERVIR_FOTOS_BODEGA_SIN_AUTH`** — *(ausente = `false`)*. **Dejarla ausente.** Es la
+  PALANCA DE ROLLBACK del cerrojo de las fotos: ponerla en `true` y reiniciar devuelve el
+  comportamiento anterior (carpeta `uploads/bodega` pública) en 30 segundos, sin desplegar
+  código. Con el valor por omisión, las fotos se sirven por `GET /api/bodega/fotos/{id}`,
+  que exige sesión y marca `mineria`.
+
+### ⚠️ Verificación de nginx — la Fase 0 NO se puede cerrar sin esto
+
+Es lo único de la Fase 0 que **no se puede verificar desde el código**, y si falla, el
+cerrojo de las fotos es decorativo. Dos comprobaciones en el servidor:
+
+```bash
+# 1) ¿nginx sirve /uploads/ por su cuenta, sin pasar por el backend?
+grep -rn "uploads" /etc/nginx/sites-enabled/
+#    Si hay un `location /uploads/` apuntando al disco, las fotos siguen PÚBLICAS
+#    aunque el mount del backend esté retirado. Hay que quitar ese location.
+
+# 2) ¿El puerto 8002 es alcanzable sin pasar por nginx?
+ss -lntp | grep 8002        # debe escuchar en 127.0.0.1, NO en 0.0.0.0
+#    Si escucha en 0.0.0.0, un atacante habla directo con uvicorn y puede inventar la
+#    cabecera X-Forwarded-For: la regla por IP del limitador de login se evade.
+
+# 3) Prueba de humo, desde fuera del servidor:
+curl -i https://machparts.bigcode.cl/uploads/bodega/cualquier-cosa.jpg   # -> 404
+curl -i https://machparts.bigcode.cl/api/bodega/fotos/1                  # -> 401
+```
+
 ## 3. Frontend
 
 ```bash
@@ -267,6 +322,14 @@ cd frontend-src && npm install && npm run build
 # ver deploy/README.md §"Frontend"): sin este paso el navegador sigue sirviendo la
 # versión anterior aunque el backend ya esté nuevo.
 cp -r dist/assets/* ../assets/ && cp dist/index.html ../index.html
+```
+
+**Verificar que nginx comprime el JS** (no se puede comprobar desde el repo; agregado
+2026-10-06). Si no comprime, el cliente del portal baja los bytes crudos del bundle
+(2,45 MB hoy en vez de ≈597 KB):
+
+```bash
+curl -sI -H 'Accept-Encoding: gzip' https://<host>/assets/<index-….js> | grep -i content-encoding   # debe decir gzip (o br)
 ```
 
 > **Rollback (verificado 2026-08-22):** revertir = SOLO el código (checkout del corte

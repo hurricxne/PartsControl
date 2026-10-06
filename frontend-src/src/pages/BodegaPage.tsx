@@ -7,7 +7,9 @@ import {
   AlertOctagon, Archive, ImagePlus, FileText, Download, Search,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
+import FotoBodega, { invalidarFoto } from '../components/FotoBodega'
 import api, { bodegaAPI } from '../services/api'
+import { detalleDe, estadoHttp } from '../services/httpErrors'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -39,7 +41,11 @@ interface RecepcionItem {
   qty_danada: number
   estado_recepcion: string | null
   observacion: string | null
-  fotos: { id: number; url_foto: string }[]
+  // El backend serializa {id, url} (routers/bodega.py). El tipo decía `url_foto`,
+  // que NUNCA llegaba: las fotos ya guardadas pintaban <img src={undefined}>.
+  // Desde 2026-08-20 la imagen se pide por ID con <FotoBodega>, así que `url`
+  // queda solo como dato informativo.
+  fotos: { id: number; url?: string }[]
 }
 
 interface Recepcion {
@@ -247,8 +253,11 @@ function fmtUsd(v: number | null) {
 // ── RecepcionItemRow ──────────────────────────────────────────────────────────
 
 function RecepcionItemRow({
+  soloLectura = false,
   item, recepcionId, onUpdate,
 }: {
+  /** Recepción ya cerrada: se puede CONSULTAR (incluidas las fotos) pero no editar. */
+  soloLectura?: boolean
   item: RecepcionItem
   recepcionId: number
   onUpdate: () => void
@@ -259,6 +268,12 @@ function RecepcionItemRow({
   const [obs, setObs]           = useState(item.observacion || '')
   const [saving, setSaving]     = useState(false)
   const [uploading, setUploading] = useState(false)
+  // Id del ítem de recepción que va en la URL de las fotos (subir y borrar). Arranca con
+  // el `id` del listado, que es el del EmbarqueItem si el ítem no está empezado, y pasa
+  // al id real cuando la primera subida crea la fila (`handleFoto`). No hace falta
+  // resincronizarlo con `item`: cada `load` de RecepcionPanel muestra el spinner y
+  // desmonta todas las filas, así que el valor inicial siempre nace de un `item` fresco.
+  const [riId, setRiId] = useState<number>(item.id)
   const [fotos, setFotos]       = useState(item.fotos || [])
   const [expanded, setExpanded] = useState(!!item.estado_recepcion)
 
@@ -290,11 +305,19 @@ function RecepcionItemRow({
     if (!file) return
     setUploading(true)
     try {
-      const { data } = await bodegaAPI.subirFoto(recepcionId, item.id, file)
-      setFotos(prev => [...prev, { id: data.foto_id, url_foto: data.url }])
+      const { data } = await bodegaAPI.subirFoto(recepcionId, riId, file, item.embarque_item_id)
+      // `data` es `FotoSubida` (services/api.ts): el id de la foto viene en `id`.
+      setFotos(prev => [...prev, { id: data.id, url: data.url }])
+      // Si el ítem no estaba empezado, esta subida creó su fila de recepción: desde acá
+      // las fotos viajan con el id real de esa fila. `save` no lo necesita: manda
+      // `embarque_item_id`, que es el dato con que el backend encuentra el ítem.
+      if (data.recepcion_item_id) setRiId(data.recepcion_item_id)
       toast.success('Foto subida')
-    } catch {
-      toast.error('Error al subir foto')
+    } catch (err: unknown) {
+      // El backend redacta mensajes para el operador (recepción ya cerrada, formato no
+      // aceptado, ítem de otra recepción, falla al guardar el archivo): se muestran tal
+      // cual en vez de taparlos con un genérico.
+      toast.error(detalleDe(err) ?? 'Error al subir foto')
     } finally {
       setUploading(false)
       e.target.value = ''
@@ -303,11 +326,23 @@ function RecepcionItemRow({
 
   const handleDeleteFoto = async (fotoId: number) => {
     try {
-      await bodegaAPI.eliminarFoto(recepcionId, item.id, fotoId)
+      await bodegaAPI.eliminarFoto(recepcionId, riId, fotoId)
+      // Solo se saca de la lista cuando el backend confirma el borrado.
+      invalidarFoto(fotoId)   // libera el objectURL del caché de <FotoBodega>
       setFotos(prev => prev.filter(f => f.id !== fotoId))
       toast.success('Foto eliminada')
-    } catch {
-      toast.error('Error al eliminar foto')
+    } catch (err: unknown) {
+      if (estadoHttp(err) === 404) {
+        // La foto ya no está en la base (otro operador la borró): la pantalla estaba
+        // atrasada, no hubo un fallo. Se saca de la lista.
+        invalidarFoto(fotoId)
+        setFotos(prev => prev.filter(f => f.id !== fotoId))
+        toast('Esa foto ya no existe')
+        return
+      }
+      // El backend explica en `detail` por qué no borró (la recepción ya está cerrada, o
+      // es la única foto de un ítem guardado como dañado): se muestra tal cual.
+      toast.error(detalleDe(err) ?? 'Error al eliminar foto')
     }
   }
 
@@ -344,8 +379,8 @@ function RecepcionItemRow({
             <label className="text-[10px] uppercase tracking-wider font-semibold mb-1.5 block" style={{ color: 'var(--text-faint)' }}>Estado recepción</label>
             <div className="flex flex-wrap gap-1.5">
               {ESTADOS.map(e => (
-                <button key={e.val} onClick={() => setEstado(e.val)}
-                  className={`text-[11px] px-2.5 py-1 rounded-lg border transition-all font-medium ${estado === e.val ? 'border-brand-400 bg-brand-500/10 text-brand-400' : 'border-[var(--border)] hover:border-[var(--border-hover)]'} ${e.color}`}>
+                <button key={e.val} onClick={() => setEstado(e.val)} disabled={soloLectura}
+                  className={`text-[11px] px-2.5 py-1 rounded-lg border transition-all font-medium disabled:opacity-60 disabled:cursor-not-allowed ${estado === e.val ? 'border-brand-400 bg-brand-500/10 text-brand-400' : 'border-[var(--border)] hover:border-[var(--border-hover)]'} ${e.color}`}>
                   {e.label}
                 </button>
               ))}
@@ -357,15 +392,15 @@ function RecepcionItemRow({
             <div>
               <label className="text-[10px] uppercase tracking-wider font-semibold mb-1 block" style={{ color: 'var(--text-faint)' }}>Qty recibida</label>
               <input type="number" min={0} max={item.cantidad * 2} value={qtyRec}
-                onChange={e => setQtyRec(e.target.value)}
-                className="input w-20 text-center text-sm px-2 py-1" />
+                onChange={e => setQtyRec(e.target.value)} readOnly={soloLectura}
+                className="input w-20 text-center text-sm px-2 py-1 read-only:opacity-60" />
             </div>
             {isDanado(estado) && (
               <div>
                 <label className="text-[10px] uppercase tracking-wider font-semibold mb-1 block" style={{ color: 'var(--text-faint)' }}>Qty dañada</label>
                 <input type="number" min={0} max={item.cantidad} value={qtyDan}
-                  onChange={e => setQtyDan(e.target.value)}
-                  className="input w-20 text-center text-sm px-2 py-1" />
+                  onChange={e => setQtyDan(e.target.value)} readOnly={soloLectura}
+                  className="input w-20 text-center text-sm px-2 py-1 read-only:opacity-60" />
               </div>
             )}
           </div>
@@ -373,46 +408,67 @@ function RecepcionItemRow({
           {/* Observacion */}
           <div>
             <label className="text-[10px] uppercase tracking-wider font-semibold mb-1 block" style={{ color: 'var(--text-faint)' }}>Observación</label>
+            {/* En una recepción CERRADA los campos quedan inertes: sin esto el operador
+                podía escribir y tocar los estados, y como el botón Guardar no está, se iba
+                creyendo que había guardado. Editar sin poder guardar es peor que no poder
+                editar. */}
             <textarea value={obs} onChange={e => setObs(e.target.value)} rows={2}
-              className="input w-full text-xs px-2 py-1.5 resize-none" placeholder="Opcional…" />
+              readOnly={soloLectura}
+              className="input w-full text-xs px-2 py-1.5 resize-none read-only:opacity-60"
+              placeholder={soloLectura ? '' : 'Opcional…'} />
           </div>
 
-          {/* Photos */}
-          {isDanado(estado) && (
-            <div>
+          {/* Fotos — disponibles para TODO ítem, no solo los dañados: en bodega se
+              fotografían los de alto valor (sobre $3.000.000 de venta) aunque lleguen
+              completos, y más de una por ítem. La foto es obligatoria solo para un ítem
+              dañado (`needsFoto`): el backend la exige al guardar el ítem (`marcar_item`)
+              y no deja borrar la última foto de un ítem ya guardado como dañado
+              (`delete_foto`). */}
+          <div>
               <div className="flex items-center gap-2 mb-2">
                 <label className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: 'var(--text-faint)' }}>
-                  Fotos {needsFoto && <span className="text-red-400">(obligatorio)</span>}
+                  Fotos
+                  {soloLectura
+                    ? null
+                    : needsFoto
+                      ? <span className="text-red-400"> (obligatorio)</span>
+                      : <span style={{ color: 'var(--text-faint)' }}> (opcional)</span>}
+                  {fotos.length > 0 && (
+                    <span style={{ color: 'var(--text-muted)' }}> · {fotos.length}</span>
+                  )}
                 </label>
-                <label className={`cursor-pointer flex items-center gap-1 text-[11px] px-2 py-0.5 rounded border transition-colors ${needsFoto ? 'border-red-400 text-red-400 hover:bg-red-400/10' : 'border-[var(--border)] hover:border-brand-400 text-brand-400'}`}>
-                  {uploading ? <Loader2 className="w-3 h-3 animate-spin" /> : <ImagePlus className="w-3 h-3" />}
-                  Agregar foto
-                  <input type="file" accept="image/*" onChange={handleFoto} className="hidden" />
-                </label>
+                {!soloLectura && (
+                  <label className={`cursor-pointer flex items-center gap-1 text-[11px] px-2 py-0.5 rounded border transition-colors ${needsFoto ? 'border-red-400 text-red-400 hover:bg-red-400/10' : 'border-[var(--border)] hover:border-brand-400 text-brand-400'}`}>
+                    {uploading ? <Loader2 className="w-3 h-3 animate-spin" /> : <ImagePlus className="w-3 h-3" />}
+                    Agregar foto
+                    <input type="file" accept="image/*" onChange={handleFoto} className="hidden" />
+                  </label>
+                )}
               </div>
               {fotos.length > 0 && (
                 <div className="flex flex-wrap gap-2">
-                  {fotos.map(f => (
+                  {fotos.map((f, i) => (
                     <div key={f.id} className="relative group">
-                      <img src={f.url_foto} alt="foto" className="w-16 h-16 object-cover rounded-lg border" style={{ borderColor: 'var(--border)' }} />
-                      <button onClick={() => handleDeleteFoto(f.id)}
-                        className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-red-500 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                      <FotoBodega id={f.id} alt={`Foto ${i + 1} de ${fotos.length} de la recepción`}
+                        className="w-16 h-16 object-cover rounded-lg border" style={{ borderColor: 'var(--border)' }} />
+                      {!soloLectura && <button onClick={() => handleDeleteFoto(f.id)}
+                        aria-label="Eliminar foto"
+                        className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-red-500 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity">
                         <X className="w-3 h-3" />
-                      </button>
+                      </button>}
                     </div>
                   ))}
                 </div>
               )}
             </div>
-          )}
 
-          {/* Save button */}
+          {/* Save button — en una recepción cerrada no hay nada que guardar */}
           <div className="flex justify-end">
-            <button onClick={save} disabled={saving || !estado || needsFoto}
+            {!soloLectura && <button onClick={save} disabled={saving || !estado || needsFoto}
               className="btn-primary text-xs px-4 py-1.5 flex items-center gap-1.5 disabled:opacity-50">
               {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
               {isSaved ? 'Actualizar' : 'Guardar'}
-            </button>
+            </button>}
           </div>
         </div>
       )}
@@ -448,6 +504,10 @@ function RecepcionPanel({ recepcionId, onClose, onFinish }: {
 
   useEffect(() => { load() }, [load])
 
+  // Una recepción CERRADA se abre para CONSULTAR (ítems, observaciones y fotos), no
+  // para editar. Antes ni siquiera se podía abrir: el Historial era una tarjeta muerta
+  // y las fotos de la recepción quedaban inalcanzables aunque estuvieran en la base.
+  const soloLectura = rec?.estado === 'cerrada'
   const marcados = rec?.items.filter(i => i.estado_recepcion).length ?? 0
   const total    = rec?.items.length ?? 0
   const pct      = total > 0 ? Math.round((marcados / total) * 100) : 0
@@ -511,8 +571,14 @@ function RecepcionPanel({ recepcionId, onClose, onFinish }: {
               <Loader2 className="w-6 h-6 animate-spin" style={{ color: 'var(--text-faint)' }} />
             </div>
           ) : (
+            // La key lleva el prefijo de su numeración: `item.id` mezcla el id de la fila
+            // de recepción con el del ítem de embarque (ver RecepcionItem), y dos filas de
+            // una misma recepción pueden compartir ese número.
             rec?.items.map(item => (
-              <RecepcionItemRow key={item.id} item={item} recepcionId={recepcionId} onUpdate={load} />
+              <RecepcionItemRow
+                key={item.recepcion_item_id != null ? `ri-${item.recepcion_item_id}` : `ei-${item.embarque_item_id}`}
+                soloLectura={soloLectura} item={item}
+                recepcionId={recepcionId} onUpdate={load} />
             ))
           )}
         </div>
@@ -521,18 +587,24 @@ function RecepcionPanel({ recepcionId, onClose, onFinish }: {
         <div className="shrink-0 border-t px-4 py-3 space-y-2.5" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--surface-200)' }}>
           <textarea value={obsGeneral} onChange={e => setObsGeneral(e.target.value)}
             rows={2} placeholder="Observación general de la recepción (opcional)…"
+            readOnly={soloLectura}
             className="input w-full text-xs px-2.5 py-1.5 resize-none" />
           <div className="flex items-center gap-3">
-            {!allDone && (
+            {soloLectura && (
+              <p className="text-xs flex-1" style={{ color: 'var(--text-muted)' }}>
+                Recepción cerrada — solo consulta. Las fotos siguen disponibles.
+              </p>
+            )}
+            {!soloLectura && !allDone && (
               <p className="text-xs text-amber-400 flex-1">
                 ⚠ {total - marcados} ítem(s) sin marcar
               </p>
             )}
-            <button onClick={() => setConfirmClose(true)} disabled={closing || total === 0}
+            {!soloLectura && <button onClick={() => setConfirmClose(true)} disabled={closing || total === 0}
               className={`ml-auto btn-primary text-sm px-5 py-2 flex items-center gap-2 disabled:opacity-50 ${!allDone ? 'opacity-80' : ''}`}>
               {closing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Archive className="w-4 h-4" />}
               Cerrar recepción
-            </button>
+            </button>}
           </div>
         </div>
 
@@ -777,11 +849,15 @@ function EmbarqueCard({ emb, onRefresh, onOpenRec, tokens = [] }: {
 // Los datos viven en la página (se cargan una sola vez): así el buscador puede
 // mostrar el conteo cruzado en la etiqueta de la pestaña sin pedirlos de nuevo.
 
-function HistorialTab({ items, loading, q, tokens }: {
+function HistorialTab({ items, loading, q, tokens, onOpenRec }: {
   items: EmbarqueResumen[]
   loading: boolean
   q: string
   tokens: string[]
+  /** Abre la recepción CERRADA en modo consulta: ítems, observaciones y FOTOS.
+   *  Antes esta pestaña era una tarjeta muerta y las fotos de una recepción ya cerrada
+   *  quedaban inalcanzables desde la pantalla, aunque estuvieran guardadas. */
+  onOpenRec: (recepcionId: number) => void
 }) {
   if (loading) return (
     <div className="flex items-center justify-center py-16">
@@ -817,7 +893,16 @@ function HistorialTab({ items, loading, q, tokens }: {
                 <span>{emb.total_items} ítems</span>
               </div>
             </div>
-            <span className="text-[11px] font-semibold text-emerald-400">Recibido</span>
+            <div className="flex items-center gap-3 shrink-0">
+              <span className="text-[11px] font-semibold text-emerald-400">Recibido</span>
+              {emb.recepcion_id && (
+                <button onClick={() => onOpenRec(emb.recepcion_id!)}
+                  className="btn-secondary text-xs px-3 py-1.5 flex items-center gap-1.5">
+                  <ImagePlus className="w-3.5 h-3.5" />
+                  Ver recepción
+                </button>
+              )}
+            </div>
           </div>
         </div>
       ))}
@@ -1230,7 +1315,8 @@ export default function BodegaPage() {
           </div>
         )
       ) : tab === 'historial' ? (
-        <HistorialTab items={historialFilt} loading={loadingHist} q={qEfectivo} tokens={qTokens} />
+        <HistorialTab items={historialFilt} loading={loadingHist} q={qEfectivo} tokens={qTokens}
+                      onOpenRec={setActiveRec} />
       ) : (
         <BuscarItemsTab
           resp={resultados}

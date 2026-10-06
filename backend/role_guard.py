@@ -35,6 +35,9 @@ def require_rol(*allowed: str):
         if rol is None:
             return current_user
         if rol not in allowed:
+            # El frontend reconoce este 403 por el comienzo del `detail` (`DETALLES_AMBITO`
+            # en frontend-src/src/services/authErrors.ts): si se cambia acá, cambiarlo allá.
+            # Lo vigila routers/tests/test_auth_errors_espejo_frontend.py.
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Acceso restringido para tu rol",

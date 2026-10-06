@@ -5,9 +5,14 @@ ENDURECIDO 2026-08-27 (dos hallazgos CRITICOS del equipo de testing, reproducido
  1. ESCAPE DE CARPETA + XSS ALMACENADO. El nombre del archivo se armaba con el campo
     `entidad` que manda el formulario (`f"{entidad}_{entidad_id}_{ts}{ext}"`), así que
     una `entidad` con "../.." resolvía FUERA de static/docs. Enviándola apuntada a
-    `uploads/bodega` —directorio que main.py publica como StaticFiles— el atacante
+    `uploads/bodega` —que en esa fecha main.py publicaba como StaticFiles— el atacante
     dejaba un .html con <script> servido por el PROPIO dominio de la aplicación, o sea
-    robo de sesión de los operadores de las DOS marcas. Ahora el nombre lo genera el
+    robo de sesión de los operadores de las DOS marcas.
+    (Nota 2026-08-20: ese mount público YA NO EXISTE por omisión — la Fase 0 del Portal
+    lo dejó tras el flag `SERVIR_FOTOS_BODEGA_SIN_AUTH`, apagado, y las fotos se sirven
+    por `GET /api/bodega/fotos/{id}`. O sea que hoy esa mitad del ataque ya no está
+    disponible; el endurecimiento de acá sigue siendo necesario igual, porque el escape
+    de carpeta permitía escribir en cualquier parte, no solo ahí.) Ahora el nombre lo genera el
     servidor (uuid4 + extensión de lista blanca) y el destino se resuelve y confina
     contra DOCS_DIR: el dato del usuario ya no participa de la ruta, ni siquiera
     indirectamente.

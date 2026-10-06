@@ -55,6 +55,21 @@ class Settings(BaseSettings):
     SMTP_PASS: str = ""
     MAIL_FROM: str = "no-reply@bigcode.cl"
     MAIL_SOPORTE: str = "soporte@bigcode.cl"
+    # ── Fase 0 del Portal de Clientes (2026-08-20) ────────────────────────────────
+    # Limite de intentos del login (politica y modos de falla: backend/rate_limit_login.py).
+    # Nace ENCENDIDO. Apagarlo es un .env + restart, sin deploy de codigo, por si bloquea a
+    # alguien un dia de operacion critica; apagado, las cuentas quedan sin tope de intentos.
+    LOGIN_RATE_LIMIT_ENABLED: bool = True
+    # Tope de peticiones por minuto de cada cuenta del Portal de Clientes (tablero,
+    # descargas, todo lo demás). Nace ENCENDIDO. Apagarlo es un .env + restart. Vive en
+    # memoria del proceso: ver backend/portal/cupo.py.
+    PORTAL_CUPO_ENABLED: bool = True
+    # Servir uploads/bodega como carpeta PUBLICA (el comportamiento historico).
+    # Nace APAGADO: las fotos de recepcion se sirven ahora por
+    # GET /api/bodega/fotos/{id}, que exige sesion y resuelve el archivo desde la BD.
+    # La carpeta publica tenia nombres adivinables (recepcion_{id}_{timestamp}.jpg).
+    # Es la PALANCA DE ROLLBACK: ponerlo en true reactiva el mount de main.py en 30 s.
+    SERVIR_FOTOS_BODEGA_SIN_AUTH: bool = False
 
     class Config:
         env_file = ".env"
@@ -62,10 +77,43 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# Fail-fast (hallazgo revision 2026-07-16): la app NO debe arrancar con la clave
-# JWT por defecto — cualquiera podria firmar tokens validos.
-if settings.SECRET_KEY == "changeme-in-production":
+# Fail-fast: la app no arranca con una SECRET_KEY que no es una clave. Con cualquiera de
+# estos valores, quien tenga el repo puede firmar un JWT con el `sub` de cualquier usuario
+# y `auth.get_usuario_autenticado` lo acepta. Si cambia el placeholder de
+# backend/.env.example, cambiarlo aca (lo vigila routers/tests/test_config_secret_key.py).
+_SECRET_KEY_SIN_CONFIGURAR = frozenset({
+    "",                                  # la variable esta, pero vacia
+    "changeme-in-production",            # el default de Settings
+    "CAMBIAR-POR-UNO-ALEATORIO-LARGO",   # el placeholder de .env.example
+})
+if settings.SECRET_KEY.strip() in _SECRET_KEY_SIN_CONFIGURAR:
     raise RuntimeError(
-        "SECRET_KEY no esta configurada (backend/.env). La app no arranca con la "
-        "clave por defecto."
+        "SECRET_KEY no esta configurada (backend/.env): esta vacia, o tiene el valor por "
+        "defecto o el de la plantilla .env.example. Generar una con: "
+        "python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+    )
+
+# Una clave corta se puede adivinar por fuerza bruta a partir de un solo token. No corta
+# el arranque: el largo de las claves ya desplegadas no se conoce desde el repo y un raise
+# dejaria el backend entero caido en el siguiente restart. Se AVISA, igual que con CORS.
+_LARGO_MINIMO_SECRET_KEY = 32
+if len(settings.SECRET_KEY.strip()) < _LARGO_MINIMO_SECRET_KEY:
+    print(
+        f"[config] AVISO SECRET_KEY: mide menos de {_LARGO_MINIMO_SECRET_KEY} caracteres. "
+        "Conviene generar una nueva (cambiarla cierra las sesiones abiertas: todos vuelven "
+        "a entrar).",
+        flush=True,
+    )
+
+# Aviso de CORS (Fase 0, 2026-08-20): el default de CORS_ORIGINS incluye
+# http://localhost:5173 para que el `npm run dev` funcione sin configurar nada. En
+# PRODUCCION eso deja un origen de desarrollo autorizado con allow_credentials=True.
+# No se cambia el default (romperia el entorno de desarrollo de todos): se AVISA en el
+# log de arranque, y se corrige poniendo CORS_ORIGINS en backend/.env (ver .env.example).
+_CORS_DEV = [o for o in settings.CORS_ORIGINS if "localhost" in o or "127.0.0.1" in o]
+if _CORS_DEV:
+    print(
+        "[config] AVISO CORS: hay origenes de desarrollo autorizados "
+        f"{_CORS_DEV}. En produccion define CORS_ORIGINS en backend/.env.",
+        flush=True,
     )

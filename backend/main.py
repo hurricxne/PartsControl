@@ -2,8 +2,12 @@ import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from auth_errors import es_403_por_falta_de_sesion
 from config import settings
 from database import Base, engine
 from routers import auth, cotizaciones, cotizador, compras, clientes, ventas, facturas
@@ -34,6 +38,10 @@ from embarques_pricing.router import router as embarques_pricing_router
 from compras_contab.router import router as compras_contab_router
 from recepcion_nacional.router import router as recepcion_nacional_router  # camino físico de la compra nacional
 from tesoreria.router import router as tesoreria_router
+from portal.router import router as portal_router              # Portal de Clientes: lo que ve el cliente
+from portal.router_admin import router as portal_admin_router  # Portal de Clientes: lo que opera el personal
+from portal.router_ordenes import router as portal_ordenes_router          # Portal de Clientes: pedidos, seguimiento, documentos, fotos
+from portal.router_admin_fotos import router as portal_admin_fotos_router  # Portal de Clientes: fotos que sube el personal
 from wasabil_dte.router import router as wasabil_dte_router  # módulo aislado (Wasabil DTE: guías de despacho electrónicas al SII)
 from monza_router_documentos import router as monza_docs_router
 from monza_router_catalog import router as monza_catalog_router
@@ -101,6 +109,10 @@ app.include_router(embarques_pricing_router, prefix="/api")
 app.include_router(compras_contab_router, prefix="/api")
 app.include_router(recepcion_nacional_router, prefix="/api")  # /api/recepcion-nacional
 app.include_router(tesoreria_router, prefix="/api")
+app.include_router(portal_router, prefix="/api")        # /api/portal (solo cuentas tipo_acceso=portal)
+app.include_router(portal_admin_router, prefix="/api")  # /api/portal-admin (solo personal de Grupo AM)
+app.include_router(portal_ordenes_router, prefix="/api")      # /api/portal (pedidos del cliente)
+app.include_router(portal_admin_fotos_router, prefix="/api")  # /api/portal-admin (fotos para el cliente)
 app.include_router(wasabil_dte_router, prefix="/api")  # /api/wasabil (guías de despacho electrónicas)
 # Contabilidad MonzaParts, activable por flag. TODOS los imports van DENTRO del if a
 # proposito: con el flag apagado los modelos no se cargan, asi create_all no crea sus
@@ -155,8 +167,52 @@ os.makedirs("results", exist_ok=True)
 os.makedirs("uploads", exist_ok=True)
 os.makedirs("uploads/bodega", exist_ok=True)
 
-# Serve uploaded bodega photos as static files
-app.mount("/uploads/bodega", StaticFiles(directory="uploads/bodega"), name="bodega_uploads")
+# Fotos de recepción de bodega — Fase 0 del Portal de Clientes (2026-08-20).
+#
+# ANTES: esta carpeta se servía SIEMPRE y SIN sesión, con nombres predecibles
+# (`recepcion_{id}_{timestamp}.jpg`). Cualquiera en internet podía enumerarlas.
+# AHORA: las sirve `GET /api/bodega/fotos/{id}` (routers/bodega.py), que exige sesión
+# y resuelve el archivo desde la base, sin exponer el nombre.
+#
+# El flag es la PALANCA DE ROLLBACK: `SERVIR_FOTOS_BODEGA_SIN_AUTH=true` en
+# backend/.env + `pm2 restart machparts-api` devuelve el comportamiento viejo en 30
+# segundos, sin desplegar código. Se deja apagado por defecto.
+if settings.SERVIR_FOTOS_BODEGA_SIN_AUTH:
+    print("[startup] AVISO: uploads/bodega se sirve SIN autenticacion "
+          "(SERVIR_FOTOS_BODEGA_SIN_AUTH=true)", flush=True)
+    app.mount("/uploads/bodega", StaticFiles(directory="uploads/bodega"), name="bodega_uploads")
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _sesion_ausente_es_401(request, exc: StarletteHTTPException):
+    """Traduce a 401 el 403 que FastAPI emite cuando FALTA el token.
+
+    POR QUÉ (Fase 0, 2026-08-20): `auth.py:12` usa `HTTPBearer()` con el
+    `auto_error=True` por defecto, así que una petición SIN el header Authorization
+    no recibe 401 sino **403 "Not authenticated"**. Eso mezcla dos cosas que el
+    frontend necesita distinguir:
+        · 401 / "no tienes sesión"      -> hay que mandar al login
+        · 403 / "tu sesión no alcanza"  -> hay que avisar, NO desloguear
+    Sin esta traducción, el interceptor del frontend tendría que adivinar comparando
+    textos de error, que se rompe en cuanto alguien cambie una palabra.
+
+    Es aditivo y de bajo riesgo: solo reclasifica DOS detalles exactos que emite la
+    librería, nunca un 403 propio del negocio (`empresa_guard`, `role_guard`), que
+    siguen llegando como 403 tal cual. El criterio vive en `backend/auth_errors.py`
+    para poder probarlo sin levantar la app entera.
+    """
+    if es_403_por_falta_de_sesion(exc.status_code, exc.detail):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Not authenticated"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    # Para TODO lo demás se delega en el manejador propio de FastAPI, no se
+    # reimplementa. Esa función sabe cosas que es fácil olvidar: por ejemplo, que los
+    # códigos que NO admiten cuerpo (204, 304) deben responder con `Response` pelado y
+    # no con un JSON — devolver un JSON ahí rompe clientes. Este handler solo
+    # reclasifica dos detalles y se aparta.
+    return await http_exception_handler(request, exc)
 
 
 @app.on_event("startup")

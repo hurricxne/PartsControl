@@ -26,7 +26,13 @@ el de **MonzaParts va apagado**. Se controla por flags — el código es el mism
 | `AUTO_CREATE_TABLES` (`backend/.env`) | *(ausente = true)* | *(ausente = true)* | Gate del `create_all` que corre al importar `main.py` |
 
 Además, `config.py` hace **fail-fast**: si `SECRET_KEY` es la default
-(`changeme-in-production`), la app **no arranca**.
+(`changeme-in-production`), el placeholder de `backend/.env.example`
+(`CAMBIAR-POR-UNO-ALEATORIO-LARGO`) o la clave vacía, la app **no arranca**. Con menos de
+32 caracteres arranca, pero avisa en el log (`[config] AVISO SECRET_KEY`). Antes de un
+restart, comprobar el `.env` del servidor sin mostrar la clave (0 = bien):
+`grep -c -E '^SECRET_KEY=("?)(CAMBIAR-POR-UNO-ALEATORIO-LARGO|changeme-in-production)?("?)[[:space:]]*$' backend/.env`.
+Generar una nueva con `python -c "import secrets; print(secrets.token_urlsafe(48))"`;
+cambiarla cierra las sesiones abiertas (todos vuelven a entrar).
 
 ### ⚠️ Apagar el flag NO exime de correr las migraciones de MonzaParts
 
@@ -84,7 +90,7 @@ grep MONZA_CONTAB_ENABLED backend/.env          # -> false
 cat frontend-src/.env.local                     # -> VITE_MONZA_CONTAB=false
 
 # 3) Migraciones: create_all NO agrega columnas a tablas existentes.
-#    Son 32 scripts y hay ORDEN obligatorio entre varios. La lista, con qué se rompe si
+#    Son decenas de scripts (la cuenta exacta la imprime `audit_schema.py --pasos`) y hay ORDEN obligatorio entre varios. La lista, con qué se rompe si
 #    se salta cada uno, está en docs/CHECKLIST-DEPLOY-2026-07-20.md §1: copiar y correr
 #    ESE bloque completo, desde backend/, con el venv del servidor.
 #    (Hasta 2026-07-30 este README listaba 1 de los 22 y no citaba el checklist. Los

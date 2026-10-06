@@ -1,5 +1,6 @@
 import axios from 'axios'
 import { useAuthStore } from '../stores/authStore'
+import { manejarErrorAuth } from './authErrors'
 
 const api = axios.create({
   baseURL: '/api',
@@ -12,13 +13,14 @@ api.interceptors.request.use((config) => {
   return config
 })
 
+// Política de sesión y permiso: vive en services/authErrors.ts y la comparten los DOS
+// clientes axios (este y monzaApi.ts). Antes cada uno manejaba el 401 a su manera y
+// NINGUNO manejaba el 403 (grep de "403" en src/ daba cero), así que un usuario sin
+// permiso se quedaba dentro del cascarón interno con las tablas vacías.
 api.interceptors.response.use(
   (res) => res,
   (err) => {
-    if (err.response?.status === 401) {
-      useAuthStore.getState().logout()
-      window.location.href = '/login'
-    }
+    manejarErrorAuth(err)
     return Promise.reject(err)
   }
 )
@@ -232,6 +234,24 @@ export const ticketsAPI = {
 }
 
 // Bodega
+/** Una foto de recepción, vista desde otra pantalla (Despachos). Los BYTES se piden a
+ *  GET /api/bodega/fotos/{id}, que exige sesión: acá solo viajan los metadatos. */
+export interface FotoRecepcionItem {
+  id: number
+  recepcion_id: number
+  estado_recepcion: string | null
+  observacion: string | null
+  fecha: string | null
+}
+
+/** Lo que responde `upload_foto` (routers/bodega.py). `url` es la ruta histórica del
+ *  archivo y es solo informativa: la imagen se pide por id con <FotoBodega>. */
+export interface FotoSubida {
+  id: number
+  url: string
+  recepcion_item_id: number
+}
+
 export const bodegaAPI = {
   listEmbarques: () => api.get('/bodega/embarques'),
   historialEmbarques: () => api.get('/bodega/embarques/historial'),
@@ -240,11 +260,17 @@ export const bodegaAPI = {
   getRecepcion: (recepcionId: number) => api.get(`/bodega/recepciones/${recepcionId}`),
   marcarItem: (recepcionId: number, itemId: number, data: Record<string, any>) =>
     api.patch(`/bodega/recepciones/${recepcionId}/items/${itemId}`, data),
-  subirFoto: (recepcionId: number, riId: number, file: File) => {
+  // `embarqueItemId` desambigua cuál ítem es: el campo `id` del listado mezcla dos
+  // espacios de numeración (RecepcionEmbarqueItem.id para el ítem ya empezado,
+  // EmbarqueItem.id para el que no), y los dos autoincrementales van casi parejos.
+  // Es la misma convención que ya usa `marcarItem`, que lo manda en el cuerpo.
+  // Opcional: sin él el backend cae al comportamiento histórico.
+  subirFoto: (recepcionId: number, riId: number, file: File, embarqueItemId?: number) => {
     const fd = new FormData()
     fd.append('file', file)
-    return api.post(`/bodega/recepciones/${recepcionId}/items/${riId}/foto`, fd, {
+    return api.post<FotoSubida>(`/bodega/recepciones/${recepcionId}/items/${riId}/foto`, fd, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      params: embarqueItemId != null ? { embarque_item_id: embarqueItemId } : undefined,
     })
   },
   eliminarFoto: (recepcionId: number, riId: number, fotoId: number) =>
@@ -254,6 +280,11 @@ export const bodegaAPI = {
   listReclamos: () => api.get('/bodega/reclamos'),
   actualizarReclamo: (id: number, data: Record<string, any>) =>
     api.patch(`/bodega/reclamos/${id}`, data),
+  // Fotos de RECEPCIÓN de una línea de venta, para consultarlas desde Despachos.
+  // Solo lectura: desde acá no se borran (son evidencia; se borran en la pantalla
+  // donde se tomaron, con su contexto a la vista).
+  fotosDeItem: (itemCotizacionId: number) =>
+    api.get<FotoRecepcionItem[]>(`/bodega/items/${itemCotizacionId}/fotos`),
   listoParaDespachar: () => api.get('/bodega/ventas/listo-para-despachar'),
   alertasPlazo: () => api.get('/bodega/ventas/alertas-plazo-critico'),
 }
@@ -368,6 +399,9 @@ export interface FirmaItemPayload {
 export interface DespachoItemDetalle {
   /** = despacho_item_id para POST /firmar */
   id: number
+  /** Línea de venta. El backend lo devuelve desde siempre; el tipo no lo declaraba.
+   *  Es la llave para pedir las fotos de RECEPCIÓN de esta pieza. */
+  item_cotizacion_id?: number
   numero_parte: string
   descripcion: string
   marca: string

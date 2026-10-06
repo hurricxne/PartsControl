@@ -84,9 +84,54 @@ def _limpiar_doc(resp):
         os.remove(ruta)
 
 
+def _barrer_mark(db):
+    """Borra TODO rastro del MARK por nombre/número/email — no por los ids de `_seed`.
+
+    `cleanup()` solo sabe borrar lo que ESTE proceso sembró (los ids de `_seed`). Si una
+    corrida muere a medio camino —un corte con Ctrl-C, un timeout, o dos suites peleando
+    por la misma base de MySQL— sus filas quedan colgadas, y como `numero` es ÚNICO el
+    `seed()` siguiente choca con `Duplicate entry '__TEST_MC__-…'` y la suite queda ROJA
+    para siempre hasta que alguien limpie la base a mano. Barrer por MARK ANTES de sembrar
+    hace que la corrida se auto-cure. Mismo criterio que `monza_tests/*::_cleanup`, que ya
+    limpia por marca (`like(f"OCP-{SUF}-%")`) en vez de por ids en memoria.
+
+    El orden respeta las FK: facturas (con cascade a items/cobranzas/factoring) y adelantos
+    primero, después despacho_items → despachos → ítems → cotizaciones → cliente → logs. El
+    `_` del MARK se escapa porque en SQL LIKE es un comodín de un carácter, y sin escapar
+    `__TEST_MC__%` barrería filas ajenas.
+    """
+    like = MARK.replace("_", r"\_") + "%"
+    cot_ids = [c.id for c in db.query(mm.MonzaCotizacion).filter(
+        mm.MonzaCotizacion.numero.like(like, escape="\\")).all()]
+    desp_ids = [d.id for d in db.query(mm.MonzaDespacho).filter(
+        mm.MonzaDespacho.numero.like(like, escape="\\")).all()]
+    item_ids = [i.id for i in db.query(mm.MonzaCotizacionItem).filter(
+        mm.MonzaCotizacionItem.cotizacion_id.in_(cot_ids or [0])).all()]
+    for f in db.query(MonzaContFacturaCliente).filter(
+            MonzaContFacturaCliente.cotizacion_id.in_(cot_ids or [0])).all():
+        db.delete(f)  # ORM delete: dispara el cascade a items/cobranzas/factoring
+    db.query(MonzaContAdelanto).filter(
+        MonzaContAdelanto.cotizacion_id.in_(cot_ids or [0])).delete(synchronize_session=False)
+    db.flush()
+    db.query(mm.MonzaDespachoItem).filter(
+        mm.MonzaDespachoItem.despacho_id.in_(desp_ids or [0])).delete(synchronize_session=False)
+    db.query(mm.MonzaDespacho).filter(
+        mm.MonzaDespacho.id.in_(desp_ids or [0])).delete(synchronize_session=False)
+    db.query(mm.MonzaCotizacionItem).filter(
+        mm.MonzaCotizacionItem.id.in_(item_ids or [0])).delete(synchronize_session=False)
+    db.query(mm.MonzaCotizacion).filter(
+        mm.MonzaCotizacion.id.in_(cot_ids or [0])).delete(synchronize_session=False)
+    db.query(mm.MonzaCliente).filter(
+        mm.MonzaCliente.nombre.like(like, escape="\\")).delete(synchronize_session=False)
+    db.query(mm.MonzaLog).filter(
+        mm.MonzaLog.user_email == f"test-{MARK}@monza.test").delete(synchronize_session=False)
+    db.commit()
+
+
 def seed():
     db = SessionLocal()
     try:
+        _barrer_mark(db)  # auto-cura: una corrida muerta no puede romper la siguiente
         cli = mm.MonzaCliente(nombre=f"{MARK} Cliente", rut="11.111.111-1")
         db.add(cli); db.flush()
         cot = mm.MonzaCotizacion(

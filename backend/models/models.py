@@ -25,6 +25,15 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     is_active = Column(Integer, default=1)
     empresa = Column(String(50), nullable=False, server_default='mineria')
+    # Quién es esta cuenta frente al sistema: 'interno' (personal de la empresa, entra al
+    # ERP) o 'portal' (contacto de un cliente, entra SOLO al Portal de Clientes). Es un eje
+    # distinto de `empresa` (la marca) y de `rol` (el perfil funcional que role_guard.py
+    # espera: admin, comercial, contabilidad…). NO se llama `rol` a propósito: role_guard,
+    # la campana de notificaciones y los gates de "Editar OC" ya leen `user.rol`, y una
+    # columna con ese nombre y el valor 'interno' dejaría a todo el personal con 403 en
+    # Contabilidad. La puerta única auth.get_current_user niega todo lo que no sea
+    # 'interno'; el portal entra por portal/deps.py. Migración: python -m portal.init_db
+    tipo_acceso = Column(String(20), nullable=False, server_default='interno')
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     cotizaciones = relationship("Cotizacion", back_populates="user")
@@ -64,6 +73,17 @@ class Cotizacion(Base):
     # Ver services/pricing_service.py:config_efectivo y docs/tc-congelado-cotizacion.md.
     pricing_snapshot = Column(Text, nullable=True)
     pricing_snapshot_at = Column(DateTime(timezone=True), nullable=True)
+    # Ancla del aislamiento del Portal de Clientes: a qué fila de `clientes` pertenece esta
+    # venta. El portal filtra SOLO por este entero — jamás por `cliente` (texto libre) ni
+    # por `rut_cliente` (nullable y sucio): filtrar por texto es un bypass trivial. NULL =
+    # sin vincular → la venta no existe para el portal (falla cerrado). Es un dato
+    # DERIVADO del RUT: lo mantiene portal/sincronia.py en cada escritura, el Cierre de
+    # Venta y `python -m portal.vincular_clientes` para lo histórico. ON DELETE SET NULL:
+    # borrar una ficha desvincula sus ventas (desaparecen del portal) en vez de impedir
+    # el borrado, que es como siempre funcionó la pantalla Clientes.
+    # Migración: python -m portal.init_db
+    cliente_id = Column(
+        Integer, ForeignKey("clientes.id", ondelete="SET NULL"), nullable=True, index=True)
 
     user = relationship("User", back_populates="cotizaciones")
     items = relationship(
@@ -95,6 +115,22 @@ class ItemCotizacion(Base):
     plazo_entrega_min = Column(Integer, nullable=True)
     plazo_entrega_max = Column(Integer, nullable=True)
     estado_item = Column(String(50), default="ingresado")
+    # Fecha prometida al cliente, congelada al Cierre de Venta (mismo criterio que
+    # pricing_snapshot): día del cierre en hora de Chile + el plazo del ítem en días
+    # hábiles, calculada UNA vez en crear_oc_cliente (routers/compras.py). El plazo es
+    # plazo_entrega_max o, si el ítem no tiene, el plazo máximo por defecto del cotizador
+    # en ese momento: lo que le informó la cotización formal. Se congela porque después
+    # del cierre plazo_entrega_max se pisa al comprar (asignar_items y la asignación
+    # parcial). Es la fecha que muestra el Portal de Clientes.
+    # NULL = venta que se cerró sin congelar (anterior a la columna: no se rellena hacia
+    # atrás, decisión del dueño) o plazo que no sirve para calcular (plazo_creible). Con
+    # NULL, Despachos usa _item_deadline (routers/despachos.py) y el portal, la fecha de
+    # entrega de la orden.
+    # No es oc_cliente.fecha_entrega: esa la sugiere la pantalla del Cierre y el comercial
+    # puede cambiarla a mano; la del ítem no la sigue.
+    # Los splits la heredan al clon vía _clone_item_cotizacion.
+    # Migración: python -m migrations.item_fecha_promesa_cliente
+    fecha_promesa_cliente = Column(Date, nullable=True)
 
     nombre_cat = Column(String(500))
     precio_cat = Column(Float)

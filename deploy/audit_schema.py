@@ -48,7 +48,7 @@ from typing import List, Optional, Tuple
 # variable AUDIT_BACKEND_DIR (útil para auditar una copia de respaldo).
 RUTA_HISTORICA_QA = Path("/var/www/machparts.bigcode.cl/backend")
 
-# Los 2 núcleos + los 11 SATÉLITES. Cada uno se importa en su propio try/except y un fallo
+# Los 2 núcleos + los SATÉLITES (la cuenta la imprime el propio auditor). Cada uno se importa en su propio try/except y un fallo
 # se CUENTA como problema (rc=1). La versión vieja hacía lo contrario: imprimía
 # `(monza_models no cargado: …)` entre paréntesis y seguía hasta el "sin problemas" con
 # rc=0, o sea que un rename de módulo apagaba media auditoría sin que nadie lo notara.
@@ -68,6 +68,7 @@ MODULOS = (
     ("monza_wasabil_dte.models",       "DTE al SII Monza (monza_wasabil_dte)"),
     ("wasabil_compras.models",         "libro de compras del SII GA (sii_libro_*)"),
     ("monza_wasabil_compras.models",   "libro de compras del SII Monza (monza_sii_libro_*)"),
+    ("portal.models",                  "Portal de Clientes GA (usuario_cliente, portal_acceso)"),
 )
 
 # Tablas que SOLO existen con `MONZA_CONTAB_ENABLED=true`: apagado el flag, `main.py` ni
@@ -153,7 +154,7 @@ def _duenios_de_tabla(Base) -> dict:
 
 
 def registrar_modelos() -> Tuple[object, List[str], List[str]]:
-    """Importa los 13 módulos de modelos y devuelve (Base, fallos, tablas_de_satelite).
+    """Importa todos los módulos de MODULOS y devuelve (Base, fallos, tablas_de_satelite).
 
     `tablas_de_satelite` son las tablas que NO declara el núcleo — o sea las que el auditor
     viejo no veía. Se calculan por DUEÑO (el módulo del mapper), no por el orden en que se

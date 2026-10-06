@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Eye, EyeOff, ChevronRight, Wrench, Car } from 'lucide-react'
+import { Eye, EyeOff, ChevronRight, Wrench, Car, AlertCircle } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { authAPI } from '../services/api'
-import { useAuthStore } from '../stores/authStore'
+import { useAuthStore, esCuentaPortal } from '../stores/authStore'
 
 type Empresa = 'mineria' | 'automotriz'
 
@@ -50,6 +50,10 @@ export default function LoginPage() {
   const [password, setPassword] = useState('')
   const [showPass, setShowPass] = useState(false)
   const [loading, setLoading] = useState(false)
+  // Aviso FIJO para el 403 del login (cuenta del portal suspendida por inactividad). No
+  // va en un toast: el mensaje trae la instrucción de qué hacer ("pide a tu ejecutivo que
+  // la reactive") y un toast de 4 segundos se va antes de que el cliente lo lea.
+  const [avisoCuenta, setAvisoCuenta] = useState('')
 
   const cfg = EMPRESAS[empresa]
 
@@ -62,8 +66,19 @@ export default function LoginPage() {
     ev.preventDefault()
     if (!email || !password) { toast.error('Completa todos los campos'); return }
     setLoading(true)
+    setAvisoCuenta('')
     try {
       const { data } = await authAPI.login(email, password)
+      // Cuenta del Portal de Clientes: entra por este mismo login y va directo a /portal.
+      // ANTES del chequeo del selector de marca: ese selector es del personal, el
+      // cliente no sabe (ni tiene por qué saber) cuál pestaña le corresponde, y con la
+      // pestaña equivocada quedaría rechazado con un mensaje que no entiende.
+      if (esCuentaPortal(data.user)) {
+        setAuth(data.access_token, data.user)
+        toast.success(`Bienvenido, ${data.user.nombre}`)
+        navigate('/portal', { replace: true })
+        return
+      }
       const userEmpresa = data.user.empresa || 'mineria'
       // Cuentas del equipo Bigcode (@bigcode.cl, ej. soporte) entran a AMBOS sistemas:
       // se les respeta la pestaña elegida en vez de exigir que coincida con su empresa.
@@ -78,7 +93,15 @@ export default function LoginPage() {
       const destino = esBigcode ? empresa : userEmpresa
       navigate(destino === 'automotriz' ? '/monzaparts/leads' : '/', { replace: true })
     } catch (err: any) {
-      toast.error(err.response?.data?.detail || 'Error al iniciar sesión')
+      const detail = err.response?.data?.detail
+      // 403 en el login = la clave ERA correcta pero la cuenta no puede entrar (portal
+      // suspendido por inactividad). El backend explica el motivo y el siguiente paso:
+      // se muestra tal cual y se deja en pantalla. El resto sigue como siempre.
+      if (err.response?.status === 403 && typeof detail === 'string' && detail) {
+        setAvisoCuenta(detail)
+      } else {
+        toast.error(detail || 'Error al iniciar sesión')
+      }
     } finally {
       setLoading(false)
     }
@@ -194,6 +217,20 @@ export default function LoginPage() {
           </div>
 
           <form onSubmit={handleLogin} className="space-y-5">
+            {avisoCuenta && (
+              <div
+                role="alert"
+                className="flex items-start gap-2.5 rounded-xl px-4 py-3 text-sm"
+                style={{
+                  backgroundColor: 'rgba(239,68,68,0.12)',
+                  border: '1px solid rgba(239,68,68,0.45)',
+                  color: 'var(--text-primary)',
+                }}
+              >
+                <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 text-red-500" aria-hidden="true" />
+                <span>{avisoCuenta}</span>
+              </div>
+            )}
             <div>
               <label className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-muted)' }}>Email</label>
               <input

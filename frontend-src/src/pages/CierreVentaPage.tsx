@@ -44,17 +44,11 @@ function easterDate(year: number): Date {
   return new Date(year, month, day)
 }
 
-/** Devuelve la fecha del n-ésimo weekday (0=Dom…6=Sáb) del mes/año */
-function nthWeekday(year: number, month: number, weekday: number, n: number): Date {
-  const d = new Date(year, month - 1, 1)
-  let count = 0
-  while (true) {
-    if (d.getDay() === weekday) { count++; if (count === n) return new Date(d) }
-    d.setDate(d.getDate() + 1)
-  }
-}
-
-/** Feriados legales Chile — incluye Jueves Santo, Viernes Santo y Pueblos Indígenas */
+/** Feriados que descuenta la cuenta de días hábiles: fechas fijas + Viernes Santo. Es la
+ *  MISMA tabla que _is_chile_holiday (backend/routers/compras.py): con esa el backend
+ *  congela la fecha prometida de cada ítem al cerrar la venta, y las fechas que muestra
+ *  esta pantalla tienen que coincidir. Las compara
+ *  backend/routers/tests/test_cierre_espejo_frontend.py: si cambia una, cambia la otra. */
 function isHoliday(date: Date): boolean {
   const mo = date.getMonth() + 1
   const dd = date.getDate()
@@ -65,6 +59,7 @@ function isHoliday(date: Date): boolean {
     [1,1],   // Año Nuevo
     [5,1],   // Día del Trabajo
     [5,21],  // Glorias Navales
+    [6,20],  // Día de los Pueblos Indígenas
     [6,29],  // San Pedro y San Pablo
     [7,16],  // Virgen del Carmen
     [8,15],  // Asunción
@@ -78,18 +73,10 @@ function isHoliday(date: Date): boolean {
   ]
   if (fixed.some(([fm, fd]) => fm === mo && fd === dd)) return true
 
-  // Pascua → Jueves Santo (−3) y Viernes Santo (−2)
+  // Viernes Santo: 2 días antes de Pascua
   const easter = easterDate(y)
-  const juevesSanto = new Date(easter); juevesSanto.setDate(easter.getDate() - 3)
   const viernesSanto = new Date(easter); viernesSanto.setDate(easter.getDate() - 2)
-  if (dd === juevesSanto.getDate()  && mo === juevesSanto.getMonth()  + 1) return true
   if (dd === viernesSanto.getDate() && mo === viernesSanto.getMonth() + 1) return true
-
-  // Día de los Pueblos Indígenas — 3er lunes de junio (desde 2021)
-  if (y >= 2021) {
-    const pueblos = nthWeekday(y, 6, 1, 3) // lunes=1, 3er ocurrencia, junio
-    if (mo === 6 && dd === pueblos.getDate()) return true
-  }
 
   return false
 }
@@ -103,6 +90,15 @@ function addBusinessDays(start: Date, days: number): Date {
     if (dow !== 0 && dow !== 6 && !isHoliday(result)) count++
   }
   return result
+}
+
+/** Plazo, en días hábiles, de la fecha de entrega que se sugiere para la orden: el del
+ *  ítem que más tarda. El ítem sin plazo máximo propio cuenta con el plazo por defecto
+ *  del cotizador, igual que al congelar su fecha en el backend (plazo_prometido,
+ *  routers/compras.py); las compara routers/tests/test_cierre_espejo_frontend.py. */
+function plazoDeLaOrden(plazos: (number | null | undefined)[], plazoDefault: number): number {
+  const efectivos = plazos.map(p => (p != null && p > 0 ? p : plazoDefault))
+  return efectivos.length > 0 ? Math.max(...efectivos) : plazoDefault
 }
 
 /** Formatea Date a YYYY-MM-DD usando fecha LOCAL (evita desfase UTC en Chile UTC-3/−4) */
@@ -279,14 +275,13 @@ export default function CierreVentaPage() {
       setItems(itemsRaw)
       setSelectedItems(new Set(itemsRaw.map(i => i.id)))
 
-      // Fecha prometida = max(plazo_entrega_max por ítem) en días hábiles.
-      // Si ningún ítem tiene plazo, usar plazo_max_default del config como fallback.
+      // Fecha de entrega sugerida = hoy + el plazo del ítem que más tarda (plazoDeLaOrden).
+      // Se calcula con el plazo máximo tal como está guardado, sin los respaldos que usa
+      // la fila: así coincide con la última de las fechas que el backend congela.
       const plazoConfig: number = data.config?.plazo_max_default ?? 45
       setPlazoDefault(plazoConfig)
-      const plazos = itemsRaw
-        .map(i => i.plazo_entrega_max)
-        .filter((v): v is number => v != null && v > 0)
-      const maxPlazo = plazos.length > 0 ? Math.max(...plazos) : plazoConfig
+      const maxPlazo = plazoDeLaOrden(
+        (data.items || []).map((it: any) => it.plazo_entrega_max), plazoConfig)
       setPlazoDias(maxPlazo)
       setFechaEntrega(toDateInput(addBusinessDays(new Date(), maxPlazo)))
     }).catch(() => toast.error('Error al cargar ítems'))

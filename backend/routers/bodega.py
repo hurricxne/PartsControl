@@ -1,16 +1,22 @@
+import mimetypes
 import os
+import re
 import shutil
+import uuid
 from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from fastapi.responses import FileResponse
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from database import get_db
 from auth import get_current_user
-# Candado de empresa SOLO para el endpoint nuevo /bodega/items (el resto del
-# router queda como está: decisión pendiente del dueño).
+# Candado de empresa ("mineria"): lo llevan `buscar_items` y las cuatro rutas de fotos
+# (`upload_foto`, `delete_foto`, `serve_foto`, `fotos_de_item`). El resto del router no
+# lo lleva: es una decisión pendiente del dueño.
 from empresa_guard import require_empresa
 from models.models import (
     User, Embarque, EmbarqueItem, ItemCotizacion, OcCliente, OcProveedor,
@@ -24,6 +30,10 @@ router = APIRouter(prefix="/bodega", tags=["bodega"])
 
 UPLOAD_DIR = "uploads/bodega"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Raíz absoluta para confinar la lectura y el borrado de fotos. Se resuelve una sola vez
+# al importar: si se calculara por request y alguien cambiara el directorio de trabajo,
+# la comprobación de prefijo compararía contra una raíz distinta y dejaría de servir.
+_FOTOS_DIR = os.path.abspath(UPLOAD_DIR)
 
 
 # ── HELPERS ────────────────────────────────────────────────────────────────────
@@ -195,6 +205,25 @@ def historial_embarques(
         q = q.filter(Embarque.estado == "despachado")
 
     embarques = q.order_by(Embarque.updated_at.desc()).limit(50).all()
+    # `recepcion_id` y `total_items` (2026-08-20): sin ellos la pestaña Historial era una
+    # tarjeta muerta — no se podía abrir la recepción cerrada para consultar sus ítems ni
+    # sus FOTOS, y el conteo de ítems que pintaba la pantalla llegaba vacío. Las fotos ya
+    # estaban en la base y `get_recepcion` ya las devolvía: lo único que faltaba era el id
+    # para llegar hasta ellas.
+    ids = [e.id for e in embarques]
+    recepciones = {
+        r.embarque_id: r.id
+        for r in db.query(RecepcionEmbarque).filter(
+            RecepcionEmbarque.embarque_id.in_(ids)).all()
+    } if ids else {}
+    # Conteo en UNA consulta agrupada, no una por embarque (N+1).
+    conteos = {
+        row[0]: row[1]
+        for row in db.query(EmbarqueItem.embarque_id, func.count(EmbarqueItem.id))
+        .filter(EmbarqueItem.embarque_id.in_(ids))
+        .group_by(EmbarqueItem.embarque_id).all()
+    } if ids else {}
+
     return [
         {
             "id": e.id,
@@ -204,6 +233,8 @@ def historial_embarques(
             "awb": e.awb,
             "awb_numero": e.awb_numero,
             "fecha_llegada_est": str(e.fecha_llegada_est) if e.fecha_llegada_est else None,
+            "recepcion_id": recepciones.get(e.id),
+            "total_items": conteos.get(e.id, 0),
         }
         for e in embarques
     ]
@@ -311,6 +342,7 @@ def get_recepcion(
             "qty_danada": ri.qty_danada,
             "estado_recepcion": ri.estado_recepcion,
             "observacion": ri.observacion,
+            # `url`: ruta histórica del archivo, solo informativa (ver `upload_foto`).
             "fotos": [{"id": f.id, "url": f.url_foto} for f in fotos],
         })
         items_out.append(d)
@@ -444,23 +476,14 @@ def marcar_item(
 
     es_danado = "danado" in body.estado_recepcion
 
-    # Resolver la fila de recepción SIEMPRE por embarque_item_id (unívoco por recepción y
-    # SIEMPRE presente en el body). NO usar el item_id de la URL como PK: para ítems aún
-    # sin recepción el frontend manda ahí el embarque_item_id, que con muchos ítems colisiona
-    # con el PK (recepcion_item_id) de OTRA fila ya marcada -> se marcaba el ítem equivocado
-    # (bug "atascado al 63%": el progreso no subía porque el ítem objetivo nunca se creaba).
-    ri = None
-    if body.embarque_item_id is not None:
-        ri = db.query(RecepcionEmbarqueItem).filter(
-            RecepcionEmbarqueItem.recepcion_id == recepcion_id,
-            RecepcionEmbarqueItem.embarque_item_id == body.embarque_item_id,
-        ).first()
-    # Fallback por PK solo si el body no trae embarque_item_id (compatibilidad).
-    if ri is None and body.embarque_item_id is None:
-        ri = db.query(RecepcionEmbarqueItem).filter(
-            RecepcionEmbarqueItem.recepcion_id == recepcion_id,
-            RecepcionEmbarqueItem.id == item_id,
-        ).first()
+    # La TERCERA puerta del mismo contador ambiguo (2026-08-20). El cuerpo ya trae
+    # `embarque_item_id` explícito, así que ese dato MANDA: buscar primero por `item_id`
+    # con `.id` hacía que, cuando los dos espacios de numeración colisionan, la cantidad
+    # recibida se escribiera en la fila de OTRO ítem — sin atacante, en el flujo normal
+    # del bodeguero. Misma regla que `_resolver_ri`, que documenta el problema completo.
+    # (Es también el arreglo del bug «atascado al 63%» que QA ya tenía inline: con
+    # embarque_item_id presente, _resolver_ri hace exactamente esa búsqueda.)
+    ri = _resolver_ri(db, recepcion_id, item_id, body.embarque_item_id)
 
     if not ri:
         ri = RecepcionEmbarqueItem(
@@ -551,29 +574,137 @@ def crear_recepcion_item(
 
 # ── UPLOAD FOTO ────────────────────────────────────────────────────────────────
 
-@router.post("/recepciones/{recepcion_id}/items/{ri_id}/foto", status_code=201)
-async def upload_foto(
+def _recepcion_abierta_con_lock(db: Session, recepcion_id: int) -> RecepcionEmbarque:
+    """La recepción, leída con candado y todavía abierta; 400 si no existe o ya cerró.
+
+    Es la PRIMERA sentencia de `upload_foto` y de `delete_foto`, por dos motivos:
+
+    · ESTADO. Una recepción cerrada es de solo consulta: sus fotos respaldan los reclamos
+      al proveedor que crea `cerrar_recepcion`. La pantalla esconde los botones, pero una
+      pantalla que quedó abierta desde antes del cierre los sigue mostrando.
+    · ORDEN. `marcar_item`, `crear_recepcion_item` y `cerrar_recepcion` empiezan tomando
+      este mismo candado. Con las fotos en la misma fila de espera, «el ítem todavía no
+      tiene fila» y «al ítem dañado le queda otra foto» se deciden sin que otra petición
+      cambie la respuesta a mitad de camino. Sin el candado, una foto subida mientras se
+      guarda el ítem crea una SEGUNDA fila del mismo ítem.
+
+    Mismo SELECT y mismo 400 que `marcar_item`.
+    """
+    rec = (
+        db.query(RecepcionEmbarque)
+        .filter(RecepcionEmbarque.id == recepcion_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
+    if not rec or rec.estado == "cerrada":
+        raise HTTPException(400, "Recepción no encontrada o ya cerrada")
+    return rec
+
+
+def _resolver_ri(db: Session, recepcion_id: int, ri_id: int,
+                 embarque_item_id: Optional[int] = None):
+    """`ri_id` de la URL -> fila de RecepcionEmbarqueItem de ESA recepción, o None.
+
+    El campo `id` que serializa `get_recepcion` vive en DOS espacios de numeración:
+    `RecepcionEmbarqueItem.id` para un ítem ya empezado y `EmbarqueItem.id` para uno que
+    no. Los dos autoincrementales van casi parejos, así que un mismo entero puede
+    designar dos filas distintas de la MISMA recepción; resolver "el primero que
+    aparezca" es una moneda al aire que pega la foto al ítem equivocado.
+
+    Por eso el llamador DESAMBIGUA con el dato que ya tiene, igual que `marcar_item`, que
+    recibe `embarque_item_id` explícito en el cuerpo desde siempre: si viene ese dato,
+    manda y no hay que adivinar. Sin él (cliente viejo) se cae al comportamiento
+    histórico —primero por `.id`, después por `embarque_item_id`— y se deja constancia en
+    el log cuando los dos resuelven a filas distintas, que es el único caso ambiguo.
+
+    OJO al tocar esto: NO conviene bloquear ante la ambigüedad. La pantalla no deja
+    guardar un ítem dañado sin foto, así que un 409 al subir dejaría al bodeguero sin
+    poder subir la foto ni guardar, y "recarga la recepción" no ayuda porque para un
+    ítem empezado los dos ids coinciden. Desambiguar con el dato del llamador es lo que
+    evita ese callejón sin salida.
+
+    Quien llama ya tiene la recepción tomada con candado (`marcar_item` con su lectura
+    bloqueante, `upload_foto` con `_recepcion_abierta_con_lock`): «no hay fila» solo es
+    una respuesta firme bajo ese candado, porque quien llama inserta la fila cuando esto
+    devuelve None.
+    """
+    # 1. El dato explícito manda. Es la ruta que usa el frontend actual.
+    if embarque_item_id is not None:
+        ri = db.query(RecepcionEmbarqueItem).filter(
+            RecepcionEmbarqueItem.embarque_item_id == embarque_item_id,
+            RecepcionEmbarqueItem.recepcion_id == recepcion_id,
+        ).first()
+        if ri:
+            return ri
+        # Sin fila todavía (ítem no empezado): que decida quien llama, con el dato bueno.
+        return None
+
+    # 2. Sin dato explícito: comportamiento histórico, con aviso si hay colisión.
+    por_id = db.query(RecepcionEmbarqueItem).filter(
+        RecepcionEmbarqueItem.id == ri_id,
+        RecepcionEmbarqueItem.recepcion_id == recepcion_id,
+    ).first()
+    por_emb = db.query(RecepcionEmbarqueItem).filter(
+        RecepcionEmbarqueItem.embarque_item_id == ri_id,
+        RecepcionEmbarqueItem.recepcion_id == recepcion_id,
+    ).first()
+    if por_id and por_emb and por_id.id != por_emb.id:
+        # Único caso genuinamente ambiguo. No se bloquea (el porqué está en el docstring):
+        # se elige la fila encontrada por `.id` y se deja rastro para poder investigarlo.
+        print(f"[bodega] ri_id {ri_id} AMBIGUO en recepcion {recepcion_id}: "
+              f"por_id={por_id.id} por_embarque_item={por_emb.id}; se usa por_id. "
+              f"El cliente deberia mandar embarque_item_id.", flush=True)
+    return por_id or por_emb
+
+
+def _descartar_archivo(ruta: str) -> None:
+    """Borra el archivo de una foto que quedó sin fila en la base. Si el borrado también
+    falla se anota y se sigue: el error que importa es el que trajo hasta acá."""
+    try:
+        os.remove(ruta)
+    except FileNotFoundError:
+        pass  # la escritura falló antes de crear el archivo: no hay nada que borrar
+    except OSError as exc:
+        print(f"[bodega] no se pudo borrar el archivo suelto {ruta}: {exc!r}", flush=True)
+
+
+@router.post("/recepciones/{recepcion_id}/items/{ri_id}/foto", status_code=201,
+             dependencies=[Depends(require_empresa("mineria"))])
+def upload_foto(
     recepcion_id: int,
     ri_id: int,
+    # Desambiguador OPCIONAL, misma convención que `marcar_item`, que lo recibe en el
+    # cuerpo desde siempre. Con él no hay nada que adivinar; sin él se cae al
+    # comportamiento histórico. Es aditivo: un cliente viejo sigue funcionando.
+    embarque_item_id: Optional[int] = None,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    ri = db.query(RecepcionEmbarqueItem).filter(
-        RecepcionEmbarqueItem.id == ri_id,
-        RecepcionEmbarqueItem.recepcion_id == recepcion_id,
-    ).first()
+    # `def` y no `async def`: el candado puede tener que esperar a otra petición, y esa
+    # espera es bloqueante. Dentro de un `async def` detiene el único proceso del servidor
+    # para todos los usuarios; y si quien tiene el candado terminó con un error, recién lo
+    # suelta el cierre de `get_db`, que necesita ese mismo proceso libre: la espera dura
+    # hasta el timeout de MySQL. En un `def`, FastAPI corre la función en un hilo aparte.
+    rec = _recepcion_abierta_con_lock(db, recepcion_id)
+    ri = _resolver_ri(db, recepcion_id, ri_id, embarque_item_id)
     if not ri:
-        # Fallback: try as embarque_item_id (for unstarted items)
-        ri = db.query(RecepcionEmbarqueItem).filter(
-            RecepcionEmbarqueItem.embarque_item_id == ri_id,
-            RecepcionEmbarqueItem.recepcion_id == recepcion_id,
+        # Ítem todavía no empezado: se crea su fila de recepción. El id del EmbarqueItem
+        # es el explícito si vino, si no el de la URL.
+        emb_item_id = embarque_item_id if embarque_item_id is not None else ri_id
+        # Se valida la pertenencia ANTES de insertar: sin esto, un id que no corresponde
+        # a ningún ítem de este embarque revienta con IntegrityError de MySQL, o sea un
+        # 500 en producción en vez de un error entendible.
+        ei = db.query(EmbarqueItem).filter(
+            EmbarqueItem.id == emb_item_id,
+            EmbarqueItem.embarque_id == rec.embarque_id,
         ).first()
-    if not ri:
-        # Create new recepcion item record
+        if not ei:
+            raise HTTPException(404, "El ítem no pertenece a esta recepción")
         ri = RecepcionEmbarqueItem(
             recepcion_id=recepcion_id,
-            embarque_item_id=ri_id,
+            embarque_item_id=emb_item_id,
             usuario_id=current_user.id,
         )
         db.add(ri)
@@ -583,23 +714,46 @@ async def upload_foto(
     if ext not in (".jpg", ".jpeg", ".png", ".webp"):
         raise HTTPException(400, "Solo se aceptan imágenes JPG/PNG/WEBP")
 
-    fname = f"recepcion_{ri.id}_{int(datetime.now().timestamp())}{ext}"
+    # El uuid4 hace ÚNICO el nombre. Con un nombre derivado del reloj, dos fotos del mismo
+    # ítem subidas en el mismo segundo comparten archivo: varias filas apuntan a uno solo
+    # y al borrar una se pierden las otras, que son la evidencia del reclamo al proveedor.
+    # El prefijo `recepcion_{ri.id}` solo sirve para reconocer el archivo al depurar.
+    fname = f"recepcion_{ri.id}_{uuid.uuid4().hex}{ext}"
     fpath = os.path.join(UPLOAD_DIR, fname)
-    with open(fpath, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    # Archivo y fila van juntos. Un archivo sin fila no lo puede pedir ni borrar nadie
+    # (`serve_foto` y `delete_foto` parten de la fila) y queda ocupando disco: si falla
+    # la escritura o el commit, se borra.
+    try:
+        with open(fpath, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    except OSError as exc:
+        _descartar_archivo(fpath)
+        print(f"[bodega] no se pudo escribir la foto {fname}: {exc!r}", flush=True)
+        raise HTTPException(500, "No se pudo guardar la foto en el servidor. "
+                                 "Intenta de nuevo; si se repite, avisa a soporte.")
 
+    # `url_foto` guarda la ruta histórica "/uploads/bodega/<archivo>" y así viaja en el
+    # campo `url` de las respuestas (esta, `get_recepcion` y `list_reclamos`). Sirve para
+    # ubicar el archivo en disco al depurar; por HTTP solo resuelve con
+    # SERVIR_FOTOS_BODEGA_SIN_AUTH=true. La imagen se pide por id a `serve_foto`.
     foto = RecepcionItemFoto(
         recepcion_item_id=ri.id,
         url_foto=f"/uploads/bodega/{fname}",
         subida_por=current_user.id,
     )
     db.add(foto)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        _descartar_archivo(fpath)
+        raise
     db.refresh(foto)
     return {"id": foto.id, "url": foto.url_foto, "recepcion_item_id": ri.id}
 
 
-@router.delete("/recepciones/{recepcion_id}/items/{ri_id}/foto/{foto_id}")
+@router.delete("/recepciones/{recepcion_id}/items/{ri_id}/foto/{foto_id}",
+               dependencies=[Depends(require_empresa("mineria"))])
 def delete_foto(
     recepcion_id: int,
     ri_id: int,
@@ -607,16 +761,205 @@ def delete_foto(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    foto = db.query(RecepcionItemFoto).filter(
-        RecepcionItemFoto.id == foto_id,
+    _recepcion_abierta_con_lock(db, recepcion_id)
+
+    # PERTENENCIA — se resuelve desde la FOTO, no desde el `ri_id` de la URL.
+    # Filtrar solo por `foto_id` dejaría que cualquier sesión borre cualquier foto
+    # acertando un entero correlativo, y esas fotos son la evidencia que `marcar_item`
+    # exige para guardar un ítem dañado. El `ri_id` tampoco sirve para encontrarla: es
+    # ambiguo por contrato (ver `_resolver_ri`). Se parte de la foto, que sabe de qué ítem
+    # cuelga; se comprueba que ese ítem sea de esta recepción; y al `ri_id` solo se le
+    # pide ser consistente con el ítem bajo alguna de sus dos formas.
+    foto = db.query(RecepcionItemFoto).filter(RecepcionItemFoto.id == foto_id).first()
+    if not foto:
+        # 404 y no `{"ok": true}`: responder «ok» sin borrar hace que la pantalla saque de
+        # la lista una foto que sigue en la base y en el disco.
+        raise HTTPException(404, "Foto no encontrada")
+
+    ri = db.query(RecepcionEmbarqueItem).filter(
+        RecepcionEmbarqueItem.id == foto.recepcion_item_id,
+        RecepcionEmbarqueItem.recepcion_id == recepcion_id,
     ).first()
-    if foto:
-        fpath = foto.url_foto.lstrip("/")
-        if os.path.exists(fpath):
+    if not ri:
+        raise HTTPException(404, "Foto no encontrada")
+
+    # El `ri_id` de la URL tiene que designar a ESE ítem, en cualquiera de sus dos formas.
+    if ri_id not in (ri.id, ri.embarque_item_id):
+        raise HTTPException(404, "Foto no encontrada")
+
+    # Un ítem guardado como dañado no puede quedar sin foto: es la regla que `marcar_item`
+    # exige al guardar, sostenida también al borrar (mismo predicado). Se cuenta bajo el
+    # candado de la recepción: dos borrados simultáneos no se saltan la cuenta.
+    if "danado" in (ri.estado_recepcion or ""):
+        otras = db.query(RecepcionItemFoto).filter(
+            RecepcionItemFoto.recepcion_item_id == ri.id,
+            RecepcionItemFoto.id != foto.id,
+        ).count()
+        if otras == 0:
+            raise HTTPException(
+                409,
+                "Un ítem guardado como dañado necesita al menos una foto: sube la de "
+                "reemplazo antes de borrar esta, o cambia su estado y guarda.",
+            )
+
+    # Se borra por la misma ruta confinada que usa `serve_foto`: una ruta relativa al
+    # directorio de trabajo, con una fila manipulada, borraría un archivo de fuera de
+    # uploads/bodega.
+    try:
+        fpath = _ruta_confinada_foto(foto.url_foto)
+        if os.path.isfile(fpath):
             os.remove(fpath)
-        db.delete(foto)
-        db.commit()
+    except HTTPException:
+        # Ruta inválida en la columna: se borra la fila igual (es lo que el usuario
+        # pidió) pero NO se toca el disco. Queda anotado para que alguien lo revise,
+        # en vez de fallar en silencio.
+        print(f"[bodega] foto {foto_id}: url_foto invalida, no se borro el archivo "
+              f"({foto.url_foto!r})", flush=True)
+    db.delete(foto)
+    db.commit()
     return {"ok": True}
+
+
+# ── SERVIR FOTOS (acceso autenticado) ──────────────────────────────────────────
+# Las fotos se piden por ID DE BASE a `serve_foto`, que exige sesión de Grupo AM: el
+# nombre del archivo no viaja en la URL. La carpeta uploads/bodega no se publica como
+# estática (main.py solo la monta con SERVIR_FOTOS_BODEGA_SIN_AUTH=true, la palanca de
+# rollback): servida sin sesión, cualquiera puede enumerar los archivos anteriores al
+# uuid4, que llevan nombres predecibles (`recepcion_{id}_{segundos}.jpg`).
+# El archivo se resuelve desde la fila y se confina dentro de _FOTOS_DIR con el mismo
+# patrón de `serve_doc` (routers/despachos.py): regex estricta -> abspath -> prefijo.
+
+def _ruta_confinada_foto(url_foto: str) -> str:
+    """Nombre de archivo -> ruta absoluta dentro de _FOTOS_DIR, o 400.
+
+    `basename` tolera los dos formatos que pueden convivir en la columna `url_foto`: el
+    histórico "/uploads/bodega/x.jpg" y un eventual "x.jpg" pelado. Por eso no hace
+    falta migrar la columna.
+
+    OJO al probar esto: `basename` ya neutraliza los payloads clásicos de traversal
+    ("../../etc/passwd" queda en "passwd", que resuelve DENTRO del directorio y muere
+    por archivo inexistente). El único payload que ejercita la comprobación de prefijo
+    es "/uploads/bodega/..", cuyo basename es ".." y sí sale de la carpeta: esa línea no
+    es código muerto, y una prueba con el payload clásico pasa igual con y sin ella.
+    """
+    nombre = os.path.basename((url_foto or "").strip())
+    if not re.match(r"^[A-Za-z0-9._-]{1,255}$", nombre):
+        raise HTTPException(400, "Nombre de archivo inválido")
+    full = os.path.abspath(os.path.join(_FOTOS_DIR, nombre))
+    if not full.startswith(_FOTOS_DIR + os.sep):
+        raise HTTPException(400, "Ruta inválida")
+    return full
+
+
+@router.get("/fotos/{foto_id}", dependencies=[Depends(require_empresa("mineria"))])
+def serve_foto(
+    foto_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Devuelve la imagen de una foto de recepción.
+
+    CONTROL DE ACCESO — dos capas, y las dos importan:
+      1. `require_empresa("mineria")` a nivel de ruta. Las fotos de recepción son
+         SOLO de Grupo AM: MonzaParts tiene su propio camino
+         (`monza_router_documentos.py`). `foto_id` es un entero correlativo: sin este
+         candado, una sesión de la otra marca baja todas las fotos recorriendo los ids.
+         Las cuatro rutas de fotos de este archivo (`upload_foto`, `delete_foto`,
+         `serve_foto`, `fotos_de_item`) llevan el MISMO candado: con una sola sin él,
+         la otra marca sube o borra evidencia que no puede ver.
+      2. La foto tiene que colgar de una recepción viva (abajo).
+
+    Responde 404 —no 403— cuando la foto no existe o quedó huérfana: un 403
+    confirmaría que ese id existe.
+
+    Se sirve INLINE (FileResponse sin `filename=`) porque el consumidor es un <img>,
+    no una descarga.
+    """
+    foto = db.query(RecepcionItemFoto).filter(RecepcionItemFoto.id == foto_id).first()
+    if not foto:
+        raise HTTPException(404, "Foto no encontrada")
+
+    # La foto tiene que colgar de un ítem de recepción, y ese de una recepción real.
+    # Una fila huérfana (borrado a medias, restore parcial) se trata como inexistente.
+    ri = db.query(RecepcionEmbarqueItem).filter(
+        RecepcionEmbarqueItem.id == foto.recepcion_item_id
+    ).first()
+    if not ri:
+        raise HTTPException(404, "Foto no encontrada")
+    recepcion = db.query(RecepcionEmbarque).filter(
+        RecepcionEmbarque.id == ri.recepcion_id
+    ).first()
+    if not recepcion:
+        raise HTTPException(404, "Foto no encontrada")
+
+    path = _ruta_confinada_foto(foto.url_foto)
+    if not os.path.isfile(path):
+        # La fila existe pero el archivo no está en disco. Es un estado real
+        # (borrado a mano, restore parcial): el frontend pinta "la foto ya no existe".
+        raise HTTPException(404, "Archivo no encontrado")
+
+    return FileResponse(
+        path,
+        media_type=mimetypes.guess_type(path)[0] or "application/octet-stream",
+        headers={
+            # `no-store`: el contenido depende de QUIÉN pregunta, y la caché del
+            # navegador se indexa por URL, no por el header Authorization. En el
+            # computador compartido de bodega, con un `max-age` el siguiente usuario
+            # ve la imagen sin volver a pasar por el candado.
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get("/items/{item_cotizacion_id}/fotos",
+            dependencies=[Depends(require_empresa("mineria"))])
+def fotos_de_item(
+    item_cotizacion_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Fotos de RECEPCIÓN de una línea de venta, para consultarlas desde Despachos.
+
+    POR QUÉ EXISTE (pedido del dueño, 2026-08-20)
+        En bodega se fotografían los ítems de alto valor (sobre $3.000.000 de venta)
+        aunque lleguen completos, y más de una foto por ítem. Al preparar el despacho hay
+        que poder mirarlas: es la evidencia del estado en que llegó la pieza.
+
+    ES DE SOLO CONSULTA. No hay borrado desde acá a propósito: son evidencia de la
+    recepción, y quien las borra tiene que hacerlo en la pantalla donde las tomó,
+    con su contexto a la vista. Los bytes de cada foto se piden a
+    `GET /api/bodega/fotos/{id}`, que lleva su propio candado.
+
+    LA CADENA, que ya existía por llaves reales:
+        items_cotizacion -> embarque_items.item_cotizacion_id
+                         -> recepcion_embarque_items.embarque_item_id
+                         -> recepcion_item_fotos.recepcion_item_id
+    Un mismo ítem puede haber pasado por MÁS DE UN embarque (re-embarque tras un
+    reclamo), así que se devuelven las fotos de todos, ordenadas por fecha.
+    """
+    filas = (
+        db.query(RecepcionItemFoto, RecepcionEmbarqueItem, RecepcionEmbarque)
+        .join(RecepcionEmbarqueItem,
+              RecepcionEmbarqueItem.id == RecepcionItemFoto.recepcion_item_id)
+        .join(EmbarqueItem,
+              EmbarqueItem.id == RecepcionEmbarqueItem.embarque_item_id)
+        .join(RecepcionEmbarque,
+              RecepcionEmbarque.id == RecepcionEmbarqueItem.recepcion_id)
+        .filter(EmbarqueItem.item_cotizacion_id == item_cotizacion_id)
+        .order_by(RecepcionItemFoto.fecha_subida.asc(), RecepcionItemFoto.id.asc())
+        .all()
+    )
+    return [
+        {
+            "id": foto.id,
+            "recepcion_id": rec.id,
+            "estado_recepcion": ri.estado_recepcion,
+            "observacion": ri.observacion,
+            "fecha": foto.fecha_subida.isoformat() if foto.fecha_subida else None,
+        }
+        for foto, ri, rec in filas
+    ]
 
 
 # ── CERRAR RECEPCION ───────────────────────────────────────────────────────────
@@ -894,6 +1237,7 @@ def list_reclamos(
             "proveedor_nombre": ocp.proveedor if ocp else None,
             "oc_proveedor_numero": ocp.numero if ocp else None,
             "numero_oc_prov": ocp.numero_oc if ocp else None,
+            # `url`: ruta histórica del archivo, solo informativa (ver `upload_foto`).
             "fotos": [{"id": f.id, "url": f.url_foto} for f in fotos],
         })
     return result

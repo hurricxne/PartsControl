@@ -20,7 +20,7 @@ from models.models import (
 )
 from auth import get_current_user
 from notificaciones import crear_notificacion
-from routers.compras import business_days_remaining, add_business_days
+from routers.compras import business_days_remaining, add_business_days, plazo_creible
 from wasabil_dte.models import (
     WasabilDte, STATUS_EMITIDO, STATUS_PROCESANDO, STATUS_PENDIENTE,
 )
@@ -153,14 +153,26 @@ def _bucket_of(estado_item: Optional[str]) -> str:
 
 def _item_deadline(item: ItemCotizacion, cot: Cotizacion, oc: OcCliente) -> Optional[date]:
     """Calculate the item-specific deadline:
-    - If item has plazo_entrega_max AND cotización has created_at:
+    - If the item has fecha_promesa_cliente (frozen at Cierre de Venta): use it as-is.
+    - Elif item has a usable plazo_entrega_max (plazo_creible) AND cotización has created_at:
         deadline = cotizacion.created_at.date() + plazo_entrega_max business days
     - Else fallback to oc.fecha_entrega
+
+    La fecha congelada manda cuando existe: es la promesa hecha al cliente al cerrar la
+    venta (crear_oc_cliente) y no se mueve aunque después asignar_items pise
+    plazo_entrega_max. Sin ella se usa el cálculo en vivo; con un plazo que no sirve para
+    calcular, la fecha de entrega de la orden.
+    El Portal de Clientes muestra la congelada y, si falta, la fecha de entrega de la
+    orden; el cálculo en vivo no, porque se mueve solo. Operador y cliente ven la misma
+    fecha en todo ítem que tiene la congelada.
     """
-    if item.plazo_entrega_max and cot.created_at:
+    if item.fecha_promesa_cliente:
+        return item.fecha_promesa_cliente
+    plazo = plazo_creible(item.plazo_entrega_max)
+    if plazo and cot.created_at:
         try:
             ref = cot.created_at.date() if hasattr(cot.created_at, "date") else cot.created_at
-            return add_business_days(ref, int(item.plazo_entrega_max))
+            return add_business_days(ref, plazo)
         except Exception:
             pass
     if oc.fecha_entrega:

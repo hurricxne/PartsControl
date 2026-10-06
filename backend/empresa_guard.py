@@ -28,6 +28,9 @@ def require_empresa(*allowed: str):
         # los módulos (más seguro). En la práctica `empresa` es NOT NULL en la BD.
         empresa = getattr(current_user, "empresa", None)
         if empresa not in allowed:
+            # El frontend reconoce este 403 por el comienzo del `detail` (`DETALLES_AMBITO`
+            # en frontend-src/src/services/authErrors.ts): si se cambia acá, cambiarlo allá.
+            # Lo vigila routers/tests/test_auth_errors_espejo_frontend.py.
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Acceso restringido a esta empresa",

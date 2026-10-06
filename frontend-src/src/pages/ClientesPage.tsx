@@ -100,7 +100,7 @@ export default function ClientesPage() {
   const deleteMutation = useMutation({
     mutationFn: (id: number) => clientesAPI.remove(id),
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['clientes'] }); toast.success('Cliente eliminado'); setDeletingId(null) },
-    onError: () => toast.error('Error al eliminar'),
+    onError: (e: any) => toast.error(e?.response?.data?.detail || 'Error al eliminar', { duration: 8000 }),
   })
 
   const resetForm = () => {

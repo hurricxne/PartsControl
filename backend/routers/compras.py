@@ -15,7 +15,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 
-from auth import get_current_user
+from auth import get_current_user, TIPO_INTERNO
 from empresa_guard import require_empresa
 from role_guard import require_rol
 from database import get_db
@@ -28,6 +28,9 @@ from models.models import (
 from services.pricing_service import (
     calcular_cotizacion, config_efectivo, CLAVES_PRICING, snapshot_desde_config,
 )
+# El «hoy» del negocio es el de Chile: el servidor corre en UTC y, pasadas las 20-21 h de
+# Chile, su fecha ya es la de mañana.
+from wasabil_dte.service import hoy_chile
 
 router = APIRouter(prefix="/compras", tags=["compras"])
 
@@ -88,12 +91,18 @@ def _easter_date(year: int) -> date:
 
 
 def _is_chile_holiday(d: date) -> bool:
-    """Retorna True si la fecha es feriado en Chile (fijos + Viernes Santo)."""
+    """True si `d` es feriado para la cuenta de días hábiles: fechas fijas + Viernes Santo.
+
+    Es una aproximación del calendario legal: no conoce los feriados que la ley traslada de
+    día ni los de elecciones. La pantalla del Cierre de Venta tiene una copia de esta tabla
+    (isHoliday, CierreVentaPage.tsx) y tiene que ser la misma, porque con esta se congela la
+    fecha prometida de cada ítem: las compara routers/tests/test_cierre_espejo_frontend.py.
+    """
     fixed = {
         (1, 1),   # Año Nuevo
         (5, 1),   # Día del Trabajo
         (5, 21),  # Glorias Navales
-        (6, 20),  # Día de los Pueblos Indígenas (tercer lunes junio — aproximado fijo)
+        (6, 20),  # Día de los Pueblos Indígenas (solsticio: 20 o 21 de junio; acá fijo el 20)
         (6, 29),  # San Pedro y San Pablo
         (7, 16),  # Virgen del Carmen
         (8, 15),  # Asunción de la Virgen
@@ -114,7 +123,10 @@ def _is_chile_holiday(d: date) -> bool:
 
 
 def add_business_days(start_date, days: int) -> date:
-    """Retorna la fecha que resulta de agregar *days* días hábiles (Chile)."""
+    """Retorna la fecha que resulta de agregar *days* días hábiles (Chile).
+
+    No acota `days`: un plazo guardado pasa antes por plazo_creible.
+    """
     if isinstance(start_date, datetime):
         current = start_date.date()
     else:
@@ -127,9 +139,52 @@ def add_business_days(start_date, days: int) -> date:
     return current
 
 
+# Tope de cordura del plazo en días hábiles (10 años). NO es cosmético: plazo_entrega_max es
+# un Integer sin cota, y add_business_days avanza día por día — un dedazo tipo 99999999
+# cuelga el request que lo calcule (el Cierre de Venta, el listado de Despachos o el de
+# Compras). Mismo valor y mismo motivo que MAX_PLAZO_DIAS del scheduler (scheduler.py) y que
+# el `le=3650` del schema de Contabilidad.
+MAX_PLAZO_DIAS_PROMESA = 3650
+
+
+def plazo_creible(plazo) -> Optional[int]:
+    """El plazo como entero si sirve para calcular una fecha; None si no sirve.
+
+    No sirve el que falta, el que no es un número, el que no es positivo y el que pasa de
+    MAX_PLAZO_DIAS_PROMESA. Es el único filtro entre un plazo guardado y add_business_days:
+    lo usan el congelado del Cierre de Venta (crear_oc_cliente), el vencimiento de
+    Despachos (_item_deadline) y el semáforo de Compras (_item_to_dict). Con un plazo que
+    no sirve, cada uno cae a su respaldo.
+    """
+    try:
+        dias = int(plazo)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return dias if 0 < dias <= MAX_PLAZO_DIAS_PROMESA else None
+
+
+# El respaldo de la cotización formal cuando la configuración no trae plazo máximo por
+# defecto (_config_to_dict, routers/cotizador.py).
+PLAZO_MAX_SIN_CONFIG = 45
+
+
+def plazo_prometido(plazo_item, plazo_por_defecto) -> Optional[int]:
+    """Plazo, en días hábiles, que la cotización formal le informó al cliente por un ítem.
+
+    Es el plazo máximo del ítem o, si no tiene, el plazo máximo por defecto del cotizador:
+    la misma regla que imprime _generar_pdf_formal (routers/cotizador.py). None si ese
+    plazo no sirve para calcular una fecha (plazo_creible).
+    """
+    return plazo_creible(plazo_item or plazo_por_defecto or PLAZO_MAX_SIN_CONFIG)
+
+
 def business_days_remaining(deadline: date) -> int:
-    """Días hábiles (Chile) hasta deadline. Negativo si ya pasó."""
-    today = date.today()
+    """Días hábiles (Chile) hasta deadline. Negativo si ya pasó.
+
+    Cuenta desde el día de Chile (hoy_chile), no desde el del servidor: una fecha que
+    vence hoy da 0 hasta la medianoche chilena.
+    """
+    today = hoy_chile()
     if deadline == today:
         return 0
     step = 1 if deadline > today else -1
@@ -436,8 +491,11 @@ def _item_to_dict(item: ItemCotizacion, ocp_id: Optional[int],
         asig_date = fecha_ref
 
     dias_restantes = None
-    if asig_date is not None and plazo_max:
-        deadline = add_business_days(asig_date, plazo_max)
+    # Un plazo que no sirve para calcular deja dias_restantes en None: sin este filtro, un
+    # solo ítem con un plazo absurdo responde 500 en el listado completo.
+    plazo_calculable = plazo_creible(plazo_max)
+    if asig_date is not None and plazo_calculable:
+        deadline = add_business_days(asig_date, plazo_calculable)
         dias_restantes = business_days_remaining(deadline)
 
     ocp_numero = None
@@ -531,13 +589,46 @@ def get_counts(
     }
 
 
+def _exigir_asesor_valido(db: Session, asesor_id: int, current_user: User) -> None:
+    """400 si `asesor_id` no es un asesor asignable. ÚNICO criterio para las dos rutas
+    que escriben oc_cliente.asesor_id (crear y editar): antes solo validaba la edición, y
+    el Cierre de Venta aceptaba cualquier id.
+
+    Mismo criterio que GET /auth/users (que alimenta el selector): el asesor debe
+    existir, estar activo, ser de la misma empresa y ser PERSONAL — un id de otra
+    empresa, o el de una cuenta del Portal de Clientes (misma tabla, misma empresa), se
+    colaría al nombre del asesor que muestran Ventas/Contabilidad.
+    """
+    asesor = (
+        db.query(User)
+        .filter(
+            User.id == asesor_id,
+            User.is_active == 1,
+            User.empresa == (current_user.empresa or "mineria"),
+            User.tipo_acceso == TIPO_INTERNO,
+        )
+        .first()
+    )
+    if not asesor:
+        raise HTTPException(400, "Asesor inválido: debe ser un usuario activo de tu empresa")
+
+
 @router.post("/oc-cliente", status_code=201)
 def crear_oc_cliente(
     body: OcClienteCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    cot = db.query(Cotizacion).filter(Cotizacion.id == body.cotizacion_id).first()
+    # La cotización se lee bajo lock: dos cierres simultáneos de la misma venta quedan en
+    # fila acá, y el segundo encuentra en `oc_existente` la OC que creó el primero. Esa
+    # lectura ve lo recién confirmado porque el motor corre en READ COMMITTED (database.py).
+    cot = (
+        db.query(Cotizacion)
+        .filter(Cotizacion.id == body.cotizacion_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
     if not cot:
         raise HTTPException(404, "Cotizacion no encontrada")
     if not (body.numero_oc or "").strip():
@@ -552,6 +643,8 @@ def crear_oc_cliente(
     )
     if oc_existente:
         return {"id": oc_existente.id, "cotizacion_id": oc_existente.cotizacion_id}
+    if body.asesor_id is not None:
+        _exigir_asesor_valido(db, body.asesor_id, current_user)
     oc = OcCliente(**body.dict())
     db.add(oc)
     # Congelar la "foto" de precios en el momento del Cierre de Venta: desde aquí el total
@@ -559,12 +652,40 @@ def crear_oc_cliente(
     # globales del cotizador. Solo se congela al crear la OC (venta que se cierra a partir
     # de esta función); las ventas cerradas ANTES quedan con snapshot NULL y siguen usando
     # el config global (decisión del dueño: congelar solo de aquí en adelante).
+    cfg_obj = db.query(ConfiguracionCotizador).filter(ConfiguracionCotizador.id == 1).first()
     if not cot.pricing_snapshot:
-        cfg_obj = db.query(ConfiguracionCotizador).filter(ConfiguracionCotizador.id == 1).first()
         if cfg_obj is not None:
             snap = snapshot_desde_config({k: getattr(cfg_obj, k, None) for k in CLAVES_PRICING})
             cot.pricing_snapshot = json.dumps(snap)
             cot.pricing_snapshot_at = func.now()
+    # Congelar la fecha prometida al cliente, por ítem: día del cierre (hora de Chile) + el
+    # plazo que le informó la cotización formal (plazo_prometido), en días hábiles. Se
+    # congela acá porque después no se puede reconstruir: asignar_items y la asignación
+    # parcial pisan plazo_entrega_max, y el plazo por defecto es configuración editable
+    # que no entra en pricing_snapshot. El ancla es el cierre y no created_at: una
+    # cotización que durmió semanas antes de cerrarse nacería con fechas ya vencidas.
+    # Un plazo que no sirve para calcular deja la fecha en NULL y el ítem sigue la fecha
+    # de entrega de la orden. La guarda «solo si es None» es la de pricing_snapshot.
+    # La pantalla del Cierre de Venta sugiere oc_cliente.fecha_entrega con esta misma
+    # cuenta (las compara routers/tests/test_cierre_espejo_frontend.py); si el comercial
+    # la cambia a mano, las fechas de los ítems no la siguen.
+    plazo_por_defecto = cfg_obj.plazo_max_default if cfg_obj is not None else None
+    ancla_cierre = hoy_chile()
+    for it_cot in db.query(ItemCotizacion).filter(
+        ItemCotizacion.cotizacion_id == body.cotizacion_id,
+    ).all():
+        plazo_it = plazo_prometido(it_cot.plazo_entrega_max, plazo_por_defecto)
+        if it_cot.fecha_promesa_cliente is None and plazo_it:
+            it_cot.fecha_promesa_cliente = add_business_days(ancla_cierre, plazo_it)
+    # Anclar la venta a su ficha de cliente (cotizaciones.cliente_id) por RUT saneado: es
+    # el entero por el que filtra el Portal de Clientes. El gancho de portal/sincronia.py
+    # ya lo hace cuando cambia el RUT; acá se cubre la ficha creada entre la cotización y
+    # el cierre. Sin ficha, sin RUT o con RUT ambiguo queda NULL: la venta se cierra igual
+    # y no existe para el portal.
+    # Import local por costumbre del archivo, pero la dependencia es dura: va sin try y,
+    # si falla, el cierre no se guarda (la notificación de más abajo sí es opcional).
+    from portal.service import sincronizar_cliente
+    sincronizar_cliente(db, cot)
     # Mark all items of this cotizacion as cerrado
     db.query(ItemCotizacion).filter(
         ItemCotizacion.cotizacion_id == body.cotizacion_id,
@@ -640,20 +761,7 @@ def actualizar_oc_cliente(
         if body.asesor_id is None:
             oc.asesor_id = None
         else:
-            # Mismo criterio que GET /auth/users (que alimenta el selector): el asesor
-            # debe existir, estar activo y ser de la misma empresa — un id de otra
-            # empresa se colaría al nombre del asesor que muestran Ventas/Contabilidad.
-            asesor = (
-                db.query(User)
-                .filter(
-                    User.id == body.asesor_id,
-                    User.is_active == 1,
-                    User.empresa == (current_user.empresa or "mineria"),
-                )
-                .first()
-            )
-            if not asesor:
-                raise HTTPException(400, "Asesor inválido: debe ser un usuario activo de tu empresa")
+            _exigir_asesor_valido(db, body.asesor_id, current_user)
             oc.asesor_id = body.asesor_id
     # La guía de despacho electrónica (SII 52) referencia esta OC (tipo 801, N° +
     # fecha): con una guía viva emitida (o en emisión), cambiar el N°/fecha de la
@@ -1127,6 +1235,11 @@ def _clone_item_cotizacion(item, qty: float, estado: str, db, clonar_vinculo: bo
         precio_finning        = item.precio_finning,
         plazo_entrega_min     = item.plazo_entrega_min,
         plazo_entrega_max     = item.plazo_entrega_max,
+        # La fecha prometida congelada al Cierre viaja con el trozo: un remanente de
+        # split es la MISMA promesa al cliente partida en dos, no una promesa nueva.
+        # Sin esta línea el clon nacería NULL y el portal mostraría la línea pendiente
+        # sin fecha comprometida — justo la que más la necesita.
+        fecha_promesa_cliente = item.fecha_promesa_cliente,
         estado_item           = estado,
         nombre_cat            = item.nombre_cat,
         precio_cat            = item.precio_cat,

@@ -1,4 +1,5 @@
 import axios from "axios";
+import { manejarErrorAuth } from "./authErrors";
 import type {
   EmbarquePricingRow, PricingDetail, PricingSavePayload,
 } from "../monza-embarques-pricing/types";
@@ -23,13 +24,14 @@ api.interceptors.request.use((cfg) => {
 // red: sin esto la pantalla de Leads mostraba «Revisa tu conexión y reintenta» y el botón
 // Reintentar repetía la misma petición para siempre, porque el token seguía vencido.
 // Es el mismo interceptor que ya tiene el cliente de MachParts (services/api.ts).
+// Misma política que el cliente de MachParts: services/authErrors.ts.
+// Antes este interceptor borraba localStorage a mano SIN llamar a logout() del store,
+// así que el token seguía vivo en memoria hasta el reload. Ahora los dos clientes
+// comparten la misma función y el mismo manejo de 403.
 api.interceptors.response.use(
   (res) => res,
   (err) => {
-    if (err.response?.status === 401) {
-      try { localStorage.removeItem("machparts-auth"); } catch { /* modo privado */ }
-      window.location.href = "/login";
-    }
+    manejarErrorAuth(err);
     return Promise.reject(err);
   },
 );

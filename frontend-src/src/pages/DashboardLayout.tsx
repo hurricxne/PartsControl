@@ -7,7 +7,7 @@ import {
   ShoppingCart, Package, Receipt, Settings, UserCog,
   FileSignature, PackageSearch, Banknote, Calculator, Building2, Anchor, Truck, Wallet, Landmark,
   LifeBuoy,
-  BookOpenCheck,
+  BookOpenCheck, KeyRound,
 } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
 import { useTheme } from '../context/ThemeContext'
@@ -85,6 +85,9 @@ const navGroups: NavGroup[] = [
       { to: '/configuracion', icon: Settings,  label: 'Configuración', exact: false },
       { to: '/usuarios',      icon: UserCog,   label: 'Usuarios',       exact: false },
       { to: '/tickets',       icon: LifeBuoy,  label: 'Tickets',        exact: false },
+      // Cuentas con las que los contactos de un cliente entran al Portal de Clientes.
+      // La ruta NO empieza con '/portal' ('/portal' es la pantalla del cliente).
+      { to: '/cuentas-portal', icon: KeyRound, label: 'Cuentas del portal', exact: false },
     ],
   },
 ]
@@ -114,6 +117,7 @@ const pageLabels: Record<string, string> = {
   '/proveedores':         'Proveedores',
   '/configuracion':       'Configuración',
   '/usuarios':            'Usuarios y Roles',
+  '/cuentas-portal':      'Cuentas del portal',
 }
 
 const MOCK_NOTIFICATIONS = [

@@ -1,0 +1,2468 @@
+/*
+ * Portal de Clientes — estilos de TODO lo que ve el CLIENTE (/portal y sus pantallas).
+ * Lo importa PortalLayout.tsx, una sola vez.
+ *
+ * POR QUÉ UN ARCHIVO PROPIO y no las clases globales de index.css (.btn-primary, .input):
+ *   · .btn-primary pinta texto blanco sobre el naranjo de marca #ea6c0d → 3.16:1, bajo
+ *     el mínimo AA (4.5:1) para texto normal. Adentro del ERP es deuda conocida; en las
+ *     pantallas que ve un cliente no se hereda.
+ *   · .input no dibuja un borde con contraste suficiente ni un foco visible por teclado.
+ *   · La pantalla del cliente no debe cambiar cuando alguien retoque el ERP.
+ * Todo cuelga de `.portal-root`: nada de acá alcanza al cascarón interno. El prefijo
+ * además sube la especificidad: este archivo se empaqueta ANTES que index.css, y sin él
+ * el reset de Tailwind (`[type='submit'] { background-color: transparent }`) le ganaría
+ * por orden a `.portal-boton` y el botón de guardar quedaría sin fondo.
+ *
+ * QUÉ VA ACÁ Y QUÉ VA EN TAILWIND: Tailwind maqueta (flex, grid, márgenes). El color, la
+ * tipografía de cifras, las insignias, la tabla y la línea de tiempo son clases portal-*,
+ * para que el tema claro/oscuro y el contraste se controlen en un solo lugar.
+ *
+ * REGLA DE COLOR (contrastes medidos, WCAG 2.1):
+ *   --portal-marca  #ea6c0d  SOLO decoración (filete, ícono). Nunca texto ni enlace.
+ *   --portal-acento          texto, enlaces y foco: #b4530a en claro (5.02:1 sobre
+ *                            blanco, 4.80:1 sobre el fondo), #fdba74 en oscuro (8.67:1
+ *                            sobre la tarjeta).
+ *   Un estado nunca se dice solo con color: lleva su palabra y una forma (✓ ● ○ !).
+ * El tema (claro/oscuro) lo decide la clase `.dark` de <html> (context/ThemeContext).
+ *
+ * LENGUAJE VISUAL: ficha técnica. Filetes finos en vez de sombras, cifras grandes y
+ * tabulares, rótulos pequeños en mayúsculas, esquinas más rectas en lo pequeño (insignia,
+ * filtro) que en lo grande (tarjeta). Se lee a pleno sol: el contraste manda.
+ *
+ * ÍNDICE: tokens · foco y accesibilidad · cabecera · piezas base · avisos · cifras y
+ * códigos · estado · tabla · tarjeta-enlace · filtros · miga de pan · avance · línea de
+ * tiempo · fotos y visor · pie · movimiento.
+ */
+
+/* ── Tokens ─────────────────────────────────────────────────────────────────── */
+.portal-root {
+  --portal-fondo: #f8fafc;
+  --portal-tarjeta: #ffffff;
+  --portal-linea: #e2e8f0;
+  --portal-linea-control: #64748b; /* 4.76:1 — borde de un control (mínimo 3:1) */
+  --portal-tinta: #0f172a;
+  --portal-tinta-suave: #475569; /* 7.58:1 */
+  --portal-marca: #ea6c0d;
+  --portal-acento: #b4530a;
+  --portal-boton: #b4530a; /* blanco encima: 5.02:1 */
+  --portal-boton-hover: #94430a;
+  --portal-boton-tinta: #ffffff;
+  --portal-campo: #ffffff;
+  --portal-nota-fondo: #fff7ed;
+  --portal-nota-linea: #fed7aa;
+  --portal-error-tinta: #b91c1c; /* 5.91:1 sobre su fondo */
+  --portal-error-fondo: #fef2f2;
+  --portal-error-linea: #fecaca;
+  --portal-ok-tinta: #166534; /* 6.81:1 sobre su fondo; 7.13:1 sobre blanco */
+  --portal-ok-fondo: #f0fdf4;
+  --portal-ok-linea: #bbf7d0;
+  --portal-atencion-tinta: #92400e; /* 6.37:1 sobre su fondo; 7.09:1 sobre blanco */
+  --portal-atencion-fondo: #fef3c7;
+  --portal-atencion-linea: #fcd34d;
+  --portal-info-tinta: #1e40af; /* 8.01:1 sobre su fondo; 8.72:1 sobre blanco */
+  --portal-info-fondo: #eff6ff;
+  --portal-info-linea: #bfdbfe;
+  --portal-neutro-fondo: #f1f5f9; /* tinta-suave encima: 6.92:1 */
+  --portal-sombra: 0 1px 2px rgba(15, 23, 42, 0.06), 0 12px 32px -16px rgba(15, 23, 42, 0.18);
+
+  --portal-radio: 1rem;
+  --portal-radio-control: 0.75rem;
+  --portal-radio-fino: 0.375rem; /* insignias, filtros, celdas: lo pequeño es más recto */
+  --portal-duracion: 150ms;
+  /* Monoespaciada DEL SISTEMA: no se descarga otra fuente con la señal de una faena. */
+  --portal-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Roboto Mono', 'Liberation Mono', monospace;
+
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--portal-fondo);
+  color: var(--portal-tinta);
+  /* Un correo o una razón social largos no pueden ensanchar la página en un teléfono. */
+  overflow-wrap: anywhere;
+}
+
+.dark .portal-root {
+  --portal-fondo: #0f172a;
+  --portal-tarjeta: #1e293b;
+  --portal-linea: #334155;
+  --portal-linea-control: #8493a8; /* 4.68:1 sobre la tarjeta */
+  --portal-tinta: #f1f5f9;
+  --portal-tinta-suave: #cbd5e1; /* 9.85:1 */
+  --portal-acento: #fdba74;
+  --portal-boton: #ea6c0d; /* acá el texto es OSCURO: 6.08:1 */
+  --portal-boton-hover: #f97316;
+  --portal-boton-tinta: #1c0a02;
+  --portal-campo: #0f172a;
+  --portal-nota-fondo: rgba(234, 108, 13, 0.1);
+  --portal-nota-linea: rgba(234, 108, 13, 0.35);
+  --portal-error-tinta: #fecaca;
+  --portal-error-fondo: rgba(239, 68, 68, 0.14);
+  --portal-error-linea: rgba(239, 68, 68, 0.45);
+  --portal-ok-tinta: #bbf7d0;
+  --portal-ok-fondo: rgba(34, 197, 94, 0.12);
+  --portal-ok-linea: rgba(34, 197, 94, 0.4);
+  /* Los fondos son translúcidos: el contraste se midió ya mezclados con la tarjeta
+     (el caso más exigente; sobre el fondo de la página es mayor). */
+  --portal-atencion-tinta: #fde68a; /* 9.19:1 sobre su fondo */
+  --portal-atencion-fondo: rgba(245, 158, 11, 0.14);
+  --portal-atencion-linea: rgba(245, 158, 11, 0.45);
+  --portal-info-tinta: #bfdbfe; /* 8.14:1 sobre su fondo */
+  --portal-info-fondo: rgba(59, 130, 246, 0.18);
+  --portal-info-linea: rgba(59, 130, 246, 0.5);
+  --portal-neutro-fondo: rgba(148, 163, 184, 0.14); /* tinta-suave encima: 7.72:1 */
+  --portal-sombra: 0 1px 2px rgba(0, 0, 0, 0.3), 0 16px 36px -18px rgba(0, 0, 0, 0.6);
+}
+
+/* ── Foco por teclado: visible en TODOS los controles ───────────────────────── */
+.portal-root :is(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 3px solid var(--portal-acento);
+  outline-offset: 2px;
+}
+/* Sobre la franja oscura de marca (y sobre el visor de fotos) el acento no contrasta:
+   ahí el foco es blanco. */
+.portal-root :is(.portal-cabecera, .portal-visor) :is(a, button, input):focus-visible {
+  outline-color: #ffffff;
+}
+/* Destinos de foco POR PROGRAMA (el <main> al cambiar de pantalla, un título de
+   confirmación): no son controles, así que no dibujan anillo. */
+.portal-root .portal-foco-silencioso:focus-visible {
+  outline: none;
+}
+
+/* ── Accesibilidad ──────────────────────────────────────────────────────────── */
+/* Texto solo para lectores de pantalla. Se define acá (y no se confía en la utilidad de
+   Tailwind) porque las piezas del portal dependen de él para decir «Cumplido:», «Sin
+   monto» o el rótulo del buscador. */
+.portal-root .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+/* «Saltar al contenido»: fuera de la vista hasta que recibe el foco con el tabulador. */
+.portal-root .portal-salto {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  z-index: 50;
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+  padding: 0 1rem;
+  border: 2px solid var(--portal-tinta);
+  border-radius: var(--portal-radio-control);
+  background-color: var(--portal-tarjeta);
+  color: var(--portal-tinta);
+  font-weight: 700;
+  transform: translateY(-200%);
+  transition: transform var(--portal-duracion) ease;
+}
+.portal-root .portal-salto:focus {
+  transform: translateY(0);
+  /* Aparece encima de la franja oscura de la cabecera: su anillo de foco va en blanco. */
+  outline-color: #ffffff;
+}
+
+/* ── Cabecera de marca ──────────────────────────────────────────────────────── */
+/* El degradado se queda en los tonos OSCUROS del de LoginPage (#431404 → #7c2d0c) y no
+   llega al naranjo: el texto blanco sobre #ea6c0d baja a 3.16:1. El naranjo aparece
+   solo como filete inferior. */
+.portal-root .portal-cabecera {
+  background: linear-gradient(135deg, #431404 0%, #7c2d0c 100%);
+  border-bottom: 3px solid var(--portal-marca);
+  color: #ffffff;
+}
+.portal-root .portal-cabecera-rotulo {
+  color: #fed7aa; /* 6.93:1 sobre #7c2d0c */
+}
+.portal-root .portal-sello {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: var(--portal-radio-control);
+  background-color: var(--portal-marca);
+  color: #ffffff;
+  box-shadow: 0 6px 16px -6px rgba(0, 0, 0, 0.6);
+}
+.portal-root .portal-boton-cabecera {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  min-height: 2.75rem; /* 44px: blanco de toque en móvil */
+  padding: 0 0.9rem;
+  border-radius: var(--portal-radio-control);
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  background-color: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+  font-size: 0.875rem;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: background-color var(--portal-duracion) ease;
+}
+.portal-root .portal-boton-cabecera:hover {
+  background-color: rgba(255, 255, 255, 0.18);
+}
+
+/* La cabecera en tres anchos (ver CabeceraPortal.tsx). Orden en el código: marca, botón
+   «Menú», secciones, buscador, acciones. Es `flex` con salto de línea y no una rejilla
+   con áreas: una fila vacía de una rejilla sigue cobrando su separación. */
+.portal-root .portal-cabecera-rejilla {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  padding-top: 0.625rem;
+  padding-bottom: 0.625rem;
+}
+.portal-root .portal-marca {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 2.75rem;
+  border-radius: var(--portal-radio-control);
+}
+.portal-root .portal-marca-nombre {
+  display: block;
+  font-size: 1.0625rem;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+.portal-root .portal-marca-rotulo {
+  display: block;
+  /* 12 px como piso y sin elipsis: con el texto del sistema agrandado el rótulo se
+     cortaba; partirse en dos líneas es mejor que perder la mitad. */
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.portal-root .portal-nav a {
+  display: flex;
+  align-items: center;
+  min-height: 2.75rem;
+  padding: 0 0.875rem;
+  border-radius: var(--portal-radio-control);
+  color: #fed7aa;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.portal-root .portal-nav a:hover {
+  background-color: rgba(255, 255, 255, 0.1);
+  color: #ffffff;
+}
+/* Sección activa: blanco, más peso y un filete (#fdba74, 5.56:1 sobre la franja). El
+   filete y el peso la marcan aunque no se distinga el color. */
+.portal-root .portal-nav a[aria-current='page'] {
+  background-color: rgba(255, 255, 255, 0.14);
+  color: #ffffff;
+  font-weight: 800;
+  box-shadow: inset 3px 0 0 #fdba74;
+}
+.portal-root .portal-buscador {
+  display: flex;
+  flex: 1 0 100%;
+  min-width: 0;
+}
+.portal-root .portal-buscador .portal-campo {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-right: 0;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.portal-root .portal-buscador-boton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 3rem;
+  min-height: 2.75rem;
+  border-radius: 0 var(--portal-radio-control) var(--portal-radio-control) 0;
+  background-color: var(--portal-boton);
+  color: var(--portal-boton-tinta);
+}
+.portal-root .portal-buscador-boton:hover {
+  background-color: var(--portal-boton-hover);
+}
+.portal-root .portal-acciones {
+  display: flex;
+  gap: 0.5rem;
+}
+
+/* Angosto: secciones y acciones viven plegadas tras «Menú». */
+@media (max-width: 47.99rem) {
+  .portal-root .portal-nav,
+  .portal-root .portal-acciones {
+    display: none;
+    flex: 1 0 100%;
+  }
+  .portal-root .portal-nav[data-abierto='true'] {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .portal-root .portal-acciones[data-abierto='true'] {
+    display: flex;
+  }
+  .portal-root .portal-acciones[data-abierto='true'] .portal-boton-cabecera {
+    flex: 1 1 0;
+  }
+  /* Sin portal que recorrer no hay «Menú»: el tema y Cerrar sesión quedan a la vista, en
+     su propia fila. `flex: none` en la misma fila de la marca partía «MachParts» en dos
+     líneas a 320 px, justo en la pantalla del primer ingreso. */
+  .portal-root .portal-cabecera-rejilla[data-navegacion='false'] .portal-acciones {
+    display: flex;
+    flex: 1 0 100%;
+  }
+  .portal-root .portal-cabecera-rejilla[data-navegacion='false'] .portal-tema-texto {
+    display: none;
+  }
+}
+/* Medio: marca + secciones arriba; buscador + acciones abajo. La base del buscador
+   (todo el ancho menos el espacio de las acciones) es lo que lo manda a la segunda fila. */
+@media (min-width: 48rem) {
+  .portal-root .portal-menu-boton,
+  .portal-root .portal-tema-texto {
+    display: none;
+  }
+  .portal-root .portal-marca {
+    flex: none;
+    margin-right: 0.5rem;
+  }
+  .portal-root .portal-nav {
+    display: flex;
+    gap: 0.25rem;
+    margin-right: auto;
+  }
+  .portal-root .portal-nav a[aria-current='page'] {
+    box-shadow: inset 0 -3px 0 #fdba74;
+  }
+  .portal-root .portal-buscador {
+    flex: 1 1 calc(100% - 16rem);
+  }
+  .portal-root .portal-cabecera-rejilla[data-navegacion='false'] .portal-acciones {
+    margin-left: auto;
+  }
+}
+/* Ancho: una sola fila. Desde 72rem y no desde 64rem: a 1024 px el buscador quedaba en
+   255 px y cortaba su propio texto de ejemplo. */
+@media (min-width: 72rem) {
+  .portal-root .portal-cabecera-rejilla {
+    flex-wrap: nowrap;
+  }
+  .portal-root .portal-nav {
+    margin-right: 0;
+  }
+  .portal-root .portal-buscador {
+    flex: 1 1 16rem;
+    max-width: 26rem;
+    margin-left: auto;
+  }
+}
+
+/* ── Piezas base ────────────────────────────────────────────────────────────── */
+.portal-root .portal-rotulo {
+  color: var(--portal-acento);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+/* Rótulo de un dato (sobre una cifra, en una ficha): neutro, para no competir con el
+   rótulo de sección, que va en acento. */
+.portal-root .portal-versalita {
+  color: var(--portal-tinta-suave);
+  /* 12 px: es el único rótulo de cada cifra, y 11 px agrandados siguen siendo chicos. */
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.portal-root .portal-suave {
+  color: var(--portal-tinta-suave);
+}
+.portal-root .portal-enlace {
+  color: var(--portal-acento);
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}
+.portal-root .portal-enlace:hover {
+  text-decoration-thickness: 2px;
+}
+.portal-root .portal-tarjeta {
+  background-color: var(--portal-tarjeta);
+  border: 1px solid var(--portal-linea);
+  border-radius: var(--portal-radio);
+  box-shadow: var(--portal-sombra);
+}
+.portal-root .portal-fila + .portal-fila {
+  border-top: 1px solid var(--portal-linea);
+}
+.portal-root .portal-inicial {
+  background-color: var(--portal-nota-fondo);
+  border: 1px solid var(--portal-nota-linea);
+  color: var(--portal-acento);
+}
+/* Nota al margen: filete de marca a la izquierda, sin sombra — no es una tarjeta con la
+   que se pueda hacer algo. */
+.portal-root .portal-nota {
+  background-color: var(--portal-nota-fondo);
+  border: 1px solid var(--portal-nota-linea);
+  border-left: 4px solid var(--portal-marca);
+  border-radius: var(--portal-radio-control);
+}
+
+.portal-root .portal-etiqueta {
+  display: block;
+  margin-bottom: 0.375rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--portal-tinta);
+}
+/* Sirve para <input>, <select> y <textarea>. */
+.portal-root .portal-campo {
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.625rem 0.875rem;
+  border-radius: var(--portal-radio-control);
+  border: 1px solid var(--portal-linea-control);
+  background-color: var(--portal-campo);
+  color: var(--portal-tinta);
+  /* 16px exactos: con menos, Safari de iOS hace zoom a la página al enfocar el campo. */
+  font-size: 1rem;
+  transition: border-color var(--portal-duracion) ease;
+}
+.portal-root .portal-campo:hover {
+  border-color: var(--portal-tinta);
+}
+/* El gris por defecto del texto de ejemplo no llega a 3:1. */
+.portal-root .portal-campo::placeholder {
+  color: var(--portal-tinta-suave);
+  opacity: 1;
+}
+.portal-root .portal-campo[aria-invalid='true'] {
+  border-color: var(--portal-error-tinta);
+  /* El grosor extra va por sombra interior: engrosar el borde movería el formulario. */
+  box-shadow: inset 0 0 0 1px var(--portal-error-tinta);
+}
+
+.portal-root .portal-boton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  min-height: 2.75rem;
+  padding: 0 1.25rem;
+  border-radius: var(--portal-radio-control);
+  background-color: var(--portal-boton);
+  color: var(--portal-boton-tinta);
+  font-size: 0.9375rem;
+  font-weight: 700;
+  transition: background-color var(--portal-duracion) ease, transform var(--portal-duracion) ease;
+}
+.portal-root .portal-boton:hover:not(:disabled) {
+  background-color: var(--portal-boton-hover);
+}
+.portal-root .portal-boton:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.portal-root .portal-boton:disabled,
+.portal-root .portal-boton[aria-disabled='true'] {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.portal-root .portal-boton-secundario {
+  background-color: transparent;
+  color: var(--portal-tinta);
+  border: 1px solid var(--portal-linea-control);
+}
+.portal-root .portal-boton-secundario:hover:not(:disabled) {
+  background-color: var(--portal-linea);
+}
+/* Acción de segundo plano (Recargar, descargar un documento): mismo alto de toque,
+   menos presencia. */
+.portal-root .portal-boton-compacto {
+  padding: 0 0.875rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.portal-root .portal-cargando {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  color: var(--portal-tinta-suave);
+}
+.portal-root .portal-cargando svg {
+  flex: none;
+  width: 1.25rem;
+  height: 1.25rem;
+}
+.portal-root .portal-actualizado {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  color: var(--portal-tinta-suave);
+  font-size: 0.875rem;
+}
+
+/* ── Avisos ─────────────────────────────────────────────────────────────────── */
+.portal-root .portal-error,
+.portal-root .portal-ok {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.625rem;
+  padding: 0.75rem 0.875rem;
+  border-radius: var(--portal-radio-control);
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+.portal-root .portal-error {
+  background-color: var(--portal-error-fondo);
+  border: 1px solid var(--portal-error-linea);
+  color: var(--portal-error-tinta);
+}
+.portal-root .portal-ok {
+  background-color: var(--portal-ok-fondo);
+  border: 1px solid var(--portal-ok-linea);
+  color: var(--portal-ok-tinta);
+}
+/* piezas.tsx::Aviso. El filete izquierdo va en el color del texto: se ve aunque el fondo
+   pálido se lave con el sol. */
+.portal-root .portal-aviso {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.625rem;
+  padding: 0.75rem 0.875rem;
+  border: 1px solid;
+  border-left: 4px solid currentColor;
+  border-radius: var(--portal-radio-control);
+  font-size: 0.9375rem;
+}
+.portal-root .portal-aviso > svg {
+  flex: none;
+  width: 1.125rem;
+  height: 1.125rem;
+  margin-top: 0.1875rem;
+}
+.portal-root .portal-aviso a {
+  color: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+}
+.portal-root .portal-aviso[data-tono='info'] {
+  background-color: var(--portal-info-fondo);
+  border-color: var(--portal-info-linea);
+  border-left-color: currentColor;
+  color: var(--portal-info-tinta);
+}
+.portal-root .portal-aviso[data-tono='atencion'] {
+  background-color: var(--portal-atencion-fondo);
+  border-color: var(--portal-atencion-linea);
+  border-left-color: currentColor;
+  color: var(--portal-atencion-tinta);
+}
+.portal-root .portal-aviso[data-tono='error'] {
+  background-color: var(--portal-error-fondo);
+  border-color: var(--portal-error-linea);
+  border-left-color: currentColor;
+  color: var(--portal-error-tinta);
+}
+
+/* ── Cifras y códigos ───────────────────────────────────────────────────────── */
+/* Toda cifra: dígitos del mismo ancho (las columnas calzan), cero cruzado (no se confunde
+   con la O), a la derecha y SIN cortes: .portal-root parte palabras largas y partiría
+   «$1.037.040». */
+.portal-root .portal-cifra {
+  font-variant-numeric: tabular-nums slashed-zero;
+  text-align: right;
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+/* La cifra protagonista de un bloque (tablero, total de la orden). */
+.portal-root .portal-cifra-grande {
+  font-size: clamp(1.75rem, 1.3rem + 2vw, 2.5rem);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums slashed-zero;
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+/* N° de parte: el dato tal cual. Monoespaciada (1 ≠ l, 0 ≠ O), sin cortes y sin cambiar
+   mayúsculas: lo que se lee acá es lo que se pega en el otro sistema. */
+.portal-root .portal-parte,
+.portal-root .portal-codigo {
+  font-family: var(--portal-mono);
+  font-variant-numeric: slashed-zero;
+  white-space: nowrap;
+  overflow-wrap: normal;
+  text-transform: none;
+}
+.portal-root .portal-parte {
+  font-weight: 600;
+}
+.portal-root .portal-parte-grupo {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.125rem;
+}
+.portal-root .portal-copiar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  min-width: 2.75rem;
+  min-height: 2.75rem;
+  border-radius: var(--portal-radio-control);
+  color: var(--portal-tinta-suave);
+}
+.portal-root .portal-copiar:hover {
+  background-color: var(--portal-neutro-fondo);
+  color: var(--portal-tinta);
+}
+.portal-root .portal-copiar svg {
+  width: 1rem;
+  height: 1rem;
+}
+/* Con mouse el blanco de toque de 44px no hace falta y engordaría cada fila de la tabla. */
+@media (pointer: fine) {
+  .portal-root .portal-copiar {
+    min-width: 2rem;
+    min-height: 2rem;
+  }
+}
+
+/* ── Estado ─────────────────────────────────────────────────────────────────── */
+/* piezas.tsx::InsigniaEstado. El borde va en el color del texto (se ve al sol); el tono
+   'pendiente' además lo lleva punteado. */
+.portal-root .portal-insignia {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.1875rem 0.5rem;
+  border: 1px solid currentColor;
+  border-radius: var(--portal-radio-fino);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  line-height: 1.3;
+  overflow-wrap: normal;
+}
+.portal-root .portal-insignia[data-tono='ok'] {
+  background-color: var(--portal-ok-fondo);
+  color: var(--portal-ok-tinta);
+}
+.portal-root .portal-insignia[data-tono='curso'] {
+  background-color: var(--portal-info-fondo);
+  color: var(--portal-info-tinta);
+}
+.portal-root .portal-insignia[data-tono='pendiente'] {
+  background-color: var(--portal-neutro-fondo);
+  border-style: dashed;
+  color: var(--portal-tinta-suave);
+}
+.portal-root .portal-insignia[data-tono='atencion'] {
+  background-color: var(--portal-atencion-fondo);
+  color: var(--portal-atencion-tinta);
+}
+/* piezas.tsx::FormaDeTono: ✓ ok · ● curso (relleno) · ○ pendiente · ! atención. */
+.portal-root .portal-forma {
+  flex: none;
+  width: 0.875em;
+  height: 0.875em;
+  stroke-width: 3;
+}
+.portal-root .portal-forma[data-tono='curso'] {
+  fill: currentColor;
+}
+/* piezas.tsx::FechaComprometida. La fecha y el plazo se cortan entre sí, nunca por dentro
+   («en 3 / días»). */
+.portal-root .portal-fecha :is(time, .portal-plazo) {
+  white-space: nowrap;
+}
+.portal-root .portal-atraso {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  color: var(--portal-atencion-tinta);
+  font-weight: 700;
+  white-space: nowrap;
+}
+.portal-root .portal-atraso svg {
+  flex: none;
+  width: 0.9375em;
+  height: 0.9375em;
+}
+
+/* ── Tabla ──────────────────────────────────────────────────────────────────── */
+/* Uso: <table class="portal-tabla"> con <th scope="col"> en el encabezado y el N° de
+   parte como <th scope="row">. Las columnas de números llevan además .portal-cifra.
+   Si la tabla puede quedar más ancha que su caja, envolverla en .portal-tabla-marco. */
+.portal-root .portal-tabla {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9375rem;
+  /* `anywhere` (heredado de .portal-root) deja que una columna se encoja partiendo
+     palabras por la mitad; `break-word` solo parte lo que de verdad no cabe. */
+  overflow-wrap: break-word;
+}
+/* `position: relative`: un texto solo para lectores de pantalla (.sr-only, absoluto) que
+   quede dentro de una tabla desplazada se ancla acá y no al viewport; anclado al viewport
+   sobresale del marco y ensancha la página. */
+.portal-root .portal-tabla-marco {
+  position: relative;
+  overflow-x: auto;
+}
+.portal-root .portal-tabla thead th {
+  padding: 0.625rem 0.75rem;
+  border-bottom: 2px solid var(--portal-tinta);
+  color: var(--portal-tinta-suave);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-align: left;
+  text-transform: uppercase;
+  vertical-align: bottom;
+  white-space: nowrap;
+}
+.portal-root .portal-tabla tbody :is(th, td) {
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--portal-linea);
+  font-weight: 400;
+  text-align: left;
+  vertical-align: top;
+}
+.portal-root .portal-tabla tbody tr:hover {
+  background-color: var(--portal-neutro-fondo);
+}
+.portal-root .portal-tabla :is(th, td).portal-cifra {
+  text-align: right;
+}
+
+/* ── Tarjeta-enlace ─────────────────────────────────────────────────────────── */
+/* Toda la tarjeta se puede tocar, con UN solo enlace real adentro:
+     <article class="portal-tarjeta portal-tarjeta-enlace">
+       <h3><Link class="portal-ancla-tarjeta" to="…">OC 4500123</Link></h3> …
+     </article>
+   El ::after del enlace se estira sobre la tarjeta. Otro control dentro de ella (copiar
+   el N° de parte) queda por encima y sigue funcionando. */
+.portal-root .portal-tarjeta-enlace {
+  position: relative;
+}
+.portal-root .portal-tarjeta-enlace:hover {
+  border-color: var(--portal-linea-control);
+}
+.portal-root .portal-ancla-tarjeta::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: var(--portal-radio);
+}
+.portal-root .portal-ancla-tarjeta:focus-visible {
+  outline: none;
+}
+.portal-root .portal-ancla-tarjeta:focus-visible::after {
+  outline: 3px solid var(--portal-acento);
+  outline-offset: 2px;
+}
+.portal-root .portal-tarjeta-enlace :is(button, a:not(.portal-ancla-tarjeta)) {
+  position: relative;
+  z-index: 1;
+}
+
+/* ── Filtros ────────────────────────────────────────────────────────────────── */
+/* <button class="portal-chip" aria-pressed="true|false">. Elegido = invertido y con más
+   peso (17.85:1 en claro): se distingue sin depender del color. */
+.portal-root .portal-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 2.75rem;
+  padding: 0 0.875rem;
+  border: 1px solid var(--portal-linea-control);
+  border-radius: var(--portal-radio-fino);
+  background-color: var(--portal-tarjeta);
+  color: var(--portal-tinta);
+  font-size: 0.875rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.portal-root .portal-chip:hover {
+  border-color: var(--portal-tinta);
+}
+.portal-root .portal-chip[aria-pressed='true'] {
+  border-color: var(--portal-tinta);
+  background-color: var(--portal-tinta);
+  color: var(--portal-tarjeta);
+  font-weight: 800;
+}
+
+/* ── Miga de pan ────────────────────────────────────────────────────────────── */
+.portal-root .portal-migas {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 0.25rem;
+  color: var(--portal-tinta-suave);
+  font-size: 0.875rem;
+  list-style: none;
+}
+.portal-root .portal-migas li {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-height: 2.75rem;
+}
+/* El blanco de toque es el enlace, no el <li>: los 44px van en el propio <a>. */
+.portal-root .portal-migas a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+}
+.portal-root .portal-migas [aria-current='page'] {
+  color: var(--portal-tinta);
+  font-weight: 600;
+}
+.portal-root .portal-migas-separador {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+}
+
+/* ── Avance ─────────────────────────────────────────────────────────────────── */
+/* piezas.tsx::BarraDeAvance. El relleno crece con transform (no con width). */
+.portal-root .portal-avance-texto {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-size: 0.875rem;
+}
+.portal-root .portal-avance-riel {
+  height: 0.5rem;
+  margin-top: 0.375rem;
+  overflow: hidden;
+  border: 1px solid var(--portal-linea-control);
+  border-radius: var(--portal-radio-fino);
+  background-color: var(--portal-tarjeta);
+}
+.portal-root .portal-avance-relleno {
+  height: 100%;
+  background-color: var(--portal-acento);
+  transform-origin: left center;
+  transition: transform 300ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.portal-root .portal-avance-relleno[data-completa='true'] {
+  background-color: var(--portal-ok-tinta);
+}
+
+/* ── Línea de tiempo ────────────────────────────────────────────────────────── */
+/* El recorrido de un ítem. Marcado que esperan estas reglas:
+     <ol class="portal-hitos">
+       <li class="portal-hito" data-estado="cumplido|actual|pendiente" aria-current="step"?>
+         <span class="portal-hito-marca" aria-hidden="true">…forma…</span>
+         <div>
+           <p class="portal-hito-titulo"><span class="sr-only">Cumplido: </span>En tránsito</p>
+           <time datetime="2026-08-12">12 ago 2026</time>      ← solo si está cumplido
+           <p class="portal-hito-detalle">Guía 1284</p>
+         </div>
+       </li>
+     </ol>
+   Cumplido = disco lleno y tramo continuo; actual = disco con halo; pendiente = aro
+   punteado y tramo punteado. Un <li data-tono="atencion"> pinta el hito actual como
+   incidencia. */
+.portal-root .portal-hitos {
+  list-style: none;
+}
+.portal-root .portal-hito {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1.75rem minmax(0, 1fr);
+  column-gap: 0.875rem;
+  padding-bottom: 1.25rem;
+}
+.portal-root .portal-hito:last-child {
+  padding-bottom: 0;
+}
+/* El tramo que une un hito con el siguiente. */
+.portal-root .portal-hito:not(:last-child)::before {
+  content: '';
+  position: absolute;
+  top: 1.75rem;
+  bottom: 0;
+  left: calc(0.875rem - 1px);
+  border-left: 2px dashed var(--portal-linea-control);
+}
+.portal-root .portal-hito[data-estado='cumplido']:not(:last-child)::before {
+  border-left-style: solid;
+  border-left-color: var(--portal-ok-tinta);
+}
+.portal-root .portal-hito-marca {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border: 2px dashed var(--portal-linea-control);
+  border-radius: 9999px;
+  background-color: var(--portal-tarjeta);
+  color: var(--portal-tinta-suave);
+}
+.portal-root .portal-hito-marca svg {
+  width: 0.875rem;
+  height: 0.875rem;
+  stroke-width: 3;
+}
+.portal-root .portal-hito[data-estado='cumplido'] .portal-hito-marca {
+  border: 2px solid var(--portal-ok-tinta);
+  background-color: var(--portal-ok-tinta);
+  color: var(--portal-tarjeta);
+}
+.portal-root .portal-hito[data-estado='actual'] .portal-hito-marca {
+  border: 2px solid var(--portal-info-tinta);
+  background-color: var(--portal-info-tinta);
+  color: var(--portal-tarjeta);
+  box-shadow: 0 0 0 4px var(--portal-info-fondo);
+}
+.portal-root .portal-hito[data-estado='actual'][data-tono='atencion'] .portal-hito-marca {
+  border-color: var(--portal-atencion-tinta);
+  background-color: var(--portal-atencion-tinta);
+  box-shadow: 0 0 0 4px var(--portal-atencion-fondo);
+}
+.portal-root .portal-hito-titulo {
+  padding-top: 0.125rem;
+  font-weight: 700;
+}
+.portal-root .portal-hito[data-estado='pendiente'] .portal-hito-titulo {
+  color: var(--portal-tinta-suave);
+  font-weight: 500;
+}
+.portal-root .portal-hito :is(time, .portal-hito-detalle) {
+  display: block;
+  color: var(--portal-tinta-suave);
+  font-size: 0.875rem;
+}
+
+/* ── Fotos y visor ──────────────────────────────────────────────────────────── */
+/* Rejilla de miniaturas: <ul class="portal-fotos"><li><button class="portal-foto">
+   <img …></button></li></ul>. A 320 px entran dos por fila. */
+.portal-root .portal-fotos {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr));
+  gap: 0.625rem;
+  list-style: none;
+}
+.portal-root .portal-foto {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  overflow: hidden;
+  border: 1px solid var(--portal-linea-control);
+  border-radius: var(--portal-radio-control);
+  background-color: var(--portal-neutro-fondo);
+  color: var(--portal-tinta-suave);
+}
+.portal-root .portal-foto img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+/* Visor a pantalla completa. Sirve sobre un <dialog> (abierto con showModal) o un <div>:
+     <dialog class="portal-visor">
+       <div class="portal-visor-barra">…título, anterior/siguiente, cerrar…</div>
+       <div class="portal-visor-lienzo"><img …></div>
+     </dialog>
+   Fondo casi negro en los dos temas: una foto se mira mejor sin nada claro alrededor. Los
+   botones de la barra pueden usar .portal-boton-cabecera (pensado para fondo oscuro). */
+.portal-root .portal-visor {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background-color: #020617;
+  color: #f8fafc;
+}
+/* `display: flex` de arriba le ganaría a la regla del navegador que esconde un <dialog>
+   cerrado. */
+.portal-root dialog.portal-visor:not([open]) {
+  display: none;
+}
+.portal-root .portal-visor::backdrop {
+  background-color: #020617;
+}
+.portal-root .portal-visor-barra {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem;
+}
+.portal-root .portal-visor-lienzo {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1 1 0;
+  min-height: 0;
+  padding: 0.5rem;
+}
+.portal-root .portal-visor-lienzo img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+/* ── Pie ────────────────────────────────────────────────────────────────────── */
+.portal-root .portal-pie {
+  border-top: 1px solid var(--portal-linea);
+  color: var(--portal-tinta-suave);
+}
+
+/* ── Movimiento ─────────────────────────────────────────────────────────────── */
+/* Entrada de la página: solo opacidad y transform (no mueven el layout). `backwards` y
+   no `both`: con `both` el elemento se queda para siempre con un `transform`, y un
+   elemento transformado pasa a ser la referencia de sus hijos `position: fixed` (un
+   visor de fotos hecho con <div> quedaría encerrado en la tarjeta en vez de cubrir la
+   pantalla). */
+@keyframes portalEntrada {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.portal-root .portal-entrada {
+  animation: portalEntrada 300ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+@keyframes portalGiro {
+  to { transform: rotate(360deg); }
+}
+.portal-root .portal-giro {
+  animation: portalGiro 800ms linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .portal-root *,
+  .portal-root *::before,
+  .portal-root *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ── TableroPage ────────────────────────────────────────────────────────────── */
+/* Inicio del portal (TableroPage.tsx); clases propias portal-tablero-*.
+   La FICHA es una sola tarjeta partida por filetes en cuatro celdas (un <dl>): los
+   pedidos abiertos mandan (cifra mayor, columna entera) y los otros tres datos
+   acompañan. No son cuatro tarjetas iguales a propósito: lo primero que se lee es lo que
+   más importa. Debajo, «dónde viene lo que falta» (barras) y los montos. */
+
+/* Año a la izquierda, «Actualizado» a la derecha. El alto mínimo reserva la fila antes
+   de que lleguen los datos, para que el contenido no salte al aparecer el selector. */
+.portal-root .portal-tablero-barra {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem 1.5rem;
+  min-height: 2.75rem;
+}
+.portal-root .portal-tablero-anio {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+}
+.portal-root .portal-tablero-anio .portal-etiqueta {
+  margin-bottom: 0;
+}
+/* .portal-campo ocupa todo el ancho; acá el selector mide lo que su texto. */
+.portal-root .portal-tablero-anio .portal-campo {
+  width: auto;
+  min-width: 11rem;
+}
+@media (max-width: 640px) {
+  .portal-root .portal-tablero-anio {
+    flex: 1 0 100%;
+  }
+  .portal-root .portal-tablero-anio .portal-campo {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+}
+
+/* La ficha. `overflow: hidden` recorta el fondo de la celda de atrasos en la esquina
+   redondeada de la tarjeta. */
+.portal-root .portal-tablero-ficha {
+  overflow: hidden;
+}
+.portal-root .portal-tablero-rejilla {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+.portal-root .portal-tablero-celda {
+  min-width: 0;
+  padding: 1.25rem;
+  border-top: 1px solid var(--portal-linea);
+}
+.portal-root .portal-tablero-celda:first-child {
+  border-top: 0;
+}
+.portal-root .portal-tablero-celda > dt {
+  margin-bottom: 0.5rem;
+}
+/* El naranjo de marca, solo como filete decorativo sobre el dato principal. */
+.portal-root .portal-tablero-principal::before {
+  content: '';
+  display: block;
+  width: 2.5rem;
+  height: 0.25rem;
+  margin-bottom: 0.875rem;
+  background-color: var(--portal-marca);
+}
+/* La celda principal es una tarjeta-enlace (.portal-ancla-tarjeta). Como la ficha recorta
+   lo que sobresale, su anillo de foco se dibuja hacia adentro: afuera no se vería. */
+.portal-root .portal-tablero-principal .portal-ancla-tarjeta:focus-visible::after {
+  outline-offset: -5px;
+}
+@media (min-width: 641px) {
+  .portal-root .portal-tablero-rejilla {
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .portal-root .portal-tablero-celda {
+    padding: 1.5rem 1.75rem;
+  }
+  .portal-root .portal-tablero-principal {
+    grid-row: 1 / span 2;
+    border-right: 1px solid var(--portal-linea);
+  }
+  .portal-root .portal-tablero-pendientes,
+  .portal-root .portal-tablero-atrasos {
+    border-top: 0;
+  }
+  .portal-root .portal-tablero-atrasos {
+    border-left: 1px solid var(--portal-linea);
+  }
+  .portal-root .portal-tablero-fecha {
+    grid-column: 2 / span 2;
+  }
+}
+
+/* La cifra que manda en la pantalla: mayor que .portal-cifra-grande. */
+.portal-root .portal-tablero-cifra-mayor {
+  font-size: clamp(3.5rem, 2.4rem + 5.5vw, 5.5rem);
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 0.95;
+  font-variant-numeric: tabular-nums slashed-zero;
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+/* Una cifra con su unidad («34 de 120 ítems», «12 ago en 3 días»): si no caben en una
+   línea, la unidad baja entera. */
+.portal-root .portal-tablero-dato {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.125rem 0.5rem;
+}
+.portal-root .portal-tablero-dato .portal-forma {
+  align-self: center;
+  width: 1.25rem;
+  height: 1.25rem;
+}
+.portal-root .portal-tablero-unidad {
+  color: var(--portal-tinta-suave);
+  font-size: 1rem;
+  font-weight: 600;
+}
+.portal-root .portal-tablero-accion {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 2.75rem;
+  margin-top: 0.5rem;
+}
+/* Con atrasos, la celda entera cambia: fondo de atención y filete en el color del texto
+   (el filete se ve aunque el fondo pálido se lave con el sol). La palabra «atrasados» y
+   el triángulo lo dicen sin depender del color. */
+.portal-root .portal-tablero-atrasos[data-tono='atencion'] {
+  background-color: var(--portal-atencion-fondo);
+  box-shadow: inset 4px 0 0 var(--portal-atencion-tinta);
+  color: var(--portal-atencion-tinta);
+}
+.portal-root .portal-tablero-atrasos[data-tono='atencion'] :is(.portal-versalita, .portal-tablero-unidad) {
+  color: inherit;
+}
+/* «Sin atrasos», «Todo lo que pediste ya fue despachado»: una buena noticia, con su ✓. */
+.portal-root .portal-tablero-en-orden {
+  color: var(--portal-ok-tinta);
+  font-size: 1.25rem;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+/* Dónde viene lo que falta: una fila por etapa. En un teléfono la insignia va en su
+   propia línea (una etiqueta larga no cabe junto a la barra) y debajo la barra con su
+   cifra; desde 641 px, todo en una fila. La columna de la cifra tiene ancho fijo para que
+   las barras de todas las filas partan y terminen en el mismo lugar. */
+.portal-root .portal-tablero-estados {
+  list-style: none;
+}
+.portal-root .portal-tablero-estado {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(5.5rem, auto);
+  grid-template-areas:
+    'nombre nombre'
+    'barra cifra';
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  padding: 0.875rem 0;
+  border-top: 1px solid var(--portal-linea);
+}
+.portal-root .portal-tablero-estado:first-child {
+  border-top: 0;
+}
+.portal-root .portal-tablero-estado-nombre {
+  grid-area: nombre;
+  min-width: 0;
+}
+.portal-root .portal-tablero-estado-cifra {
+  grid-area: cifra;
+  font-weight: 700;
+}
+.portal-root .portal-tablero-riel {
+  grid-area: barra;
+  height: 0.75rem;
+  overflow: hidden;
+  border-radius: var(--portal-radio-fino);
+  background-color: var(--portal-neutro-fondo);
+}
+/* Crece con transform (no con width). El color repite el tono de la insignia. */
+.portal-root .portal-tablero-relleno {
+  height: 100%;
+  background-color: var(--portal-info-tinta);
+  transform-origin: left center;
+  transition: transform 300ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.portal-root .portal-tablero-relleno[data-tono='pendiente'] {
+  background-color: var(--portal-tinta-suave);
+}
+.portal-root .portal-tablero-relleno[data-tono='atencion'] {
+  background-color: var(--portal-atencion-tinta);
+}
+.portal-root .portal-tablero-relleno[data-tono='ok'] {
+  background-color: var(--portal-ok-tinta);
+}
+@media (min-width: 641px) {
+  .portal-root .portal-tablero-estado {
+    grid-template-columns: minmax(0, 15rem) minmax(0, 1fr) minmax(5.5rem, auto);
+    grid-template-areas: 'nombre barra cifra';
+  }
+}
+
+/* Montos: rótulo a la izquierda, cifra a la derecha. */
+.portal-root .portal-tablero-monto-fila {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.25rem 1rem;
+  padding: 0.875rem 0;
+  border-top: 1px solid var(--portal-linea);
+}
+.portal-root .portal-tablero-monto-fila:first-child {
+  border-top: 0;
+}
+/* La cifra queda a la derecha también cuando no cabe junto a su rótulo y baja de línea. */
+.portal-root .portal-tablero-monto-fila > dd {
+  margin-left: auto;
+}
+.portal-root .portal-tablero-monto {
+  font-size: 1.125rem;
+  font-weight: 700;
+}
+/* Lo comprado es el total del que salen las otras dos cifras: va más grande. */
+.portal-root .portal-tablero-monto-fila:first-child .portal-tablero-monto {
+  font-size: clamp(1.25rem, 1.1rem + 0.6vw, 1.5rem);
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+
+/* ── ItemPage ───────────────────────────────────────────────────────────────── */
+/* Seguimiento de un ítem (ItemPage.tsx); clases propias portal-item-*.
+   Arriba, la FICHA: una tarjeta partida en dos. A la izquierda (arriba en un teléfono) lo
+   que el cliente viene a buscar —estado y fecha comprometida—; a la derecha, los datos
+   del ítem como renglones rótulo–valor. Debajo, el recorrido (clases portal-hito*, más
+   arriba en este archivo), las fotos y los documentos. */
+
+/* El título con su botón de copiar al lado (el botón no va DENTRO del <h1>: se colaría
+   en el nombre del encabezado). */
+.portal-root .portal-item-titulo-grupo {
+  display: flex;
+  align-items: center;
+  column-gap: 0.25rem;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+/* El título de la pantalla ES el N° de parte (piezas.tsx::NumeroDeParte dentro del <h1>). */
+.portal-root .portal-item-titulo {
+  font-size: clamp(1.5rem, 1rem + 2.5vw, 2.25rem);
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+.portal-root .portal-item-titulo .portal-parte-grupo {
+  max-width: 100%;
+}
+.portal-root .portal-item-titulo .portal-parte {
+  font-weight: 800;
+}
+/* La regla es que un N° de parte no se corta. La excepción es uno tan largo que, al
+   tamaño de un título, ensancharía la página en un teléfono: se achica y se le permite
+   partirse. Lo decide ItemPage.tsx por el largo del texto (data-largo). */
+.portal-root .portal-item-titulo[data-largo='true'] {
+  font-size: 1.25rem;
+}
+.portal-root .portal-item-titulo[data-largo='true'] .portal-parte {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* La ficha. `overflow: hidden` recorta el filete de marca contra la esquina redondeada
+   de la tarjeta. */
+.portal-root .portal-item-ficha {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  overflow: hidden;
+}
+.portal-root .portal-item-compromiso {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 0.625rem;
+  padding: 1.25rem 1.25rem 1.25rem 1rem;
+  /* El naranjo de marca va solo acá, como filete: nunca en un texto. */
+  border-left: 4px solid var(--portal-marca);
+}
+/* Atrasado: el bloque entero pasa al tono de atención. La palabra «atrasado» y su ícono
+   (piezas.tsx::FechaComprometida) lo dicen aunque el color no se distinga. */
+.portal-root .portal-item-compromiso[data-tono='atencion'] {
+  background-color: var(--portal-atencion-fondo);
+  border-left-color: var(--portal-atencion-tinta);
+}
+/* La fecha comprometida es EL dato de la pantalla: va al tamaño de un titular. */
+.portal-root .portal-item-compromiso-fecha {
+  font-size: clamp(1.25rem, 1.05rem + 1vw, 1.625rem);
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+.portal-root .portal-item-datos {
+  padding: 0.375rem 1.25rem;
+  border-top: 1px solid var(--portal-linea);
+}
+@media (min-width: 48rem) {
+  .portal-root .portal-item-ficha {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .portal-root .portal-item-compromiso {
+    padding: 1.75rem 1.75rem 1.75rem 1.5rem;
+  }
+  .portal-root .portal-item-datos {
+    padding: 0.625rem 1.75rem;
+    border-top: 0;
+    border-left: 1px solid var(--portal-linea);
+  }
+}
+/* Un renglón de la ficha: rótulo a la izquierda, valor a la derecha. Si no caben en una
+   línea (320 px) el valor baja y sigue a la derecha. */
+.portal-root .portal-item-dato {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.25rem 1rem;
+  padding: 0.6875rem 0;
+}
+.portal-root .portal-item-dato + .portal-item-dato {
+  border-top: 1px solid var(--portal-linea);
+}
+/* Dígitos del mismo ancho y a la derecha: cantidades y montos quedan en columna. */
+.portal-root .portal-item-dato > dd {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums slashed-zero;
+  font-weight: 700;
+  text-align: right;
+}
+.portal-root .portal-item-dato[data-destacado='true'] > dd {
+  font-size: 1.25rem;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+/* «6 · Despachado / 4 · En nuestra bodega»: cuando el ítem va repartido en más de un
+   estado. */
+.portal-root .portal-item-partes {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.375rem;
+  list-style: none;
+}
+.portal-root .portal-item-partes li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+/* Nota al pie del recorrido. */
+.portal-root .portal-item-nota {
+  margin-top: 1.25rem;
+  padding-top: 0.875rem;
+  border-top: 1px solid var(--portal-linea);
+}
+/* La línea fija del hito «en gestión» (una incidencia, no un paso): en el tono de
+   atención, igual que su disco. */
+.portal-root .portal-hito .portal-item-gestion {
+  margin-top: 0.25rem;
+  color: var(--portal-atencion-tinta);
+  font-weight: 600;
+}
+
+/* ── GaleriaDeFotos ─────────────────────────────────────────────────────────── */
+/* Fotos de un ítem (GaleriaDeFotos.tsx); clases propias portal-galeria-*. Se apoya en
+   las compartidas portal-fotos, portal-foto y portal-visor (bloque «Fotos y visor»): acá
+   va solo lo que esta pieza agrega. */
+
+/* Siempre al menos dos por fila: la rejilla vive dentro de una tarjeta, y con el mínimo
+   fijo de .portal-fotos a 320 px quedaría una sola columna. En una tarjeta ancha entran
+   tres o cuatro. */
+.portal-root .portal-galeria-rejilla {
+  grid-template-columns: repeat(auto-fill, minmax(min(8.5rem, calc(50% - 0.3125rem)), 1fr));
+}
+.portal-root .portal-galeria-miniatura {
+  cursor: zoom-in;
+  transition: border-color var(--portal-duracion) ease;
+}
+.portal-root .portal-galeria-miniatura:hover {
+  border-color: var(--portal-tinta);
+}
+.portal-root .portal-galeria-miniatura img {
+  transition: transform var(--portal-duracion) ease;
+}
+.portal-root .portal-galeria-miniatura:hover img {
+  transform: scale(1.04);
+}
+.portal-root .portal-galeria-miniatura:active img {
+  transform: scale(1);
+}
+/* Ícono de «todavía no se pide», «cargando» y «no se pudo cargar». */
+.portal-root .portal-galeria-icono {
+  flex: none;
+  width: 1.5rem;
+  height: 1.5rem;
+}
+.portal-root .portal-galeria-fallo {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.5rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.25;
+  text-align: center;
+}
+
+/* Lo que sigue va DENTRO del visor, que es casi negro en los dos temas: los colores son
+   fijos y no los tokens (la tinta suave del tema claro no se leería ahí). */
+.portal-root .portal-galeria-cuenta {
+  min-width: 0;
+  font-size: 1rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+/* La caja de la imagen se ajusta a la foto (no al lienzo): conserva su proporción y una
+   foto pequeña no se agranda. Los topes los pone .portal-visor-lienzo img. */
+.portal-root .portal-galeria-foto-grande {
+  width: auto;
+  height: auto;
+}
+/* «Cargando foto…» y el error con su «Reintentar». */
+.portal-root .portal-galeria-aviso {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.875rem;
+  max-width: 22rem;
+  padding: 1rem;
+  color: #e2e8f0; /* 16.3:1 sobre el fondo del visor */
+  text-align: center;
+}
+/* Anterior / Siguiente van ABAJO: en un teléfono es donde llega el pulgar. */
+.portal-root .portal-galeria-pasos {
+  display: flex;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem 0.875rem;
+}
+.portal-root .portal-galeria-paso {
+  flex: 1 1 0;
+  max-width: 14rem;
+  min-height: 3rem;
+  font-size: 1rem;
+}
+.portal-root .portal-galeria-paso[aria-disabled='true'] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.portal-root .portal-galeria-paso[aria-disabled='true']:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+/* ── PedidosPage ────────────────────────────────────────────────────────────── */
+/* Mis pedidos (PedidosPage.tsx, PedidosFiltros.tsx, PedidosResultados.tsx); clases
+   propias portal-pedidos-*. Arriba los FILTROS (buscador, chips de estado, año); debajo
+   la barra con el conteo y «Actualizado», y la LISTA: tabla desde 60rem (960 px: antes
+   no caben sus siete columnas sin barra horizontal) y tarjetas por debajo, una orden a
+   la vez. Las dos vistas se escriben siempre y estas reglas muestran una sola. Al pie,
+   la paginación. */
+
+/* Los filtros: el buscador ocupa su fila; los chips y el año comparten la siguiente. */
+.portal-root .portal-pedidos-filtros {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+/* La lupa y la × van ENCIMA del campo y no al lado, para que el campo siga siendo uno
+   solo (un borde, un foco). El hueco de la × se reserva siempre: si apareciera y
+   desapareciera con el texto, el ancho útil del campo cambiaría a cada tecla. */
+.portal-root .portal-pedidos-buscador {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.portal-root .portal-pedidos-buscador .portal-campo {
+  padding-left: 2.75rem;
+  padding-right: 3rem;
+}
+/* La × nativa de <input type="search"> mide unos 16 px (con guantes no se acierta): en
+   Mis pedidos la reemplaza .portal-pedidos-limpiar y en la cabecera basta borrar y
+   buscar. En «Filtrar ítems» (ItemsDeOrden) se deja: es lo único que limpia ese campo. */
+.portal-root .portal-buscador .portal-campo::-webkit-search-cancel-button,
+.portal-root .portal-pedidos-buscador .portal-campo::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
+}
+.portal-root .portal-pedidos-lupa {
+  position: absolute;
+  top: 50%;
+  left: 0.875rem;
+  width: 1.125rem;
+  height: 1.125rem;
+  transform: translateY(-50%);
+  color: var(--portal-tinta-suave);
+  pointer-events: none;
+}
+/* 44px también con mouse: con guantes, en una faena, una × chica no se acierta. */
+.portal-root .portal-pedidos-limpiar {
+  position: absolute;
+  top: 50%;
+  right: 0.25rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  transform: translateY(-50%);
+  border-radius: var(--portal-radio-control);
+  color: var(--portal-tinta-suave);
+}
+.portal-root .portal-pedidos-limpiar:hover {
+  background-color: var(--portal-neutro-fondo);
+  color: var(--portal-tinta);
+}
+.portal-root .portal-pedidos-limpiar svg {
+  width: 1.125rem;
+  height: 1.125rem;
+}
+.portal-root .portal-pedidos-filtros-fila {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem 1.5rem;
+}
+.portal-root .portal-pedidos-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+/* Año: como .portal-tablero-anio, el selector mide lo que su texto; en angosto, cuando
+   baja a su propia fila, la llena. */
+.portal-root .portal-pedidos-anio {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 0.625rem;
+}
+.portal-root .portal-pedidos-anio .portal-campo {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+@media (min-width: 40rem) {
+  .portal-root .portal-pedidos-anio {
+    flex: none;
+  }
+  .portal-root .portal-pedidos-anio .portal-campo {
+    flex: none;
+    min-width: 9rem;
+  }
+}
+
+/* La región de resultados. Al cambiar de página la pantalla se desplaza hasta acá: el
+   margen de desplazamiento deja aire sobre el conteo. */
+.portal-root .portal-pedidos-resultados {
+  margin-top: 1.5rem;
+  scroll-margin-top: 1rem;
+}
+/* Conteo a la izquierda, «Actualizado» a la derecha. El alto mínimo reserva la fila para
+   que la lista no salte cuando aparezca el botón Recargar. */
+.portal-root .portal-pedidos-barra {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1.5rem;
+  min-height: 2.75rem;
+  margin-bottom: 1rem;
+}
+/* El conteo es texto corrido y puede ser largo («12 pedidos abiertos de 2026 para
+   “bomba”, página 2 de 3»): el ícono de espera va en línea, no en una caja aparte. */
+.portal-root .portal-pedidos-conteo {
+  flex: 1 1 16rem;
+  min-width: 0;
+  font-weight: 600;
+}
+.portal-root .portal-pedidos-conteo svg {
+  display: inline-block;
+  width: 1.125rem;
+  height: 1.125rem;
+  margin-right: 0.5rem;
+  vertical-align: -0.1875rem;
+}
+.portal-root .portal-pedidos-nota {
+  color: var(--portal-tinta-suave);
+  font-weight: 400;
+}
+/* Mientras llega la búsqueda nueva se sigue viendo la lista anterior, atenuada. A pleno
+   sol la atenuación no se nota: por eso el conteo además dice «Buscando…». */
+/* Mientras llega otra búsqueda la lista anterior queda tal cual (el conteo dice
+   «Buscando…» y el ícono gira): atenuarla bajaba el contraste del texto a menos de 3:1
+   justo en el estado que más dura con mala señal. */
+
+/* Tabla desde 60rem, tarjetas por debajo (la vista escondida sale también del árbol de
+   accesibilidad). El selector de las tarjetas lleva las dos clases a propósito:
+   .portal-pedidos-tarjetas también declara `display`, y a igual especificidad ganaría la
+   regla que viene después en el archivo (una media query no suma especificidad). */
+@media (max-width: 59.99rem) {
+  .portal-root .portal-pedidos-solo-tabla {
+    display: none;
+  }
+}
+@media (min-width: 60rem) {
+  .portal-root .portal-pedidos-tarjetas.portal-pedidos-solo-tarjetas {
+    display: none;
+  }
+}
+
+/* La tabla vive dentro de una tarjeta: las celdas de los extremos llevan más aire para
+   que el texto no toque la esquina redondeada. */
+.portal-root .portal-pedidos-tabla :is(th, td):first-child {
+  padding-left: 1.25rem;
+}
+.portal-root .portal-pedidos-tabla :is(th, td):last-child {
+  padding-right: 1.25rem;
+}
+.portal-root .portal-pedidos-numero {
+  font-weight: 700;
+}
+/* En la tabla el enlace es una línea de texto de ~19 px: se le da el alto de toque
+   completo sin mover la fila (el relleno de la celda lo absorbe). */
+.portal-root .portal-pedidos-tabla .portal-pedidos-numero {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+}
+/* La razón social bajo el N° de orden (una cuenta puede representar a varias empresas). */
+.portal-root .portal-pedidos-empresa {
+  display: block;
+  margin-top: 0.125rem;
+  color: var(--portal-tinta-suave);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+/* Una fecha entera («12 ago 2026») no se parte en dos líneas. */
+.portal-root .portal-pedidos-entera {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+/* La barra de avance necesita un ancho mínimo para decir algo. */
+.portal-root .portal-pedidos-celda-avance {
+  min-width: 9rem;
+}
+/* El único encabezado largo puede partirse en dos líneas (los demás van en una). */
+.portal-root .portal-pedidos-tabla thead .portal-pedidos-titulo-largo {
+  min-width: 8rem;
+  white-space: normal;
+}
+.portal-root .portal-pedidos-dia {
+  font-weight: 700;
+}
+.portal-root .portal-pedidos-proxima .portal-plazo {
+  color: var(--portal-tinta-suave);
+}
+/* Cuántos ítems van atrasados: en el tono de atención, con su palabra al lado (en la
+   tarjeta) o bajo el encabezado «Atrasados» (en la tabla). */
+.portal-root .portal-pedidos-atrasados {
+  color: var(--portal-atencion-tinta);
+  font-weight: 700;
+}
+/* Una orden con atrasos lleva un filete de atención a la izquierda, en la fila y en la
+   tarjeta. Va por sombra interior y no por borde: un borde cambiaría el ancho de esa
+   fila sola. El fondo no cambia: diez órdenes atrasadas serían una pared amarilla. */
+.portal-root .portal-pedidos-tabla tr[data-atrasada='true'] > :first-child {
+  box-shadow: inset 4px 0 0 var(--portal-atencion-tinta);
+}
+.portal-root .portal-pedidos-tarjeta[data-atrasada='true'] {
+  box-shadow: inset 4px 0 0 var(--portal-atencion-tinta), var(--portal-sombra);
+}
+
+/* «Coincide con»: por qué salió la orden en la búsqueda. En la tabla es una segunda
+   fila del mismo <tbody>, pegada a la de la orden (sin filete entre las dos); en la
+   tarjeta, un bloque al pie. */
+.portal-root .portal-pedidos-tabla tr[data-coincide='true'] > :is(th, td) {
+  border-bottom: 0;
+}
+.portal-root .portal-pedidos-fila-coincide > td {
+  padding-top: 0;
+  padding-bottom: 1rem;
+}
+/* Al pasar el mouse se ilumina el <tbody> entero: la orden y sus coincidencias son una. */
+.portal-root .portal-pedidos-tabla tbody:hover tr {
+  background-color: var(--portal-neutro-fondo);
+}
+.portal-root .portal-pedidos-coincide {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}
+.portal-root .portal-pedidos-tarjeta .portal-pedidos-coincide {
+  margin-top: 1rem;
+  padding-top: 0.875rem;
+  border-top: 1px solid var(--portal-linea);
+}
+.portal-root .portal-pedidos-coincide-lista {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  min-width: 0;
+  max-width: 100%;
+  list-style: none;
+}
+.portal-root .portal-pedidos-coincide-lista > li {
+  min-width: 0;
+  max-width: 100%;
+}
+/* Cada coincidencia es un enlace con forma de ficha. El N° de parte adentro no se corta:
+   si es más ancho que la pantalla se desplaza dentro de la ficha y no empuja la página. */
+.portal-root .portal-pedidos-ficha {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.375rem;
+  max-width: 100%;
+  min-height: 2.75rem;
+  padding: 0.25rem 0.75rem;
+  overflow-x: auto;
+  position: relative; /* ancla el texto .sr-only de adentro (ver .portal-tabla-marco) */
+  border: 1px solid var(--portal-linea-control);
+  border-radius: var(--portal-radio-fino);
+  background-color: var(--portal-tarjeta);
+  color: var(--portal-tinta);
+  font-size: 0.875rem;
+  font-weight: 600;
+  transition: border-color var(--portal-duracion) ease, background-color var(--portal-duracion) ease;
+}
+.portal-root .portal-pedidos-ficha:hover {
+  border-color: var(--portal-tinta);
+  background-color: var(--portal-neutro-fondo);
+}
+.portal-root .portal-pedidos-ficha svg {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+  color: var(--portal-tinta-suave);
+}
+.portal-root .portal-pedidos-ficha-detalle {
+  min-width: 0;
+  color: var(--portal-tinta-suave);
+  font-weight: 500;
+}
+
+/* Las tarjetas: una columna en un teléfono, dos en una tablet. */
+.portal-root .portal-pedidos-tarjetas {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.875rem;
+  list-style: none;
+}
+@media (min-width: 40rem) {
+  .portal-root .portal-pedidos-tarjetas {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.portal-root .portal-pedidos-tarjetas > li {
+  min-width: 0;
+}
+/* `height: 100%`: las dos tarjetas de una fila miden lo mismo. */
+.portal-root .portal-pedidos-tarjeta {
+  height: 100%;
+  padding: 1.125rem 1.25rem;
+}
+.portal-root .portal-pedidos-tarjeta-cabeza {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.portal-root .portal-pedidos-tarjeta .portal-pedidos-numero {
+  font-size: 1.125rem;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+/* La flecha dice que la tarjeta se toca; el enlace real es el N° de orden. */
+.portal-root .portal-pedidos-flecha {
+  flex: none;
+  width: 1.25rem;
+  height: 1.25rem;
+  color: var(--portal-tinta-suave);
+}
+.portal-root .portal-pedidos-tarjeta:hover .portal-pedidos-flecha {
+  color: var(--portal-tinta);
+}
+.portal-root .portal-pedidos-tarjeta-estado {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  margin-top: 0.75rem;
+}
+.portal-root .portal-pedidos-tarjeta-estado .portal-pedidos-empresa {
+  margin-top: 0;
+}
+/* Los datos de la tarjeta, de a dos por fila; la fecha comprometida y el avance ocupan
+   la fila entera (data-ancho="completo"). auto-fit y no repeat(2, …): con el texto del
+   sistema agrandado (ajuste típico para leer a pleno sol) dos columnas fijas desbordan
+   la página en un teléfono; así la rejilla cae sola a una columna cuando no caben. */
+.portal-root .portal-pedidos-datos {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 8rem), 1fr));
+  gap: 0.875rem 1rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--portal-linea);
+}
+.portal-root .portal-pedidos-dato {
+  min-width: 0;
+}
+.portal-root .portal-pedidos-dato[data-ancho='completo'] {
+  grid-column: 1 / -1;
+}
+.portal-root .portal-pedidos-dato > dt {
+  margin-bottom: 0.25rem;
+}
+.portal-root .portal-pedidos-dato > dd {
+  font-weight: 600;
+}
+.portal-root .portal-pedidos-dato .portal-pedidos-atrasados {
+  margin-top: 0.25rem;
+  font-size: 0.875rem;
+}
+
+/* Paginación. En un teléfono, Anterior y Siguiente comparten la fila (donde llega el
+   pulgar) y «Página N de M» va debajo, centrada; desde 36rem, todo en una fila. */
+.portal-root .portal-pedidos-paginas {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1.25rem;
+}
+.portal-root .portal-pedidos-paginas > a {
+  flex: 1 1 0;
+}
+/* Sin página en esa dirección el enlace queda en su lugar, deshabilitado (aria-disabled):
+   tampoco cambia de fondo al pasar el mouse. */
+.portal-root .portal-pedidos-paginas > a[aria-disabled='true']:hover {
+  background-color: transparent;
+}
+.portal-root .portal-pedidos-pagina {
+  order: 1;
+  flex: 1 0 100%;
+  color: var(--portal-tinta-suave);
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums slashed-zero;
+  text-align: center;
+}
+@media (min-width: 36rem) {
+  .portal-root .portal-pedidos-paginas > a {
+    flex: none;
+  }
+  .portal-root .portal-pedidos-pagina {
+    order: 0;
+    flex: 1 1 auto;
+  }
+}
+
+/* ── OrdenPage ──────────────────────────────────────────────────────────────── */
+/* Una orden (OrdenPage.tsx, FichaDeOrden.tsx, ItemsDeOrden.tsx); clases propias
+   portal-orden-*. El título lleva el N° de OC. La FICHA es una tarjeta en dos pisos:
+   arriba, dos o tres celdas grandes (cuándo llega lo próximo, cuánto falta, cuánto
+   suma); abajo, una fila de datos chicos (estado, fechas, ejecutivo). Luego los ÍTEMS:
+   controles (ordenar, filtrar), tabla desde 64rem (1024 px: con las dos columnas de
+   montos no cabe antes) y tarjetas por debajo; los ya entregados, plegados. */
+
+/* Título y «Actualizado» en una fila; en angosto, el segundo baja. */
+.portal-root .portal-orden-titulo {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 0.75rem 1.5rem;
+  margin-top: 0.5rem;
+}
+/* El N° de OC es el dato tal cual (ver .portal-parte): monoespaciado y sin el tracking
+   apretado del título. Es texto libre y sí puede partirse: no se le pone nowrap. */
+.portal-root .portal-orden-numero {
+  font-family: var(--portal-mono);
+  font-variant-numeric: slashed-zero;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* La ficha. Los filetes entre celdas no son bordes: son el fondo del contenedor asomando
+   por un hueco de 1 px. Así quedan bien se repartan como se repartan las celdas (dos
+   arriba y una abajo, tres en fila…) sin calcular cuál es la primera de cada fila.
+   `overflow: hidden` recorta ese fondo contra la esquina redondeada. */
+.portal-root .portal-orden-ficha {
+  overflow: hidden;
+}
+.portal-root .portal-orden-celdas {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1px;
+  background-color: var(--portal-linea);
+}
+/* Cada celda pide 18rem: lo que necesita el total con IVA a su tamaño de titular. Con
+   menos ancho bajan de a una (en una tablet, dos arriba y una abajo). */
+.portal-root .portal-orden-celda {
+  flex: 1 1 18rem;
+  min-width: 0;
+  padding: 1.25rem;
+  background-color: var(--portal-tarjeta);
+}
+@media (min-width: 40rem) {
+  .portal-root .portal-orden-celda {
+    padding: 1.5rem 1.75rem;
+  }
+}
+/* La fila de datos chicos: celdas más angostas y con menos aire; la del ejecutivo pide
+   el doble (data-ancho). */
+.portal-root .portal-orden-datos {
+  border-top: 1px solid var(--portal-linea);
+}
+.portal-root .portal-orden-datos .portal-orden-celda {
+  flex-basis: 10rem;
+  padding: 0.875rem 1.25rem;
+}
+.portal-root .portal-orden-datos .portal-orden-celda[data-ancho='true'] {
+  flex-grow: 2;
+  flex-basis: 20rem;
+}
+@media (min-width: 40rem) {
+  .portal-root .portal-orden-datos .portal-orden-celda {
+    padding: 1rem 1.75rem;
+  }
+}
+/* El total con IVA, a tamaño de titular: un poco menor que .portal-cifra-grande porque
+   «$14.691.357» tiene el doble de caracteres que «28 sep» y debe caber en su celda. */
+.portal-root .portal-orden-total {
+  font-size: clamp(1.5rem, 1.1rem + 1.6vw, 2.25rem);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.05;
+}
+/* Neto e IVA bajo el total: dos pares rótulo–cifra en línea. */
+.portal-root .portal-orden-desglose {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1.25rem;
+  margin-top: 0.625rem;
+  font-size: 0.875rem;
+}
+.portal-root .portal-orden-desglose > div {
+  display: flex;
+  align-items: baseline;
+  gap: 0.375rem;
+  min-width: 0;
+}
+.portal-root .portal-orden-desglose dt {
+  color: var(--portal-tinta-suave);
+}
+.portal-root .portal-orden-desglose dd {
+  font-weight: 600;
+}
+/* El correo del ejecutivo: blanco de toque de 44px sin dejar de ser un enlace. */
+.portal-root .portal-orden-correo {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-height: 2.75rem;
+}
+
+/* Controles de la lista: «Ordenar por» a la izquierda, el filtro a la derecha; en
+   angosto se apilan. En los dos, el rótulo va sobre su control. */
+.portal-root .portal-orden-controles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 0.75rem 1.5rem;
+  margin-top: 1rem;
+}
+.portal-root .portal-orden-ordenar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.portal-root .portal-orden-ordenar > .portal-versalita {
+  flex: 1 0 100%;
+}
+.portal-root .portal-orden-filtro {
+  flex: 1 1 16rem;
+  max-width: 24rem;
+}
+
+/* «N ítems ya entregados», plegado. El <summary> es el control: 44px de alto y sin el
+   triángulo del navegador, que reemplaza la flecha (gira al abrir). El plegable «Qué
+   viajó» de Documentos.tsx (.portal-docs-plegable) es el mismo control y comparte estas
+   reglas. */
+.portal-root .portal-orden-entregados {
+  margin-top: 1.25rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--portal-linea);
+}
+.portal-root :is(.portal-orden-entregados, .portal-docs-plegable) > summary {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.75rem;
+  padding: 0 0.5rem 0 0.25rem;
+  margin-left: -0.25rem;
+  border-radius: var(--portal-radio-control);
+  font-weight: 700;
+  cursor: pointer;
+  list-style: none;
+}
+.portal-root :is(.portal-orden-entregados, .portal-docs-plegable) > summary::-webkit-details-marker {
+  display: none;
+}
+.portal-root :is(.portal-orden-entregados, .portal-docs-plegable) > summary:hover {
+  background-color: var(--portal-neutro-fondo);
+}
+.portal-root .portal-orden-flecha,
+.portal-root .portal-docs-flecha {
+  flex: none;
+  width: 1.125rem;
+  height: 1.125rem;
+  color: var(--portal-tinta-suave);
+  transition: transform var(--portal-duracion) ease;
+}
+.portal-root :is(.portal-orden-entregados, .portal-docs-plegable)[open] > summary :is(.portal-orden-flecha, .portal-docs-flecha) {
+  transform: rotate(90deg);
+}
+
+/* Tabla desde 64rem, tarjetas por debajo. */
+@media (max-width: 63.99rem) {
+  .portal-root .portal-orden-en-tabla {
+    display: none;
+  }
+}
+@media (min-width: 64rem) {
+  .portal-root .portal-orden-en-tarjetas {
+    display: none;
+  }
+}
+/* Ocho columnas a 1024 px: las celdas llevan menos aire a los lados que en las otras
+   tablas. Descripción y estado son las columnas con más texto: un ancho mínimo evita que
+   la tabla se las coma; si aun así no cabe, el marco (.portal-tabla-marco) se desplaza. */
+.portal-root .portal-orden-tabla :is(th, td) {
+  padding-left: 0.5rem;
+  padding-right: 0.5rem;
+}
+.portal-root .portal-orden-col-descripcion {
+  min-width: 9rem;
+}
+.portal-root .portal-orden-col-estado {
+  min-width: 10rem;
+}
+/* Un ítem atrasado: filete de atención a la izquierda, en la fila y en la tarjeta (el
+   mismo recurso que las órdenes atrasadas de Mis pedidos). */
+.portal-root .portal-orden-tabla tr[data-atrasado='true'] > :first-child {
+  box-shadow: inset 4px 0 0 var(--portal-atencion-tinta);
+}
+.portal-root .portal-orden-tarjeta[data-atrasado='true'] {
+  box-shadow: inset 4px 0 0 var(--portal-atencion-tinta), var(--portal-sombra);
+}
+/* Estado, desglose por unidades y fecha comprometida, apilados. */
+.portal-root .portal-orden-estado {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.375rem;
+}
+.portal-root .portal-orden-estado .portal-fecha {
+  font-size: 0.875rem;
+}
+/* «6 · Despachado / 4 · En nuestra bodega»: cuando el ítem va repartido en más de un
+   estado, la forma de cada tono acompaña a su cifra. */
+.portal-root .portal-orden-partes {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  color: var(--portal-tinta-suave);
+  font-size: 0.875rem;
+  list-style: none;
+}
+.portal-root .portal-orden-partes li {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+.portal-root .portal-orden-partes .portal-cifra {
+  color: var(--portal-tinta);
+  font-weight: 700;
+}
+/* «Ver seguimiento» y el contador de fotos. */
+.portal-root .portal-orden-seguimiento {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.75rem;
+}
+.portal-root .portal-orden-ver {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.125rem;
+  min-height: 2.75rem;
+  white-space: nowrap;
+}
+.portal-root .portal-orden-ver svg {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+}
+/* En la tabla el enlace puede partirse en dos líneas: a 1024 px es lo que falta para que
+   las ocho columnas quepan sin desplazar el marco. */
+.portal-root .portal-orden-tabla .portal-orden-ver {
+  white-space: normal;
+}
+.portal-root .portal-orden-fotos {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  color: var(--portal-tinta-suave);
+  font-size: 0.875rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+.portal-root .portal-orden-fotos svg {
+  flex: none;
+  width: 1rem;
+  height: 1rem;
+}
+
+/* Las tarjetas de ítems: una columna en un teléfono, dos en una tablet. */
+.portal-root .portal-orden-tarjetas {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.875rem;
+  list-style: none;
+}
+@media (min-width: 40rem) {
+  .portal-root .portal-orden-tarjetas {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.portal-root .portal-orden-tarjetas > li {
+  min-width: 0;
+}
+.portal-root .portal-orden-tarjeta {
+  height: 100%;
+  padding: 1.125rem 1.25rem;
+}
+.portal-root .portal-orden-tarjeta-cabeza {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+.portal-root .portal-orden-tarjeta-cabeza > .portal-versalita {
+  flex: none;
+}
+/* El N° de parte de la tarjeta, a tamaño de título. No se corta: si es más ancho que la
+   tarjeta se desplaza adentro. El relleno (compensado con margen negativo) deja lugar al
+   anillo de foco del botón de copiar, que un contenedor desplazable recortaría.
+   `position: relative` ancla el aviso «Copiado» (.sr-only) al contenedor y no al viewport. */
+.portal-root .portal-orden-parte {
+  position: relative;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0.375rem;
+  margin: -0.375rem;
+  overflow-x: auto;
+  font-size: 1.0625rem;
+}
+.portal-root .portal-orden-tarjeta .portal-orden-estado {
+  margin-top: 0.75rem;
+}
+/* Cantidad y montos de la tarjeta: pares rótulo–cifra, de a varios por fila. */
+.portal-root .portal-orden-cifras {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+  margin-top: 0.75rem;
+}
+.portal-root .portal-orden-cifras > div {
+  min-width: 0;
+}
+.portal-root .portal-orden-cifras dt {
+  color: var(--portal-tinta-suave);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+/* Rótulo arriba y cifra abajo: la cifra va a la izquierda, bajo su rótulo. */
+.portal-root .portal-orden-cifras dd {
+  margin-top: 0.125rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums slashed-zero;
+  text-align: left;
+}
+.portal-root .portal-orden-tarjeta .portal-orden-seguimiento {
+  justify-content: space-between;
+  margin-top: 0.875rem;
+  padding-top: 0.625rem;
+  border-top: 1px solid var(--portal-linea);
+}
+
+/* ── Documentos ─────────────────────────────────────────────────────────────── */
+/* Guías de despacho y facturas de un pedido o de un ítem (Documentos.tsx); clases
+   propias portal-docs-*. Es una LISTA y no una tabla: a 320 px una tabla con montos no
+   cabe, y así el mismo marcado sirve en todos los anchos. Cada documento es un renglón
+   de la tarjeta: a la izquierda el título con su folio, la fecha, la recepción (y, en
+   una guía, el plegable «Qué viajó»); a la derecha, las descargas. */
+
+.portal-root .portal-docs-lista {
+  margin-top: 0.75rem;
+  list-style: none;
+}
+.portal-root .portal-docs-doc {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.875rem 1.5rem;
+  padding: 1.125rem 1.25rem;
+}
+.portal-root .portal-docs-doc + .portal-docs-doc {
+  border-top: 1px solid var(--portal-linea);
+}
+/* Lo primero del renglón es el bloque de datos: crece y deja a las descargas a su
+   derecha; si no caben juntos, las descargas bajan y toman la fila entera. */
+.portal-root .portal-docs-doc > :first-child {
+  flex: 1 1 18rem;
+  min-width: 0;
+}
+.portal-root .portal-docs-titulo {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 1.0625rem;
+  font-weight: 700;
+  line-height: 1.3;
+}
+.portal-root .portal-docs-titulo > svg {
+  flex: none;
+  width: 1.125rem;
+  height: 1.125rem;
+  color: var(--portal-tinta-suave);
+}
+/* «Anticipo» es una marca del documento, no un estado (por eso no es .portal-insignia):
+   neutra y chica. */
+.portal-root .portal-docs-marca {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.0625rem 0.5rem;
+  border: 1px solid currentColor;
+  border-radius: var(--portal-radio-fino);
+  background-color: var(--portal-neutro-fondo);
+  color: var(--portal-tinta-suave);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1.5;
+  text-transform: uppercase;
+}
+/* Neto, IVA y total de la factura: rótulo sobre cifra, de a varios por fila. */
+.portal-root .portal-docs-montos {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+  margin-top: 0.75rem;
+}
+.portal-root .portal-docs-montos > div {
+  min-width: 0;
+}
+.portal-root .portal-docs-montos dd {
+  margin-top: 0.125rem;
+  font-weight: 600;
+}
+/* Las descargas, apiladas y del mismo ancho (el del botón más largo). En angosto toman
+   la fila entera: botones de borde a borde, fáciles de tocar. */
+.portal-root .portal-docs-acciones {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-width: 100%;
+}
+@media (max-width: 39.99rem) {
+  .portal-root .portal-docs-acciones {
+    flex: 1 0 100%;
+  }
+}
+/* El botón y, si la descarga falló, su aviso debajo. */
+.portal-root .portal-docs-descarga {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+}
+.portal-root .portal-docs-descarga > .portal-boton {
+  width: 100%;
+}
+
+/* «Qué viajó». El <summary> y la flecha toman las reglas de .portal-orden-entregados
+   (sección OrdenPage): es el mismo control. */
+.portal-root .portal-docs-plegable {
+  margin-top: 0.5rem;
+}
+/* Las líneas de la guía. En un teléfono: N° de parte y cantidad en la primera línea, la
+   descripción debajo y, si la hubo, la alerta al pie. Desde 40rem, el N° de parte en una
+   columna de ancho fijo (así las líneas calzan entre sí) y la descripción al lado. */
+.portal-root .portal-docs-items {
+  margin-top: 0.25rem;
+  list-style: none;
+}
+.portal-root .portal-docs-items > li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    'parte cantidad'
+    'descripcion descripcion'
+    'alerta alerta';
+  gap: 0.125rem 1rem;
+  padding: 0.625rem 0;
+  border-top: 1px solid var(--portal-linea);
+  font-size: 0.9375rem;
+}
+/* El N° de parte no se oculta: si no cabe en la celda, se parte en más líneas (una celda
+   desplazable no se alcanza con teclado; mismo recurso que .portal-item-titulo). */
+.portal-root .portal-docs-item-parte {
+  grid-area: parte;
+  min-width: 0;
+}
+.portal-root .portal-docs-item-parte .portal-parte {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.portal-root .portal-docs-item-descripcion {
+  grid-area: descripcion;
+  min-width: 0;
+}
+.portal-root .portal-docs-item-cantidad {
+  grid-area: cantidad;
+  justify-self: end;
+  white-space: nowrap;
+  font-weight: 700;
+}
+/* «recibidas 2 de 4»: el cliente firmó menos de lo que viajó. Tono de atención, con su
+   triángulo. */
+.portal-root .portal-docs-alerta {
+  grid-area: alerta;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  justify-self: start;
+  color: var(--portal-atencion-tinta);
+  font-size: 0.875rem;
+  font-weight: 700;
+}
+.portal-root .portal-docs-alerta svg {
+  flex: none;
+  width: 0.9375em;
+  height: 0.9375em;
+}
+@media (min-width: 40rem) {
+  .portal-root .portal-docs-items > li {
+    grid-template-columns: 10rem minmax(0, 1fr) auto;
+    grid-template-areas:
+      'parte descripcion cantidad'
+      'parte alerta cantidad';
+    column-gap: 1.25rem;
+  }
+}
