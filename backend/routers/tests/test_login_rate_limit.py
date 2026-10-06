@@ -202,8 +202,10 @@ def _paso_4_se_levanta_y_el_exito_limpia():
     check("bloqueado tras el tope", rl.estado(llave, ip)["bloqueado"] is True)
 
     # La ventana se levanta: en vez de esperar 15 minutos, se envejecen las marcas.
+    # Desde 2026-10-06 las reglas 1 y 2 cuentan por (llave, IP): ver rl._contador.
+    contador = rl._contador(llave, ip)
     with rl._LOCK:
-        rl._FALLOS[llave] = [t - rl.VENTANA_SEGUNDOS - 1 for t in rl._FALLOS[llave]]
+        rl._FALLOS[contador] = [t - rl.VENTANA_SEGUNDOS - 1 for t in rl._FALLOS[contador]]
         rl._SPRAY_IP[ip] = {e: t - rl.VENTANA_SEGUNDOS - 1 for e, t in rl._SPRAY_IP[ip].items()}
     check("se levanta solo al pasar la ventana", rl.estado(llave, ip)["bloqueado"] is False,
           rl.estado(llave, ip))
@@ -269,12 +271,13 @@ def _paso_6_la_reserva_es_atomica():
 
     check(f"con {N} hilos simultáneos pasan EXACTAMENTE {rl.MAX_FALLOS_POR_LLAVE}",
           len(pasaron) == rl.MAX_FALLOS_POR_LLAVE, len(pasaron))
+    contador = rl._contador(llave, ip)   # reglas 1 y 2 por (llave, IP) desde 2026-10-06
     check("y el contador de fallos quedó consistente",
-          len(rl._FALLOS.get(llave, [])) == rl.MAX_FALLOS_POR_LLAVE,
-          len(rl._FALLOS.get(llave, [])))
+          len(rl._FALLOS.get(contador, [])) == rl.MAX_FALLOS_POR_LLAVE,
+          len(rl._FALLOS.get(contador, [])))
     check("y los rechazados no dejaron marca en el contador de intentos",
-          len(rl._INTENTOS.get(llave, [])) == rl.MAX_FALLOS_POR_LLAVE,
-          len(rl._INTENTOS.get(llave, [])))
+          len(rl._INTENTOS.get(contador, [])) == rl.MAX_FALLOS_POR_LLAVE,
+          len(rl._INTENTOS.get(contador, [])))
 
 
 def _paso_7_las_tildes_no_dan_cupo_nuevo():
@@ -363,7 +366,7 @@ def _paso_8_el_diagnostico_coincide_con_el_limitador():
     # Más marcas que el tope, con la más antigua a punto de salir de la ventana.
     ahora = time.time()
     with rl._LOCK:
-        rl._FALLOS[llave] = [ahora - rl.VENTANA_SEGUNDOS + 1 + i for i in range(8)]
+        rl._FALLOS[rl._contador(llave, ip)] = [ahora - rl.VENTANA_SEGUNDOS + 1 + i for i in range(8)]
         rl._SPRAY_IP[ip] = {llave: ahora}
 
     est = rl.estado(llave, ip)

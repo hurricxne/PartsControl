@@ -19,13 +19,24 @@ LA LLAVE DEL CONTADOR — leerla primero: el resto habla de «llaves», no de co
         prefijo separa los dos espacios: un texto tecleado como correo nunca puede
         imitar la llave `uid:N` de una cuenta real.
 
-QUÉ HACE — tres reglas, cada una en ventanas de 15 minutos
-    1) FALLOS por llave: 5 -> 429. Frena adivinar la clave de una cuenta. Un intento
-       correcto borra estas marcas (`limpiar_exito`).
-    2) INTENTOS por llave: 30, hayan salido bien o mal -> 429. El éxito NO los borra.
-       Frena a quien SÍ sabe la clave (un cliente, o quien se la robó) y la usa para
-       gastar bcrypt en bucle: sin esta regla, cada éxito borraría el rastro y una sola
-       cuenta ocuparía todos los hilos y las conexiones que comparte el ERP.
+QUÉ HACE — cuatro reglas, cada una en ventanas de 15 minutos
+    Las reglas 1 y 2 cuentan por (llave, IP) — el «contador» (`_contador`) — y no por la
+    llave sola (cambio del 2026-10-06, hallazgo MEDIO de la revisión de la entrega): con
+    la llave sola, quien conociera el correo de una cuenta interna la dejaba sin poder
+    entrar 15 minutos con 5 claves malas desde CUALQUIER IP, renovable sin fin. Contando
+    por (llave, IP), esos 5 fallos bloquean solo la IP de quien los hizo; el dueño entra
+    desde la suya. Si la IP no distingue al cliente (sin X-Forwarded-For), el contador
+    vuelve a ser la llave sola: el comportamiento anterior.
+    1) FALLOS por (llave, IP): 5 -> 429. Frena adivinar la clave de una cuenta desde una
+       conexión. Un intento correcto borra estas marcas (`limpiar_exito`).
+    1b) FALLOS por CUENTA, sumando todas las IPs: 50 -> 429 (`MAX_FALLOS_POR_CUENTA`).
+       Frena la fuerza bruta REPARTIDA en muchas IPs, que la regla 1 por sí sola dejaría
+       en 5 intentos por IP. El éxito NO lo borra: si lo borrara, los ingresos del dueño
+       le renovarían el cupo al atacante.
+    2) INTENTOS por (llave, IP): 30, hayan salido bien o mal -> 429. El éxito NO los
+       borra. Frena a quien SÍ sabe la clave (un cliente, o quien se la robó) y la usa
+       para gastar bcrypt en bucle: sin esta regla, cada éxito borraría el rastro y una
+       sola cuenta ocuparía todos los hilos y las conexiones que comparte el ERP.
     3) LLAVES distintas por IP: 10 -> 429. Frena el rociado de contraseñas (una clave
        común contra muchas cuentas).
 
@@ -50,11 +61,12 @@ EL BCRYPT DE RELLENO (`cupo_de_relleno`)
     401 de un correo sin cuenta sale sin bcrypt (se pierde el disimulo, no la CPU).
 
 COSTO ACEPTADO
-    Quien conoce el correo de una cuenta puede dejar su LOGIN bloqueado 15 minutos, y
-    renovarlo indefinidamente con 20 peticiones por hora. Se acepta porque bloquea el
-    login y no la cuenta (quien ya está dentro sigue trabajando), y un humano lo limpia
-    con `pm2 restart machparts-api`. Si algún día molesta de verdad, la mitigación
-    estándar es contar por (llave, ip) en vez de por llave sola.
+    Bloquear el login de OTRO ahora exige la regla 1b: 50 fallos en 15 minutos, que con
+    5 por IP son al menos 10 IPs distintas (la regla 1 corta antes a cada una). Sigue
+    siendo posible para quien controle muchas IPs; bloquea el login y no la cuenta (quien
+    ya está dentro sigue trabajando) y un humano lo limpia con `pm2 restart machparts-api`.
+    El precio de contar por (llave, IP): quien adivina tiene 5 intentos por IP en vez de
+    5 en total, con el techo de 50 por cuenta de la regla 1b.
     El cambio de clave del portal (POST /portal/yo/clave) usa la misma llave `uid:{id}`:
     durante el bloqueo tampoco se puede cambiar la clave. A cambio no hay un segundo
     contador que regale 5 intentos más contra la misma cuenta.
@@ -75,6 +87,9 @@ MODOS DE FALLA — leerlos antes de confiar en esto
       de una línea "[scheduler] APScheduler started" al arrancar, o dos `pid` distintos
       en llamadas seguidas a GET /api/auth/rate-limit/estado.
       SÍNTOMA: el usuario ve 429 pero ese diagnóstico responde "bloqueado": false.
+      OJO: desde el 2026-10-06 el diagnóstico hay que pedirlo CON la ip de la persona
+      (`&ip=`); sin ella mira el contador sin IP y también diría "false" con un solo
+      proceso. Descartar eso antes de concluir que hay varios procesos.
     · La IP del cliente sale del ÚLTIMO salto de X-Forwarded-For, que escribe nginx solo
       si tiene `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`. Sin esa
       línea todos los clientes llegan como 127.0.0.1: la regla 3 se omite y cada intento
@@ -113,19 +128,22 @@ from fastapi import HTTPException
 
 # ── Política ──────────────────────────────────────────────────────────────────
 VENTANA_SEGUNDOS = 15 * 60      # 15 min: corta para el usuario, larga para el ataque
-MAX_FALLOS_POR_LLAVE = 5        # regla 1: muy por encima del ritmo humano de tipeo
-MAX_INTENTOS_POR_LLAVE = 30     # regla 2: nadie inicia sesión 30 veces en 15 minutos
+MAX_FALLOS_POR_LLAVE = 5        # regla 1, por (llave, IP): muy por encima del ritmo humano
+MAX_FALLOS_POR_CUENTA = 50      # regla 1b, por llave sumando IPs: fuerza bruta repartida
+MAX_INTENTOS_POR_LLAVE = 30     # regla 2, por (llave, IP): nadie entra 30 veces en 15 min
 MAX_LLAVES_POR_IP = 10          # regla 3: firma del rociado de contraseñas
 MAX_RELLENOS_POR_VENTANA = 300  # bcrypt de relleno (correos sin cuenta), en total
 _MAX_LLAVES = 10_000            # techo anti-crecimiento (las llaves `mail:` las elige el atacante)
 
 # Nombres de las reglas: salen en el log del rechazo y en `estado()["motivo"]`.
-MOTIVO_FALLOS, MOTIVO_INTENTOS, MOTIVO_IP = "fallos", "intentos", "ip"
+MOTIVO_FALLOS, MOTIVO_CUENTA, MOTIVO_INTENTOS, MOTIVO_IP = "fallos", "cuenta", "intentos", "ip"
 
 # ── Estado (en memoria del proceso) ───────────────────────────────────────────
-# llave -> marcas de los intentos que ningún éxito ha borrado todavía (regla 1)
+# contador (llave+IP, ver `_contador`) -> marcas que ningún éxito ha borrado (regla 1)
 _FALLOS: Dict[str, List[float]] = {}
-# llave -> marcas de TODOS los intentos admitidos; el éxito no las borra (regla 2)
+# llave -> marcas de fallos de la cuenta desde TODAS las IPs; el éxito no las borra (1b)
+_FALLOS_CUENTA: Dict[str, List[float]] = {}
+# contador -> marcas de TODOS los intentos admitidos; el éxito no las borra (regla 2)
 _INTENTOS: Dict[str, List[float]] = {}
 # ip -> {llave: marca del último intento sin éxito de esa llave desde esa ip} (regla 3)
 _SPRAY_IP: Dict[str, Dict[str, float]] = {}
@@ -286,6 +304,19 @@ def _ip_identifica_cliente(ip: str) -> bool:
 
 
 # ── Los contadores ────────────────────────────────────────────────────────────
+def _contador(llave: str, ip: str) -> str:
+    """La clave de las reglas 1 y 2: la llave más la IP, si la IP distingue al cliente.
+
+    Sin IP útil (detrás de nginx sin X-Forwarded-For todos son 127.0.0.1) es la llave
+    sola, como antes del 2026-10-06: contar por una IP que comparten todos repartiría el
+    tope entre nadie. La IP se acota en largo: la escribe nginx, pero el contador no debe
+    crecer con un valor que no se controla.
+    """
+    if _ip_identifica_cliente(ip):
+        return f"{llave}|ip={ip[:64]}"
+    return llave
+
+
 def _vencer(marcas_por_llave: Dict[str, List[float]], corte: float) -> None:
     """Saca de un diccionario llave -> marcas todo lo anterior a `corte`."""
     for llave in list(marcas_por_llave):
@@ -304,6 +335,7 @@ def _purgar(ahora: float, aplicar_techo: bool = True) -> None:
     """
     corte = ahora - VENTANA_SEGUNDOS
     _vencer(_FALLOS, corte)
+    _vencer(_FALLOS_CUENTA, corte)
     _vencer(_INTENTOS, corte)
     for ip in list(_SPRAY_IP):
         vivas = {llave: t for llave, t in _SPRAY_IP[ip].items() if t > corte}
@@ -317,7 +349,7 @@ def _purgar(ahora: float, aplicar_techo: bool = True) -> None:
 
     # Techo duro: si aun así hay demasiadas llaves, se descartan las MÁS VIEJAS.
     # Perder contadores viejos es preferible a que el proceso crezca sin límite.
-    for marcas_por_llave in (_FALLOS, _INTENTOS):
+    for marcas_por_llave in (_FALLOS, _FALLOS_CUENTA, _INTENTOS):
         while len(marcas_por_llave) > _MAX_LLAVES:
             del marcas_por_llave[min(marcas_por_llave, key=lambda k: max(marcas_por_llave[k]))]
     while len(_SPRAY_IP) > _MAX_LLAVES:
@@ -352,9 +384,11 @@ def _esperas(llave: str, ip: str, ahora: float) -> Dict[str, int]:
     por_ip = 0
     if _ip_identifica_cliente(ip):
         por_ip = _segundos_restantes(list(_SPRAY_IP.get(ip, {}).values()), MAX_LLAVES_POR_IP, ahora)
+    contador = _contador(llave, ip)
     return {
-        MOTIVO_FALLOS: _segundos_restantes(_FALLOS.get(llave, ()), MAX_FALLOS_POR_LLAVE, ahora),
-        MOTIVO_INTENTOS: _segundos_restantes(_INTENTOS.get(llave, ()), MAX_INTENTOS_POR_LLAVE, ahora),
+        MOTIVO_FALLOS: _segundos_restantes(_FALLOS.get(contador, ()), MAX_FALLOS_POR_LLAVE, ahora),
+        MOTIVO_CUENTA: _segundos_restantes(_FALLOS_CUENTA.get(llave, ()), MAX_FALLOS_POR_CUENTA, ahora),
+        MOTIVO_INTENTOS: _segundos_restantes(_INTENTOS.get(contador, ()), MAX_INTENTOS_POR_LLAVE, ahora),
         MOTIVO_IP: por_ip,
     }
 
@@ -389,7 +423,8 @@ def reservar_intento(llave: str, ip: str, correo: str = "", origen: str = "login
     ahora = time.time()
     regla_ip = _ip_identifica_cliente(ip)
     avisar_sin_ip = False
-    n_fallos = n_intentos = n_ip = 0
+    n_fallos = n_cuenta = n_intentos = n_ip = 0
+    contador = _contador(llave, ip)
     with _LOCK:
         _purgar(ahora)
         esperas = _esperas(llave, ip, ahora)
@@ -397,15 +432,17 @@ def reservar_intento(llave: str, ip: str, correo: str = "", origen: str = "login
         faltan = esperas[motivo]
         if faltan <= 0:
             # Cupo disponible: se toma AHORA, dentro del mismo lock.
-            _FALLOS.setdefault(llave, []).append(ahora)
-            _INTENTOS.setdefault(llave, []).append(ahora)
+            _FALLOS.setdefault(contador, []).append(ahora)
+            _FALLOS_CUENTA.setdefault(llave, []).append(ahora)
+            _INTENTOS.setdefault(contador, []).append(ahora)
             if regla_ip:
                 # Una IP que no identifica al cliente no deja rastro acá: sin la regla
                 # que lo acota en 10, su conjunto de llaves crecería sin límite.
                 _SPRAY_IP.setdefault(ip, {})[llave] = ahora
             elif not _aviso_sin_ip_dado:
                 _aviso_sin_ip_dado = avisar_sin_ip = True
-            n_fallos, n_intentos = len(_FALLOS[llave]), len(_INTENTOS[llave])
+            n_fallos, n_intentos = len(_FALLOS[contador]), len(_INTENTOS[contador])
+            n_cuenta = len(_FALLOS_CUENTA[llave])
             n_ip = len(_SPRAY_IP.get(ip, ()))
 
     quien = (f"llave={_seguro_para_log(llave)} correo={_seguro_para_log(correo)} "
@@ -429,25 +466,30 @@ def reservar_intento(llave: str, ip: str, correo: str = "", origen: str = "login
     de_la_ip = f"llaves_ip={n_ip}/{MAX_LLAVES_POR_IP}" if regla_ip else "regla_ip=omitida"
     print(
         f"[login] intento {quien} fallos={n_fallos}/{MAX_FALLOS_POR_LLAVE} "
+        f"cuenta={n_cuenta}/{MAX_FALLOS_POR_CUENTA} "
         f"intentos={n_intentos}/{MAX_INTENTOS_POR_LLAVE} {de_la_ip}{marca}",
         flush=True,
     )
     if n_fallos >= MAX_FALLOS_POR_LLAVE:
         print(f"[login] TOPE ALCANZADO {quien}{marca}", flush=True)
+    if n_cuenta >= MAX_FALLOS_POR_CUENTA:
+        print(f"[login] TOPE DE CUENTA ALCANZADO (muchas IPs) {quien}{marca}", flush=True)
     if n_ip >= MAX_LLAVES_POR_IP:
         print(f"[login] SPRAY ip={_seguro_para_log(ip)} llaves_distintas={n_ip}", flush=True)
 
 
 def limpiar_exito(llave: str, ip: str) -> None:
-    """Un intento correcto borra los FALLOS de la llave: dos tipeos y entrar no deja nada.
+    """Un intento correcto borra los FALLOS de la llave DESDE ESTA IP: dos tipeos y entrar
+    no deja nada.
 
     También saca la llave del conjunto de la IP, para que la persona que se equivocó y
     después entró no siga sumando al contador de rociado de su propia oficina.
     NO toca los intentos totales (regla 2): si los borrara, quien sabe la clave no
-    tendría ningún tope.
+    tendría ningún tope. Tampoco el tope de la cuenta (regla 1b): si lo borrara, cada
+    ingreso del dueño le renovaría el cupo a quien adivina desde muchas IPs.
     """
     with _LOCK:
-        _FALLOS.pop(llave, None)
+        _FALLOS.pop(_contador(llave, ip), None)
         llaves = _SPRAY_IP.get(ip)
         if llaves:
             llaves.pop(llave, None)
@@ -495,14 +537,18 @@ def estado(llave: str, ip: str = "") -> dict:
     Calcula las esperas con la misma función que `reservar_intento` (`_esperas`) y, como
     ella, purga antes lo vencido. Lo que NO hace es aplicar el techo de llaves, para que
     una consulta de diagnóstico no descarte contadores vivos.
-    `ip` es opcional: sin ella no se informa la regla por IP.
+    `ip` es opcional: sin ella no se informa la regla por IP, y los fallos e intentos que
+    se ven son los del contador sin IP (desde 2026-10-06 las reglas 1 y 2 cuentan por
+    llave + IP: para ver los de una persona, pasar SU ip).
     """
     ahora = time.time()
+    contador = _contador(llave, ip)
     with _LOCK:
         _purgar(ahora, aplicar_techo=False)
         esperas = _esperas(llave, ip, ahora)
-        fallos = len(_FALLOS.get(llave, ()))
-        intentos = len(_INTENTOS.get(llave, ()))
+        fallos = len(_FALLOS.get(contador, ()))
+        fallos_cuenta = len(_FALLOS_CUENTA.get(llave, ()))
+        intentos = len(_INTENTOS.get(contador, ()))
         llaves_ip = len(_SPRAY_IP.get(ip, ()))
     motivo = max(esperas, key=esperas.get)
     faltan = esperas[motivo]
@@ -513,6 +559,8 @@ def estado(llave: str, ip: str = "") -> dict:
         "faltan_segundos": faltan,
         "intentos_fallidos": fallos,
         "max_intentos": MAX_FALLOS_POR_LLAVE,
+        "fallos_cuenta": fallos_cuenta,
+        "max_fallos_cuenta": MAX_FALLOS_POR_CUENTA,
         "intentos_totales": intentos,
         "max_intentos_totales": MAX_INTENTOS_POR_LLAVE,
         "ip": ip or None,
@@ -528,6 +576,7 @@ def reset() -> None:
     global _aviso_sin_ip_dado, _aviso_relleno_dado
     with _LOCK:
         _FALLOS.clear()
+        _FALLOS_CUENTA.clear()
         _INTENTOS.clear()
         _SPRAY_IP.clear()
         _RELLENOS.clear()

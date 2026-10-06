@@ -9,9 +9,17 @@ from sqlalchemy.orm import Session
 
 from auth import get_current_user
 from database import get_db
+from empresa_guard import require_empresa
 from models.models import Cliente, User
 
-router = APIRouter(prefix="/clientes", tags=["clientes"])
+# Candado de marca en el ROUTER (2026-10-06, hallazgo MEDIO de la revisión del Portal):
+# estas fichas son de Grupo AM y deciden qué ve cada cuenta del portal (ver abajo). Con
+# solo `get_current_user`, un usuario de MonzaParts podía crear una ficha con el RUT de un
+# cliente escrito de otra forma —el RUT queda ambiguo y sus ventas desaparecen de su
+# portal—, cambiarle el RUT o borrarla. MonzaParts tiene sus propias fichas
+# (monza_router_clientes); el soporte @bigcode.cl pasa por la excepción de require_empresa.
+router = APIRouter(prefix="/clientes", tags=["clientes"],
+                   dependencies=[Depends(require_empresa("mineria"))])
 
 
 # ── Portal de Clientes: la ficha es el ANCLA del aislamiento ──────────────────────────

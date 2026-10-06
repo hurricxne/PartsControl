@@ -429,7 +429,10 @@ def run():
         r = _login(correo, nueva_temporal)
         check("d6c con el cupo agotado por el cambio de clave, el login correcto → 429",
               r.status_code == 429, r.status_code)
-        r = client.get("/api/auth/rate-limit/estado", params={"email": correo}, headers=cab)
+        # Con `ip`: desde 2026-10-06 los fallos cuentan por (llave, IP) y el diagnóstico
+        # muestra los de la IP que se le indica (TestClient llega como 'testclient').
+        r = client.get("/api/auth/rate-limit/estado", params={"email": correo, "ip": "testclient"},
+                       headers=cab)
         d = r.json() if r.status_code == 200 else {}
         check("d6c y el diagnóstico lo ve bloqueado en la llave de la cuenta",
               r.status_code == 200 and d.get("bloqueado") is True
