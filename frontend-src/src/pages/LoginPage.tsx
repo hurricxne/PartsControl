@@ -4,41 +4,29 @@ import { Eye, EyeOff, ChevronRight, Wrench, Car, AlertCircle } from 'lucide-reac
 import toast from 'react-hot-toast'
 import { authAPI } from '../services/api'
 import { useAuthStore, esCuentaPortal } from '../stores/authStore'
+import firma from '../assets/gam/firma-oscuro.svg'
+import foto from '../assets/gam/login.jpg'
+import './LoginPage.gam.css'
 
 type Empresa = 'mineria' | 'automotriz'
 
+// El diseño es el de GAM Parts para las dos empresas: la pestaña solo cambia los textos.
 const EMPRESAS = {
   mineria: {
     nombre: 'Grupo AM',
-    descripcion: 'Maquinarias y motores para minería',
-    tagline: 'Soluciones CAT para operaciones mineras',
-    color: '#ea6c0d',
-    colorHover: '#c45c0a',
-    colorLight: 'rgba(234,108,13,0.15)',
-    colorBorder: 'rgba(234,108,13,0.4)',
-    gradient: 'linear-gradient(135deg, #431404 0%, #7c2d0c 40%, #ea6c0d 100%)',
     icon: Wrench,
-    features: [
-      { icon: '⛏️', title: 'Partes de motor', desc: 'Componentes originales CAT minería' },
-      { icon: '🔧', title: 'Cotización inteligente', desc: 'Precios validados automáticamente' },
-      { icon: '📦', title: 'Gestión de embarques', desc: 'Seguimiento completo de pedidos' },
-    ],
+    titulo: ['Que tu producción', 'no se detenga.'],
+    texto: 'Repuestos y componentes para minería: cotizaciones, compras, embarques, bodega y despachos en un solo sistema.',
+    chips: [['Repuestos', 'genuinos, originales y OEM'], ['Cotización', 'precios validados'], ['Embarques', 'seguimiento completo']],
+    sub: 'Plataforma de gestión comercial y de operaciones.',
   },
   automotriz: {
     nombre: 'Monzaparts',
-    descripcion: 'Repuestos automotrices',
-    tagline: 'Soluciones completas para flota automotriz',
-    color: '#1550d4',
-    colorHover: '#0e3faf',
-    colorLight: 'rgba(21,80,212,0.15)',
-    colorBorder: 'rgba(21,80,212,0.4)',
-    gradient: 'linear-gradient(135deg, #031f6a 0%, #0e3faf 40%, #1a5cf0 100%)',
     icon: Car,
-    features: [
-      { icon: '🚗', title: 'Repuestos originales', desc: 'Catálogo automotriz completo' },
-      { icon: '💰', title: 'Precios competitivos', desc: 'Comparativa automática de mercado' },
-      { icon: '📊', title: 'Control de ventas', desc: 'Reportes y seguimiento comercial' },
-    ],
+    titulo: ['Tu flota', 'siempre en ruta.'],
+    texto: 'Repuestos automotrices: leads, cotizaciones, ventas y post-venta, de la compra al despacho.',
+    chips: [['Repuestos', 'catálogo automotriz'], ['Precios', 'comparativa de mercado'], ['Ventas', 'control y seguimiento']],
+    sub: 'CRM y cotizador de repuestos automotrices.',
   },
 } as const
 
@@ -108,187 +96,102 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="min-h-screen flex">
-
-      {/* ── Panel izquierdo — branding empresa (reactivo al selector) ── */}
-      <div
-        className="hidden lg:flex lg:w-[42%] relative overflow-hidden flex-col items-center justify-center p-12 transition-all duration-500"
-        style={{ background: cfg.gradient }}
-      >
-        <div className="absolute -top-32 -left-32 w-80 h-80 bg-white/5 rounded-full blur-3xl" />
-        <div
-          className="absolute -bottom-24 -right-24 w-72 h-72 rounded-full blur-3xl transition-colors duration-500"
-          style={{ backgroundColor: `${cfg.color}30` }}
-        />
-
-        <div className="relative z-10 text-center">
-          <div className="mb-8 flex justify-center">
-            <div className="w-48 h-48 flex items-center justify-center">
-              <img src="/logo.png" alt="PartsControl" className="w-48 h-48 object-contain drop-shadow-lg" />
-            </div>
-          </div>
-          <h1 className="text-4xl font-extrabold text-white mb-1 tracking-tight">PartsControl</h1>
-          <p className="text-lg font-semibold mb-2" style={{ color: 'rgba(255,255,255,0.85)' }}>
-            {cfg.nombre}
-          </p>
-          <p className="text-sm mb-12 text-white/60">{cfg.tagline}</p>
-
-          <div className="space-y-3 text-left max-w-xs mx-auto">
-            {cfg.features.map(f => (
-              <div key={f.title} className="flex items-center gap-4 bg-white/8 backdrop-blur rounded-2xl px-4 py-3 ring-1 ring-white/10">
-                <span className="text-2xl shrink-0">{f.icon}</span>
-                <div>
-                  <p className="text-white text-sm font-semibold">{f.title}</p>
-                  <p className="text-xs text-white/60">{f.desc}</p>
-                </div>
-              </div>
+    <div className="gl">
+      <aside className="gl-side" style={{ '--gl-foto': `url(${foto})` } as React.CSSProperties} aria-hidden="true">
+        <img className="gl-firma" src={firma} alt="" />
+        <div>
+          <h1>{cfg.titulo[0]}<br />{cfg.titulo[1]}</h1>
+          <p className="gl-texto">{cfg.texto}</p>
+          <div className="gl-chips">
+            {cfg.chips.map(([titulo, detalle]) => (
+              <div key={titulo} className="gl-chip"><b>{titulo}</b><span>{detalle}</span></div>
             ))}
           </div>
         </div>
-
-        <div className="absolute bottom-6 left-0 right-0 flex justify-center">
-          <span className="text-white/40 text-xs">Powered by BigCode · v2.0</span>
+        <div className="gl-pie">
+          <p className="gl-lema">Solución · Rapidez · Calidad</p>
+          <p className="gl-marca">GAM Parts es una marca de Grupo AM SpA · gamparts.cl</p>
         </div>
-      </div>
+        <i className="gl-canal" />
+      </aside>
 
-      {/* ── Panel derecho — formulario con selector integrado ── */}
-      <div
-        className="flex-1 flex flex-col items-center justify-center px-8 py-12 lg:px-16"
-        style={{ backgroundColor: 'var(--surface)' }}
-      >
-        <div className="w-full max-w-md animate-fade-in">
+      <main className="gl-main">
+        <div className="gl-caja">
+          <img className="gl-logo-movil" src={firma} alt="GAM Parts by Grupo AM" />
 
-          {/* Selector de empresa */}
-          <div className="mb-8">
-            <p className="text-xs font-semibold uppercase tracking-widest mb-3" style={{ color: 'var(--text-faint)' }}>
-              Selecciona tu empresa
-            </p>
-            <div
-              className="flex rounded-xl p-1 gap-1"
-              style={{ backgroundColor: 'var(--surface-200)', border: '1px solid var(--border)' }}
-            >
-              {(Object.entries(EMPRESAS) as [Empresa, typeof EMPRESAS['mineria']][]).map(([key, e]) => {
-                const Icon = e.icon
-                const isActive = empresa === key
-                return (
-                  <button
-                    key={key}
-                    type="button"
-                    onClick={() => setEmpresa(key)}
-                    className="flex-1 flex items-center justify-center gap-2 py-2.5 px-3 rounded-lg text-sm font-semibold transition-all duration-200"
-                    style={isActive ? {
-                      backgroundColor: e.colorLight,
-                      border: `1px solid ${e.colorBorder}`,
-                      color: e.color,
-                    } : {
-                      backgroundColor: 'transparent',
-                      border: '1px solid transparent',
-                      color: 'var(--text-faint)',
-                    }}
-                  >
-                    <Icon className="w-4 h-4 flex-shrink-0" />
-                    <span>{e.nombre}</span>
-                  </button>
-                )
-              })}
-            </div>
+          <p className="gl-ey" id="gl-empresa-t">Selecciona tu empresa</p>
+          <div className="gl-sel" role="group" aria-labelledby="gl-empresa-t">
+            {(Object.entries(EMPRESAS) as [Empresa, typeof EMPRESAS[Empresa]][]).map(([key, e]) => {
+              const Icon = e.icon
+              return (
+                <button key={key} type="button" className="gl-op" aria-pressed={empresa === key} onClick={() => setEmpresa(key)}>
+                  <Icon aria-hidden="true" />
+                  {e.nombre}
+                </button>
+              )
+            })}
           </div>
 
-          {/* Cabecera */}
-          <div className="mb-8">
-            <div className="flex items-center gap-2 mb-2">
-              <div className="w-2 h-2 rounded-full transition-colors duration-300" style={{ backgroundColor: cfg.color }} />
-              <p className="text-sm font-semibold uppercase tracking-widest transition-colors duration-300" style={{ color: cfg.color }}>
-                {cfg.nombre}
-              </p>
-            </div>
-            <h2 className="text-3xl font-bold tracking-tight" style={{ color: 'var(--text-primary)' }}>
-              Iniciar sesión
-            </h2>
-            <p className="mt-2 text-sm" style={{ color: 'var(--text-muted)' }}>
-              Ingresa tus credenciales para acceder al sistema
-            </p>
+          <p className="gl-marca-ey"><span className="gl-punto" aria-hidden="true" />{cfg.nombre}</p>
+          <h2>Iniciar sesión</h2>
+          <p className="gl-sub">{cfg.sub}</p>
+
+          <div className="gl-estado">
+            <span className="gl-estado-l"><span className="gl-luz" aria-hidden="true" />Sistema</span>
+            <span className="gl-estado-v">Conectado</span>
           </div>
 
-          <div className="flex items-center gap-2 mb-6 px-4 py-2.5 rounded-xl ring-1" style={{ backgroundColor: 'var(--surface-200)' }}>
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-            <span className="text-xs" style={{ color: 'var(--text-muted)' }}>Sistema</span>
-            <span className="text-xs font-semibold text-emerald-500 ml-auto">Conectado</span>
-          </div>
+          <form className="gl-form" onSubmit={handleLogin}>
+            <label htmlFor="gl-correo">Correo</label>
+            <input
+              id="gl-correo"
+              type="email"
+              className="gl-campo"
+              placeholder="usuario@empresa.cl"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              autoComplete="email"
+              inputMode="email"
+              autoCapitalize="none"
+              spellCheck={false}
+            />
 
-          <form onSubmit={handleLogin} className="space-y-5">
-            {avisoCuenta && (
-              <div
-                role="alert"
-                className="flex items-start gap-2.5 rounded-xl px-4 py-3 text-sm"
-                style={{
-                  backgroundColor: 'rgba(239,68,68,0.12)',
-                  border: '1px solid rgba(239,68,68,0.45)',
-                  color: 'var(--text-primary)',
-                }}
+            <label htmlFor="gl-clave">Contraseña</label>
+            <div className="gl-clave">
+              <input
+                id="gl-clave"
+                type={showPass ? 'text' : 'password'}
+                className="gl-campo"
+                placeholder="••••••••"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="current-password"
+              />
+              <button
+                type="button"
+                className="gl-ojo"
+                onClick={() => setShowPass(!showPass)}
+                aria-label={showPass ? 'Ocultar contraseña' : 'Mostrar contraseña'}
+                aria-pressed={showPass}
               >
-                <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 text-red-500" aria-hidden="true" />
+                {showPass ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+              </button>
+            </div>
+
+            {avisoCuenta && (
+              <div role="alert" className="gl-aviso">
+                <AlertCircle aria-hidden="true" />
                 <span>{avisoCuenta}</span>
               </div>
             )}
-            <div>
-              <label className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-muted)' }}>Email</label>
-              <input
-                type="email"
-                className="input"
-                placeholder="usuario@empresa.cl"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                autoComplete="email"
-              />
-            </div>
 
-            <div>
-              <label className="block text-sm font-medium mb-1.5" style={{ color: 'var(--text-muted)' }}>Contraseña</label>
-              <div className="relative">
-                <input
-                  type={showPass ? 'text' : 'password'}
-                  className="input pr-11"
-                  placeholder="••••••••"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  autoComplete="current-password"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPass(!showPass)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 transition-colors"
-                  style={{ color: 'var(--text-faint)' }}
-                >
-                  {showPass ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              disabled={loading}
-              className="btn-primary w-full justify-center py-3 mt-2"
-            >
-              {loading ? (
-                <>
-                  <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  Ingresando...
-                </>
-              ) : (
-                <>
-                  Ingresar al sistema
-                  <ChevronRight className="w-4 h-4" />
-                </>
-              )}
+            <button type="submit" className="gl-ingresar" disabled={loading}>
+              {loading ? (<><span className="gl-giro" aria-hidden="true" />Ingresando…</>) : (<>Ingresar al sistema<ChevronRight aria-hidden="true" /></>)}
             </button>
           </form>
-
-          <p className="text-center text-xs mt-10" style={{ color: 'var(--text-faint)' }}>
-            PartsControl v2.0 · Powered by <span className="font-medium" style={{ color: cfg.color }}>BigCode</span>
-          </p>
         </div>
-      </div>
+        <p className="gl-pie-form">PartsControl v2.0 · Powered by <a href="https://bigcode.cl" target="_blank" rel="noopener noreferrer">BigCode</a></p>
+      </main>
     </div>
   )
 }
