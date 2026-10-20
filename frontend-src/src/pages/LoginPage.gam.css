@@ -1,0 +1,94 @@
+/* Login con la identidad GAM Parts (manual de marca v1.0), igual que repuestos.gamparts.cl.
+   Todo va bajo .gl: no toca el tema del resto del sistema. Esquinas rectas; dorado solo como acento. */
+@font-face { font-family: 'Poppins GAM'; font-weight: 400; font-display: swap; src: url('../assets/gam/fonts/Poppins-Regular.woff2') format('woff2'); }
+@font-face { font-family: 'Poppins GAM'; font-weight: 500; font-display: swap; src: url('../assets/gam/fonts/Poppins-Medium.woff2') format('woff2'); }
+@font-face { font-family: 'Poppins GAM'; font-weight: 600; font-display: swap; src: url('../assets/gam/fonts/Poppins-SemiBold.woff2') format('woff2'); }
+
+.gl {
+  --tinta: #0E0E0F; --panel: #161513; --campo: #1E1D1B; --borde: #2E2B27; --borde-h: #3A3733;
+  --dorado: #BFA073; --gris: #A9A39A; --gris-claro: #BDB6AB; --tenue: #8C877F; --txt: #E6E1D8;
+  --ok: #7FBF8E; --ok-luz: #5FB07A; --mal: #E29A8A;
+  min-height: 100vh; min-height: 100dvh;
+  display: grid; grid-template-columns: 1fr;
+  background: var(--tinta); color: #fff;
+  font-family: 'Poppins GAM', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased; color-scheme: dark;
+}
+.gl :focus-visible { outline: 2px solid var(--dorado); outline-offset: 3px; }
+
+/* Panel de la foto (solo escritorio) */
+.gl-side {
+  position: relative; overflow: hidden; display: none;
+  flex-direction: column; justify-content: space-between; gap: 2.5rem; padding: 3rem;
+  background: linear-gradient(180deg, rgba(14,14,15,.62) 0%, rgba(14,14,15,.78) 55%, rgba(14,14,15,.94) 100%),
+              var(--gl-foto) 62% center / cover no-repeat, var(--tinta);
+}
+.gl-firma { display: block; width: 13.5rem; height: auto; }
+.gl-side h1 { margin: 0; font-size: 2.8rem; line-height: 1.05; font-weight: 600; letter-spacing: -.03em; }
+.gl-side h1::after { content: ""; display: block; width: 3rem; height: 3px; margin-top: 1.2rem; background: var(--dorado); }
+.gl-texto { margin: 1rem 0 0; max-width: 32rem; font-size: 1.05rem; line-height: 1.55; color: var(--gris-claro); }
+.gl-chips { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1.5rem; }
+.gl-chip { padding: .8rem 1.1rem; border: 1px solid rgba(191,160,115,.45); }
+.gl-chip b { display: block; font-size: 1.15rem; font-weight: 600; color: var(--dorado); }
+.gl-chip span { font-size: .78rem; color: var(--gris-claro); }
+.gl-pie { display: grid; gap: .4rem; position: relative; z-index: 1; }
+.gl-lema { margin: 0; font-size: .72rem; font-weight: 600; letter-spacing: .16em; text-transform: uppercase; color: var(--dorado); }
+.gl-marca { margin: 0; font-size: .78rem; color: var(--gris-claro); opacity: .75; }
+.gl-canal { position: absolute; right: 14%; bottom: -2rem; width: .4rem; height: 62%; background: var(--dorado);
+            transform: skewX(-21.3deg); transform-origin: bottom left; pointer-events: none; }
+
+/* Panel del formulario */
+.gl-main { position: relative; display: flex; align-items: center; justify-content: center; padding: 2.5rem 1.25rem 4.5rem; background: var(--tinta); }
+.gl-caja { width: 100%; max-width: 420px; }
+.gl-logo-movil { display: block; width: 11rem; height: auto; margin: 0 auto 2.25rem; }
+.gl-ey { margin: 0; font-size: .75rem; font-weight: 500; letter-spacing: .16em; text-transform: uppercase; color: var(--gris); }
+.gl-sel { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: 6px; margin-top: .75rem; background: var(--campo); border: 1px solid var(--borde); }
+.gl-op { display: flex; align-items: center; justify-content: center; gap: .6rem; min-height: 48px; padding: 0 .75rem;
+         border: 1.5px solid transparent; background: transparent; color: var(--gris); font-size: 15px; font-weight: 600; font-family: inherit;
+         cursor: pointer; transition: color .2s, border-color .2s, background .2s; }
+.gl-op:hover { color: #fff; border-color: var(--borde-h); }
+.gl-op[aria-pressed="true"] { background: rgba(191,160,115,.14); border-color: var(--dorado); color: #fff; cursor: default; }
+.gl-op svg { width: 16px; height: 16px; flex: none; }
+.gl-op[aria-pressed="true"] svg { color: var(--dorado); }
+.gl-marca-ey { display: flex; align-items: center; gap: .5rem; margin: 2.5rem 0 0; font-size: .75rem; font-weight: 600; letter-spacing: .16em; text-transform: uppercase; color: var(--dorado); }
+.gl-punto { width: 7px; height: 7px; border-radius: 50%; background: var(--dorado); }
+.gl h2 { margin: .6rem 0 0; font-size: 2.2rem; line-height: 1.1; font-weight: 600; letter-spacing: -.02em; color: #fff; }
+.gl-sub { margin: .6rem 0 0; font-size: .94rem; color: var(--gris); }
+.gl-estado { display: flex; align-items: center; justify-content: space-between; min-height: 44px; padding: 0 1rem; margin-top: 1.75rem; background: #1A1918; border: 1px solid var(--borde); font-size: .82rem; }
+.gl-estado-l { display: flex; align-items: center; gap: .6rem; color: var(--gris-claro); }
+.gl-luz { width: 8px; height: 8px; border-radius: 50%; background: var(--ok-luz); }
+.gl-estado-v { font-weight: 500; color: var(--ok); }
+.gl-form { display: flex; flex-direction: column; margin-top: 1.6rem; }
+.gl-form label { margin-top: 1.25rem; font-size: .875rem; font-weight: 500; color: var(--txt); }
+.gl-form label:first-of-type { margin-top: 0; }
+.gl-campo { display: block; width: 100%; height: 52px; margin-top: .5rem; padding: 0 1rem; background: var(--campo); border: 1px solid var(--borde);
+            border-radius: 0; color: #fff; font-size: 16px; font-weight: 400; font-family: inherit; }
+.gl-campo::placeholder { color: #77716A; }
+.gl-campo:focus { outline: 2px solid var(--dorado); outline-offset: 0; border-color: var(--dorado); }
+.gl-campo:-webkit-autofill { -webkit-text-fill-color: #fff; -webkit-box-shadow: 0 0 0 40px var(--campo) inset; caret-color: #fff; }
+.gl-clave { position: relative; }
+.gl-clave .gl-campo { padding-right: 3.5rem; }
+.gl-ojo { position: absolute; top: calc(.5rem + 4px); right: 4px; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center;
+          background: none; border: 0; color: var(--gris); cursor: pointer; }
+.gl-ojo:hover { color: #fff; }
+.gl-aviso { display: flex; align-items: flex-start; gap: .6rem; margin-top: 1.25rem; padding: .75rem .9rem; border-left: 3px solid var(--mal);
+            background: rgba(226,154,138,.08); color: #F1C4B9; font-size: .875rem; }
+.gl-aviso svg { width: 16px; height: 16px; margin-top: 2px; flex: none; }
+.gl-ingresar { display: flex; align-items: center; justify-content: center; gap: .6rem; min-height: 56px; margin-top: 1.75rem; border: 0;
+               background: var(--dorado); color: var(--tinta); font-size: 16px; font-weight: 600; font-family: inherit; cursor: pointer; transition: background .2s; }
+.gl-ingresar:hover { background: #fff; }
+.gl-ingresar[disabled] { opacity: .65; cursor: wait; }
+.gl-ingresar svg { width: 16px; height: 16px; }
+.gl-giro { width: 16px; height: 16px; border: 2px solid rgba(14,14,15,.3); border-top-color: var(--tinta); border-radius: 50%; animation: gl-giro .8s linear infinite; }
+@keyframes gl-giro { to { transform: rotate(360deg); } }
+.gl-pie-form { position: absolute; left: 0; right: 0; bottom: 1.25rem; margin: 0; text-align: center; font-size: .75rem; color: var(--tenue); }
+.gl-pie-form a { color: var(--dorado); text-decoration: none; }
+
+@media (min-width: 960px) {
+  .gl { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); }
+  .gl-side { display: flex; }
+  .gl-logo-movil { display: none; }
+  .gl-main { padding: 3rem 2.5rem 4.5rem; }
+}
+@media (max-width: 360px) { .gl-op { font-size: 14px; gap: .4rem; } }
+@media (prefers-reduced-motion: reduce) { .gl * { transition: none !important; animation: none !important; } }
