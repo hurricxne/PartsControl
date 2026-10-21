@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 480
     CORS_ORIGINS: List[str] = ["http://localhost:5173", "https://machparts.bigcode.cl"]
     NEXOR_WEBHOOK_KEY: str = ""
+    # Clave de la integración PartsFlow (POST /api/monza/integraciones/partsflow/leads,
+    # 2026-10-21). Vacía = integración deshabilitada (responde 401). Una por ambiente.
+    PARTSFLOW_API_KEY: str = ""
     # Contabilidad MonzaParts: en PROD va APAGADA (decision cliente 2026-07-15).
     # Con False, main.py ni importa esos modulos -> sus rutas responden 404 y create_all
     # no crea sus tablas. Son 6 modulos: contabilidad, tesoreria, compras/CxP, pricing,

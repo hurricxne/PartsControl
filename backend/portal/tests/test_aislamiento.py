@@ -88,6 +88,9 @@ PUBLICAS = {
     ("GET", "/api/health"),
     ("POST", "/api/auth/login"),
     ("POST", "/api/monza/integraciones/nexor/leads"),  # entra con X-API-Key, no con JWT
+    # PartsFlow (2026-10-21): entra con X-API-Key = PARTSFLOW_API_KEY (solo cabecera, sin
+    # ?key=), no con JWT. Lo cubre monza_tests/test_integracion_partsflow.py §7.
+    ("POST", "/api/monza/integraciones/partsflow/leads"),
 }
 # Rutas del ERP que aceptan cualquier tipo de cuenta (solo devuelven datos del propio usuario).
 CUALQUIER_CUENTA = {("GET", "/api/auth/me")}

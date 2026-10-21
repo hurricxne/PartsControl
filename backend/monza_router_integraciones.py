@@ -1,20 +1,30 @@
 """
-Integraciones MonzaParts. Webhook receptor de leads (Nexor).
-Captura el payload crudo (auto-documentado) + crea el lead.
-Auth: header X-API-Key == settings.NEXOR_WEBHOOK_KEY
+Integraciones MonzaParts. Receptores de leads:
+  · Nexor     POST /nexor/leads      — mapeo flexible del payload de Nexor (auto-documentado).
+                                       Auth: X-API-Key (o ?key=) == settings.NEXOR_WEBHOOK_KEY
+  · PartsFlow POST /partsflow/leads  — contrato ESTRICTO, versión 1 (documento «Integración
+                                       PartsFlow → MonzaParts: creación de leads», 2026-10-21).
+                                       Auth: SOLO X-API-Key == settings.PARTSFLOW_API_KEY
+Los dos guardan el payload crudo en monza_webhook_log antes de procesar.
 """
+import hmac
 import json
 import re
+import threading
+import time
+from collections import deque
 from fastapi import APIRouter, Depends, Request, HTTPException, Header
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
-from typing import Optional
+from typing import List, Literal, Optional
 from datetime import datetime
 
 from database import get_db
 from auth import get_current_user
 from monza_correlativos import agregar_lead_con_numero, reintentar_carrera
-from monza_rut import rut_identidad
+from monza_rut import rut_identidad, buscar_ficha_por_rut
 from monza_telefono import buscar_ficha_por_telefono
 from empresa_guard import require_empresa
 from config import settings
@@ -319,6 +329,325 @@ async def recibir_lead_nexor(
             status_code=500,
             detail="Error procesando el lead. El payload quedó guardado para revisión.",
         )
+
+
+# ══ PartsFlow (2026-10-21) ════════════════════════════════════════════════════════════
+# WhatsApp IA de repuestos (Meta Business Partner): el agente pulsa «Crear lead» y PartsFlow
+# llama a este endpoint. A DIFERENCIA de Nexor, el contrato lo escribimos nosotros (el
+# documento entregado al proveedor), así que acá se VALIDA en vez de adivinar: un dato
+# mal formado vuelve 422 con el campo exacto, y PartsFlow lo corrige de su lado.
+# Lo que se reutiliza de Nexor, por ser lo ya probado en producción: el payload crudo se
+# guarda ANTES de procesar, el cliente se dedupea con las puertas únicas de la casa y el
+# correlativo del lead pasa por agregar_lead_con_numero + reintentar_carrera.
+
+PF_FUENTE = "partsflow"
+PF_CANAL = "PartsFlow"
+PF_MAX_BYTES = 64 * 1024
+PF_MAX_POR_MINUTO = 60
+
+_E164 = re.compile(r"\+[1-9]\d{7,14}")
+_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+_ID_EXTERNO = re.compile(r"[A-Za-z0-9._:\-]{1,120}")
+
+
+def _dv_rut(cuerpo: str) -> str:
+    s, m = 0, 2
+    for d in reversed(cuerpo):
+        s += int(d) * m
+        m = 2 if m == 7 else m + 1
+    dv = 11 - s % 11
+    return "0" if dv == 11 else "K" if dv == 10 else str(dv)
+
+
+class _PFContacto(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+    nombre: str = Field(min_length=1, max_length=200)
+    telefono: str = Field(max_length=20)
+    email: Optional[str] = Field(None, max_length=150)
+    rut: Optional[str] = Field(None, max_length=12)
+    empresa: Optional[str] = Field(None, max_length=200)
+
+    @field_validator("telefono")
+    @classmethod
+    def _telefono(cls, v):
+        if not _E164.fullmatch(v):
+            raise ValueError("Debe venir en formato E.164, por ejemplo +56912345678")
+        return v
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, v):
+        if v and not _EMAIL.fullmatch(v):
+            raise ValueError("No es un correo válido")
+        return v or None
+
+    @field_validator("rut")
+    @classmethod
+    def _rut(cls, v):
+        if not v:
+            return None
+        ident = rut_identidad(v)
+        if not ident or _dv_rut(ident[:-1]) != ident[-1]:
+            raise ValueError("RUT inválido (revisa el dígito verificador), por ejemplo 76.123.456-7")
+        return v
+
+
+class _PFVehiculo(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+    patente: Optional[str] = Field(None, max_length=10)
+    vin: Optional[str] = Field(None, max_length=17)
+    marca: Optional[str] = Field(None, max_length=100)
+    modelo: Optional[str] = Field(None, max_length=100)
+    anio: Optional[int] = Field(None, ge=1950, le=datetime.utcnow().year + 1)
+    motor: Optional[str] = Field(None, max_length=100)
+
+    @field_validator("patente", "vin")
+    @classmethod
+    def _alfanumerico(cls, v):
+        if v and not v.isalnum():
+            raise ValueError("Solo letras y números, sin guiones ni espacios")
+        return v.upper() if v else None
+
+
+class _PFRepuesto(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+    descripcion: str = Field(min_length=1, max_length=300)
+    cantidad: int = Field(1, ge=1, le=999)
+    numero_parte: Optional[str] = Field(None, max_length=100)
+    marca: Optional[str] = Field(None, max_length=100)
+
+
+class _PFLead(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+    external_id: str
+    creado_en: Optional[datetime] = None
+    contacto: _PFContacto
+    vehiculo: Optional[_PFVehiculo] = None
+    repuestos: List[_PFRepuesto] = Field(default_factory=list, max_length=50)
+    comentario: Optional[str] = Field(None, max_length=2000)
+    urgencia: Literal["normal", "alta"] = "normal"
+    url_conversacion: Optional[str] = Field(None, max_length=500)
+
+    @field_validator("external_id")
+    @classmethod
+    def _external_id(cls, v):
+        if not _ID_EXTERNO.fullmatch(v):
+            raise ValueError("Entre 1 y 120 caracteres: letras, números y . _ : -")
+        return v
+
+    @field_validator("url_conversacion")
+    @classmethod
+    def _url(cls, v):
+        if v and not v.lower().startswith("https://"):
+            raise ValueError("Debe ser una dirección https://")
+        return v or None
+
+
+def _pf_campo(loc) -> str:
+    """('repuestos', 0, 'descripcion') -> 'repuestos[0].descripcion', como lo nombra el documento."""
+    texto = ""
+    for parte in loc:
+        texto += f"[{parte}]" if isinstance(parte, int) else (f".{parte}" if texto else str(parte))
+    return texto or "cuerpo"
+
+
+def _pf_mensaje(err: dict) -> str:
+    tipo, ctx = err.get("type", ""), err.get("ctx") or {}
+    if tipo == "missing":
+        return "Es obligatorio"
+    if tipo == "string_too_short":
+        return "No puede venir vacío"
+    if tipo == "string_too_long":
+        return f"Supera el máximo de {ctx.get('max_length')} caracteres"
+    if tipo == "too_long":
+        return f"Máximo {ctx.get('max_length')} ítems"
+    if tipo in ("int_parsing", "int_type", "int_from_float"):
+        return "Debe ser un número entero"
+    if tipo == "greater_than_equal":
+        return f"Debe ser mayor o igual a {ctx.get('ge')}"
+    if tipo == "less_than_equal":
+        return f"Debe ser menor o igual a {ctx.get('le')}"
+    if tipo == "literal_error":
+        return f"Valor no permitido; use {ctx.get('expected')}"
+    if tipo.startswith("datetime"):
+        return "Fecha inválida; use ISO 8601, por ejemplo 2026-10-21T15:42:00-03:00"
+    if tipo in ("model_type", "dict_type", "model_attributes_type"):
+        return "Debe ser un objeto JSON"
+    if tipo == "list_type":
+        return "Debe ser una lista"
+    if tipo == "string_type":
+        return "Debe ser texto"
+    if tipo == "value_error":
+        return str(err.get("msg", "")).removeprefix("Value error, ")
+    return str(err.get("msg", "Valor inválido"))
+
+
+# Límite de uso: 60 solicitudes por minuto. En MEMORIA del proceso, igual que el
+# limitador del login: supone UN proceso uvicorn (--workers 1), y un restart lo vacía.
+_PF_MARCAS: deque = deque()
+_PF_LOCK = threading.Lock()
+
+
+def _pf_cupo() -> int:
+    """0 si hay cupo (y lo toma), o los segundos a esperar."""
+    ahora = time.time()
+    with _PF_LOCK:
+        while _PF_MARCAS and _PF_MARCAS[0] <= ahora - 60:
+            _PF_MARCAS.popleft()
+        if len(_PF_MARCAS) >= PF_MAX_POR_MINUTO:
+            return max(1, int(_PF_MARCAS[0] + 60 - ahora) + 1)
+        _PF_MARCAS.append(ahora)
+        return 0
+
+
+# Un candado por external_id: el doble clic llega en dos peticiones casi simultáneas, y sin
+# esto las dos verían «no procesado» y crearían dos leads. Por proceso (ver arriba).
+_PF_CANDADOS: dict = {}
+_PF_CANDADOS_LOCK = threading.Lock()
+
+
+def _pf_candado(external_id: str) -> threading.Lock:
+    with _PF_CANDADOS_LOCK:
+        if len(_PF_CANDADOS) > 1000:  # techo: los candados libres se descartan
+            for k in [k for k, c in _PF_CANDADOS.items() if not c.locked()]:
+                del _PF_CANDADOS[k]
+        return _PF_CANDADOS.setdefault(external_id, threading.Lock())
+
+
+def _pf_error(status: int, detalle: str, **extra) -> JSONResponse:
+    return JSONResponse(status_code=status, content={"ok": False, "detail": detalle, **extra})
+
+
+@router.post("/partsflow/leads")
+async def recibir_lead_partsflow(request: Request, db: Session = Depends(get_db),
+                                 x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    # Clave SOLO por cabecera (a diferencia de Nexor, nunca ?key=: una URL queda en logs).
+    # compare_digest: el tiempo de la comparación no dice cuántos caracteres acertó.
+    clave = settings.PARTSFLOW_API_KEY or ""
+    if not clave or not x_api_key or not hmac.compare_digest(x_api_key.encode(), clave.encode()):
+        return _pf_error(401, "Clave ausente o incorrecta")
+
+    espera = _pf_cupo()
+    if espera:
+        return JSONResponse(status_code=429, headers={"Retry-After": str(espera)},
+                            content={"ok": False, "detail": f"Demasiadas solicitudes. Reintenta en {espera} segundos."})
+
+    raw = await request.body()
+    if len(raw) > PF_MAX_BYTES:
+        return _pf_error(413, "El cuerpo supera 64 KB")
+    try:
+        cuerpo = json.loads(raw or b"")
+    except (ValueError, UnicodeDecodeError):
+        cuerpo = None
+    if not isinstance(cuerpo, dict):
+        return _pf_error(400, "El cuerpo debe ser un objeto JSON válido")
+
+    # Se GUARDA antes de validar y de procesar: un 422 o un 500 quedan con su payload para
+    # revisar con el proveedor (mismo criterio que Nexor; la clave no se guarda).
+    cabeceras = {k: v for k, v in request.headers.items() if k.lower() not in ("x-api-key", "authorization", "cookie")}
+    log = MonzaWebhookLog(fuente=PF_FUENTE, headers=json.dumps(cabeceras, ensure_ascii=False)[:4000],
+                          payload=raw.decode("utf-8", "replace")[:8000])
+    log.external_id = str(cuerpo.get("external_id"))[:120] if cuerpo.get("external_id") else None
+    db.add(log)
+    db.commit()
+
+    try:
+        datos = _PFLead.model_validate(cuerpo)
+    except ValidationError as e:
+        errores = [{"campo": _pf_campo(err.get("loc", ())), "mensaje": _pf_mensaje(err)} for err in e.errors()]
+        log.error = ("422: " + "; ".join(f"{x['campo']}: {x['mensaje']}" for x in errores))[:400]
+        db.commit()
+        return JSONResponse(status_code=422, content={"ok": False, "errores": errores})
+
+    c, v = datos.contacto, datos.vehiculo or _PFVehiculo()
+    with _pf_candado(datos.external_id):
+        previo = (db.query(MonzaWebhookLog)
+                  .filter(MonzaWebhookLog.fuente == PF_FUENTE, MonzaWebhookLog.external_id == datos.external_id,
+                          MonzaWebhookLog.procesado == 1, MonzaWebhookLog.id != log.id)
+                  .order_by(MonzaWebhookLog.id).first())
+        if previo:
+            log.procesado, log.lead_id, log.lead_numero = 1, previo.lead_id, previo.lead_numero
+            log.error = "duplicado (external_id ya procesado)"
+            db.commit()
+            return JSONResponse(status_code=200, content={"ok": True, "lead_numero": previo.lead_numero,
+                                                          "duplicado": True})
+
+        def _procesar():
+            # Cliente: RUT (evidencia fuerte) → teléfono → email, con las puertas únicas de
+            # la casa. buscar_ficha_por_telefono no fusiona fichas con RUT contradictorio.
+            cliente = buscar_ficha_por_rut(db, MonzaCliente, c.rut) if c.rut else None
+            if not cliente:
+                cliente = buscar_ficha_por_telefono(db, MonzaCliente, c.telefono, rut_tecleado=c.rut)
+            if not cliente and c.email:
+                cliente = db.query(MonzaCliente).filter(MonzaCliente.email == c.email).first()
+            existente = cliente is not None
+            if cliente:
+                if c.rut and not rut_identidad(cliente.rut):
+                    cliente.rut = c.rut          # el RUT recibido COMPLETA la ficha sin RUT
+                if c.email and not cliente.email:
+                    cliente.email = c.email
+                if (cliente.nombre and c.nombre.strip().lower() != cliente.nombre.strip().lower()):
+                    log.error = (f"REVISAR: lead de «{c.nombre}» vinculado a la ficha «{cliente.nombre}» "
+                                 "por RUT/teléfono/email — confirmar si es el mismo cliente")[:400]
+            else:
+                cliente = MonzaCliente(nombre=c.nombre, telefono=c.telefono, email=c.email, rut=c.rut)
+                db.add(cliente)
+                db.flush()
+
+            notas = []
+            if v.patente:
+                notas.append(f"Patente: {v.patente}")
+            if v.motor:
+                notas.append(f"Motor: {v.motor}")
+            if datos.urgencia == "alta":
+                notas.append("Urgencia: ALTA")
+            if c.empresa:
+                notas.append(f"Empresa: {c.empresa}")
+            if datos.url_conversacion:
+                notas.append(f"Conversación PartsFlow: {datos.url_conversacion}")
+            comentario = " · ".join(notas)
+            if datos.comentario:
+                comentario = f"{comentario}\n{datos.comentario}" if comentario else datos.comentario
+
+            vehiculo = " ".join(x for x in (v.marca, v.modelo) if x) or None
+            lead = MonzaLead(cliente_id=cliente.id, vehiculo=vehiculo, vehicle_label=vehiculo,
+                             marca=v.marca, modelo=v.modelo, anio=str(v.anio) if v.anio else None,
+                             vin=v.vin, canal_origen=PF_CANAL, estado="pendiente",
+                             comentario=comentario or None, linea="autos")
+            agregar_lead_con_numero(db, lead)
+            for r in datos.repuestos:
+                db.add(MonzaLeadItem(lead_id=lead.id, descripcion=r.descripcion, cantidad=r.cantidad,
+                                     numero_parte=r.numero_parte, marca=r.marca, calidad="sin_calificar"))
+            log.procesado, log.lead_id, log.lead_numero = 1, lead.id, lead.numero
+            db.commit()
+            try:
+                from monza_notif import crear_notif
+                crear_notif(db, f"Nuevo lead desde PartsFlow · {lead.numero}", c.nombre, "info",
+                            "/monzaparts/leads", "lead", lead.id)
+            except Exception:
+                pass
+            return JSONResponse(status_code=201, content={"ok": True, "lead_numero": lead.numero,
+                                                          "duplicado": False, "cliente_existente": existente})
+
+        try:
+            return reintentar_carrera(db, _procesar, que="leads")
+        except HTTPException as e:
+            if e.status_code == 409:   # correlativo ocupado tras varios intentos: «reintenta»
+                db.rollback()
+                fila = db.query(MonzaWebhookLog).filter(MonzaWebhookLog.id == log.id).first()
+                if fila:
+                    fila.error = "creación simultánea: no se pudo asignar correlativo"
+                    db.commit()
+                return _pf_error(503, "Sistema ocupado. Reintenta el envío.")
+            raise
+        except Exception as e:
+            db.rollback()
+            fila = db.query(MonzaWebhookLog).filter(MonzaWebhookLog.id == log.id).first()
+            if fila:
+                fila.error = str(e)[:400]
+                db.commit()
+            # Sin el detalle: arrastraría el INSERT con datos del cliente (igual que Nexor).
+            return _pf_error(500, "Error procesando el lead. La solicitud quedó guardada para revisión.")
 
 
 @router.get("/nexor/log")
