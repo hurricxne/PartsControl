@@ -11,7 +11,7 @@ from auth import (
     get_usuario_autenticado, TIPO_INTERNO, TIPO_PORTAL,
 )
 from config import settings
-from empresa_guard import require_empresa
+from empresa_guard import es_cuenta_soporte, require_empresa
 import rate_limit_login as rl
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -135,7 +135,12 @@ def register(
 
     El usuario nuevo HEREDA la empresa de quien lo crea, para que una cuenta de una
     marca no pueda fabricar cuentas de la otra y saltarse el candado de empresa.
+
+    Una cuenta @bigcode.cl salta el candado de empresa (soporte ve las dos marcas), así que
+    solo soporte puede crear otra: si no, cualquier interno se fabricaba acceso a ambas.
     """
+    if es_cuenta_soporte(data.email) and not es_cuenta_soporte(getattr(current_user, "email", None)):
+        raise HTTPException(status_code=403, detail="Solo soporte puede crear cuentas de soporte")
     if db.query(User).filter(User.email == data.email).first():
         raise HTTPException(status_code=400, detail="El email ya está registrado")
     user = User(

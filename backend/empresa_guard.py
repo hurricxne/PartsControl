@@ -13,6 +13,14 @@ from fastapi import Depends, HTTPException, status
 from auth import get_current_user
 from models.models import User
 
+DOMINIO_SOPORTE = "@bigcode.cl"
+
+
+def es_cuenta_soporte(email: str | None) -> bool:
+    """¿Es una cuenta del equipo de soporte Bigcode? Única definición de la excepción: la
+    usan este guard y /auth/register (que impide fabricar cuentas de soporte)."""
+    return (email or "").strip().lower().endswith(DOMINIO_SOPORTE)
+
 
 def require_empresa(*allowed: str):
     """Dependency de router: deniega con 403 si la empresa del usuario no está en `allowed`.
@@ -21,8 +29,7 @@ def require_empresa(*allowed: str):
         # Excepción soporte Bigcode: las cuentas @bigcode.cl (equipo interno) acceden a
         # AMBAS marcas — misma excepción documentada del bypass de login (commit 71c4f06).
         # El candado de empresa separa CLIENTES entre marcas, no al equipo de soporte.
-        email = (getattr(current_user, "email", "") or "").lower()
-        if email.endswith("@bigcode.cl"):
+        if es_cuenta_soporte(getattr(current_user, "email", None)):
             return current_user
         # Sin default mágico: un usuario sin empresa definida queda bloqueado en TODOS
         # los módulos (más seguro). En la práctica `empresa` es NOT NULL en la BD.

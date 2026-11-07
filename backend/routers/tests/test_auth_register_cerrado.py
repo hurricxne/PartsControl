@@ -44,9 +44,9 @@ cliente_anonimo = TestClient(app_anonima)
 # App CON sesión: el camino legítimo (un usuario ya autenticado crea a otro).
 app_con_sesion = FastAPI()
 app_con_sesion.include_router(auth_router, prefix="/api")
-CURRENT = {"empresa": "automotriz"}
+CURRENT = {"empresa": "automotriz", "email": "admin@test.invalid"}
 app_con_sesion.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
-    id=1, empresa=CURRENT["empresa"], email="admin@test.invalid")
+    id=1, empresa=CURRENT["empresa"], email=CURRENT["email"])
 cliente_con_sesion = TestClient(app_con_sesion)
 
 
@@ -111,7 +111,30 @@ def test_usuario_creado_hereda_la_empresa_de_quien_lo_crea():
         _limpiar()
 
 
+def test_solo_soporte_crea_cuentas_de_soporte():
+    """Una cuenta @bigcode.cl salta el candado de empresa: un interno cualquiera no puede
+    fabricarse una (revisión de seguridad 2026-11-07). Mayúsculas y espacios no la cuelan."""
+    _limpiar()
+    try:
+        CURRENT.update(empresa="automotriz", email="vendedor@test.invalid")
+        for correo in (f"falso-{MARK}@bigcode.cl", f"FALSO2-{MARK.upper()}@BigCode.CL",
+                       f" falso3-{MARK}@bigcode.cl "):
+            r = cliente_con_sesion.post("/api/auth/register", json={
+                "email": correo, "nombre": "Soporte falso", "password": "x123456"})
+            assert r.status_code == 403, f"un interno creó {correo!r}: HTTP {r.status_code}"
+        assert _emails_de_prueba() == [], f"quedó creada: {_emails_de_prueba()}"
+
+        CURRENT.update(empresa="mineria", email="soporte@bigcode.cl")
+        r = cliente_con_sesion.post("/api/auth/register", json={
+            "email": f"nuevo-{MARK}@bigcode.cl", "nombre": "Soporte", "password": "x123456"})
+        assert r.status_code == 201, f"soporte ya no puede crear soporte: {r.status_code} {r.text[:200]}"
+    finally:
+        CURRENT.update(empresa="automotriz", email="admin@test.invalid")
+        _limpiar()
+
+
 if __name__ == "__main__":
     test_register_no_es_publico()
     test_usuario_creado_hereda_la_empresa_de_quien_lo_crea()
+    test_solo_soporte_crea_cuentas_de_soporte()
     print("TODO OK — el registro exige sesión y la empresa se hereda")
