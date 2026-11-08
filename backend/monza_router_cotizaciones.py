@@ -15,6 +15,7 @@ from auth import get_current_user
 from empresa_guard import require_empresa
 from role_guard import require_rol
 from monza_correlativos import siguiente_secuencia, reintentar_carrera
+from monza_largos import limpio, validar_largos
 from monza_fechas import hoy_chile, rango_utc
 from monza_notif import crear_notif
 from monza_models import (
@@ -579,6 +580,13 @@ def create_cotizacion(body: CotCreate, db: Session = Depends(get_db), current_us
     entre dos cotizaciones DEL MISMO CLIENTE llega como deadlock, no como violación del
     UNIQUE, y un deadlock deshace la transacción entera. Ver monza_correlativos.
     """
+    # Antes de tocar la base: un texto que no cabe es un 422 claro, no un 500 (monza_largos).
+    body.anio = limpio(body.anio)
+    validar_largos(body.model_dump(include={"tipo_cotizacion", "forma_pago", "linea", "vehiculo",
+                                            "anio", "oc_cliente", "vin"}),
+                   MonzaCotizacion.__table__)
+    for n, it in enumerate(body.items, start=1):
+        validar_largos(it.model_dump(), MonzaCotizacionItem.__table__, prefijo=f"Repuesto {n}: ")
     return reintentar_carrera(db, lambda: _crear_cotizacion_tx(body, db, current_user),
                               que="cotizaciones")
 

@@ -13,6 +13,7 @@ from auth import get_current_user
 from empresa_guard import require_empresa
 from monza_fechas import hoy_chile, inicio_mes_utc, rango_utc
 from monza_correlativos import agregar_lead_con_numero, reintentar_carrera
+from monza_largos import limpio, validar_largos
 from monza_rut import buscar_ficha_por_rut, parece_rut, rut_identidad, rut_norm_py, rut_norm_sql
 from monza_telefono import (buscar_ficha_por_telefono, telefono_identidad,
                             telefono_norm_py, telefono_norm_sql)
@@ -234,34 +235,9 @@ def _cliente_dict(c: MonzaCliente) -> dict:
     }
 
 
-# Textos de un ítem de lead y cómo nombrarlos ante el usuario. El ANCHO se lee de la
-# columna del modelo, no se copia acá, para que no se desincronicen.
-# POR QUÉ (2026-09-25, PROD): un texto más largo que su columna llegaba a la base y el
-# usuario veía un 500 crudo — "Data too long for column 'numero_parte'", dos veces ese
-# día, al pegar la descripción del repuesto en el campo del N° de parte.
-_TEXTOS_ITEM = {
-    "descripcion": "La descripción",
-    "numero_parte": "El N° de parte",
-    "marca": "La marca",
-    "procedencia": "La procedencia",
-    "calidad": "La calidad",
-    "plazo_entrega": "El plazo de entrega",
-}
-
-
 def _validar_largos_item(datos: dict, prefijo: str = "") -> None:
-    """422 con un mensaje que el usuario entiende si algún texto no cabe en su columna.
-    Cuenta CARACTERES, igual que MariaDB en utf8mb4: una tilde o una ñ valen uno."""
-    for campo, nombre in _TEXTOS_ITEM.items():
-        valor = datos.get(campo)
-        maximo = MonzaLeadItem.__table__.c[campo].type.length
-        if isinstance(valor, str) and maximo and len(valor) > maximo:
-            pista = (" Si pegaste la descripción del repuesto, va en el campo Descripción."
-                     if campo == "numero_parte" else "")
-            raise HTTPException(
-                status_code=422,
-                detail=f"{prefijo}{nombre} admite hasta {maximo} caracteres y tiene {len(valor)}.{pista}",
-            )
+    """422 claro si algún texto del ítem no cabe en su columna (ver monza_largos)."""
+    validar_largos(datos, MonzaLeadItem.__table__, prefijo)
 
 
 def _item_dict(it: MonzaLeadItem) -> dict:
@@ -647,8 +623,11 @@ def create_lead(body: LeadCreate, db: Session = Depends(get_db), current_user=De
     Medido con 6 creaciones REALMENTE simultáneas del mismo cliente: sin esto sobrevivían
     2 y los otros 4 leads se perdían con un 500 mientras el vendedor los estaba tipeando.
     """
-    # ANTES de crear nada (cliente al vuelo, correlativo): un ítem que no cabe no puede
+    # ANTES de crear nada (cliente al vuelo, correlativo): un texto que no cabe no puede
     # dejar un lead o una ficha a medio nacer. Mismo filtro de ítems vacíos que la tx.
+    body.anio = limpio(body.anio)
+    validar_largos(body.model_dump(include={"vehiculo", "marca", "modelo", "anio", "vin", "linea"}),
+                   MonzaLead.__table__)
     for n, it in enumerate(body.items, start=1):
         if it.descripcion.strip():
             _validar_largos_item(it.model_dump(), prefijo=f"Repuesto {n}: ")

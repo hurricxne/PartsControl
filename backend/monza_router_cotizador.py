@@ -14,6 +14,7 @@ from typing import Optional, List
 from database import get_db
 from auth import get_current_user
 from empresa_guard import require_empresa
+from monza_largos import limpio, validar_largos
 from monza_models import MonzaLead, MonzaLeadItem, MonzaConfig
 
 # CANDADO DE EMPRESA a nivel de ROUTER (2026-08-22): el CRM de MonzaParts estaba
@@ -307,6 +308,10 @@ def aplicar_precios(body: AplicarBody, db: Session = Depends(get_db), current_us
     lead = db.query(MonzaLead).filter(MonzaLead.id == body.lead_id).first()
     if not lead:
         raise HTTPException(status_code=404, detail="Lead no encontrado")
+    # Antes de mutar nada: un texto que no cabe es un 422 claro, no un 500 (monza_largos).
+    for n, ap in enumerate(body.items, start=1):
+        ap.numero_parte = limpio(ap.numero_parte)
+        validar_largos(ap.model_dump(), MonzaLeadItem.__table__, prefijo=f"Repuesto {n}: ")
 
     from datetime import datetime
     from monza_models import MonzaLeadActividad
