@@ -264,8 +264,9 @@ def _paso_a_el_candado_vive_en_un_solo_archivo():
         if cuantos:
             usos[archivo.name] = cuantos
     # Estos MANTIENEN el vínculo (lo escriben, o lo cuentan para el personal); no deciden
-    # qué ve un cliente.
-    permitidos = {"candado.py", "router_admin.py", "seed_piloto.py", "service.py"}
+    # qué ve un cliente. visible_desde.py es la consola del corte por ficha: cuenta ventas
+    # para quien lo fija; el corte que ve el cliente lo aplica candado.py.
+    permitidos = {"candado.py", "router_admin.py", "seed_piloto.py", "service.py", "visible_desde.py"}
     fuera = {a: n for a, n in usos.items() if a not in permitidos}
     check("§A `Cotizacion.cliente_id` no se usa fuera de candado.py en lo que ve el cliente",
           not fuera and usos.get("candado.py") == 1, usos)

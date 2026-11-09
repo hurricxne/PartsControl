@@ -371,6 +371,10 @@ class Cliente(Base):
     direccion = Column(String(500))
     ciudad = Column(String(100))
     giro = Column(String(255))
+    # Portal de Clientes: el cliente ve solo las ventas ingresadas desde este momento
+    # (oc_cliente.created_at). NULL = todas. Lo fija portal/visible_desde.py.
+    # Migración: python -m migrations.cliente_portal_visible_desde
+    portal_visible_desde = Column(DateTime, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

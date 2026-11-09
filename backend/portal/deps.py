@@ -38,7 +38,7 @@ from sqlalchemy.orm import Session
 
 from auth import TIPO_PORTAL, get_usuario_autenticado
 from database import get_db
-from models.models import User
+from models.models import Cliente, User
 from .models import PERFIL_BODEGA, PERFIL_PROCUREMENT, PortalAcceso, UsuarioCliente
 from .service import cuenta_vencida
 
@@ -100,6 +100,10 @@ class PortalScope:
     perfil: str             # 'procurement' | 'bodega'
     # La cuenta sigue con la clave temporal que le entregó su ejecutivo.
     debe_cambiar_clave: bool = False
+    # (cliente_id, desde) de las fichas con corte de visibilidad (clientes.portal_visible_desde):
+    # de esas, solo las ventas ingresadas desde ese momento. Las que no están acá, todas.
+    # Lo aplica candado.de_sus_ordenes.
+    visibles_desde: tuple = ()
 
     @property
     def ve_montos(self) -> bool:
@@ -127,11 +131,15 @@ def require_portal(
     # 'bodega': el scope tiene un solo perfil y, ante la duda, se muestra de menos.
     perfil = (PERFIL_PROCUREMENT if all(f.perfil == PERFIL_PROCUREMENT for f in filas)
               else PERFIL_BODEGA)
+    cliente_ids = frozenset(f.cliente_id for f in filas)
+    cortes = (db.query(Cliente.id, Cliente.portal_visible_desde)
+              .filter(Cliente.id.in_(cliente_ids), Cliente.portal_visible_desde.isnot(None)).all())
     return PortalScope(
         usuario_id=user.id,
-        cliente_ids=frozenset(f.cliente_id for f in filas),
+        cliente_ids=cliente_ids,
         perfil=perfil,
         debe_cambiar_clave=acceso.clave_temporal_desde is not None,
+        visibles_desde=tuple(sorted((cid, desde) for cid, desde in cortes)),
     )
 
 
