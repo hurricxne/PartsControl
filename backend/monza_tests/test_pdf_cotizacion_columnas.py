@@ -134,6 +134,14 @@ def run():
     check("3a el PDF de una cotización legado se genera igual",
           isinstance(pdf3, bytes) and pdf3[:4] == b"%PDF", "")
 
+    # ── 4) Cliente sin RUT (NULL): el PDF no revienta (500 en PROD el 11-11 con leads de PartsFlow) ──
+    sin_rut = _cot(items, 1234567, 234568, 1469135)
+    sin_rut.cliente = SimpleNamespace(nombre=None, rut=None)
+    pdf4 = _generar_pdf(sin_rut, _cfg())
+    check("4a cliente con RUT y nombre NULL: el PDF se genera",
+          isinstance(pdf4, bytes) and pdf4[:4] == b"%PDF", "")
+    check("4b ...y el bloque de datos sale completo (RUT de la empresa)", "77.111.222-3" in "\n".join(_texto(pdf4)), "")
+
     if _fails:
         raise AssertionError(f"{len(_fails)} checks fallaron: {_fails}")
     print("\n=== TODO OK ===")

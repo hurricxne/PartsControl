@@ -590,7 +590,8 @@ async def recibir_lead_partsflow(request: Request, db: Session = Depends(get_db)
                     log.error = (f"REVISAR: lead de «{c.nombre}» vinculado a la ficha «{cliente.nombre}» "
                                  "por RUT/teléfono/email — confirmar si es el mismo cliente")[:400]
             else:
-                cliente = MonzaCliente(nombre=c.nombre, telefono=c.telefono, email=c.email, rut=c.rut)
+                # Sin RUT ni email: "" como la ficha manual (las 796 de la casa); un NULL tumbaba el PDF.
+                cliente = MonzaCliente(nombre=c.nombre, telefono=c.telefono, email=c.email or "", rut=c.rut or "")
                 db.add(cliente)
                 db.flush()
 

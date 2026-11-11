@@ -99,6 +99,9 @@ def run():
     # ══ 2 · Lead mínimo ══
     r = _post(_minimo("minimo", telefono="+56900000003"))
     check("2 lead mínimo → 201", r.status_code == 201, (r.status_code, r.text[:200]))
+    _, _, cli = _lead(r.json().get("lead_numero"))
+    check("2b ficha nueva sin RUT ni email → \"\" como la manual (un NULL tumbaba el PDF, 11-11)",
+          cli is not None and cli.rut == "" and cli.email == "", cli and (cli.rut, cli.email))
 
     # ══ 3 · Duplicado: misma solicitud dos veces ══
     r2 = _post(completo)

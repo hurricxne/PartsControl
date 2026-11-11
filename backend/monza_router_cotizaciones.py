@@ -1415,9 +1415,9 @@ def _generar_pdf(cot, cfg) -> bytes:
     cli_rows = [
         [Paragraph("Datos Cliente", sec_lbl), "",
          Paragraph("Datos para Orden de Compra", sec_lbl), ""],
-        [Paragraph("Cliente:", lbl_b),    Paragraph(cli.nombre if cli else "", val_b),
+        [Paragraph("Cliente:", lbl_b),    Paragraph((cli.nombre or "") if cli else "", val_b),
          Paragraph("Razón social:", lbl_b), Paragraph(cfg.razon_social or "", val_b)],
-        [Paragraph("Rut:", lbl_b),        Paragraph(cli.rut if cli else "", val_b),
+        [Paragraph("Rut:", lbl_b),        Paragraph((cli.rut or "") if cli else "", val_b),
          Paragraph("Rut:", lbl_b),          Paragraph(cfg.rut_empresa or "", val_b)],
         [Paragraph("Atención:", lbl_b),   Paragraph(aten, val_b),
          Paragraph("Dirección:", lbl_b),    Paragraph(cfg.direccion or "", val_b)],
